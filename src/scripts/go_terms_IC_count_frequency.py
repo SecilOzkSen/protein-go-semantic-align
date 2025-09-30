@@ -5,7 +5,7 @@ and compute Information Content (IC) for FEW-SHOT / COMMON stratification.
 Overview
 --------
 This script prepares frequency and IC statistics for GO terms based on
-the training dataset, following the "true-path rule". Each protein is
+the training dataset, following the "true-path rule". Each proteins is
 annotated not only with its directly assigned GO terms but also with all
 ancestor terms (via `is_a` relations) in the ontology DAG. This ensures
 that counts reflect biologically valid hierarchical propagation.
@@ -24,7 +24,7 @@ Steps
    - Use memoization for efficiency.
 
 3. Apply true-path propagation:
-   - For each protein, expand its GO annotations to include all ancestors.
+   - For each proteins, expand its GO annotations to include all ancestors.
    - Count how many proteins support each GO term.
 
 4. Compute Information Content (IC):
@@ -59,7 +59,7 @@ Notes
 -----
 - True-path propagation uses only `is_a` relations (consistent with many pipelines).
 - Laplace smoothing avoids undefined log values for zero-count terms.
-- Frequency bands and IC-based cutoffs can be adjusted via config thresholds.
+- Frequency bands and IC-based cutoffs can be adjusted via configs thresholds.
 """
 
 import pickle
@@ -68,7 +68,7 @@ import math
 import pandas as pd
 from functools import lru_cache
 
-from src.config.paths import (
+from src.configs.paths import (
     GOA_PARSED_FILE,          # {protein_id -> [go_ids]}  (TRAIN)
     GO_TERMS_PKL,             # {go_id -> {"name":..., "namespace":..., "is_a":[...], ...}}
     GO_TERM_COUNTS_PKL,       # output: true-path counts (Counter)
@@ -83,7 +83,7 @@ from src.config.paths import (
     FS_TERMS_PER_NS_IC_MF_TSV,
 )
 
-from src.config.parameters import (
+from src.configs.parameters import (
     EPSILON,
     GAMMA_IC_Q75,
     GAMMA_IC_Q90,

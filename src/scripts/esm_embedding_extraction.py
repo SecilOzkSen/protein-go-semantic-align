@@ -1,6 +1,4 @@
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Created by @Secil Sen
 ESM embedding extraction CLI
@@ -20,13 +18,13 @@ Requires: fair-esm  (pip install fair-esm)
 """
 ESM Embedding Extraction Pipeline (CLI)
 
-This script extracts residue-level protein embeddings using Meta AI's ESM models
-and saves them in shards for downstream tasks such as protein function prediction.
+This script extracts residue-level proteins embeddings using Meta AI's ESM models
+and saves them in shards for downstream tasks such as proteins function prediction.
 
 Pipeline Overview:
 ------------------
 1. **Input**: 
-   - `sequences_full.pkl`: A dictionary mapping protein IDs → amino acid sequences.
+   - `sequences_full.pkl`: A dictionary mapping proteins IDs → amino acid sequences.
    - These sequences typically come from curated datasets (e.g., Swiss-Prot, TrEMBL, CAFA5)
      with GO annotations filtered by strong experimental evidence.
 
@@ -41,7 +39,7 @@ Pipeline Overview:
    - CLS/EOS tokens are removed, retaining only residue embeddings.
 
 4. **Sharding & Storage**:
-   - Segment embeddings are concatenated per protein.
+   - Segment embeddings are concatenated per proteins.
    - Proteins are grouped into shards (`shard_size`) and stored as `.pt` files 
      (`esm_embed_00000.pt`, `esm_embed_00001.pt`, …).
    - This keeps memory usage low and makes processing resumable.
@@ -56,7 +54,7 @@ Pipeline Overview:
      for the current GPU/CPU, preventing OOM errors.
 
 7. **Output**:
-   - A directory of `.pt` files with protein embeddings.
+   - A directory of `.pt` files with proteins embeddings.
    - Auxiliary pickle files (`all_proteins.pkl`, `remaining_proteins.pkl`) 
      tracking dataset progress.
 
@@ -113,7 +111,7 @@ def segment_sequence(seq, max_len, overlap):
 def auto_batch_size(model, batch_converter, device, seqs, max_try=16):
     for batch_size in range(1, max_try + 1):
         try:
-            batch_labels = [(f"protein{i}", seq) for i, seq in enumerate(seqs[:batch_size])]
+            batch_labels = [(f"proteins{i}", seq) for i, seq in enumerate(seqs[:batch_size])]
             labels, sequences, tokens = batch_converter(batch_labels)
             tokens = tokens.to(device)
             with torch.no_grad():
