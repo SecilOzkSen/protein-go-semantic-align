@@ -1,0 +1,105 @@
+data:
+  overlap: 256
+  no_cache_shards: false
+
+  # DAG & expansion
+  use_dag_in_ds: true
+  min_pos_for_expand: 3
+  max_ancestor_add: 4
+  max_hops: 3
+  ancestor_gamma: 0.7
+
+  # Few/Zero-shot
+  fs_target_ratio: 0.3
+
+caches:
+  go_cache: null         # ör: /content/drive/MyDrive/protein-go-align/data/go_cache_phase1.pt
+  faiss_index: null      # ör: /content/drive/MyDrive/protein-go-align/data/faiss_phase1.index
+
+  # Faz-temelli cache şablonları (tercihim bu)
+  go_cache_template: /content/drive/MyDrive/data/go_cache/go_cache_phase{phase}.pt
+  faiss_template: /content/drive/MyDrive/data/faiss/faiss_phase{phase}.index
+
+training:
+  epochs: 30
+  batch_size: 8
+  eval_batch_size: 8
+  num_workers: 2            # for Colab
+  fp16: true                # true if GPU available
+  cpu: false
+  seed: 42
+  output_dir: /content/drive/MyDrive/protein-go-align/outputs/run1
+  save_every: 1000
+  keep_last_n: 3
+  resume: null
+  log_every: 50
+  log_level: INFO
+
+optim:
+  lr: 0.0003
+  weight_decay: 0.01
+  grad_clip: 1.0
+
+model:
+  align_dim: 768
+  temperature: 0.07
+  attn_heads: 2
+  attn_dropout: 0.1
+  entropy_reg: 0.01
+  win_size: 1024
+  win_stride: 256
+
+loss:
+  lambda_con: 1.0
+  lambda_dag: 0.2
+  lambda_attr: 0.1
+  dag_margin: 0.05
+  dag_scale: 10.0
+  lambda_vtrue: 0.2
+  tau_distill: 1.5
+
+curriculum:
+  epochs: 4
+  warmup_frac: 0.1
+  mode: cosine
+  hard_frac: [0.2, 0.7]
+  shortlist_M: [256, 1024]
+  k_hard: [16, 64]
+  hier_up: [1, 0]
+  hier_dn: [1, 0]
+  random_k: [8, 0]
+  inbatch_easy: [1.0, 0.0]
+  neg_k: 32
+
+schedule:
+  phase_breaks: [5, 12, 25]
+  stageA_mix: [1.0, 0.0, 0.0]
+  stageB_mix: [0.7, 0.3, 0.0]
+  stageC_mix: [0.4, 0.4, 0.2]
+  stageD_mix: [0.4, 0.4, 0.2]
+  lambda_attr_start: 6
+  lambda_attr_max: 0.2
+
+wandb:
+  enabled: true
+  project: protein-go-align
+  entity: null
+  run_name: null
+  mode: online      # WANDB_MODE=enabled
+
+stores:
+  train_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_train_ids.txt
+  pid2pos_path: /content/drive/MyDrive/data/training_ready/proteins/pid_to_positives.json
+  val_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_val_ids.txt
+
+  # ESM/ProtBERT gövde embeddinglerinin klasörü (senin pipeline ne üretiyorsa)
+  embed_dir: /content/drive/MyDrive/esm-output/embeddings
+
+  # protein seq len lookup
+  seq_len_lookup_dir: /content/drive/MyDrive/data/proteins/seq_len_lookup
+
+  protein_manifest_file: /content/drive/MyDrive/data/manifest_cache/esm_manifest.jsonl
+
+  output_dir: /content/drive/MyDrive/protein-go-align-outputs
+  logs: /content/drive/MyDrive/protein-go-align-logs
+  go_text_folder: /content/drive/MyDrive/data/training_ready/go_indexes

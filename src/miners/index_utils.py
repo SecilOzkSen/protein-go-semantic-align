@@ -11,7 +11,7 @@ def load_faiss_index_for_phase(phase: int, to_gpu: bool = True):
     if phase < 0:
         raise RuntimeError("Phase value must be bigger than 0.")
 
-    phases_dict = TrainingReadyDataPaths.phases[phase]
+    phases_dict = TrainingReadyDataPaths().phases[phase]
     # 1) meta check
     if not os.path.isfile(phases_dict["meta"]):
         raise FileNotFoundError(phases_dict["meta"])

@@ -56,7 +56,7 @@ def load_go_cache(path: str) -> Dict[str, Any]:
     Ensures row2id/ id2row consistency.
     """
     blob = torch.load(path, map_location="cpu")
-    # TODO: burayı sil! - normalizasyonu go embeddingde yapıcaz
+    # TODO: remove here! - normalization should be done during embedding creation. But for safety, we keep it.
     blob['embs'] = F.normalize(blob['embs'], p=2, dim=1) # FAISS expects L2 normalized vectors!
 
     assert "embs" in blob and "id2row" in blob, "Cache missing 'embs' or 'id2row'."

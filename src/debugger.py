@@ -534,8 +534,7 @@ def main():
             ok_order = dbg_check_order_alignment(go_cache, memory_bank, sample=2000)
             dbg_spot_check_vectors(go_cache, memory_bank, n=16)
 
-            # (opsiyonel) FAISS id evren kontrolü
-            if hasattr(vres, "ids_tensor"):   # örnek; sende nasıl saklandıysa
+            if hasattr(vres, "ids_tensor"):
                  dbg_check_faiss_ids_against_universe(go_cache, vres.ids_tensor)
 
             if not ok_uni:
@@ -548,11 +547,15 @@ def main():
             return
 
         try:
-            idxs = list(range(min(8, memory_bank.embs.shape[0])))
+            idxs = list(range(min(8, memory_bank.embs.shape[0])))  # row indices
             sub = F.normalize(memory_bank.embs[idxs] + 1e-3, p=2, dim=1).cpu()
-            memory_bank.update(idxs, sub)
+
+            row2id = ctx.go_cache.row2id  # {row:int -> go_id:int/str}
+            go_ids = [row2id[r] for r in idxs]
+
+            memory_bank.update(go_ids, sub)  # <-- artık GO ID veriyoruz
             faiss_re = rebuild_faiss_from_bank(memory_bank, metric="ip")
-            VectorResources(faiss_re, memory_bank.embs)  # smoke
+            VectorResources(faiss_re, memory_bank.embs)
             log.info("bank refresh ok, rebuilt ntotal=%s", getattr(faiss_re, "ntotal", "unknown"))
         except Exception as e:
             log.warning("bank refresh test failed: %r", e)

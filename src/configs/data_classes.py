@@ -15,12 +15,11 @@ from src.configs.paths import (
 @dataclass
 class TrainSchedule:
     """
-    Faz geçişleri ve faza bağlı GO/FAISS cache path'leri.
-    phase_breaks örn: (5, 12, 25) => [0..4]=phase0, [5..11]=phase1, [12..24]=phase2, [25..]=phase3
+    Phase scheduling and batch mix ratios.
+    phase_breaks ex: (5, 12, 25) => [0..4]=phase0, [5..11]=phase1, [12..24]=phase2, [25..]=phase3
     """
     phase_breaks: Tuple[int, int, int] = (5, 12, 25)
 
-    # Yeni paths yapısıyla: doğrudan GO_INDEX üzerinden Path listeleri
     go_cache_paths: List[Path] = field(
         default_factory=lambda: [GO_INDEX[p]["TEXT_EMB"] for p in (1, 2, 3, 4)]
     )
@@ -82,7 +81,6 @@ class TrainSchedule:
         return min(ramp, base_lambda_attr if base_lambda_attr is not None else self.lambda_attr_max)
 
     def resolve_go_cache_path(self, phase: int) -> Path:
-        """phase: 0-based index; içerde 1-based GO_INDEX’e mapliyoruz."""
         p1 = int(phase) + 1
         return go_index_paths(p1)["TEXT_EMB"]
 
@@ -181,7 +179,6 @@ class TrainingReadyDataPaths:
     few_shot_id_only_json: Path = FEW_SHOT_IC_TERMS_ID_ONLY_JSON
     common_id_only_json: Path = COMMON_IC_GO_TERMS_ID_ONLY_JSON
 
-    # Faz path’leri yeni API ile (Path tipinde)
     phases: List[Dict[str, Path]] = field(default_factory=lambda: [
         dict(embeddings=GO_INDEX[1]["TEXT_EMB"], ip=GO_INDEX[1]["FAISS_IP"], meta=GO_INDEX[1]["META"]),
         dict(embeddings=GO_INDEX[2]["TEXT_EMB"], ip=GO_INDEX[2]["FAISS_IP"], meta=GO_INDEX[2]["META"]),
