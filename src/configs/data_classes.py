@@ -186,6 +186,15 @@ class TrainingReadyDataPaths:
         dict(embeddings=GO_INDEX[4]["TEXT_EMB"], ip=GO_INDEX[4]["FAISS_IP"], meta=GO_INDEX[4]["META"]),
     ])
 
+@dataclass
+class LoggingConfig:
+    log_every: int = 50
+    log_lora_hist: bool = False
+    probe_eval_every: int = 500
+    probe_batch_size: int = 8
+    gospec_tau: float = 0.02
+    gospec_topk: float = 32
+
 
 @dataclass
 class TrainingContext:
@@ -205,6 +214,17 @@ class TrainingContext:
     last_refresh_reason: Any = None
     batch_builder: Any = None
     go_text_store: Any = None
+    run_name: str = None
+    logging: LoggingConfig = LoggingConfig()
+
+    def to_dict(self):
+        d = dict(
+            run_name=self.run_name,
+            device=self.device,
+        )
+        # make sure logging is included:
+        d["logging"] = self.logging.__dict__ if hasattr(self.logging, "__dict__") else vars(self.logging)
+        return d
 
 
 @dataclass
@@ -228,3 +248,6 @@ class TrainerConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
     max_epochs: int = 20
+
+
+

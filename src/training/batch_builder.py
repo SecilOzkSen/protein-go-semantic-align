@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Set, Deque, Tuple
+from collections import deque
+import random
 
 import torch
 
-# Utilities
+# ---------------- Utilities ----------------
 @torch.no_grad()
 def _mean_pool(H: torch.Tensor, attn_valid: torch.Tensor) -> torch.Tensor:
     """
@@ -30,6 +32,9 @@ def _broadcast_zs_mask(zs_mask: torch.Tensor, B: int) -> torch.Tensor:
 
 def _normalize_pos_list(pos_go_global: Union[torch.Tensor, List[torch.Tensor]],
                         B: int, device: torch.device) -> List[torch.Tensor]:
+    """
+    Normalize positives into a list of 1D LongTensors (length Pi per item).
+    """
     out: List[torch.Tensor] = []
     if isinstance(pos_go_global, torch.Tensor):
         assert pos_go_global.dim() == 2 and pos_go_global.size(0) == B
@@ -46,11 +51,52 @@ def _normalize_pos_list(pos_go_global: Union[torch.Tensor, List[torch.Tensor]],
     return out
 
 
-# Simplified BatchBuilder (drop-in)
-#   - Single entry point used by trainer: build_from_embs(...)
-#   - Coarse shortlist via ANN (VectorResources or FAISS)
-#   - Filter by zero-shot mask and remove positives
-#   - Optional curriculum to read M/K (else defaults)
+def _bfs_within_hops(start_ids: Set[int],
+                     graph: Dict[int, List[int]],
+                     max_hops: int) -> Set[int]:
+    """
+    Limited BFS: return all nodes reachable from any start id within 'max_hops' steps.
+    If max_hops <= 0 or graph is None/empty, returns empty set.
+    """
+    if max_hops is None or max_hops <= 0 or not graph:
+        return set()
+    visited: Set[int] = set()
+    q: Deque[Tuple[int, int]] = deque()
+    for s in start_ids:
+        q.append((s, 0))
+        visited.add(s)
+    reached: Set[int] = set()
+    while q:
+        node, d = q.popleft()
+        if d == 0:
+            # do not include the start nodes themselves as "within hops" by default
+            pass
+        if d > 0:
+            reached.add(node)
+        if d >= max_hops:
+            continue
+        for nb in graph.get(node, []):
+            if nb not in visited:
+                visited.add(nb)
+                q.append((nb, d + 1))
+    return reached
+
+
+# ---------------- BatchBuilder ----------------
+# Single entry point used by trainer: build_from_embs(...)
+# Knobs (via CurriculumConfig):
+#   - shortlist_M: ANN shortlist size
+#   - k_hard: number of hard negatives from shortlist
+#   - hier_max_hops_up / hier_max_hops_down: exclude candidates that are ancestors/descendants
+#   - random_k: additional random easy negatives (after hard negatives)
+#   - use_inbatch_easy: optionally fill part of random_k using other items' positives
+#
+# Output contract:
+#   {
+#     "neg_go_ids": LongTensor [B, K_total]  (-1 padded where needed),
+#     "cand_ids":   LongTensor [B, M],        (may include -1)
+#     "stats":      {"M": int, "K": int, "K_hard": int, "random_k": int, "inbatch_used": int}
+#   }
 
 class BatchBuilder:
     def __init__(self,
@@ -71,10 +117,10 @@ class BatchBuilder:
         self.default_K = int(default_K)
         self.all_go_ids = all_go_ids  # id mapping if needed
 
-        # kept only for API compatibility (not used inside simplified flow)
+        # Kept for API parity
         self.go_encoder_rerank = go_encoder_rerank
-        self.dag_parents = dag_parents
-        self.dag_children = dag_children
+        self.dag_parents = dag_parents or {}
+        self.dag_children = dag_children or {}
         self.use_hier_mask = use_hier_mask
 
     # --- internal ANN adaptor ---
@@ -108,10 +154,10 @@ class BatchBuilder:
 
     @torch.no_grad()
     def build_from_embs(self,
-                        prot_emb_pad: torch.Tensor,  # [B, Lmax, Dh]
-                        prot_attn_mask: torch.Tensor,  # [B, Lmax]  True=VALID
+                        prot_emb_pad: torch.Tensor,            # [B, Lmax, Dh]
+                        prot_attn_mask: torch.Tensor,          # [B, Lmax]  True=VALID
                         pos_go_global: Union[torch.Tensor, List[torch.Tensor]],
-                        zs_mask: torch.Tensor,  # [G] or [B,G]  (bool; True=ZS→drop)
+                        zs_mask: torch.Tensor,                  # [G] or [B,G]  (bool; True=ZS→drop)
                         curriculum_config: Optional["CurriculumConfig"] = None,
                         true_vecs: Optional[torch.Tensor] = None,  # optional direct [B,d] query
                         ) -> Dict[str, torch.Tensor]:
@@ -131,23 +177,39 @@ class BatchBuilder:
         device = prot_emb_pad.device
         B = int(prot_emb_pad.size(0))
 
-        # ---- curriculum M/K (fallback to defaults)
+        # ---- curriculum knobs (fallback to defaults)
         M = int(getattr(self, "default_M", 128))
-        K = int(getattr(self, "default_K", 64))
+        K_hard = int(getattr(self, "default_K", 64))
+        hops_up = 0
+        hops_down = 0
+        random_k = 0
+        use_inbatch_easy = False
+
         if curriculum_config is not None:
-            try:
-                M = int(curriculum_config.shortlist_M[-1])
-                K = int(curriculum_config.k_hard[-1])
-            except Exception:
-                pass
+            # support either arrays (schedules) or scalars
+            def _last_or_scalar(x, default=None):
+                try:
+                    if isinstance(x, (list, tuple)):
+                        return x[-1]
+                    return x
+                except Exception:
+                    return default
+
+            M = int(_last_or_scalar(getattr(curriculum_config, "shortlist_M", M), M))
+            K_hard = int(_last_or_scalar(getattr(curriculum_config, "k_hard", K_hard), K_hard))
+            hops_up = int(_last_or_scalar(getattr(curriculum_config, "hier_max_hops_up", hops_up), hops_up))
+            hops_down = int(_last_or_scalar(getattr(curriculum_config, "hier_max_hops_down", hops_down), hops_down))
+            random_k = int(_last_or_scalar(getattr(curriculum_config, "random_k", random_k), random_k))
+            use_inbatch_easy = bool(getattr(curriculum_config, "use_inbatch_easy", use_inbatch_easy))
+
         M = max(0, M)
-        K = max(0, K)
+        K_hard = max(0, K_hard)
+        random_k = max(0, random_k)
 
         # ---- 1) Build query vectors
         if true_vecs is not None:
             q = true_vecs.to(device)
         elif self.vres is not None and hasattr(self.vres, "true_prot_vecs"):
-            # prefer VectorResources true_prot_vecs if available
             q = self.vres.true_prot_vecs(prot_emb_pad, prot_attn_mask)  # [B,d]
         else:
             q = _mean_pool(prot_emb_pad, prot_attn_mask)  # [B,d]
@@ -166,13 +228,33 @@ class BatchBuilder:
             cand_ids = cand_ids.long()
         cand_ids = cand_ids.to(device, non_blocking=True)
 
-        # ---- 3) filter by zs_mask and remove positives (robust)
+        # ---- 3) broadcast ZS mask and normalize positives
         zs = _broadcast_zs_mask(zs_mask.to(device).bool(), B)  # [B,G]
         assert zs.dim() == 2 and zs.size(0) == B, f"zs_mask after broadcast must be [B,G], got {tuple(zs.shape)}"
         G = int(zs.size(1))
-
         pos_list = _normalize_pos_list(pos_go_global, B, device)  # list of [Pi] long
 
+        # Pre-build per-item positive sets for quick lookup
+        pos_sets: List[Set[int]] = []
+        for b in range(B):
+            pb = pos_list[b]
+            pos_sets.append(set(int(x) for x in pb.tolist()))
+
+        # ---- 4) hierarchical masks (exclude close ancestors/descendants)
+        # Build "close-to-positives" exclusion sets per item if hops knobs are set
+        exclude_hier: List[Set[int]] = [set() for _ in range(B)]
+        if (hops_up > 0 or hops_down > 0) and (self.dag_parents or self.dag_children):
+            for b in range(B):
+                Pset = pos_sets[b]
+                if not Pset:
+                    continue
+                anc = _bfs_within_hops(Pset, self.dag_parents, hops_up) if hops_up > 0 else set()
+                des = _bfs_within_hops(Pset, self.dag_children, hops_down) if hops_down > 0 else set()
+                # Exclude ancestors/descendants within hops (do not exclude the positives themselves here
+                # because they will be removed explicitly below)
+                exclude_hier[b] = (anc | des)
+
+        # ---- 5) filter shortlist: drop paddings, out-of-range, zero-shot, positives, hier-close
         post_shortlist: List[torch.Tensor] = []
         for b in range(B):
             raw = cand_ids[b]  # [M], may include -1
@@ -185,54 +267,157 @@ class BatchBuilder:
             # b) restrict to valid id range [0, G)
             if G > 0:
                 valid = raw < G
-                if not torch.all(valid):
-                    raw = raw[valid]
-                    if raw.numel() == 0:
-                        post_shortlist.append(raw)
-                        continue
+                raw = raw[valid]
+                if raw.numel() == 0:
+                    post_shortlist.append(raw)
+                    continue
             else:
-                # No GO space; everything invalid
                 post_shortlist.append(torch.empty(0, dtype=torch.long, device=device))
                 continue
 
             # c) zero-shot filter (True=ZS → drop)
             zs_b = zs[b]  # [G] bool
             keep_mask = ~zs_b[raw]  # [k]
-            kept = raw[keep_mask]  # [k_keep]
+            kept = raw[keep_mask]
             if kept.numel() == 0:
                 post_shortlist.append(kept)
                 continue
 
             # d) remove known positives
-            pos_b = pos_list[b]  # [Pi]
-            if pos_b.numel() > 0:
-                pos_set = set(int(x) for x in pos_b.tolist())
-                if pos_set:
-                    keep2 = torch.tensor([int(x) not in pos_set for x in kept.tolist()],
-                                         device=device, dtype=torch.bool)
-                    kept = kept[keep2]
+            if pos_sets[b]:
+                keep2 = torch.tensor([int(x) not in pos_sets[b] for x in kept.tolist()],
+                                     device=device, dtype=torch.bool)
+                kept = kept[keep2]
+                if kept.numel() == 0:
+                    post_shortlist.append(kept)
+                    continue
+
+            # e) remove hierarchical-close negatives if requested
+            if exclude_hier[b]:
+                keep3 = torch.tensor([int(x) not in exclude_hier[b] for x in kept.tolist()],
+                                     device=device, dtype=torch.bool)
+                kept = kept[keep3]
 
             post_shortlist.append(kept)
 
-        # ---- 4) top-K from shortlist, with fallback padding (-1)
-        final_ids: List[torch.Tensor] = []
+        # ---- 6) choose K_hard from shortlist (truncate) ----
+        hard_lists: List[torch.Tensor] = []
         for kept in post_shortlist:
-            if kept.numel() >= K:
-                final_ids.append(kept[:K])
+            if kept.numel() >= K_hard:
+                hard_lists.append(kept[:K_hard])
             else:
-                need = K - kept.numel()
-                if need > 0:
-                    pad = torch.full((need,), -1, dtype=torch.long, device=device)
-                    final_ids.append(torch.cat([kept, pad], dim=0))
-                else:
-                    final_ids.append(kept)
+                hard_lists.append(kept)
 
-        neg_go_ids = (torch.stack(final_ids, dim=0)
-                      if len(final_ids) > 0
-                      else torch.empty((B, K), dtype=torch.long, device=device))
+        # ---- 7) add random/easy negatives
+        # Build global allowed pool per item: ids in [0,G) that are not ZS, not positives, not already selected,
+        # and not hier-close (if enforced).
+        K_total_per_item: List[int] = []
+        final_ids: List[torch.Tensor] = []
+        inbatch_used_counts: List[int] = []
+
+        # Prepare in-batch easy pool: union of other items' positives (per item)
+        if use_inbatch_easy:
+            all_other_pos: List[Set[int]] = []
+            for b in range(B):
+                others = set()
+                for b2 in range(B):
+                    if b2 == b:
+                        continue
+                    others |= pos_sets[b2]
+                all_other_pos.append(others)
+        else:
+            all_other_pos = [set() for _ in range(B)]
+
+        for b in range(B):
+            selected = set(int(x) for x in hard_lists[b].tolist())
+            # Base allowed mask
+            allowed = []
+            if G > 0:
+                zs_b = zs[b].tolist()
+                # We iterate through kept shortlist union random pool as needed
+                # Build a candidate pool of all IDs; we'll filter below
+                # NOTE: For speed, we sample later, not list all G always (could be large).
+            # In-batch easy fill preference:
+            inbatch_fill = []
+            if use_inbatch_easy and random_k > 0 and all_other_pos[b]:
+                # Prioritize other items' positives as "easy negatives" if they pass filters
+                for gid in all_other_pos[b]:
+                    if gid < 0 or gid >= G:
+                        continue
+                    if zs_b[gid]:
+                        continue
+                    if gid in pos_sets[b]:
+                        continue
+                    if gid in selected:
+                        continue
+                    if exclude_hier[b] and gid in exclude_hier[b]:
+                        continue
+                    inbatch_fill.append(gid)
+                    if len(inbatch_fill) >= random_k:
+                        break
+
+            # Random pool fill (if still need)
+            remaining_rand = max(0, random_k - len(inbatch_fill))
+            rand_fill: List[int] = []
+            if remaining_rand > 0 and G > 0:
+                # Sample without replacement from a filtered pool.
+                # To avoid enumerating all G, we attempt randomized trials with an upper cap.
+                trials = 0
+                cap = max(1000, 20 * remaining_rand)
+                while len(rand_fill) < remaining_rand and trials < cap:
+                    gid = random.randrange(0, G)
+                    trials += 1
+                    if zs_b[gid]:
+                        continue
+                    if gid in pos_sets[b] or gid in selected:
+                        continue
+                    if exclude_hier[b] and gid in exclude_hier[b]:
+                        continue
+                    # avoid duplicates against inbatch_fill / rand_fill
+                    if gid in rand_fill or gid in inbatch_fill:
+                        continue
+                    rand_fill.append(gid)
+
+            # Merge: hard -> inbatch -> random
+            merged = list(selected)
+            # Keep order stable: hard first in original shortlist order
+            hard_tensor = hard_lists[b]
+            merged = [int(x) for x in hard_tensor.tolist()]
+            if len(inbatch_fill) > 0:
+                merged += inbatch_fill
+            if len(rand_fill) > 0:
+                merged += rand_fill
+
+            K_total = len(merged)
+            K_total_per_item.append(K_total)
+            inbatch_used_counts.append(len(inbatch_fill))
+
+            final_ids.append(torch.as_tensor(merged, dtype=torch.long, device=device))
+
+        # ---- 8) pad to common K_total across batch with -1
+        K_max = max(K_total_per_item) if K_total_per_item else 0
+        padded_final: List[torch.Tensor] = []
+        for ids in final_ids:
+            need = K_max - ids.numel()
+            if need > 0:
+                pad = torch.full((need,), -1, dtype=torch.long, device=device)
+                ids = torch.cat([ids, pad], dim=0)
+            padded_final.append(ids)
+
+        neg_go_ids = (torch.stack(padded_final, dim=0)
+                      if len(padded_final) > 0
+                      else torch.empty((B, 0), dtype=torch.long, device=device))
+
+        stats = {
+            "M": int(M),
+            "K": int(K_max),
+            "K_hard": int(K_hard),
+            "random_k": int(random_k),
+            "inbatch_used": int(sum(inbatch_used_counts)) if inbatch_used_counts else 0
+        }
 
         return {
-            "neg_go_ids": neg_go_ids,  # [B,K], -1 padded
-            "cand_ids": cand_ids,  # [B,M], may contain -1
-            "stats": {"M": int(M), "K": int(K)},
+            "neg_go_ids": neg_go_ids,   # [B,K_max], -1 padded
+            "cand_ids": cand_ids,       # [B,M], may contain -1
+            "stats": stats,
         }

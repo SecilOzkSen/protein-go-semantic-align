@@ -22,7 +22,7 @@ from src.datasets.protein_dataset import ProteinEmbDataset
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
 from src.configs.data_classes import (
-    FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext
+    FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
 from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache
@@ -450,6 +450,15 @@ def run_training(args, schedule: TrainSchedule):
         scheduler=scheduler,
         go_text_store=go_text_store,
     )
+    training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    training_context.logging = LoggingConfig(
+        log_every=int(args.log_every),
+        log_lora_hist=False,
+        probe_eval_every=500,
+        probe_batch_size=8,
+        gospec_tau=0.02,
+        gospec_topk=32,
+    )
 
     # Align vector backends to MemoryBank embeddings (prefer bank)
     try:
@@ -536,6 +545,7 @@ def run_training(args, schedule: TrainSchedule):
                                   settings=wandb.Settings(start_method="thread"))
            wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
            wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
+           wandb_logger = WandbLogger(wandb_run)
 #
 
 
