@@ -119,6 +119,7 @@ def build_light_args(args, schedule: TrainSchedule):
     args.num_workers = 0
     args.log_every = 1
     args.epochs = 1
+    args.max_len=1024
     # curriculum squeeze
     args.curriculum_epochs = max(1, int(getattr(args, "curriculum_epochs", 4)))
     args.shortlist_M_start = min(64, getattr(args, "shortlist_M_start", 256))

@@ -165,6 +165,7 @@ def build_store(args) -> ESMResidueStore:
     store = ESMResidueStore(
         embed_dir=args.embed_dir,
         seq_len_lookup=seq_len_lookup,
+        max_len=args.max_len,
         overlap=args.overlap,
         cache_shards=(not args.no_cache_shards),
         pro_manifest_file=args.pro_manifest if args.pro_manifest else None,
@@ -772,6 +773,7 @@ def load_structured_cfg(path: str = TRAINING_CONFIG):
         go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
 
         overlap=data.get("overlap"),
+        max_len=data.get("max_len", 1024),
         no_cache_shards=bool(data.get("no_cache_shards", False)),
 
         # dataset DAG / expansion / few-zero
