@@ -145,8 +145,8 @@ class LoRAParameters:
         "attention.output.dense",
     ]))
     use_rslora: bool = False
-    layers_to_transform: List[int] = None
-    layers_pattern: str = None
+    layers_to_transform: Optional[List[int]] = None
+    layers_pattern: Optional[str] = None
     bias: Literal["none", "all", "lora_only"] = "none"
     task_type: str = "FEATURE_EXTRACTION"
 
@@ -193,7 +193,7 @@ class LoggingConfig:
     probe_eval_every: int = 500
     probe_batch_size: int = 8
     gospec_tau: float = 0.02
-    gospec_topk: float = 32
+    gospec_topk: int = 32
 
 
 @dataclass
@@ -215,7 +215,7 @@ class TrainingContext:
     batch_builder: Any = None
     go_text_store: Any = None
     run_name: str = None
-    logging: LoggingConfig = LoggingConfig()
+    logging: LoggingConfig = None
 
     def to_dict(self):
         d = dict(
@@ -248,6 +248,3 @@ class TrainerConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
     max_epochs: int = 20
-
-
-
