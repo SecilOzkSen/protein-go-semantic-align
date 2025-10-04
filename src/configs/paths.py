@@ -1,6 +1,6 @@
 from __future__ import annotations
-import os
 from pathlib import Path
+import os
 
 def _detect_project_root() -> Path:
     """
@@ -44,6 +44,7 @@ def _detect_project_root() -> Path:
 
 # ---- Root & data layout ------------------------------------------------------
 
+PLATFORM = os.getenv("PLATFORM", "local")  # local, colab, kaggle, ...
 PROJECT_ROOT = _detect_project_root()
 SRC_DIR = PROJECT_ROOT / "src"
 DATA_DIR = SRC_DIR / "data"             # mevcut yapına uyuyor
@@ -86,7 +87,10 @@ FEW_SHOT_IC_TERMS_ID_ONLY_JSON     = TRAINING_READY / "go_few_zero_common" / "ic
 COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic_common_terms_id_only.json"
 
 # ---- GO indexes by phase -----------------------------
-_GO_IDX = lambda p: TRAINING_READY / "go_indexes" / f"phase{p}"
+if PLATFORM == "colab":
+    _GO_IDX = lambda p: "content" / "drive" / "MyDrive" / "data" / "training_ready" / "go_indexes" / f"phase{p}"
+else:
+    _GO_IDX = lambda p: TRAINING_READY / "go_indexes" / f"phase{p}"
 GO_INDEX = {
     1: {
         "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.pt",
