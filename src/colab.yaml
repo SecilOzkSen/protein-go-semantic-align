@@ -103,4 +103,4 @@ stores:
 
   output_dir: /content/drive/MyDrive/protein-go-align-outputs
   logs: /content/drive/MyDrive/protein-go-align-logs
-  go_text_folder: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/data/training_ready/processed/go_terms/go_phases
+  go_text_folder: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/training_ready/processed/go_terms/go_phases
