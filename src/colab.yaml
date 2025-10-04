@@ -89,18 +89,15 @@ wandb:
   mode: online      # WANDB_MODE=enabled
 
 stores:
-  train_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_train_ids.txt
-  pid2pos_path: /content/drive/MyDrive/data/training_ready/proteins/pid_to_positives.json
-  val_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_val_ids.txt
+  train_ids_path: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/training_ready/proteins/protein_train_ids.txt
+  pid2pos_path: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/training_ready/proteins/pid_to_positives.json
+  val_ids_path: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/training_ready/proteins/protein_val_ids.txt
 
-  # ESM/ProtBERT gövde embeddinglerinin klasörü (senin pipeline ne üretiyorsa)
   embed_dir: /content/drive/MyDrive/esm-output/embeddings
 
   # protein seq len lookup
-  seq_len_lookup_dir: /content/drive/MyDrive/data/proteins/seq_len_lookup
-
-  protein_manifest_file: /content/drive/MyDrive/data/manifest_cache/esm_manifest.jsonl
-
+  seq_len_lookup_dir: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/training_ready/proteins/seq_len_lookup.pkl
+  protein_manifest_file: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/training_ready/manifest_cache/esm_manifest.jsonl
   output_dir: /content/drive/MyDrive/protein-go-align-outputs
   logs: /content/drive/MyDrive/protein-go-align-logs
   go_text_folder: /content/drive/MyDrive/protein-go-align/protein-go-semantic-align/src/data/processed/go_terms/go_phases
