@@ -87,10 +87,7 @@ FEW_SHOT_IC_TERMS_ID_ONLY_JSON     = TRAINING_READY / "go_few_zero_common" / "ic
 COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic_common_terms_id_only.json"
 
 # ---- GO indexes by phase -----------------------------
-if PLATFORM == "colab":
-    _GO_IDX = lambda p: "content" / "drive" / "MyDrive" / "data" / "training_ready" / "go_indexes" / f"phase{p}"
-else:
-    _GO_IDX = lambda p: TRAINING_READY / "go_indexes" / f"phase{p}"
+_GO_IDX = lambda p: TRAINING_READY / "go_indexes" / f"phase{p}"
 GO_INDEX = {
     1: {
         "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.pt",
