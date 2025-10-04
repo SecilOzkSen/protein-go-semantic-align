@@ -28,7 +28,7 @@ from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache
 from src.go import load_go_parents, load_go_children
 from src.miners import load_faiss_index_for_phase
-from src.utils import (
+from src.utils.helpers import (
     load_go_set, load_raw_pickle, load_raw_json, load_raw_txt, load_go_texts_by_phase
 )
 from src.encoders import BioMedBERTEncoder
