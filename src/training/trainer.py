@@ -203,6 +203,8 @@ class OppTrainer:
             go_encoder=go_encoder,  # BioMedBERTEncoder (with LoRA)
             normalize=True,
         )
+        device = torch.device(self.cfg.device)
+        self.model.to(device)
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr)
         self._global_step = 0
 

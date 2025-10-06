@@ -19,14 +19,40 @@ class VectorResources:
 
     @torch.no_grad()
     def project_queries_to_index(self, Q: torch.Tensor) -> torch.Tensor:
-        # Q: [B, 1280] or [B, 768]
+        """
+        Q: [B, 1280] or [B, 768]
+        - If Q is a single row, makes it [1, D].
+        - If Q's channel is not align_dim, projects it with self.query_projector.
+        - Before projection, moves Q to the projector's device (CPU/GPU compatibility).
+        - Result is L2 normalized.
+        """
         if Q.dim() == 1:
             Q = Q.unsqueeze(0)
-        if Q.size(1) != self.align_dim:
-            if self.query_projector is None:
-                raise ValueError(f"No query_projector set for dim {Q.size(1)} -> {self.align_dim}")
-            Q = self.query_projector(Q)  # W_h uygula
-        return torch.nn.functional.normalize(Q, p=2, dim=1)
+        try:
+            proj_dev = next(self.query_projector.parameters()).device
+        except StopIteration:
+            proj_dev = getattr(self.query_projector, "weight", Q).device if hasattr(self.query_projector, "weight") else Q.device
+
+        if Q.device != proj_dev:
+            Q = Q.to(device=proj_dev, non_blocking=True,
+                     dtype=getattr(self.query_projector, 'weight', Q).dtype if hasattr(self.query_projector, 'weight') else None)
+
+        was_training = getattr(self.query_projector, "training", False)
+        try:
+            self.query_projector.eval()
+        except Exception:
+            pass
+
+        with torch.no_grad():
+            Q = self.query_projector(Q)
+
+        try:
+            if was_training:
+                self.query_projector.train()
+        except Exception:
+            pass
+
+        return F.normalize(Q, dim=1)
 
     @torch.no_grad()
     def coarse_prot_vecs(self, prot_emb_pad: torch.Tensor, prot_attn_mask: torch.Tensor) -> torch.Tensor:
