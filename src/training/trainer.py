@@ -194,7 +194,7 @@ def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
 
 # ------------- Trainer -------------
 class OppTrainer:
-    def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder):
+    def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None, wlogger=None):
         self.cfg, self.attr, self.ctx = cfg, attr, ctx
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
@@ -237,25 +237,28 @@ class OppTrainer:
             self.builder = ctx.batch_builder
 
         # W&B setup
-        self._wandb_configs()
+        self._wandb_configs(wandb_run=wandb_run, wlogger=wlogger)
 
-    def _wandb_configs(self):
-        """Initialize W&B run, logger, and per-phase accumulators."""
-        self.wandb_run = wandb.init(
-            project="protein-go-semantic-align",
-            name=self.ctx.run_name,
-            config=self.ctx.to_dict()
-        )
-        self.wlogger = WabLogger(self.wandb_run, project="protein-go-semantic-align", config=self.ctx.to_dict())
-        self._phase_acc = defaultdict(lambda: defaultdict(list))
-        self._current_phase_id = None
-
-        # Optional: watch model for gradients/parameters (guarded)
+    def _wandb_configs(self, wandb_run=None, wlogger=None):
+        if wandb_run is not None:
+            self.wandb_run = wandb_run
+        else:
+            self.wandb_run = wandb.init(
+                project="protein-go-semantic-align",
+                name=self.ctx.run_name,
+                config=self.ctx.to_dict(),
+                reinit=False
+            )
+        if wlogger is not None:
+            self.wlogger = wlogger
+        else:
+            self.wlogger = WabLogger(self.wandb_run, project="protein-go-semantic-align",
+                                                config=self.ctx.to_dict())
+        # watch (guarded)
         try:
             wandb.watch(self.model, log="all", log_freq=max(100, getattr(self.cfg, "log_every", 50)))
         except Exception:
             pass
-
     # --------- Wandb helpers (phase bookkeeping) ---------
     def _on_phase_change(self, new_phase_id: int, new_phase_name: str, step: int):
         """Flush summary for previous phase and start a new one."""

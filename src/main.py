@@ -33,6 +33,7 @@ from src.utils import (
 )
 from src.encoders import BioMedBERTEncoder
 from src.training.batch_builder import BatchBuilder
+import signal, traceback, time as _time
 
 from src.configs.paths import (
     PROTEIN_TRAIN_IDS,
@@ -47,9 +48,21 @@ from src.configs.paths import (
     GO_ANCESTOR_STOPLIST,
     COMMON_IC_GO_TERMS_ID_ONLY_JSON,
 )
-
+# To prevent sigint (potential cause)
+import torch.multiprocessing as mp
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
 # ============== Utilities ==============
+
+def _sigint_handler(signum, frame):
+    print(f"\n[DBG] Caught SIGINT at {_time.strftime('%H:%M:%S')}")
+    traceback.print_stack(frame)
+signal.signal(signal.SIGINT, _sigint_handler)
+
+
 def setup_logging(output_dir: Path, level: str = "INFO"):
     output_dir.mkdir(parents=True, exist_ok=True)
     log_path = output_dir / "train.log"
@@ -228,7 +241,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=0,
+        persistent_workers=False,
         pin_memory=False,
         collate_fn=collate,
     )
@@ -238,7 +252,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             datasets["val"],
             batch_size=args.eval_batch_size or args.batch_size,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=0,
+            persistent_workers=False,
             pin_memory=False,
             collate_fn=collate,
         )
@@ -374,6 +389,7 @@ class WandbLogger:
 
 # ============== Runner ==============
 def run_training(args, schedule: TrainSchedule):
+    signal.signal(signal.SIGINT, _sigint_handler)
     logger = logging.getLogger("main")
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     logger.info("Device: %s", device)
@@ -540,14 +556,16 @@ def run_training(args, schedule: TrainSchedule):
     if args.wandb:
            os.environ.setdefault("WANDB_MODE", args.wandb_mode)
            cfg = build_wandb_config(args, schedule)
-           wandb_run = wandb.init(project=args.wandb_project, entity=args.wandb_entity or None,
-                                  name=args.wandb_run_name or None, config=cfg, dir=args.output_dir,
-                                  settings=wandb.Settings(start_method="thread"))
-           wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
-           wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
+           wandb_run = wandb.init(project=args.wandb_project,
+                                  entity=args.wandb_entity or None,
+                                  name=args.wandb_run_name or None,
+                                  config=cfg,
+                                  dir=args.output_dir)
+           wandb.define_metric("global_step")
+           wandb.define_metric("*", step_metric="global_step")
+        #   wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
+        #   wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
            wandb_logger = WandbLogger(wandb_run)
-#
-
 
     # infer dims
     with torch.no_grad():
@@ -574,13 +592,7 @@ def run_training(args, schedule: TrainSchedule):
         lambda_vtrue = getattr(args, "lambda_vtrue", 0.2),
         tau_distill = getattr(args, "tau_distill", 1.5)
     )
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
-
-    if wandb_run is not None and hasattr(trainer, "model"):
-        try:
-            wandb.watch(trainer.model, log="all", log_freq=max(100, args.log_every))
-        except Exception:
-            pass
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=wandb_run, wlogger=wandb_logger)
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
@@ -592,6 +604,12 @@ def run_training(args, schedule: TrainSchedule):
     for epoch in range(args.epochs):
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
         try:
+            if wandb_run is not None and global_step == 1:
+                try:
+                    wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
+                    wandb_dataset_quickstats(wandb, datasets["train"], sample_n=256)  # daha küçük örnek
+                except Exception as e:
+                    logging.getLogger("wandb").warning("deferred previews failed: %r", e)
             if len(seen_go_ids_prev) > 0:
                 ids_to_update = sorted(set(int(i) for i in seen_go_ids_prev))
                 toks = go_text_store.batch(ids_to_update)
@@ -660,18 +678,10 @@ def run_training(args, schedule: TrainSchedule):
             # per-step logging
             if (global_step % max(1, args.log_every)) == 0:
                 avg = {k: (running[k] / max(1, n_batches)) for k in running}
-                try:
-                    lr0 = trainer.opt.param_groups[0].get("lr", None)
-                    log_payload = {f"train/{k}": v for k, v in avg.items()}
-                    if lr0 is not None:
-                        log_payload["train/lr"] = float(lr0)
-                    logger.info(f"[train] epoch {epoch} step {global_step} :: " +
-                                " | ".join([f"{k}:{v:.4f}" for k, v in avg.items()]) +
-                                (f" | lr:{lr0:.2e}" if lr0 is not None else ""))
-                    if wandb_logger is not None:
-                        wandb_logger.log(log_payload, step=global_step)
-                except Exception:
-                    pass
+                lr0 = trainer.opt.param_groups[0].get("lr", None)
+                logger.info(f"[train] epoch {epoch} step {global_step} :: " +
+                            " | ".join([f"{k}:{v:.4f}" for k, v in avg.items()]) +
+                            (f" | lr:{lr0:.2e}" if lr0 is not None else ""))
 
             # periodic checkpoint
             if (global_step % max(1, args.save_every)) == 0:
@@ -885,6 +895,7 @@ def load_structured_cfg(path: str = TRAINING_CONFIG):
 
 
 def main():
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args, schedule = load_structured_cfg(TRAINING_CONFIG)
     out = Path(args.output_dir)
     setup_logging(out, level=args.log_level)
