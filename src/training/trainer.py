@@ -14,6 +14,9 @@ import wandb
 from collections import defaultdict
 from src.utils.wandb_logger import WabLogger
 
+from src.metrics.cafa import compute_fmax, compute_term_aupr
+
+
 
 # ------------- Helpers -------------
 def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:
@@ -273,6 +276,71 @@ class OppTrainer:
         if rows:
             table = wandb.Table(columns=["phase_id", "metric", "mean", "std", "min", "max", "n"], data=rows)
             wandb.log({f"phase_summary/phase_{phase_id}": table}, step=step)
+
+    # --------- Eval space builder (for val/test) ---------
+    def _build_eval_space(self, batch):
+        """
+        Returns:
+          G_eval:   (B, Geval, Dg)  — her protein için aynı Geval uzayı (GO embeddingleri)
+          y_true:   (B, Geval)      — multi-hot GT (pozitif GO’lar 1)
+          eval_ids: (Geval,) LongTensor — kullanılan global GO id’leri
+        Mantık:
+          - Eğer ctx.eval_id_list varsa onu kullan (global sabit uzay).
+          - Yoksa batch içindeki uniq_go_embs + uniq_go_ids’i kullan (lokal uzay).
+        """
+        device = self.cfg.device
+        B = batch["prot_emb_pad"].size(0)
+
+        # --- Eval GO ID setini seç ---
+        if hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list:
+            # Global sabit uzay
+            eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long, device=device)  # (Geval,)
+            rows = torch.as_tensor([self.ctx.go_cache.id2row[int(g)] for g in eval_ids.tolist()],
+                                   dtype=torch.long, device=device)
+            G_eval_once = self.ctx.memory_bank.embs.to(device).index_select(0, rows)  # (Geval, Dg)
+        else:
+            # Batch-local uzay
+            eval_ids = batch["uniq_go_ids"].to(device)  # (Geval,)
+            if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
+                toks = batch["pos_go_tokens"]
+                G_eval_once = self.model.go_encoder(
+                    input_ids=toks["input_ids"].to(device),
+                    attention_mask=toks["attention_mask"].to(device),
+                )  # (Geval, Dg)
+                G_eval_once = F.normalize(G_eval_once, p=2, dim=1)
+            else:
+                G_eval_once = batch["uniq_go_embs"].to(device)  # (Geval, Dg)
+
+        Geval, Dg = G_eval_once.size(0), G_eval_once.size(1)
+
+        # (Geval, Dg) -> (B, Geval, Dg) (broadcast)
+        G_eval = G_eval_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()
+
+        # --- y_true: (B, Geval) multi-hot
+        y_true = torch.zeros(B, Geval, dtype=torch.float32, device=device)
+        # map: global id -> col index (sadece global eval uzayı için gerekli)
+        id2col = {int(eval_ids[i].item()): i for i in range(Geval)}
+
+        # Pozitifler batch’ten geliyor: pos_go_local (uniq indeksler) VE/YA da global id listesi
+        pos_local = batch["pos_go_local"]  # list[LongTensor]
+        if eval_ids.data_ptr() == batch["uniq_go_ids"].to(device).data_ptr():
+            # lokal uzay: indeksler aynı
+            for b, loc in enumerate(pos_local):
+                if loc.numel() > 0:
+                    y_true[b, loc.to(device)] = 1.0
+        else:
+            # global sabit uzay: önce uniq_go_ids ile global id’yi bul, sonra id2col ile kolon
+            uniq_go_ids = batch["uniq_go_ids"].to(device)  # (G_local,)
+            for b, loc in enumerate(pos_local):
+                if loc.numel() == 0:
+                    continue
+                glob = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))
+                for g in glob.tolist():
+                    j = id2col.get(int(g), None)
+                    if j is not None:
+                        y_true[b, j] = 1.0
+
+        return G_eval, y_true, eval_ids
 
     # --------- Scoring (tensor path) ---------
     def forward_scores(self, H, G, pad_mask, **kwargs):
@@ -538,6 +606,10 @@ class OppTrainer:
         device = self.cfg.device
         logs = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
         n = 0
+        # CAFA accumulation
+        all_pred_blocks: List[torch.Tensor] = []
+        all_true_blocks: List[torch.Tensor] = []
+
 
         for batch in loader:
             H = batch["prot_emb_pad"].to(device)
@@ -606,6 +678,15 @@ class OppTrainer:
             l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents, margin=0.0, scale=1.0)
             total = l_con + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
+            # ---- CAFA eval space & predictions ----
+            G_eval, y_true_b, _ = self._build_eval_space(batch)        # (B, Geval, Dg), (B, Geval)
+            scores_eval, _ = self.forward_scores(H, G_eval, pad_mask)  # (B, Geval) logits
+            probs_eval = torch.sigmoid(scores_eval)                     # (B, Geval)
+
+            all_pred_blocks.append(probs_eval.detach().cpu())
+            all_true_blocks.append(y_true_b.detach().cpu())
+
+
             logs["total"] += float(total.detach().item())
             logs["contrastive"] += float(l_con.detach().item())
             logs["dag"] += float(l_dag.detach().item())
@@ -615,4 +696,18 @@ class OppTrainer:
 
         for k in logs:
             logs[k] /= max(1, n)
+
+        # --- CAFA metrics over full split ---
+        if all_pred_blocks:
+            import numpy as np
+            y_pred = torch.cat(all_pred_blocks, dim=0).numpy()  # (N, Geval)
+            y_true = torch.cat(all_true_blocks, dim=0).numpy()  # (N, Geval)
+            fmax, _ = compute_fmax(y_true, y_pred)
+            aupr    = compute_term_aupr(y_true, y_pred)
+            logs["cafa_fmax"] = float(fmax)
+            logs["cafa_aupr"] = float(aupr)
+        else:
+            logs["cafa_fmax"] = 0.0
+            logs["cafa_aupr"] = 0.0
+
         return logs

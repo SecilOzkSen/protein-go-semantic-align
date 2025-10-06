@@ -229,7 +229,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         collate_fn=collate,
     )
     val_loader = None
@@ -239,7 +239,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             batch_size=args.eval_batch_size or args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            pin_memory=True,
+            pin_memory=False,
             collate_fn=collate,
         )
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)

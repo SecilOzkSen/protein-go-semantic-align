@@ -25,7 +25,7 @@ training:
   epochs: 30
   batch_size: 8
   eval_batch_size: 8
-  num_workers: 2            # for Colab
+  num_workers: 0            # for Colab
   fp16: true                # true if GPU available
   cpu: false
   seed: 42
