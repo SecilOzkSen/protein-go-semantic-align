@@ -1,5 +1,5 @@
 from typing import Dict, Any, List, Tuple, Optional
-
+import copy
 import torch
 import torch.nn.functional as F
 
@@ -208,9 +208,10 @@ class OppTrainer:
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr)
         self._global_step = 0
 
-        # If VectorResources is present, align its query projector to model's projector
-        if hasattr(self.ctx, "vres") and self.ctx.vres is not None:
-            self.ctx.vres.query_projector = self.model.proj_p   # nn.Linear 1280 -> 768
+        self.index_projector = copy.deepcopy(self.model.proj_p).eval().requires_grad_(False)
+        self.ctx.vres.align_dim = self.cfg.d_z  # 768
+        self.ctx.vres.query_projector = self.index_projector
+
 
         # Safe defaults for miner shortlist K/M
         default_M, default_K = 64, 4
@@ -346,6 +347,11 @@ class OppTrainer:
                         y_true[b, j] = 1.0
 
         return G_eval, y_true, eval_ids
+    # --------- Projection layer updates ---------
+    @torch.no_grad()
+    def update_ema(self, dst, src, m=0.995):
+        for pd, ps in zip(dst.parameters(), src.parameters()):
+            pd.mul_(m).add_(ps, alpha=1 - m)
 
     # --------- Scoring (tensor path) ---------
     def forward_scores(self, H, G, pad_mask, **kwargs):

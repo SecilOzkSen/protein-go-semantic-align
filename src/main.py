@@ -601,6 +601,16 @@ def run_training(args, schedule: TrainSchedule):
     best_val = None
     global_step = 0
 
+    #TODO: remove
+    # train loop’tan önce 1 örnek:
+    pid0 = datasets["train"].pids[0]
+    H0 = store.get(pid0)
+    print("[STORE] H0.shape =", H0.shape)  # -> (L, D) D KAÇ?
+    shard_path = datasets["train"].store.pid2shard[pid0]
+    blob = torch.load(shard_path, map_location="cpu")
+    k0 = next(k for k, v in blob.items() if hasattr(v, "shape"))
+    print("[SHARD] first tensor:", k0, blob[k0].shape)  # ... x D
+
     for epoch in range(args.epochs):
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
         try:
@@ -697,6 +707,8 @@ def run_training(args, schedule: TrainSchedule):
                     except Exception:
                         pass
 
+        # epoch finished - update ema
+        trainer.update_ema(trainer.index_projector, trainer.model.proj_p, m=0.995)
         # validation
         if val_loader is not None:
             val_logs = trainer.eval_epoch(val_loader, epoch)

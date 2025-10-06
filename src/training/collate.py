@@ -49,6 +49,8 @@ class ContrastiveEmbCollator:
         Lmax = max(int(p.shape[0]) for p in prot_list)
 
         prot_pad = torch.zeros(B, Lmax, D, dtype=prot_list[0].dtype)
+        #TODO: KALDIR
+        print("[COL] prot_pad.shape =", prot_pad.shape)
         attn_mask = torch.zeros(B, Lmax, dtype=torch.bool)
         for i, P in enumerate(prot_list):
             L = int(P.shape[0])
