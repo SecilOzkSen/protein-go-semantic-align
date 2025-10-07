@@ -241,6 +241,8 @@ class OppTrainer:
 
         # W&B setup
         self._wandb_configs(wandb_run=wandb_run, wlogger=wlogger)
+        self._phase_acc = defaultdict(lambda: defaultdict(list))
+        self._current_phase_id = None
 
     def _wandb_configs(self, wandb_run=None, wlogger=None):
         if wandb_run is not None:
