@@ -215,12 +215,12 @@ class BatchBuilder:
             q = _mean_pool(prot_emb_pad, prot_attn_mask)  # [B,d]
 
         # Ensure queries match index dim via VectorResources.project_queries_to_index if available
-        if self.vres is not None and hasattr(self.vres, "project_queries_to_index"):
-            try:
-                q = self.vres.project_queries_to_index(q)
-            except Exception:
-                # fallback: assume already aligned
-                pass
+    #    if self.vres is not None and hasattr(self.vres, "project_queries_to_index"):
+    #        try:
+    #            q = self.vres.project_queries_to_index(q)
+    #        except Exception:
+    #            # fallback: assume already aligned
+    #            pass
 
         # ---- 2) shortlist via ANN
         cand_ids = self._ann_query(q, M) if M > 0 else torch.empty(B, 0, dtype=torch.long, device=device)  # [B,M]
