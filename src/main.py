@@ -376,17 +376,6 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
         logging.getLogger("wandb").warning("Dataset quickstats failed: %r", e)
 
 
-class WandbLogger:
-    def __init__(self, wandb_run):
-        self.wandb = wandb_run
-
-    def log(self, metrics: Dict[str, float], step: Optional[int] = None):
-        try:
-            self.wandb.log(metrics, step=step)
-        except Exception as e:
-            logging.getLogger("wandb").warning("wandb.log failed: %r", e)
-
-
 # ============== Runner ==============
 def run_training(args, schedule: TrainSchedule):
     signal.signal(signal.SIGINT, _sigint_handler)
@@ -565,7 +554,7 @@ def run_training(args, schedule: TrainSchedule):
            wandb.define_metric("*", step_metric="global_step")
         #   wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
         #   wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
-           wandb_logger = WandbLogger(wandb_run)
+        #   wandb_logger = WandbLogger(wandb_run)
 
     # infer dims
     with torch.no_grad():
@@ -592,7 +581,7 @@ def run_training(args, schedule: TrainSchedule):
         lambda_vtrue = getattr(args, "lambda_vtrue", 0.2),
         tau_distill = getattr(args, "tau_distill", 1.5)
     )
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=wandb_run, wlogger=wandb_logger)
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=wandb_run)
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
