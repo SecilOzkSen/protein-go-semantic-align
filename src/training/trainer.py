@@ -261,7 +261,7 @@ class OppTrainer:
                                                 config=self.ctx.to_dict())
         # watch (guarded)
         try:
-            wandb.watch(self.model, log="all", log_freq=max(100, getattr(self.cfg, "log_every", 50)))
+            wandb.watch(self.model, log="gradients", log_freq=max(100, getattr(self.cfg, "log_every", 50)))
         except Exception:
             pass
     # --------- Wandb helpers (phase bookkeeping) ---------
