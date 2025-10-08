@@ -493,7 +493,7 @@ class OppTrainer:
         scores_teacher = torch.einsum("bd,bkd->bk", vt, Gn)
 
         # ---- Contrastive over candidate set (student) ----
-        scores_cand, _ = self.forward_scores(H, G_cand, pad_mask)  # (B, K)
+        scores_cand, _ = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)  # (B, K)
         l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
 
         # 4) KL distillation: teacher distribution → student logits
@@ -655,7 +655,7 @@ class OppTrainer:
                 go_cache_embs=self.ctx.memory_bank.embs.to(device),
                 id2row=self.ctx.go_cache.id2row,
             )
-            scores_cand, _ = self.forward_scores(H, G_cand, pad_mask)
+            scores_cand, _ = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)
             l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
 
             # Positives-only for attribution
@@ -693,7 +693,7 @@ class OppTrainer:
 
             # ---- CAFA eval space & predictions ----
             G_eval, y_true_b, _ = self._build_eval_space(batch)        # (B, Geval, Dg), (B, Geval)
-            scores_eval, _ = self.forward_scores(H, G_eval, pad_mask)  # (B, Geval) logits
+            scores_eval, _ = self.forward_scores(H, G_eval, pad_mask, return_alpha=False)  # (B, Geval) logits
             probs_eval = torch.sigmoid(scores_eval)                     # (B, Geval)
 
             all_pred_blocks.append(probs_eval.detach().cpu())

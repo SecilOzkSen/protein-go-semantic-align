@@ -23,8 +23,8 @@ caches:
 
 training:
   epochs: 30
-  batch_size: 8
-  eval_batch_size: 8
+  batch_size: 4
+  eval_batch_size: 4
   num_workers: 0            # for Colab
   fp16: true                # true if GPU available
   cpu: false
@@ -64,8 +64,8 @@ curriculum:
   warmup_frac: 0.1
   mode: cosine
   hard_frac: [0.2, 0.7]
-  shortlist_M: [256, 1024]
-  k_hard: [16, 64]
+  shortlist_M: [128, 64]
+  k_hard: [16, 8]
   hier_up: [1, 0]
   hier_dn: [1, 0]
   random_k: [8, 0]
