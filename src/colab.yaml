@@ -93,7 +93,7 @@ stores:
   pid2pos_path: /content/data/training_ready/proteins/pid_to_positives.json
   val_ids_path: /content/data/training_ready/proteins/protein_val_ids.txt
 
-  embed_dir: /content/esm-output/embeddings
+  embed_dir: /content/data/esm-output/embeddings
 
   # protein seq len lookup
   seq_len_lookup_dir: /content/data/training_ready/proteins/seq_len_lookup.pkl
