@@ -168,7 +168,7 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
 def build_faiss(phase: int):
     logger = logging.getLogger("build_faiss")
     logger.info(f"Loading FAISS index via miners for phase {phase + 1}")
-    index = load_faiss_index_for_phase(phase)
+    index = load_faiss_index_for_phase(phase, to_gpu=False)
     logger.info("FAISS index ready.")
     return index
 
@@ -241,9 +241,10 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
-        persistent_workers=False,
-        pin_memory=False,
+        num_workers=4,
+        persistent_workers=True,
+        pin_memory=True,
+        prefetch_factor=4,
         collate_fn=collate,
     )
     val_loader = None
@@ -252,10 +253,11 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             datasets["val"],
             batch_size=args.eval_batch_size or args.batch_size,
             shuffle=False,
-            num_workers=0,
-            persistent_workers=False,
-            pin_memory=False,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
             collate_fn=collate,
+            prefetch_factor=2
         )
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
     return train_loader, val_loader, collate

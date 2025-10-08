@@ -32,6 +32,8 @@ class GoTextStore:
         print("Tokenize ended.")
 
     def update_phase_and_tokenize(self, new_phase:int):
+        if new_phase == self.phase:
+            return
         self.phase = new_phase
         self.id2text = self.full_id2text[self.phase]
         self.tokenize()

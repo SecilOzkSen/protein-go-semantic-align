@@ -3,7 +3,7 @@ import torch
 import faiss
 from src.configs.data_classes import TrainingReadyDataPaths
 
-def load_faiss_index_for_phase(phase: int, to_gpu: bool = True):
+def load_faiss_index_for_phase(phase: int, to_gpu: bool = False):
     """
     go_faiss_ip.faiss and meta.json loading.
     Checks if 'phase' matches the real phase in meta.json
