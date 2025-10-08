@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+import torch.multiprocessing as mp
 from datetime import datetime
 import glob
 import types
@@ -229,6 +230,11 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
     zs_mask_np = getattr(train_ds, "zs_mask", None)
     zs_mask_vec = torch.as_tensor(zs_mask_np, dtype=torch.bool) if zs_mask_np is not None else None
 
+    try:
+        mp.set_sharing_strategy("file_system")
+    except RuntimeError:
+        pass
+
     collate = ContrastiveEmbCollator(
         go_lookup=go_cache,
         go_text_store=go_text_store,
@@ -241,10 +247,10 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        persistent_workers=True,
+        num_workers=2,
+        persistent_workers=False,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
         collate_fn=collate,
     )
     val_loader = None
@@ -253,11 +259,10 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             datasets["val"],
             batch_size=args.eval_batch_size or args.batch_size,
             shuffle=False,
-            num_workers=4,
-            persistent_workers=True,
+            num_workers=2,
+            persistent_workers=False,
             pin_memory=True,
             collate_fn=collate,
-            prefetch_factor=2
         )
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
     return train_loader, val_loader, collate
@@ -420,7 +425,7 @@ def run_training(args, schedule: TrainSchedule):
     )
 
     # GoTextStore and dataloaders
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0)
+    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
     # Memory bank from initial GO cache
@@ -591,6 +596,14 @@ def run_training(args, schedule: TrainSchedule):
 
     best_val = None
     global_step = 0
+
+    #TODO: sil
+    import itertools
+    t0 = time.time()
+    for i, b in enumerate(itertools.islice(train_loader, 5)):
+        dt = time.time() - t0
+        print(f"[DL] batch {i} hazırlandı: {dt:.2f}s")
+        t0 = time.time()
 
     for epoch in range(args.epochs):
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
