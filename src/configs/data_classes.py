@@ -216,6 +216,7 @@ class TrainingContext:
     go_text_store: Any = None
     run_name: str = None
     logging: LoggingConfig = None
+    use_queue_miner: bool = True
 
     def to_dict(self):
         d = dict(

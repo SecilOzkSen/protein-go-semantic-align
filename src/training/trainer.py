@@ -1,3 +1,4 @@
+# src/training/trainer.py
 from typing import Dict, Any, List, Tuple, Optional
 import copy
 import torch
@@ -5,9 +6,8 @@ import torch.nn.functional as F
 
 from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss, windowed_attr_loss
-from src.configs.data_classes import TrainerConfig, AttrConfig, CurriculumConfig
-
-from src.training.batch_builder import BatchBuilder
+from src.configs.data_classes import TrainerConfig, AttrConfig
+from src.miners.queue_miner import QueueMiner
 
 # Wandb
 import wandb
@@ -15,7 +15,6 @@ from collections import defaultdict
 from src.utils.wandb_logger import WabLogger
 
 from src.metrics.cafa import compute_fmax, compute_term_aupr
-
 
 
 # ------------- Helpers -------------
@@ -33,75 +32,21 @@ def entropy_regularizer(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 def multi_positive_infonce_from_candidates(scores: torch.Tensor, pos_mask: torch.Tensor, tau: float) -> torch.Tensor:
     """
-    scores: (B, K) similarity over candidate set (positives + mined negatives)
-    pos_mask: (B, K) boolean; True where candidate is a positive for that item
+    scores: (B, K)  (positives + negatives)
+    pos_mask: (B, K) boolean; True at positives
+    NaN-safe when a row has 0 positives.
     """
-    logits = scores / max(1e-8, tau)          # (B, K)
-    denom = torch.logsumexp(logits, dim=-1)   # (B,)
-    # Avoid -inf when no positives (shouldn't happen); we mask with -inf then logsumexp.
+    logits = scores / max(1e-8, tau)                    # (B, K)
+    denom = torch.logsumexp(logits, dim=-1)             # (B,)
     pos_logits = logits.masked_fill(~pos_mask, float('-inf'))
-    num = torch.logsumexp(pos_logits, dim=-1) # (B,)
-    return -(num - denom).mean()
-
-def gather_go_rows(go_ids: torch.Tensor, id2row: dict) -> torch.Tensor:
-    # Map GO integer ids (shape: (N,)) to row indices in cache
-    idx = [id2row[int(g)] for g in go_ids.tolist()]
-    return torch.as_tensor(idx, dtype=torch.long, device=go_ids.device)
-
-def build_candidates_for_batch(
-    uniq_go_embs: torch.Tensor,                  # (G, Dg) for this batch (positives universe)
-    pos_go_local: List[torch.Tensor],            # list of LongTensor (indices into uniq_go_embs)
-    neg_go_ids: torch.Tensor,                    # (B, k_hard) global GO ids from BatchBuilder (-1 padded)
-    go_cache_embs: torch.Tensor,                 # (N_GO, Dg) global cache embs
-    id2row: dict,                                # mapping id->row
-) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int]]]:
-    """
-    Returns:
-      G_cand:  (B, K, Dg) candidates per item (positives first, then negatives)
-      pos_mask:(B, K) booleans for positives
-      slices:  list of (pos_len, neg_len) per item (for debugging)
-    """
-    B = len(pos_go_local)
-    device = uniq_go_embs.device
-    Dg = uniq_go_embs.size(1)
-
-    # Build per-item positives (from uniq_go_embs)
-    pos_embs, pos_lens = [], []
-    for b in range(B):
-        if pos_go_local[b].numel() == 0:
-            pos_embs.append(torch.zeros(0, Dg, device=device, dtype=uniq_go_embs.dtype))
-            pos_lens.append(0)
-        else:
-            pos_embs.append(uniq_go_embs.index_select(0, pos_go_local[b].to(device)))
-            pos_lens.append(int(pos_go_local[b].numel()))
-
-    # Build per-item negatives (from global cache via id2row)
-    neg_embs, neg_lens = [], []
-    for b in range(B):
-        valid = neg_go_ids[b] >= 0
-        gids = neg_go_ids[b, valid]
-        if gids.numel() == 0:
-            neg_embs.append(torch.zeros(0, Dg, device=device, dtype=go_cache_embs.dtype))
-            neg_lens.append(0)
-        else:
-            rows = gather_go_rows(gids.to(device), id2row)  # (k_v,)
-            neg_embs.append(go_cache_embs.index_select(0, rows))
-            neg_lens.append(int(rows.numel()))
-
-    # Pad to common K (positives first, then negatives)
-    K = max((p + n) for p, n in zip(pos_lens, neg_lens)) if B > 0 else 1
-    G_cand = torch.zeros(B, K, Dg, device=device, dtype=uniq_go_embs.dtype)
-    pos_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
-    slices = []
-    for b in range(B):
-        p, n = pos_lens[b], neg_lens[b]
-        if p > 0:
-            G_cand[b, :p] = pos_embs[b]
-            pos_mask[b, :p] = True
-        if n > 0:
-            G_cand[b, p:p+n] = neg_embs[b]
-        slices.append((p, n))
-    return G_cand, pos_mask, slices
+    pos_any = pos_mask.any(dim=1)
+    # rows with no positives: use a very small finite value to avoid -inf
+    if (~pos_any).any():
+        pos_logits = pos_logits.clone()
+        pos_logits[~pos_any] = -1e9
+    num = torch.logsumexp(pos_logits, dim=-1)           # (B,)
+    loss = -(num - denom)                               # (B,)
+    return loss[pos_any].mean() if pos_any.any() else denom.mean()*0.0
 
 def surrogate_delta_y_from_mask_grad(H, G, model, pad_mask=None) -> torch.Tensor:
     """
@@ -128,10 +73,6 @@ def dag_consistency_loss_pos(scores_pos: torch.Tensor,
     """
     DAG consistency on POSITIVES only.
     Enforce: score(parent) >= score(child) + margin
-    scores_pos: (B, T_max) scores for positives G_pos (padded with zeros beyond t_b)
-    pos_local: list of LongTensor (indices into uniq_go_ids) per item
-    uniq_go_ids: (G,) LongTensor mapping local uniq index -> global GO id
-    dag_parents: dict {child_global_id: [parent_global_id, ...]}
     """
     if dag_parents is None or len(pos_local) == 0:
         return torch.zeros((), device=scores_pos.device)
@@ -144,16 +85,13 @@ def dag_consistency_loss_pos(scores_pos: torch.Tensor,
         if t <= 1:
             continue
         sp = scores_pos[b, :t]  # (t,)
-        # map global ids for these positives
         glob = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))  # (t,)
         id2t = {int(glob[i].item()): i for i in range(t)}
-        # for each child present, consider its parents if also present
         for child_gid, child_t in list(id2t.items()):
             parents = dag_parents.get(child_gid, [])
             for pg in parents:
                 if pg in id2t:
                     p_t = id2t[pg]
-                    # softplus on (child - parent + margin)
                     diff = sp[child_t] - sp[p_t] + margin
                     losses.append(F.softplus(scale * diff))
     if len(losses) == 0:
@@ -162,9 +100,7 @@ def dag_consistency_loss_pos(scores_pos: torch.Tensor,
 
 def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
     """
-    Eval-time actual mask-out for full-length case.
-    alpha_full: (B, T, L). For each (b,t): pick Top-K residues, zero them (one-by-one), recompute scores.
-    Returns delta_full: (B, T, L) with nonzero at tested residues, normalized per (b,t).
+    Eval-time mask-out for full-length case.
     """
     B, T, L = alpha_full.shape
     device = H.device
@@ -174,7 +110,7 @@ def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
     for b in range(B):
         for t in range(T):
             topk = min(k, L)
-            vals, idx = torch.topk(alpha_full[b, t], k=topk, dim=-1)
+            _, idx = torch.topk(alpha_full[b, t], k=topk, dim=-1)
             for i in idx.tolist():
                 Hminus = H.clone()
                 Hminus[b, i, :] = 0.0
@@ -185,7 +121,6 @@ def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
                     return_alpha=True
                 )
                 delta[b, t, i] = (base_scores[b, t] - y_minus.squeeze(0)[t]).clamp_min(0.0)
-            # normalize per (b,t)
             m = delta[b, t].amax()
             if m > 0:
                 delta[b, t] = delta[b, t] / m
@@ -196,53 +131,58 @@ def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
 class OppTrainer:
     def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None, wlogger=None):
         self.cfg, self.attr, self.ctx = cfg, attr, ctx
+        self.device = torch.device(self.cfg.device)
+
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
-            d_g=None,          # will be inferred from go encoder
-            d_z=cfg.d_z,       # NOTE: expected 768
-            go_encoder=go_encoder,  # BioMedBERTEncoder (with LoRA)
+            d_g=None,
+            d_z=cfg.d_z,          # e.g., 768
+            go_encoder=go_encoder,
             normalize=True,
-        )
-        device = torch.device(self.cfg.device)
-        self.model.to(device)
+        ).to(self.device)
+
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr)
         self._global_step = 0
 
+        # projector for teacher alignment
         self.index_projector = copy.deepcopy(self.model.proj_p).eval().requires_grad_(False)
-        self.ctx.vres.align_dim = self.cfg.d_z  # 768
+        self.ctx.vres.align_dim = self.cfg.d_z
         self.ctx.vres.query_projector = self.index_projector
 
+        # --- Queue miner (FAISS tamamen kaldırıldı) ---
+        self.use_queue_miner: bool = True
+        self.queue_K: int = int(getattr(cfg, "queue_K", getattr(ctx, "queue_K", 8192)))
+        self.k_hard_queue: int = int(getattr(cfg, "k_hard", getattr(ctx, "k_hard", 32)))
+        self.queue_miner: Optional[QueueMiner] = None
 
-        # Safe defaults for miner shortlist K/M
-        default_M, default_K = 64, 4
-        if getattr(ctx, "scheduler", None) is not None:
-            try:
-                cur = ctx.scheduler(0)
-                default_M = int(getattr(cur.cfg, "shortlist_M", default_M))
-                default_K = int(getattr(cur.cfg, "k_hard", default_K))
-            except Exception:
-                pass
-
-        # Build BatchBuilder if not supplied from context
-        if getattr(self.ctx, "batch_builder", None) is None:
-            self.builder = BatchBuilder(
-                vres=getattr(ctx, "vres", None),
-                faiss_index=getattr(ctx, "faiss_index", None) if getattr(ctx, "vres", None) is None else None,
-                go_encoder_rerank=go_encoder,
-                dag_parents=ctx.dag_parents,
-                dag_children=ctx.dag_children,
-                scheduler=ctx.scheduler,
-                default_M=default_M,
-                default_K=default_K,
-                all_go_ids=ctx.go_cache.row2id
-            )
-        else:
-            self.builder = ctx.batch_builder
-
-        # W&B setup
+        # W&B
         self._wandb_configs(wandb_run=wandb_run, wlogger=wlogger)
         self._phase_acc = defaultdict(lambda: defaultdict(list))
         self._current_phase_id = None
+
+        # Cache (opsiyonel): memory bank'ı tek sefer device'a al
+        self._mb_embs = getattr(self.ctx, "memory_bank", None)
+        if self._mb_embs is not None:
+            self._mb_embs = self.ctx.memory_bank.embs.to(self.device)
+
+    # ---------- robust mask helper ----------
+    def _valid_and_pad_masks(self, batch):
+        """
+        Returns:
+          attn_valid: bool[B,L]  (True = VALID token)
+          pad_mask:   bool[B,L]  (True = PAD)
+        """
+        m = batch.get("prot_attn_mask", None)
+        if m is None:
+            raise KeyError("batch['prot_attn_mask'] missing")
+        m = m.to(self.device)
+        if m.dim() == 3 and m.size(-1) == 1:
+            m = m.squeeze(-1)
+        if m.dtype is not torch.bool:
+            m = m != 0
+        attn_valid = m
+        pad_mask = ~attn_valid
+        return attn_valid, pad_mask
 
     def _wandb_configs(self, wandb_run=None, wlogger=None):
         if wandb_run is not None:
@@ -258,15 +198,14 @@ class OppTrainer:
             self.wlogger = wlogger
         else:
             self.wlogger = WabLogger(self.wandb_run, project="protein-go-semantic-align",
-                                                config=self.ctx.to_dict())
-        # watch (guarded)
+                                     config=self.ctx.to_dict())
         try:
             wandb.watch(self.model, log="gradients", log_freq=max(100, getattr(self.cfg, "log_every", 50)))
         except Exception:
             pass
+
     # --------- Wandb helpers (phase bookkeeping) ---------
     def _on_phase_change(self, new_phase_id: int, new_phase_name: str, step: int):
-        """Flush summary for previous phase and start a new one."""
         if self._current_phase_id is not None:
             self._flush_phase_table(self._current_phase_id, step)
         self._current_phase_id = new_phase_id
@@ -274,7 +213,6 @@ class OppTrainer:
         wandb.log({"phase/change_to": new_phase_id, "phase/name": new_phase_name}, step=step)
 
     def _flush_phase_table(self, phase_id: int, step: int):
-        """Aggregate mean/std/min/max for metrics collected within a phase and log a table."""
         import numpy as np
         rows = []
         for k, vals in self._phase_acc[phase_id].items():
@@ -285,60 +223,92 @@ class OppTrainer:
             table = wandb.Table(columns=["phase_id", "metric", "mean", "std", "min", "max", "n"], data=rows)
             wandb.log({f"phase_summary/phase_{phase_id}": table}, step=step)
 
+    def _maybe_init_queue_miner(self, Dg: int):
+        if self.queue_miner is None:
+            self.queue_miner = QueueMiner(dim=int(Dg), K=int(self.queue_K), device=str(self.device))
+            print(f"[Trainer] QueueMiner enabled (K={self.queue_K}, k_hard={self.k_hard_queue}, Dg={Dg}).")
+
+    def _build_candidates_with_queue(self,
+                                     uniq_go_embs: torch.Tensor,
+                                     pos_go_local: List[torch.Tensor],
+                                     neg_from_queue: Optional[torch.Tensor]
+                                     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Positives from batch, negatives from QueueMiner.
+        """
+        B = len(pos_go_local)
+        device = uniq_go_embs.device
+        Dg = uniq_go_embs.size(1)
+
+        # positives
+        pos_embs, pos_lens = [], []
+        for b in range(B):
+            loc = pos_go_local[b]
+            if loc.numel() == 0:
+                pos_embs.append(torch.zeros(0, Dg, device=device, dtype=uniq_go_embs.dtype))
+                pos_lens.append(0)
+            else:
+                pos_embs.append(uniq_go_embs.index_select(0, loc.to(device)))
+                pos_lens.append(int(loc.numel()))
+
+        kq = 0 if (neg_from_queue is None) else neg_from_queue.size(1)
+        K = max((p + kq) for p in pos_lens) if B > 0 else (kq or 1)
+        G_cand = torch.zeros(B, K, Dg, device=device, dtype=uniq_go_embs.dtype)
+        pos_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
+
+        for b in range(B):
+            p = pos_lens[b]
+            if p > 0:
+                G_cand[b, :p] = pos_embs[b]
+                pos_mask[b, :p] = True
+            if kq > 0:
+                G_cand[b, p:p+kq] = neg_from_queue[b]
+        return G_cand, pos_mask
+
     # --------- Eval space builder (for val/test) ---------
     def _build_eval_space(self, batch):
         """
         Returns:
-          G_eval:   (B, Geval, Dg)  — her protein için aynı Geval uzayı (GO embeddingleri)
-          y_true:   (B, Geval)      — multi-hot GT (pozitif GO’lar 1)
-          eval_ids: (Geval,) LongTensor — kullanılan global GO id’leri
-        Mantık:
-          - Eğer ctx.eval_id_list varsa onu kullan (global sabit uzay).
-          - Yoksa batch içindeki uniq_go_embs + uniq_go_ids’i kullan (lokal uzay).
+          G_eval:   (B, Geval, Dg)
+          y_true:   (B, Geval)
+          eval_ids: (Geval,)
         """
-        device = self.cfg.device
+        device = self.device
         B = batch["prot_emb_pad"].size(0)
 
-        # --- Eval GO ID setini seç ---
         if hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list:
-            # Global sabit uzay
-            eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long, device=device)  # (Geval,)
+            eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long, device=device)
             rows = torch.as_tensor([self.ctx.go_cache.id2row[int(g)] for g in eval_ids.tolist()],
                                    dtype=torch.long, device=device)
-            G_eval_once = self.ctx.memory_bank.embs.to(device).index_select(0, rows)  # (Geval, Dg)
+            mb = self._mb_embs if self._mb_embs is not None else self.ctx.memory_bank.embs.to(device)
+            G_eval_once = mb.index_select(0, rows)  # (Geval, Dg)
         else:
-            # Batch-local uzay
             eval_ids = batch["uniq_go_ids"].to(device)  # (Geval,)
             if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
                 toks = batch["pos_go_tokens"]
                 G_eval_once = self.model.go_encoder(
                     input_ids=toks["input_ids"].to(device),
                     attention_mask=toks["attention_mask"].to(device),
-                )  # (Geval, Dg)
+                )
                 G_eval_once = F.normalize(G_eval_once, p=2, dim=1)
             else:
-                G_eval_once = batch["uniq_go_embs"].to(device)  # (Geval, Dg)
+                G_eval_once = batch["uniq_go_embs"].to(device)
 
         Geval, Dg = G_eval_once.size(0), G_eval_once.size(1)
-
-        # (Geval, Dg) -> (B, Geval, Dg) (broadcast)
         G_eval = G_eval_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()
 
-        # --- y_true: (B, Geval) multi-hot
+        # y_true multi-hot
         y_true = torch.zeros(B, Geval, dtype=torch.float32, device=device)
-        # map: global id -> col index (sadece global eval uzayı için gerekli)
-        id2col = {int(eval_ids[i].item()): i for i in range(Geval)}
+        pos_local = batch["pos_go_local"]
 
-        # Pozitifler batch’ten geliyor: pos_go_local (uniq indeksler) VE/YA da global id listesi
-        pos_local = batch["pos_go_local"]  # list[LongTensor]
-        if eval_ids.data_ptr() == batch["uniq_go_ids"].to(device).data_ptr():
-            # lokal uzay: indeksler aynı
+        same_space = torch.equal(eval_ids, batch["uniq_go_ids"].to(device))
+        if same_space:
             for b, loc in enumerate(pos_local):
                 if loc.numel() > 0:
                     y_true[b, loc.to(device)] = 1.0
         else:
-            # global sabit uzay: önce uniq_go_ids ile global id’yi bul, sonra id2col ile kolon
-            uniq_go_ids = batch["uniq_go_ids"].to(device)  # (G_local,)
+            uniq_go_ids = batch["uniq_go_ids"].to(device)
+            id2col = {int(eval_ids[i].item()): i for i in range(Geval)}
             for b, loc in enumerate(pos_local):
                 if loc.numel() == 0:
                     continue
@@ -349,6 +319,7 @@ class OppTrainer:
                         y_true[b, j] = 1.0
 
         return G_eval, y_true, eval_ids
+
     # --------- Projection layer updates ---------
     @torch.no_grad()
     def update_ema(self, dst, src, m=0.995):
@@ -357,86 +328,17 @@ class OppTrainer:
 
     # --------- Scoring (tensor path) ---------
     def forward_scores(self, H, G, pad_mask, **kwargs):
-        """
-        Use the model's tensor path to score arbitrary G tensors (e.g., candidates or positives).
-        By default returns alpha maps as well unless return_alpha=False is provided.
-        """
         return_alpha = kwargs.pop("return_alpha", True)
         return self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, **kwargs)
-
-    # --------- Negative mining ---------
-    def _build_negatives(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Updated mining flow:
-          - coarse shortlist via FAISS (vres.coarse_search)
-          - true-pooling rerank using ctx.vres.true_prot_vecs (attention-weighted)
-        """
-        device = self.cfg.device
-
-        # Resolve positive GO global ids for builder
-        if "pos_go_global" in batch:
-            pos_go_global = batch["pos_go_global"]
-        else:
-            # Fallback: map local -> global using uniq_go_ids
-            uniq_go_ids = batch["uniq_go_ids"]  # (G,)
-            pos_go_global = []
-            for loc in batch["pos_go_local"]:
-                pos_go_global.append(uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device)))
-
-        # Curriculum params at this step (store for logging)
-        self.curriculum_params = None
-        new_phase_id, new_phase_name = None, None
-        if getattr(self.ctx, "scheduler", None) is not None:
-            curr = self.ctx.scheduler(self._global_step)
-
-            # Store as-is for later logging
-            self.curriculum_params = curr
-
-            # --- Phase detection (supports both dict-like and dataclass-like schedulers) ---
-            # Try common attribute names first
-            def _get(attr, *fallbacks):
-                for a in (attr, *fallbacks):
-                    if isinstance(curr, dict) and a in curr:  # dict scheduler
-                        return curr[a]
-                    if hasattr(curr, a):  # object
-                        return getattr(curr, a)
-                    if hasattr(getattr(curr, "cfg", None), a):  # nested cfg
-                        return getattr(curr.cfg, a)
-                return None
-
-            new_phase_id = _get("phase_id", "phase", "id")
-            new_phase_name = _get("phase_name", "name")
-            if new_phase_id is not None and new_phase_name is None:
-                new_phase_name = f"phase{int(new_phase_id)}"
-
-            # If phase changed, flush previous phase summary and start new one
-            if new_phase_id is not None and new_phase_id != self._current_phase_id:
-                self._on_phase_change(int(new_phase_id), str(new_phase_name), step=self._global_step)
-
-            # Builder expects a CurriculumConfig? Pass only if it is the right type
-            curr_cfg = curr if isinstance(curr, CurriculumConfig) else None
-        else:
-            curr_cfg = None
-
-        # Preferred: build directly from segmented embeddings (coarse + true rerank inside)
-        out = self.builder.build_from_embs(
-            prot_emb_pad=batch["prot_emb_pad"].to(device),
-            prot_attn_mask=batch["prot_attn_mask"].to(device),
-            pos_go_global=pos_go_global,
-            zs_mask=batch["zs_mask"].to(device),
-            curriculum_config=curr_cfg if isinstance(curr_cfg, CurriculumConfig) else None
-        )
-        return out
 
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
         self.model.train()
-        device = self.cfg.device
+        device = self.device
 
         # --- Protein & mask ---
         H = batch["prot_emb_pad"].to(device)               # (B, Lmax, Dh)
-        attn_valid = batch["prot_attn_mask"].to(device)    # True = VALID
-        pad_mask = ~attn_valid
+        attn_valid, pad_mask = self._valid_and_pad_masks(batch)
         pos_local: List[torch.Tensor] = batch["pos_go_local"]
         B = H.size(0)
 
@@ -449,64 +351,91 @@ class OppTrainer:
             uniq_go_embs = self.model.go_encoder(
                 input_ids=toks["input_ids"].to(device),
                 attention_mask=toks["attention_mask"].to(device),
-            )  # [G, Dg], pooled
+            )  # [G, Dg]
             try:
                 uniq_go_embs = F.normalize(uniq_go_embs, p=2, dim=1)
             except Exception:
                 pass
         else:
-            # Fallback: ready-made embeddings from collator/cache
-            uniq_go_embs = batch["uniq_go_embs"].to(device)  # (G, Dg)
+            uniq_go_embs = batch["uniq_go_embs"].to(device)
 
-        # --- NEGATIVES (IDs via miner → embeddings via MemoryBank) ---
-        mined = self._build_negatives(batch)
-        neg_go_ids = mined["neg_go_ids"].to(device)  # (B, k_hard), -1 padded
+        # --- Queue miner init (once we know Dg) ---
+        self._maybe_init_queue_miner(uniq_go_embs.size(1))
 
-        # --- Candidate set (positives + mined negatives) using MemoryBank ---
-        G_cand, pos_mask, _ = build_candidates_for_batch(
-            uniq_go_embs=uniq_go_embs,            # [G, Dg]
-            pos_go_local=pos_local,               # List[Tensor]
-            neg_go_ids=neg_go_ids,                # [B, K]
-            go_cache_embs=self.ctx.memory_bank.embs.to(device),
-            id2row=self.ctx.go_cache.id2row,
-        )  # -> (B, K, Dg), (B, K), meta
+        # --- Curriculum knobs (k_hard & optional hard_frac) ---
+        hard_frac = None
+        if getattr(self.ctx, "scheduler", None) is not None:
+            curr = self.ctx.scheduler(self._global_step)
+            src = getattr(curr, "cfg", curr)
+            kh = getattr(src, "k_hard", None)
+            if kh is not None:
+                self.k_hard_queue = int(kh)
+            hard_frac = getattr(src, "hard_frac", None)
 
-        # Teacher vector from true pooling (optionally with importance weights)
-        use_weights = (epoch_idx >= self.attr.curriculum_epochs)
-        weights_provider = getattr(self, "weights_provider", None) if use_weights else None
-        v_true = self.ctx.vres.true_prot_vecs(H, attn_valid, watti_or_model=weights_provider)  # [B, d?]
+            # Phase logging
+            new_phase_id = getattr(src, "phase_id", getattr(src, "phase", None))
+            new_phase_name = getattr(src, "phase_name", getattr(src, "name", None))
+            if new_phase_id is not None and new_phase_id != self._current_phase_id:
+                if new_phase_name is None:
+                    new_phase_name = f"phase{int(new_phase_id)}"
+                self._on_phase_change(int(new_phase_id), str(new_phase_name), step=self._global_step)
+            self.curriculum_params = curr
+
+        # --- prot_query = vt (teacher) projected to GO space ---
+        v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)        # [B, Dh]
+        vt_for_miner = v_true_early
+        try:
+            vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
+        except Exception:
+            pass
+        prot_query = vt_for_miner
+
+        # --- get hard negatives from queue ---
+        neg_from_queue = self.queue_miner.get_negatives(
+            prot_query.detach(), k_hard=self.k_hard_queue
+        ) if (self.queue_miner is not None) else None
+
+        # --- (optional) mix easy in-batch negatives by hard_frac ---
+        if neg_from_queue is not None and hard_frac is not None:
+            all_neg = F.normalize(uniq_go_embs.detach(), dim=1)              # [G, Dg]
+            sims = F.normalize(prot_query, dim=1) @ all_neg.T                # [B, G]
+            # mask positives
+            for b, loc in enumerate(pos_local):
+                if loc.numel() > 0:
+                    sims[b, loc.to(sims.device)] = -1e9
+            k_easy = max(0, int(neg_from_queue.size(1) * (1 - float(hard_frac))))
+            if k_easy > 0:
+                _, idx_easy = sims.topk(k_easy, dim=1)
+                easy_embs = all_neg.index_select(0, idx_easy.reshape(-1)).reshape(idx_easy.size(0), idx_easy.size(1), -1)
+                neg_from_queue = torch.cat([neg_from_queue, easy_embs], dim=1)
+
+        # --- Candidate set (positives + queue negatives) ---
+        G_cand, pos_mask = self._build_candidates_with_queue(
+            uniq_go_embs=uniq_go_embs,
+            pos_go_local=pos_local,
+            neg_from_queue=neg_from_queue
+        )
 
         # ====================== Teacher (v_true) → KL DISTILLATION ======================
-        # 1) Align v_true to the GO index space if a projector is available
-        vt = v_true
-        if self.ctx.vres is not None and hasattr(self.ctx.vres, "project_queries_to_index"):
-            try:
-                vt = self.ctx.vres.project_queries_to_index(vt)  # [B, Dg]
-            except Exception:
-                pass
-
-        # 2) Normalize for cosine similarity
-        vt = F.normalize(vt, dim=-1)       # [B, Dg]
-        Gn = F.normalize(G_cand, dim=-1)   # [B, K, Dg]
-
-        # 3) Teacher scores: <v_true, G_k>  → [B, K]
+        v_true = v_true_early
+        vt = vt_for_miner
+        vt = F.normalize(vt, dim=-1)                 # [B, Dg]
+        Gn = F.normalize(G_cand, dim=-1)             # [B, K, Dg]
         scores_teacher = torch.einsum("bd,bkd->bk", vt, Gn)
 
-        # ---- Contrastive over candidate set (student) ----
+        # ---- Student scores + InfoNCE ----
         scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)  # (B, K)
         l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
 
-        # 4) KL distillation: teacher distribution → student logits
+        # ---- KL distillation (teacher → student) ----
         tau = float(self.attr.tau_distill)
         with torch.no_grad():
-            p_t = F.softmax(scores_teacher / tau, dim=1)  # teacher target (stopgrad)
-        log_p_s = F.log_softmax(scores_cand / tau, dim=1)  # student
+            p_t = F.softmax(scores_teacher / tau, dim=1)
+        log_p_s = F.log_softmax(scores_cand / tau, dim=1)
         l_con_teacher = F.kl_div(log_p_s, p_t, reduction="batchmean") * (tau ** 2)
-
-        # Teacher weight (default 0.2 if not specified)
         lambda_v = float(getattr(self.attr, "lambda_vtrue", 0.2))
-        # ================================================================================
-        # ---- Positives-only tensor for attribution / DAG ----
+
+        # ---- Positives-only for attribution / DAG ----
         T_max = max((int(x.numel()) for x in pos_local), default=1)
         Dg = uniq_go_embs.size(1)
         G_pos = torch.zeros(B, T_max, Dg, device=device, dtype=uniq_go_embs.dtype)
@@ -517,9 +446,8 @@ class OppTrainer:
 
         scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask)
 
-        # ---- Attribution losses (surrogate during training) ----
         if "alpha_full" in alpha_info:
-            alpha = alpha_info["alpha_full"]  # (B, T, L)
+            alpha = alpha_info["alpha_full"]
             if use_attr:
                 delta, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
                 l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
@@ -541,19 +469,26 @@ class OppTrainer:
         else:
             l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
 
-        # ---- DAG loss over positives ----
         uniq_go_ids = batch['uniq_go_ids'].to(device)
-        l_dag = dag_consistency_loss_pos(
-            scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents, margin=0.0, scale=1.0
-        )
+        l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents, margin=0.0, scale=1.0)
 
-        # ---- Total loss (incl. teacher) ----
         total = (l_con + lambda_v * l_con_teacher) + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
         # === Step / logging ===
         self._global_step += 1
 
-        # Prepare W&B logging payloads
+        # --- Update the queue: enqueue all positive GO embeddings from the batch ---
+        if self.queue_miner is not None:
+            with torch.no_grad():
+                pos_list = []
+                for loc in pos_local:
+                    if loc.numel() > 0:
+                        pos_list.append(uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device)))
+                if len(pos_list) > 0:
+                    go_pos_all = torch.cat(pos_list, dim=0)   # [sum_t, Dg]
+                    self.queue_miner.enqueue(go_pos_all.detach())
+
+        # --- Logging ---
         losses_log = {
             "total": float(total.detach().item()),
             "contrastive": float(l_con.detach().item()),
@@ -563,32 +498,22 @@ class OppTrainer:
             "entropy": float(l_ent.detach().item()),
         }
 
-        # Curriculum knobs (flatten if CurriculumConfig)
         sched = None
         if getattr(self, "curriculum_params", None) is not None:
             cp = self.curriculum_params
-            # try both dataclass.cfg and dict-like access
             source = getattr(cp, "cfg", cp)
             sched = dict(
                 hard_frac=float(getattr(source, "hard_frac", getattr(source, "hard_frac_start", 0.0))) if hasattr(source, "hard_frac") or hasattr(source, "hard_frac_start") else None,
                 k_hard=int(getattr(source, "k_hard", 0)) if hasattr(source, "k_hard") else None,
-                shortlist_M=int(getattr(source, "shortlist_M", 0)) if hasattr(source, "shortlist_M") else None,
-                hier_max_hops_up=int(getattr(source, "hier_max_hops_up", 0)) if hasattr(source, "hier_max_hops_up") else None,
-                hier_max_hops_down=int(getattr(source, "hier_max_hops_down", 0)) if hasattr(source, "hier_max_hops_down") else None,
-                random_k=int(getattr(source, "random_k", 0)) if hasattr(source, "random_k") else None,
-                use_inbatch_easy=float(getattr(source, "use_inbatch_easy", 0.0)) if hasattr(source, "use_inbatch_easy") else None,
             )
 
-        # Phase identity (if your context exposes it)
         phase = dict(
             id=getattr(self, "phase_id", getattr(self.ctx, "phase_id", -1)),
             name=getattr(self, "phase_name", getattr(self.ctx, "phase_name", f"phase{getattr(self,'phase_id',-1)}"))
         )
 
-        # Log losses + phase + sched
         self.wlogger.log_losses(losses_log, step=self._global_step, epoch=epoch_idx, phase=phase, sched=sched)
 
-        # Accumulate phase-wise stats for summaries
         pid = int(phase["id"]) if isinstance(phase.get("id", -1), (int,)) else -1
         for k, v in losses_log.items():
             self._phase_acc[pid][f"loss/{k}"].append(v)
@@ -597,7 +522,6 @@ class OppTrainer:
                 if v is not None:
                     self._phase_acc[pid][f"sched/{k}"].append(float(v))
 
-        # LoRA diagnostics every N steps
         log_every = int(getattr(self.cfg, "log_every", 50))
         if (self._global_step % log_every) == 0:
             self.wlogger.log_lora_summaries(self.model, step=self._global_step)
@@ -616,20 +540,19 @@ class OppTrainer:
     @torch.no_grad()
     def eval_epoch(self, loader, epoch_idx: int):
         self.model.eval()
-        device = self.cfg.device
+        device = self.device
         logs = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
         n = 0
-        # CAFA accumulation
+
         all_pred_blocks: List[torch.Tensor] = []
         all_true_blocks: List[torch.Tensor] = []
 
-
         for batch in loader:
             H = batch["prot_emb_pad"].to(device)
-            pad_mask = ~batch["prot_attn_mask"].to(device)
+            attn_valid, pad_mask = self._valid_and_pad_masks(batch)
             pos_local: List[torch.Tensor] = batch["pos_go_local"]
 
-            # --- POSITIVES (GoEncoder if available, else fallback) ---
+            # POSITIVES
             if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
                 toks = batch["pos_go_tokens"]
                 uniq_go_embs = self.model.go_encoder(
@@ -643,18 +566,29 @@ class OppTrainer:
             else:
                 uniq_go_embs = batch["uniq_go_embs"].to(device)
 
-            # --- NEGATIVES (IDs via miner → embeddings via MemoryBank) ---
-            mined = self._build_negatives(batch)
-            neg_go_ids = mined["neg_go_ids"].to(device)
+            # Queue negatives in eval (no enqueue)
+            if self.queue_miner is not None:
+                v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh]
+                vt_for_miner = v_true_early
+                try:
+                    vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
+                except Exception:
+                    pass
+                prot_query = vt_for_miner
+                neg_from_queue = self.queue_miner.get_negatives(prot_query.detach(), k_hard=self.k_hard_queue)
+                G_cand, pos_mask = self._build_candidates_with_queue(
+                    uniq_go_embs=uniq_go_embs,
+                    pos_go_local=pos_local,
+                    neg_from_queue=neg_from_queue
+                )
+            else:
+                # Fallback: only positives if queue empty
+                G_cand, pos_mask = self._build_candidates_with_queue(
+                    uniq_go_embs=uniq_go_embs,
+                    pos_go_local=pos_local,
+                    neg_from_queue=None
+                )
 
-            # Candidate set with MemoryBank embeddings
-            G_cand, pos_mask, _ = build_candidates_for_batch(
-                uniq_go_embs=uniq_go_embs,
-                pos_go_local=pos_local,
-                neg_go_ids=neg_go_ids,
-                go_cache_embs=self.ctx.memory_bank.embs.to(device),
-                id2row=self.ctx.go_cache.id2row,
-            )
             scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)
             l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
 
@@ -677,7 +611,6 @@ class OppTrainer:
                 l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
             elif all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
                 AW = alpha_info["alpha_windows"]; Ww = alpha_info["win_weights"]; spans = alpha_info["spans"]
-                # For simplicity, reuse surrogate in eval here; switch to real windowed eval if desired.
                 delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
                 delta_win = torch.zeros_like(AW)
                 for wi, (s, e) in enumerate(spans):
@@ -692,13 +625,12 @@ class OppTrainer:
             total = l_con + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
             # ---- CAFA eval space & predictions ----
-            G_eval, y_true_b, _ = self._build_eval_space(batch)        # (B, Geval, Dg), (B, Geval)
-            scores_eval = self.forward_scores(H, G_eval, pad_mask, return_alpha=False)  # (B, Geval) logits
-            probs_eval = torch.sigmoid(scores_eval)                     # (B, Geval)
+            G_eval, y_true_b, _ = self._build_eval_space(batch)
+            scores_eval = self.forward_scores(H, G_eval, pad_mask, return_alpha=False)
+            probs_eval = torch.sigmoid(scores_eval)
 
             all_pred_blocks.append(probs_eval.detach().cpu())
             all_true_blocks.append(y_true_b.detach().cpu())
-
 
             logs["total"] += float(total.detach().item())
             logs["contrastive"] += float(l_con.detach().item())
@@ -710,11 +642,9 @@ class OppTrainer:
         for k in logs:
             logs[k] /= max(1, n)
 
-        # --- CAFA metrics over full split ---
         if all_pred_blocks:
-            import numpy as np
-            y_pred = torch.cat(all_pred_blocks, dim=0).numpy()  # (N, Geval)
-            y_true = torch.cat(all_true_blocks, dim=0).numpy()  # (N, Geval)
+            y_pred = torch.cat(all_pred_blocks, dim=0).numpy()
+            y_true = torch.cat(all_true_blocks, dim=0).numpy()
             fmax, _ = compute_fmax(y_true, y_pred)
             aupr    = compute_term_aupr(y_true, y_pred)
             logs["cafa_fmax"] = float(fmax)

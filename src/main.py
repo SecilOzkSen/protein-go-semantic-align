@@ -1,3 +1,4 @@
+# src/main.py
 import os
 import sys
 import time
@@ -15,6 +16,8 @@ import torch.multiprocessing as mp
 from datetime import datetime
 import glob
 import types
+import signal, traceback, time as _time
+import itertools
 
 import wandb
 
@@ -28,13 +31,10 @@ from src.configs.data_classes import (
 from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache
 from src.go import load_go_parents, load_go_children
-from src.miners import load_faiss_index_for_phase
 from src.utils import (
     load_go_set, load_raw_pickle, load_raw_json, load_raw_txt, load_go_texts_by_phase
 )
 from src.encoders import BioMedBERTEncoder
-from src.training.batch_builder import BatchBuilder
-import signal, traceback, time as _time
 
 from src.configs.paths import (
     PROTEIN_TRAIN_IDS,
@@ -49,8 +49,8 @@ from src.configs.paths import (
     GO_ANCESTOR_STOPLIST,
     COMMON_IC_GO_TERMS_ID_ONLY_JSON,
 )
+
 # To prevent sigint (potential cause)
-import torch.multiprocessing as mp
 try:
     mp.set_start_method("spawn", force=True)
 except RuntimeError:
@@ -76,7 +76,6 @@ def setup_logging(output_dir: Path, level: str = "INFO"):
         ],
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("faiss").setLevel(logging.WARNING)
     logging.info("Logging initialized. Log file: %s", str(log_path))
 
 
@@ -133,45 +132,14 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int = 3):
                 pass
 
 
-# ---- Helper: rebuild FAISS index from MemoryBank embeddings ----
-def rebuild_faiss_from_bank(memory_bank, metric: str = 'ip'):
-    """Rebuild a FAISS index from the current memory_bank.embs tensor."""
-    import numpy as np
-    try:
-        import faiss  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"FAISS is required to rebuild index: {e}")
-    embs = memory_bank.embs
-    if hasattr(embs, 'detach'):
-        embs = embs.detach().cpu()
-    vecs = np.ascontiguousarray(embs.numpy().astype('float32'))
-    d = vecs.shape[1]
-    if metric.lower() == 'l2':
-        index = faiss.IndexFlatL2(d)
-    else:
-        index = faiss.IndexFlatIP(d)
-    if vecs.shape[0] > 0:
-        index.add(vecs)
-    return index
-
-
 # ============== Builders ==============
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
     logger.info("Loading GO cache: %s", go_cache_path)
     blob = torch.load(go_cache_path, map_location="cpu")
-    # L2-normalize (for cosine/IP FAISS consistency)
     blob['embs'] = F.normalize(blob['embs'], p=2, dim=1)
     cache = GoLookupCache(blob)
     return cache
-
-
-def build_faiss(phase: int):
-    logger = logging.getLogger("build_faiss")
-    logger.info(f"Loading FAISS index via miners for phase {phase + 1}")
-    index = load_faiss_index_for_phase(phase, to_gpu=False)
-    logger.info("FAISS index ready.")
-    return index
 
 
 def build_store(args) -> ESMResidueStore:
@@ -360,13 +328,11 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
                 if isinstance(item, dict):
                     for k in ["res_len", "length", "residue_len"]:
                         if k in item:
-                            L = int(item[k]);
-                            break
+                            L = int(item[k]); break
                     if L is None:
                         for k in ["H", "residue_emb", "emb"]:
                             if k in item and hasattr(item[k], "shape"):
-                                L = int(item[k].shape[0]);
-                                break
+                                L = int(item[k].shape[0]); break
                 elif isinstance(item, (list, tuple)) and len(item) > 0:
                     head = item[0]
                     if hasattr(head, "shape") and len(head.shape) >= 2:
@@ -392,21 +358,20 @@ def run_training(args, schedule: TrainSchedule):
     wandb.login()
 
     # Phase 0 resources
-    phase0 = 0  # first phase index
+    phase0 = 0
     go_cache_path = schedule.resolve_go_cache_path(phase0)
 
     go_cache = build_go_cache(go_cache_path)
-    faiss_index = build_faiss(phase=phase0)
     dag_parents = load_go_parents()
     dag_children = load_go_children()
 
-    # Build GO text dict per phase
+    # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
     for ph in range(total_phases):
         go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
 
-    store = build_store(args) #ESM residue store
+    store = build_store(args)
     datasets = build_datasets(args, store, go_cache)
     n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
@@ -424,11 +389,11 @@ def run_training(args, schedule: TrainSchedule):
         lora_parameters=lora_params,
     )
 
-    # GoTextStore and dataloaders
+    # GoTextStore + dataloaders
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
-    # Memory bank from initial GO cache
+    # Memory bank (initial GO cache)
     memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
     seen_go_ids_prev: set = set()
 
@@ -441,26 +406,29 @@ def run_training(args, schedule: TrainSchedule):
     cur_cfg = build_scheduler_cfg(args, n_spe)
     scheduler = CurriculumScheduler(cur_cfg)
 
-    vres = VectorResources(faiss_index, go_cache.embs)
+    # Vector resources — FAISS YOK: sadece bank embs ile
+    vres = VectorResources(faiss_index=None, go_embs=go_cache.embs)
+
     out_dir = Path(args.output_dir)
 
     # Lightweight runtime context
     training_context = TrainingContext(
         device=device,
-        schedule=schedule,  # Curriculum Scheduler
+        schedule=schedule,
         go_cache=go_cache,
-        faiss_index=faiss_index,
+        faiss_index=None,              # FAISS kaldırıldı
         vres=vres,
         memory_bank=memory_bank,
         current_phase=None,
         last_refresh_epoch=None,
         last_refresh_reason=None,
-        batch_builder=None,
+        batch_builder=None,            # FAISS akışı yok
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
         scheduler=scheduler,
         go_text_store=go_text_store,
+        use_queue_miner=True
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -472,24 +440,11 @@ def run_training(args, schedule: TrainSchedule):
         gospec_topk=32,
     )
 
-    # Align vector backends to MemoryBank embeddings (prefer bank)
+    # VectorResources backend’i MemoryBank ile hizala (FAISS yok)
     try:
-        training_context.vres.set_backends(training_context.faiss_index, training_context.memory_bank.embs)
+        training_context.vres.set_backends(None, training_context.memory_bank.embs)
     except Exception:
         pass
-
-    # Vector resources + BatchBuilder (coarse FAISS + rerank)
-    training_context.batch_builder = BatchBuilder(
-           vres=training_context.vres,
-           dag_parents=dag_parents,
-           dag_children=dag_children,
-           use_hier_mask=True,
-           scheduler=scheduler,
-           default_M=cur_cfg.shortlist_M[0],
-           default_K=cur_cfg.k_hard[0],
-           go_encoder_rerank=go_encoder
-       )
-
 
     def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
         new_phase = training_context.schedule.phase_for_epoch(current_epoch)
@@ -497,10 +452,12 @@ def run_training(args, schedule: TrainSchedule):
 
         if prev_phase is None:
             training_context.current_phase = new_phase
-            training_context.vres.set_backends(training_context.faiss_index, training_context.go_cache.embs)
+            try:
+                training_context.vres.set_backends(None, training_context.go_cache.embs)
+            except Exception:
+                pass
             training_context.last_refresh_epoch = current_epoch
             training_context.last_refresh_reason = "init"
-            # GoTextStore başlangıç fazı:
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
             return
 
@@ -509,10 +466,8 @@ def run_training(args, schedule: TrainSchedule):
 
             new_go_path = training_context.schedule.resolve_go_cache_path(new_phase)
             new_go_cache = build_go_cache(new_go_path)
-            new_faiss_index = build_faiss(new_phase)
 
             training_context.go_cache = new_go_cache
-            training_context.faiss_index = new_faiss_index
 
             # MemoryBank’i yeni cache ile yenile
             try:
@@ -523,19 +478,16 @@ def run_training(args, schedule: TrainSchedule):
             except Exception:
                 pass
 
-            # Memorybank rebuild
+            # Backend’i sadece bank embs ile güncelle
             try:
-                training_context.faiss_index = rebuild_faiss_from_bank(training_context.memory_bank, metric='ip')
-            except Exception as _e:
-                logging.getLogger('faiss').warning('Rebuild FAISS failed on phase change: %r', _e)
-
-            try:
-                training_context.vres.set_backends(training_context.faiss_index, training_context.memory_bank.embs)
+                training_context.vres.set_backends(None, training_context.memory_bank.embs)
             except Exception:
-                training_context.vres.set_backends(training_context.faiss_index, training_context.go_cache.embs)
+                training_context.vres.set_backends(None, training_context.go_cache.embs)
 
+            # GoTextStore fazı
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
 
+            # Dataloader’ları yeniden kur
             nonlocal train_loader, val_loader, collate
             train_loader, val_loader, collate = build_dataloaders(
                 datasets, args, training_context.go_cache, training_context.go_text_store)
@@ -547,21 +499,22 @@ def run_training(args, schedule: TrainSchedule):
     # expose refresher
     training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources
 
+    # W&B
     wandb_run = None
     wandb_logger = None
     if args.wandb:
-           os.environ.setdefault("WANDB_MODE", args.wandb_mode)
-           cfg = build_wandb_config(args, schedule)
-           wandb_run = wandb.init(project=args.wandb_project,
-                                  entity=args.wandb_entity or None,
-                                  name=args.wandb_run_name or None,
-                                  config=cfg,
-                                  dir=args.output_dir)
-           wandb.define_metric("global_step")
-           wandb.define_metric("*", step_metric="global_step")
-        #   wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
-        #   wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
-        #   wandb_logger = WandbLogger(wandb_run)
+        os.environ.setdefault("WANDB_MODE", args.wandb_mode)
+        cfg = build_wandb_config(args, schedule)
+        wandb_run = wandb.init(project=args.wandb_project,
+                               entity=args.wandb_entity or None,
+                               name=args.wandb_run_name or None,
+                               config=cfg,
+                               dir=args.output_dir)
+        wandb.define_metric("global_step")
+        wandb.define_metric("*", step_metric="global_step")
+        # İstersen aç:
+        # wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
+        # wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
 
     # infer dims
     with torch.no_grad():
@@ -585,8 +538,8 @@ def run_training(args, schedule: TrainSchedule):
         topk_per_window=int(getattr(args, "topk_per_window", 64)),
         curriculum_epochs=int(getattr(args, "curriculum_epochs", 10)),
         temperature=float(getattr(args, "temperature", 0.07)),
-        lambda_vtrue = getattr(args, "lambda_vtrue", 0.2),
-        tau_distill = getattr(args, "tau_distill", 1.5)
+        lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
+        tau_distill=getattr(args, "tau_distill", 1.5),
     )
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=wandb_run)
 
@@ -597,8 +550,7 @@ def run_training(args, schedule: TrainSchedule):
     best_val = None
     global_step = 0
 
-    #TODO: sil
-    import itertools
+    # (opsiyonel) dataloader hız ping
     t0 = time.time()
     for i, b in enumerate(itertools.islice(train_loader, 5)):
         dt = time.time() - t0
@@ -611,7 +563,7 @@ def run_training(args, schedule: TrainSchedule):
             if wandb_run is not None and global_step == 1:
                 try:
                     wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
-                    wandb_dataset_quickstats(wandb, datasets["train"], sample_n=256)  # daha küçük örnek
+                    wandb_dataset_quickstats(wandb, datasets["train"], sample_n=256)
                 except Exception as e:
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
             if len(seen_go_ids_prev) > 0:
@@ -622,20 +574,11 @@ def run_training(args, schedule: TrainSchedule):
                                           attention_mask=toks['attention_mask'].to(device)).detach().cpu()
                 new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
                 training_context.memory_bank.update(ids_to_update, new_embs)
+                # Backend’i güncelle (sadece bank embs)
                 try:
-                    training_context.faiss_index = rebuild_faiss_from_bank(training_context.memory_bank, metric='ip')
-                except Exception as _e:
-                    logging.getLogger('faiss').warning('Rebuild FAISS failed on refresh: %r', _e)
-                try:
-                    training_context.vres.set_backends(training_context.faiss_index, training_context.memory_bank.embs)
+                    training_context.vres.set_backends(None, training_context.memory_bank.embs)
                 except Exception:
                     pass
-                if wandb_logger is not None:
-                    try:
-                        wandb_logger.log({'bank/updated_ids': len(ids_to_update), 'bank/epoch': epoch,
-                                          'faiss/rebuilt': 1}, step=global_step)
-                    except Exception:
-                        pass
             seen_go_ids = set()
         except Exception as _e:
             logging.getLogger('bank').warning('Partial refresh failed: %r', _e)
@@ -650,8 +593,7 @@ def run_training(args, schedule: TrainSchedule):
             # Collect GO ids seen in this batch for later partial refresh
             try:
                 if isinstance(batch, dict) and ('uniq_go_ids' in batch) and batch['uniq_go_ids'] is not None:
-                    ids_list = batch['uniq_go_ids'].tolist() if hasattr(batch['uniq_go_ids'], 'tolist') else list(
-                        batch['uniq_go_ids'])
+                    ids_list = batch['uniq_go_ids'].tolist() if hasattr(batch['uniq_go_ids'], 'tolist') else list(batch['uniq_go_ids'])
                     for _gid in ids_list:
                         seen_go_ids.add(int(_gid))
             except Exception:
@@ -693,45 +635,16 @@ def run_training(args, schedule: TrainSchedule):
                                        trainer=trainer, args=args,
                                        epoch=epoch, step=global_step)
                 cleanup_old_checkpoints(out_dir, keep_last_n=args.keep_last_n)
-                if wandb_logger is not None:
-                    try:
-                        art = wandb.Artifact(name=f"ckpt_step{global_step}", type="model")
-                        art.add_file(str(path))
-                        wandb_run.log_artifact(art)
-                    except Exception:
-                        pass
+                # (opsiyonel) wandb artifact
 
         # epoch finished - update ema
         trainer.update_ema(trainer.index_projector, trainer.model.proj_p, m=0.995)
+
         # validation
         if val_loader is not None:
             val_logs = trainer.eval_epoch(val_loader, epoch)
             msg = " | ".join([f"{k}: {val_logs[k]:.4f}" for k in val_logs])
             logger.info(f"[val]   epoch {epoch} :: {msg}")
-            if wandb_logger is not None:
-                try:
-                    wandb_logger.log({f"val/{k}": float(v) for k, v in val_logs.items()}, step=global_step)
-                except Exception:
-                    pass
-
-            try:
-                metric = float(val_logs.get("total", None))
-                if metric is not None and (best_val is None or metric < best_val):
-                    best_val = metric
-                    path = save_checkpoint(out_dir, tag="best", trainer=trainer,
-                                           args=args, epoch=epoch, step=global_step,
-                                           extra={"best_val_total": best_val})
-                    cleanup_old_checkpoints(out_dir, keep_last_n=max(2, args.keep_last_n))
-                    if wandb_logger is not None:
-                        try:
-                            wandb_run.summary["best_val_total"] = best_val
-                            art = wandb.Artifact(name="ckpt_best", type="model")
-                            art.add_file(str(path))
-                            wandb_run.log_artifact(art)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
 
         # Persist seen GO ids for next epoch's partial refresh
         try:
@@ -751,27 +664,22 @@ def run_training(args, schedule: TrainSchedule):
     try:
         final_path = save_checkpoint(out_dir, tag="final", trainer=trainer,
                                      args=args, epoch=epoch, step=global_step)
-        if wandb_logger is not None:
-            try:
-                art = wandb.Artifact(name="ckpt_final", type="model")
-                art.add_file(str(final_path))
-                wandb_run.log_artifact(art)
-            except Exception:
-                pass
     except Exception:
         pass
 
     logger.info("Training finished. Artifacts saved under: %s", args.output_dir)
 
-    if wandb_run is not None:
-        try:
-            wandb_run.finish()
-        except Exception:
-            pass
+    # close wandb
+    try:
+        if wandb.run is not None:
+            wandb.run.finish()
+    except Exception:
+        pass
 
 
 # ============== YAML parser ==============
-def load_structured_cfg(path: str = TRAINING_CONFIG):
+from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT
+def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
@@ -794,8 +702,6 @@ def load_structured_cfg(path: str = TRAINING_CONFIG):
         embed_dir=Path(stores.get("embed_dir", GOOGLE_DRIVE_ESM3B_EMBEDDINGS)),
         seq_len_lookup=Path(stores.get("seq_len_lookup_dir", P_SEQ_LEN_LOOKUP)),
         pro_manifest=Path(stores.get("protein_manifest_file", GOOGLE_DRIVE_MANIFEST_CACHE)),
-        faiss=Path(stores.get("faiss")) if stores.get("faiss") else None,
-        logs=Path(stores.get("logs")) if stores.get("logs") else None,
         go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
 
         overlap=data.get("overlap"),
@@ -812,11 +718,8 @@ def load_structured_cfg(path: str = TRAINING_CONFIG):
         few_shot_terms=stores.get("few_shot_terms_file", FEW_SHOT_IC_TERMS_ID_ONLY_JSON),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.3)),
 
-        # caches (fallbacks)
+        # caches (legacy keys kept for compatibility; FAISS yok)
         go_cache=caches.get("go_cache"),
-        faiss_index=caches.get("faiss_index"),
-        go_cache_template=caches.get("go_cache_template"),
-        faiss_template=caches.get("faiss_template"),
 
         # training
         epochs=int(training.get("epochs", 10)),
@@ -869,8 +772,6 @@ def load_structured_cfg(path: str = TRAINING_CONFIG):
         k_hard_end=int((curriculum.get("k_hard") or [16, 64])[1]),
         hier_up_start=int((curriculum.get("hier_up") or [1, 0])[0]),
         hier_up_end=int((curriculum.get("hier_up") or [1, 0])[1]),
-        hier_dn_start=int((curriculum.get("hier_dn") or [1, 0])[0]),
-        hier_dn_end=int((curriculum.get("hier_dn") or [1, 0])[1]),
         random_k_start=int((curriculum.get("random_k") or [8, 0])[0]),
         random_k_end=int((curriculum.get("random_k") or [8, 0])[1]),
         inbatch_easy_start=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[0]),
