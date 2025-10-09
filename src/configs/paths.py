@@ -47,7 +47,7 @@ def _detect_project_root() -> Path:
 PLATFORM = os.getenv("PLATFORM", "local")  # local, colab, kaggle, ...
 PROJECT_ROOT = _detect_project_root()
 SRC_DIR = PROJECT_ROOT / "src"
-DATA_DIR = SRC_DIR / "data"             # mevcut yapına uyuyor
+DATA_DIR = SRC_DIR / "data"
 RAW_PATH = DATA_DIR / "raw"
 PROCESSED_PATH = DATA_DIR / "processed"
 TRAINING_READY = DATA_DIR / "training_ready"

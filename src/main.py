@@ -772,10 +772,13 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         k_hard_end=int((curriculum.get("k_hard") or [16, 64])[1]),
         hier_up_start=int((curriculum.get("hier_up") or [1, 0])[0]),
         hier_up_end=int((curriculum.get("hier_up") or [1, 0])[1]),
+        hier_dn_start=int((curriculum.get("hier_dn") or [0, 0])[0]),
+        hier_dn_end=int((curriculum.get("hier_dn") or [0, 0])[1]),
         random_k_start=int((curriculum.get("random_k") or [8, 0])[0]),
         random_k_end=int((curriculum.get("random_k") or [8, 0])[1]),
         inbatch_easy_start=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[0]),
         inbatch_easy_end=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[1]),
+
 
         # wandb
         wandb=bool(wandb_block.get("enabled", False)),

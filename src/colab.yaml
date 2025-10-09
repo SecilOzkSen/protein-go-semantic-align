@@ -67,7 +67,7 @@ curriculum:
   shortlist_M: [128, 64]
   k_hard: [16, 8]
   hier_up: [1, 0]
-  hier_dn: [1, 0]
+  hier_dn: [0, 0]
   random_k: [8, 0]
   inbatch_easy: [1.0, 0.0]
   neg_k: 32
