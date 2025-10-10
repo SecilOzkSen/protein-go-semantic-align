@@ -794,6 +794,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         random_k_end=int((curriculum.get("random_k") or [8, 0])[1]),
         inbatch_easy_start=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[0]),
         inbatch_easy_end=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[1]),
+        neg_k=int(curriculum.get("neg_k", 4)),
 
 
         # wandb
