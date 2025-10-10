@@ -56,6 +56,11 @@ try:
 except RuntimeError:
     pass
 
+torch.multiprocessing.set_sharing_strategy("file_system")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"   # çok önemli
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 # ============== Utilities ==============
 
 def _sigint_handler(signum, frame):
@@ -192,6 +197,11 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dic
 
 
 def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore):
+    def _worker_init(_):
+        import os, random, torch
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        torch.set_num_threads(1)
+        random.seed(torch.initial_seed() % 2 ** 32)
     logger = logging.getLogger("build_dataloaders")
 
     train_ds = datasets["train"]
@@ -215,10 +225,12 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         persistent_workers=False,
+        multiprocessing_context="forkserver",
         pin_memory=True,
-        prefetch_factor=2,
+        worker_init_fn=_worker_init,
+    #    prefetch_factor=2,
         collate_fn=collate,
     )
     val_loader = None
@@ -227,10 +239,13 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             datasets["val"],
             batch_size=args.eval_batch_size or args.batch_size,
             shuffle=False,
-            num_workers=2,
+            num_workers=0,
             persistent_workers=False,
             pin_memory=True,
             collate_fn=collate,
+            multiprocessing_context="forkserver",
+            worker_init_fn=_worker_init,
+            drop_last=False
         )
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
     return train_loader, val_loader, collate
@@ -408,6 +423,7 @@ def run_training(args, schedule: TrainSchedule):
 
     # GoTextStore + dataloaders
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
+    go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
     # Memory bank (initial GO cache)
