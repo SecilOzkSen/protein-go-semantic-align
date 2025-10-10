@@ -227,7 +227,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         shuffle=True,
         num_workers=0,
         persistent_workers=False,
-        multiprocessing_context="forkserver",
+#        multiprocessing_context="forkserver",
         pin_memory=True,
         worker_init_fn=_worker_init,
     #    prefetch_factor=2,
@@ -243,7 +243,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             persistent_workers=False,
             pin_memory=True,
             collate_fn=collate,
-            multiprocessing_context="forkserver",
+#            multiprocessing_context="forkserver",
             worker_init_fn=_worker_init,
             drop_last=False
         )
