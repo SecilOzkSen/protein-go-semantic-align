@@ -239,15 +239,32 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
 def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
     total_steps = max(1, n_steps_per_epoch * args.curriculum_epochs)
     warmup = int(args.warmup_frac * n_steps_per_epoch)
+
+    hier_dn_start = int(getattr(args, "hier_dn_start", 0))
+    hier_dn_end = int(getattr(args, "hier_dn_end", 0))
+    hier_up_start = int(getattr(args, "hier_up_start", 0))
+    hier_up_end = int(getattr(args, "hier_up_end", 0))
+
+    shortlist_M_start = int(getattr(args, "shortlist_M_start", 256))
+    shortlist_M_end = int(getattr(args, "shortlist_M_end", 1024))
+    k_hard_start = int(getattr(args, "k_hard_start", 16))
+    k_hard_end = int(getattr(args, "k_hard_end", 64))
+    hard_frac_start = float(getattr(args, "hard_frac_start", 0.2))
+    hard_frac_end = float(getattr(args, "hard_frac_end", 0.7))
+    inbatch_easy_start = float(getattr(args, "inbatch_easy_start", 1.0))
+    inbatch_easy_end = float(getattr(args, "inbatch_easy_end", 0.0))
+    random_k_start = int(getattr(args, "random_k_start", 8))
+    random_k_end = int(getattr(args, "random_k_end", 0))
+
     cfg = CurriculumConfig(
         total_steps=total_steps,
-        hard_frac=(args.hard_frac_start, args.hard_frac_end),
-        shortlist_M=(args.shortlist_M_start, args.shortlist_M_end),
-        k_hard=(args.k_hard_start, args.k_hard_end),
-        hier_max_hops_up=(args.hier_up_start, args.hier_up_end),
-        hier_max_hops_down=(args.hier_dn_start, args.hier_dn_end),
-        random_k=(args.random_k_start, args.random_k_end),
-        use_inbatch_easy=(args.inbatch_easy_start, args.inbatch_easy_end),
+        hard_frac=(hard_frac_start, hard_frac_end),
+        shortlist_M=(shortlist_M_start, shortlist_M_end),
+        k_hard=(k_hard_start, k_hard_end),
+        hier_max_hops_up=(hier_up_start, hier_up_end),
+        hier_max_hops_down=(hier_dn_start, hier_dn_end),
+        random_k=(random_k_start, random_k_end),
+        use_inbatch_easy=(inbatch_easy_start, inbatch_easy_end),
         mode=args.curriculum_mode,
         warmup=warmup,
     )
@@ -761,7 +778,6 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
 
         # curriculum
         curriculum_epochs=int(curriculum.get("epochs", 4)),
-        neg_k=int(curriculum.get("neg_k", 32)),
         warmup_frac=float(curriculum.get("warmup_frac", 0.1)),
         curriculum_mode=curriculum.get("mode", "cosine"),
         hard_frac_start=float((curriculum.get("hard_frac") or [0.2, 0.7])[0]),
