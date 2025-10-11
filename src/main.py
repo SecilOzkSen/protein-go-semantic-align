@@ -427,9 +427,16 @@ def run_training(args, schedule: TrainSchedule):
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
     # Memory bank (initial GO cache)
+    memory_bank = None
     if args.use_go_memory_bank:
-        logger.info("Using GoMemoryBank for training.")
-        memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
+        logger.info("Using GoMemoryBank for training (CPU fp16).")
+        embs_cpu16 = go_cache.embs.half().cpu()
+        memory_bank = GoMemoryBank(
+            init_embs=embs_cpu16,
+            row2id=getattr(go_cache, 'row2id', None)
+        )
+   #     logger.info("Using GoMemoryBank for training.")
+   #     memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
 
     seen_go_ids_prev: set = set()
 
@@ -477,10 +484,16 @@ def run_training(args, schedule: TrainSchedule):
     )
 
     # VectorResources backend’i MemoryBank ile hizala (FAISS yok)
-    try:
-        training_context.vres.set_backends(None, training_context.memory_bank.embs)
-    except Exception:
-        pass
+  #  try:
+  #      training_context.vres.set_backends(None, training_context.memory_bank.embs)
+  #  except Exception:
+  #      pass
+
+    # VectorResources backend seçimi (FAISS yok)
+    if training_context.memory_bank is not None:
+        training_context.vres.set_backends(None, training_context.memory_bank.embs)  # CPU bank
+    else:
+        training_context.vres.set_backends(None, training_context.go_cache.embs)  # fallback: cache embs
 
     def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
         new_phase = training_context.schedule.phase_for_epoch(current_epoch)
@@ -505,19 +518,23 @@ def run_training(args, schedule: TrainSchedule):
 
             training_context.go_cache = new_go_cache
 
-            # MemoryBank’i yeni cache ile yenile
-            try:
-                training_context.memory_bank = GoMemoryBank(
-                    init_embs=new_go_cache.embs,
-                    row2id=getattr(new_go_cache, 'row2id', None)
-                )
-            except Exception:
-                pass
+            # MemoryBank’i yeni cache ile yenile (CPU + fp16)
+            if args.use_go_memory_bank:
+                try:
+                    embs_cpu16 = new_go_cache.embs.half().cpu()
+                    training_context.memory_bank = GoMemoryBank(
+                        init_embs=embs_cpu16,
+                        row2id=getattr(new_go_cache, 'row2id', None)
+                    )
+                except Exception:
+                    training_context.memory_bank = None
+            else:
+                training_context.memory_bank = None
 
-            # Backend’i sadece bank embs ile güncelle
-            try:
+            # Backend seçim
+            if training_context.memory_bank is not None:
                 training_context.vres.set_backends(None, training_context.memory_bank.embs)
-            except Exception:
+            else:
                 training_context.vres.set_backends(None, training_context.go_cache.embs)
 
             # GoTextStore fazı
