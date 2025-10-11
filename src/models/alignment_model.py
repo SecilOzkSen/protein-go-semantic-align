@@ -45,7 +45,7 @@ class ProteinGoAligner(nn.Module):
         mask: torch.Tensor,       # [B, T] bool
         return_alpha: bool = False
     ):
-        Z, alpha_info = self.pooler(H, G, attn_mask=mask, return_alpha=True)  # (B, T, d_h), dict
+        Z, alpha_info = self.pooler(H, G, attn_mask=mask, return_alpha=return_alpha)  # (B, T, d_h), dict
         Zp = self.proj_p(Z)  # (B, T, d_z)
         Gz = self.proj_g(G)  # (B, T, d_z)
 
@@ -54,7 +54,7 @@ class ProteinGoAligner(nn.Module):
             Gz = F.normalize(Gz, dim=-1)
 
         scores = torch.einsum("btd,btd->bt", Zp, Gz)  # cosine per token, then summed along last dim
-        return (scores, alpha_info) if return_alpha else scores
+        return (scores, alpha_info) if return_alpha else (scores, None)
 
     # ------------------ Helpers ------------------
     @staticmethod

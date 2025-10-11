@@ -13,6 +13,11 @@ data:
   # Few/Zero-shot
   fs_target_ratio: 0.3
 
+general:
+  use_queue_miner: True
+  use_go_memory_bank: True
+  use_faiss: False
+
 caches:
   go_cache: null         # ör: /content/drive/MyDrive/protein-go-align/data/go_cache_phase1.pt
   faiss_index: null      # ör: /content/drive/MyDrive/protein-go-align/data/faiss_phase1.index
@@ -25,15 +30,19 @@ training:
   epochs: 30
   batch_size: 4
   eval_batch_size: 4
-  num_workers: 0            # for Colab
+  num_workers: 1
+  val_num_workers: 0 # for Colab
+  pin_memory: true
+  persistent_workers: false
+  prefetch_factor: 2
   fp16: true                # true if GPU available
   cpu: false
   seed: 42
   output_dir: /content/protein-go-align/outputs/run
-  save_every: 1000
+  save_every: 2000
   keep_last_n: 3
   resume: null
-  log_every: 50
+  log_every: 500
   log_level: INFO
 
 optim:
@@ -53,10 +62,10 @@ model:
 loss:
   lambda_con: 1.0
   lambda_dag: 0.2
-  lambda_attr: 0.1
+  lambda_attr: 0.0 #closed
   dag_margin: 0.05
   dag_scale: 10.0
-  lambda_vtrue: 0.2
+  lambda_vtrue: 0.0 #closed
   tau_distill: 1.5
 
 curriculum:
@@ -71,6 +80,7 @@ curriculum:
   random_k: [4, 0]
   inbatch_easy: [1.0, 0.0]
   neg_k: 8
+  curriculum_mode: cosine
 
 schedule:
   phase_breaks: [5, 12, 25]

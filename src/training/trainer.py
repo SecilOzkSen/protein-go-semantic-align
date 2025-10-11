@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Tuple, Optional
 import copy
 import torch
 import torch.nn.functional as F
+import time
 
 from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss, windowed_attr_loss
@@ -160,7 +161,6 @@ class OppTrainer:
         self._phase_acc = defaultdict(lambda: defaultdict(list))
         self._current_phase_id = None
 
-        # Cache (opsiyonel): memory bank'ı tek sefer device'a al
         self._mb_embs = getattr(self.ctx, "memory_bank", None)
         if self._mb_embs is not None:
             self._mb_embs = self.ctx.memory_bank.embs.to(self.device)
@@ -328,11 +328,12 @@ class OppTrainer:
 
     # --------- Scoring (tensor path) ---------
     def forward_scores(self, H, G, pad_mask, **kwargs):
-        return_alpha = kwargs.pop("return_alpha", True)
+        return_alpha = kwargs.pop("return_alpha", False)
         return self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, **kwargs)
 
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
+        t0 = time.time()
         self.model.train()
         device = self.device
 
@@ -343,7 +344,8 @@ class OppTrainer:
         B = H.size(0)
 
         # Use attribution loss only during early curriculum epochs
-        use_attr = (epoch_idx < self.attr.curriculum_epochs)
+        use_attr = (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
+        print("[Trainer] use_attr =", use_attr, f"(epoch {epoch_idx} < {self.attr.curriculum_epochs})")
 
         # --- POSITIVES (GoEncoder → uniq_go_embs) ---
         if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
@@ -421,19 +423,22 @@ class OppTrainer:
         vt = vt_for_miner
         vt = F.normalize(vt, dim=-1)                 # [B, Dg]
         Gn = F.normalize(G_cand, dim=-1)             # [B, K, Dg]
-        scores_teacher = torch.einsum("bd,bkd->bk", vt, Gn)
 
         # ---- Student scores + InfoNCE ----
         scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)  # (B, K)
         l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
 
         # ---- KL distillation (teacher → student) ----
-        tau = float(self.attr.tau_distill)
-        with torch.no_grad():
-            p_t = F.softmax(scores_teacher / tau, dim=1)
-        log_p_s = F.log_softmax(scores_cand / tau, dim=1)
-        l_con_teacher = F.kl_div(log_p_s, p_t, reduction="batchmean") * (tau ** 2)
-        lambda_v = float(getattr(self.attr, "lambda_vtrue", 0.2))
+        lambda_v = float(getattr(self.attr, "lambda_vtrue", 0.0))
+        if lambda_v > 0.0: #KL Distillation active
+            scores_teacher = torch.einsum("bd,bkd->bk", vt, Gn)
+            tau = float(self.attr.tau_distill)
+            with torch.no_grad():
+                p_t = F.softmax(scores_teacher / tau, dim=1)
+            log_p_s = F.log_softmax(scores_cand / tau, dim=1)
+            l_con_teacher = F.kl_div(log_p_s, p_t, reduction="batchmean") * (tau ** 2)
+        else:
+            l_con_teacher = torch.zeros((), device=device) # TODO: düzelt
 
         # ---- Positives-only for attribution / DAG ----
         T_max = max((int(x.numel()) for x in pos_local), default=1)
@@ -444,9 +449,9 @@ class OppTrainer:
             if t > 0:
                 G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
 
-        scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask)
+        scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=use_attr)
 
-        if "alpha_full" in alpha_info:
+        if alpha_info is not None and "alpha_full" in alpha_info:
             alpha = alpha_info["alpha_full"]
             if use_attr:
                 delta, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
@@ -454,7 +459,7 @@ class OppTrainer:
                 l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
             else:
                 l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
-        elif all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
+        elif alpha_info is not None and all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
             AW = alpha_info["alpha_windows"]; Ww = alpha_info["win_weights"]; spans = alpha_info["spans"]
             if use_attr:
                 delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
@@ -467,6 +472,7 @@ class OppTrainer:
             else:
                 l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
         else:
+            print("[Trainer] Warning: no alpha info for attribution loss.")
             l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
 
         uniq_go_ids = batch['uniq_go_ids'].to(device)
@@ -487,6 +493,40 @@ class OppTrainer:
                 if len(pos_list) > 0:
                     go_pos_all = torch.cat(pos_list, dim=0)   # [sum_t, Dg]
                     self.queue_miner.enqueue(go_pos_all.detach())
+        torch.cuda.synchronize()  # doğru süre için
+        dt = time.time() - t0
+        # TODO: Quick eval - to be erased!
+
+        # --- Quick on-batch retrieval metrics (cheap) ---
+        with torch.no_grad():
+            # scores_cand: (B, K)  -- zaten hesaplandı (InfoNCE/Distill açıkken)
+            # pos_mask: (B, K)
+            if scores_cand.numel() > 1:
+                topk = min(5, scores_cand.size(1))
+                topk_idx = scores_cand.topk(topk, dim=1).indices  # (B, topk)
+                # recall@1/@5
+                hit1 = pos_mask.gather(1, topk_idx[:, :1]).any(dim=1).float().mean().item()
+                hit5 = pos_mask.gather(1, topk_idx).any(dim=1).float().mean().item()
+                # mean rank of positives
+                ranks = torch.argsort(torch.argsort(-scores_cand, dim=1), dim=1)  # 0=best
+                pos_ranks = ranks[pos_mask].float()
+                mean_pos_rank = pos_ranks.mean().item() if pos_ranks.numel() else float('nan')
+            else:
+                hit1 = hit5 = mean_pos_rank = float('nan')
+
+            # queue hardness (opsiyonel)
+            try:
+                # pozitif skorlar (sadece pozitif kolonlarda)
+                pos_scores = scores_cand[pos_mask]
+                # negatif skorlar
+                neg_mask = ~pos_mask
+                neg_scores = scores_cand[neg_mask]
+                if pos_scores.numel() > 0 and neg_scores.numel() > 0:
+                    hard_gap = (pos_scores.mean() - neg_scores.mean()).item()
+                else:
+                    hard_gap = float('nan')
+            except:
+                hard_gap = float('nan')
 
         # --- Logging ---
         losses_log = {
@@ -496,6 +536,13 @@ class OppTrainer:
             "hierarchy": float(l_dag.detach().item()),
             "attr": float(l_attr.detach().item()),
             "entropy": float(l_ent.detach().item()),
+            # TODO: to be deleted
+            "retrieval/recall@1": hit1,
+            "retrieval/recall@5": hit5,
+            "retrieval/mean_pos_rank": mean_pos_rank,
+            "retrieval/hard_gap": hard_gap,
+            "perf/step_sec": dt,
+            "perf/samples_per_sec": H.size(0) / dt
         }
 
         sched = None

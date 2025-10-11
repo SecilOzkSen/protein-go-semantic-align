@@ -217,6 +217,7 @@ class TrainingContext:
     run_name: str = None
     logging: LoggingConfig = None
     use_queue_miner: bool = True
+    attribute_loss_enabled = False
 
     def to_dict(self):
         d = dict(
@@ -230,7 +231,7 @@ class TrainingContext:
 
 @dataclass
 class AttrConfig:
-    lambda_attr: float = 0.1
+    lambda_attr: float = 0.0
     lambda_entropy_alpha: float = 0.05
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64

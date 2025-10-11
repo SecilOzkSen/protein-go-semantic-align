@@ -427,7 +427,10 @@ def run_training(args, schedule: TrainSchedule):
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
     # Memory bank (initial GO cache)
-    memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
+    if args.use_memory_bank:
+        logger.info("Using GoMemoryBank for training.")
+        memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
+
     seen_go_ids_prev: set = set()
 
     if args.wandb:
@@ -533,18 +536,18 @@ def run_training(args, schedule: TrainSchedule):
     training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources
 
     # W&B
-    wandb_run = None
-    wandb_logger = None
-    if args.wandb:
-        os.environ.setdefault("WANDB_MODE", args.wandb_mode)
-        cfg = build_wandb_config(args, schedule)
-        wandb_run = wandb.init(project=args.wandb_project,
-                               entity=args.wandb_entity or None,
-                               name=args.wandb_run_name or None,
-                               config=cfg,
-                               dir=args.output_dir)
-        wandb.define_metric("global_step")
-        wandb.define_metric("*", step_metric="global_step")
+  #  wandb_run = None
+  #  wandb_logger = None
+  #  if args.wandb:
+  #      os.environ.setdefault("WANDB_MODE", args.wandb_mode)
+  #      cfg = build_wandb_config(args, schedule)
+  #      wandb_run = wandb.init(project=args.wandb_project,
+  #                             entity=args.wandb_entity or None,
+  #                             name=args.wandb_run_name or None,
+    #                           config=cfg,
+    #                           dir=args.output_dir)
+    #    wandb.define_metric("global_step")
+    #    wandb.define_metric("*", step_metric="global_step")
         # İstersen aç:
         # wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
         # wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
@@ -574,7 +577,7 @@ def run_training(args, schedule: TrainSchedule):
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
     )
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=wandb_run)
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
@@ -726,8 +729,13 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
     wandb_block = cfg.get("wandb", {})
     sched = cfg.get("schedule", {})
     stores = cfg.get("stores", {})
+    general = cfg.get("general", {})
 
     args = types.SimpleNamespace(
+        # general
+        use_queue_miner = bool(general.get("use_queue_miner", True)),
+        use_go_memory_bank = bool(general.get("use_go_memory_bank", False)),
+        use_faiss = bool(general.get("use_faiss", False)),
         # paths / store
         train_ids=Path(stores.get("train_ids_path", PROTEIN_TRAIN_IDS)),
         pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),
