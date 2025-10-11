@@ -427,7 +427,7 @@ def run_training(args, schedule: TrainSchedule):
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
     # Memory bank (initial GO cache)
-    if args.use_memory_bank:
+    if args.use_go_memory_bank:
         logger.info("Using GoMemoryBank for training.")
         memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
 
