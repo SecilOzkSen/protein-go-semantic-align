@@ -210,13 +210,13 @@ def build_store(args) -> ESMResidueStore:
         gdrive_cache=gdrive_cache,          # Drive yolundaysan True; değilse False
         prefer_fp16=prefer_fp16,
         # HF lazy fetch params
-        hub_repo_id=hub_repo_id,
-        hub_revision=hub_revision,
-        hub_repo_type="dataset",
-        hub_local_dir=hub_local_dir,
-        hub_symlinks=getattr(args, "hub_symlinks", True),
-        hub_cache_max_gb=90.0,
-        hub_cache_reserve_gb=12.0,
+    #    hub_repo_id=hub_repo_id,
+    #    hub_revision=hub_revision,
+    #    hub_repo_type="dataset",
+    #    hub_local_dir=hub_local_dir,
+    #    hub_symlinks=getattr(args, "hub_symlinks", True),
+    #    hub_cache_max_gb=90.0,
+    #    hub_cache_reserve_gb=12.0,
     )
 
     logger.info("Store ready (lazy HF enabled; snapshot disabled).")

@@ -136,7 +136,7 @@ else:
     GOOGLE_DRIVE_ESM3B = TRAINING_READY / "esm3b_embeddings"  # repo içi default
 
 GOOGLE_DRIVE_ESM3B_EMBEDDINGS = GOOGLE_DRIVE_ESM3B / "embeddings"  # symlink edebilirsin
-GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest_hf.pkl"
+GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest.pkl"
 
 # CONFIG
 TRAINING_CONFIG = SRC_DIR / "colab.yaml"
