@@ -18,7 +18,7 @@ import glob
 import types
 import signal, traceback, time as _time
 import itertools
-from huggingface_hub import snapshot_download
+from torch.utils.data import Subset
 
 import wandb
 
@@ -63,6 +63,14 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 # ============== Utilities ==============
+
+def get_allowed_pids(target_shard = "esm_embed_00000.pt", store: Optional[ESMResidueStore] = None):
+
+    allowed_pids = {pid for pid, rel in store.pid2rel.items()
+                    if Path(rel).name == target_shard}
+
+    print(f"[subset] {target_shard} -> {len(allowed_pids)} protein")
+    return allowed_pids
 
 def _sigint_handler(signum, frame):
     print(f"\n[DBG] Caught SIGINT at {_time.strftime('%H:%M:%S')}")
@@ -222,7 +230,7 @@ def build_store(args) -> ESMResidueStore:
     logger.info("Store ready (lazy HF enabled; snapshot disabled).")
     return store
 
-def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dict[str, torch.utils.data.Dataset]:
+def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowed_pids = None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
@@ -254,6 +262,19 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dic
 
     train_ds = ProteinEmbDataset(protein_ids=train_ids, **ds_kwargs)
     val_ds = ProteinEmbDataset(protein_ids=val_ids, **ds_kwargs) if val_ids else None
+
+    # ALLOWED PIDS
+
+    idxs = [i for i, pid in enumerate(train_ds.pids) if pid in allowed_pids]
+    train_ds = Subset(train_ds, idxs)
+
+    # val için de istersen
+    vidxs = [i for i, pid in enumerate(val_ds.pids) if pid in allowed_pids]
+    val_ds = Subset(val_ds, vidxs)
+
+    # ALLOWED PIDS ENDED
+
+    print(f"[subset] train={len(idxs)}, val={len(vidxs)}")
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds}
 
@@ -466,7 +487,8 @@ def run_training(args, schedule: TrainSchedule):
         go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
 
     store = build_store(args)
-    datasets = build_datasets(args, store, go_cache)
+    allowed_pids = get_allowed_pids(store=store)
+    datasets = build_datasets(args, store, go_cache, allowed_pids=allowed_pids)
     n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
     # Text encoder (GO)
@@ -812,9 +834,9 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
 
     args = types.SimpleNamespace(
         # general
-        use_queue_miner = bool(general.get("use_queue_miner", True)),
-        use_go_memory_bank = bool(general.get("use_go_memory_bank", False)),
-        use_faiss = bool(general.get("use_faiss", False)),
+        use_queue_miner=bool(general.get("use_queue_miner", True)),
+        use_go_memory_bank=bool(general.get("use_go_memory_bank", False)),
+        use_faiss=bool(general.get("use_faiss", False)),
         # paths / store
         train_ids=Path(stores.get("train_ids_path", PROTEIN_TRAIN_IDS)),
         pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),

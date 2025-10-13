@@ -27,7 +27,7 @@ caches:
   faiss_template: /content/data/faiss/faiss_phase{phase}.index
 
 training:
-  epochs: 30
+  epochs: 5
   batch_size: 4
   eval_batch_size: 4
   num_workers: 1
