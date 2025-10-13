@@ -230,10 +230,11 @@ def build_store(args) -> ESMResidueStore:
     logger.info("Store ready (lazy HF enabled; snapshot disabled).")
     return store
 
-def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowed_pids = None) -> Dict[str, torch.utils.data.Dataset]:
+def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowed_pids=None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
+    # --- load splits & aux ---
     pid2pos = load_raw_json(PID_TO_POSITIVES)
     train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
     val_ids = load_raw_txt(PROTEIN_VAL_IDS)
@@ -263,23 +264,69 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     train_ds = ProteinEmbDataset(protein_ids=train_ids, **ds_kwargs)
     val_ds = ProteinEmbDataset(protein_ids=val_ids, **ds_kwargs) if val_ids else None
 
-    # ALLOWED PIDS
+    # --- ALLOWED PIDS (smoke subset) ---
+    if allowed_pids is not None:
+        allow = set(allowed_pids)
+        # train
+        if hasattr(train_ds, "pids"):
+            t_idxs = [i for i, pid in enumerate(train_ds.pids) if pid in allow]
+            train_ds = Subset(train_ds, t_idxs)
+        else:
+            # dataset içinde pids listesi yoksa fall-back: identity indeksleri filtrele
+            t_idxs = list(range(len(train_ds)))
+            train_ds = Subset(train_ds, t_idxs)
+        # val
+        if val_ds is not None:
+            if hasattr(val_ds, "pids"):
+                v_idxs = [i for i, pid in enumerate(val_ds.pids) if pid in allow]
+                val_ds = Subset(val_ds, v_idxs)
+            else:
+                v_idxs = list(range(len(val_ds)))
+                val_ds = Subset(val_ds, v_idxs)
+        else:
+            v_idxs = []
+        print(f"[subset] train={len(t_idxs)}, val={len(v_idxs)}")
+    else:
+        t_idxs, v_idxs = None, None
+        print(f"[subset] train={len(train_ds)}, val={len(val_ds) if val_ds is not None else 0}")
 
-    idxs = [i for i, pid in enumerate(train_ds.pids) if pid in allowed_pids]
-    train_ds = Subset(train_ds, idxs)
+    # --- Build zs_mask_vec for collator (fixes None.bool() crash) ---
+    # go_cache.z2i is mapping label -> index (dict-like)
+    z2i = go_cache.z2i if hasattr(go_cache, "z2i") else go_cache["z2i"]
+    num_labels = len(z2i)
 
-    # val için de istersen
-    vidxs = [i for i, pid in enumerate(val_ds.pids) if pid in allowed_pids]
-    val_ds = Subset(val_ds, vidxs)
+    import torch as _torch
+    zs_mask_vec = _torch.zeros(num_labels, dtype=_torch.bool)
+    if zs:  # zero-shot terim listesi doluysa sadece onları işaretle
+        for term in zs:
+            idx = z2i.get(term) if isinstance(z2i, dict) else (z2i[term] if term in z2i else None)
+            if idx is not None:
+                zs_mask_vec[idx] = True
+        # Eğer listedeki hiçbiri mevcut değilse, smoke’ta her şeyi açık bırakalım:
+        if zs_mask_vec.sum() == 0:
+            zs_mask_vec[:] = True
+    else:
+        # smoke / default: hepsi açık (collate None.bool patlamasın)
+        zs_mask_vec[:] = True
 
-    # ALLOWED PIDS ENDED
+    logger.info(
+        "Datasets ready. Train=%s%s | num_labels=%d | zs_mask_sum=%d",
+        len(train_ds),
+        f", Val={len(val_ds)}" if val_ds is not None else "",
+        num_labels,
+        int(zs_mask_vec.sum().item()),
+    )
 
-    print(f"[subset] train={len(idxs)}, val={len(vidxs)}")
-    logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
-    return {"train": train_ds, "val": val_ds}
+    return {
+        "train": train_ds,
+        "val": val_ds,
+        # collate için ekler:
+        "zs_mask_vec": zs_mask_vec,   # torch.BoolTensor [num_labels]
+        "num_labels": num_labels,
+    }
 
 
-def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore):
+def build_dataloaders(packs, args, go_cache: GoLookupCache, go_text_store: GoTextStore):
     def _worker_init(_):
         import os, random, torch
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -287,9 +334,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         random.seed(torch.initial_seed() % 2 ** 32)
     logger = logging.getLogger("build_dataloaders")
 
-    train_ds = datasets["train"]
-    zs_mask_np = getattr(train_ds, "zs_mask", None)
-    zs_mask_vec = torch.as_tensor(zs_mask_np, dtype=torch.bool) if zs_mask_np is not None else None
+    train_ds, val_ds = packs["train"], packs["val"]
+    zs_mask_vec, num_labels = packs["zs_mask_vec"], packs["num_labels"]
 
     try:
         mp.set_sharing_strategy("file_system")
