@@ -266,11 +266,31 @@ def _get_z2i(go_cache):
     )
 
 
-def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowed_pids=None) -> Dict[str, torch.utils.data.Dataset]:
+def _get_num_labels(go_cache) -> int:
+    # 1) Yaygın attr isimleri
+    for name in ("num_labels", "n_labels", "label_count", "size"):
+        if hasattr(go_cache, name):
+            val = getattr(go_cache, name)
+            return int(val() if callable(val) else val)
+    # 2) Uzunluk veriyorsa
+    try:
+        return int(len(go_cache))
+    except Exception:
+        pass
+    # 3) Zorunda kalırsak z2i uzunluğunu deneriz (varsa)
+    for name in ("z2i", "label2idx", "go2idx", "term_to_idx"):
+        if hasattr(go_cache, name):
+            m = getattr(go_cache, name)
+            if callable(m):
+                m = m()
+            if isinstance(m, dict):
+                return int(len(m))
+    raise TypeError("num_labels tespit edilemedi (GoLookupCache).")
+
+def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowed_pids=None):
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
-    # --- split & aux yükleri ---
     pid2pos = load_raw_json(PID_TO_POSITIVES)
     train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
     val_ids = load_raw_txt(PROTEIN_VAL_IDS)
@@ -278,12 +298,8 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     zs = load_go_set(ZERO_SHOT_TERMS_ID_ONLY_JSON)
     fs = load_go_set(FEW_SHOT_IC_TERMS_ID_ONLY_JSON)
     common = load_go_set(COMMON_IC_GO_TERMS_ID_ONLY_JSON)
-    fz = FewZeroConfig(
-        zero_shot_terms=zs,
-        few_shot_terms=fs,
-        common_terms=common,
-        fs_target_ratio=args.fs_target_ratio,
-    )
+    fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs, common_terms=common,
+                       fs_target_ratio=args.fs_target_ratio)
 
     dag_parents = load_go_parents()
     ancestor_stoplist = load_raw_txt(GO_ANCESTOR_STOPLIST)
@@ -304,17 +320,16 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     train_ds = ProteinEmbDataset(protein_ids=train_ids, **ds_kwargs)
     val_ds = ProteinEmbDataset(protein_ids=val_ids, **ds_kwargs) if val_ids else None
 
-    # --- allowed_pids (smoke subset) güvenli filtre ---
+    # --- smoke subset (allowed_pids) güvenli filtre ---
     if allowed_pids is not None:
         allow = set(allowed_pids)
-        # train
         if hasattr(train_ds, "pids"):
             t_idxs = [i for i, pid in enumerate(train_ds.pids) if pid in allow]
             train_ds = Subset(train_ds, t_idxs)
         else:
             t_idxs = list(range(len(train_ds)))
             train_ds = Subset(train_ds, t_idxs)
-        # val
+
         if val_ds is not None:
             if hasattr(val_ds, "pids"):
                 v_idxs = [i for i, pid in enumerate(val_ds.pids) if pid in allow]
@@ -328,37 +343,21 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     else:
         print(f"[subset] train={len(train_ds)}, val={len(val_ds) if val_ds is not None else 0}")
 
-    # --- zs_mask_vec üret (None.bool hatasını önler) ---
-    import torch as _torch
-    z2i = _get_z2i(go_cache)
-    num_labels = len(z2i)
-
-    zs_mask_vec = _torch.zeros(num_labels, dtype=_torch.bool)
-    if zs:
-        # listedeki terimlerden repo'da olanları işaretle
-        for term in zs:
-            idx = z2i.get(term)
-            if idx is not None:
-                zs_mask_vec[idx] = True
-        if zs_mask_vec.sum() == 0:
-            # smoke'ta hiçbir eşleşme yoksa hepsini aç
-            zs_mask_vec[:] = True
-    else:
-        # smoke/default: tüm label’lar açık
-        zs_mask_vec[:] = True
+    # --- ZS mask: collate içinde üretilecek (None => all-ones) ---
+    num_labels = _get_num_labels(go_cache)
+    zs_mask_vec = None  # <-- önemli: collate guard'ı devrede olacak
 
     logger.info(
-        "Datasets ready. Train=%s%s | num_labels=%d | zs_mask_sum=%d",
+        "Datasets ready. Train=%s%s | num_labels=%d",
         len(train_ds),
         f", Val={len(val_ds)}" if val_ds is not None else "",
         num_labels,
-        int(zs_mask_vec.sum().item()),
     )
 
     return {
         "train": train_ds,
         "val": val_ds,
-        "zs_mask_vec": zs_mask_vec,   # collate için
+        "zs_mask_vec": zs_mask_vec,
         "num_labels": num_labels,
     }
 
@@ -384,7 +383,8 @@ def build_dataloaders(packs, args, go_cache: GoLookupCache, go_text_store: GoTex
         go_text_store=go_text_store,
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
-        neg_k=args.neg_k
+        neg_k=args.neg_k,
+        num_labels=num_labels
     )
 
     train_loader = DataLoader(

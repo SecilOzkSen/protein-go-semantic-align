@@ -31,9 +31,18 @@ class ContrastiveEmbCollator:
                  bidirectional: bool = True,
                  go_text_store: Optional[object] = None,
                  faiss_miner: Optional[Callable[[List[int], int, torch.Tensor], List[List[int]]]] = None,
-                 neg_k: int = 0):
+                 neg_k: int = 0,
+                 num_labels=None,
+                 device: torch.device = torch.device("cpu")):
         self.go_lookup = go_lookup
-        self.zs_mask_vec = zs_mask_vec.bool()
+        self.device = device
+        if zs_mask_vec is None:
+            if num_labels is None:
+                raise ValueError("zs_mask_vec is None -> num_labels mandatory.")
+            self.zs_mask_vec = torch.ones(num_labels, dtype=torch.bool, device=self.device)
+        else:
+            self.zs_mask_vec = zs_mask_vec.to(self.device).bool()
+   #     self.zs_mask_vec = zs_mask_vec.bool()
         self.bidirectional = bidirectional
         self.go_text_store = go_text_store
         self.faiss_miner = faiss_miner
