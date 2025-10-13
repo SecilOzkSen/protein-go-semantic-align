@@ -149,25 +149,78 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
 
 
 def build_store(args) -> ESMResidueStore:
+    """
+    Build an ESMResidueStore that:
+      - DOES NOT snapshot the whole repo
+      - Lazily downloads shards from HF Hub into a bounded local cache
+      - Optionally uses Google Drive LRU caching if embed_dir points to Drive
+    Expected args:
+      - seq_len_lookup: path to pickle
+      - embed_dir: base dir for relative manifest paths (optional; default=hub_local_dir)
+      - max_len, overlap, no_cache_shards (bool flag)
+      - hub_repo_id (optional), hub_revision (optional), hub_local_dir (optional), hub_symlinks (bool)
+    """
     logger = logging.getLogger("build_store")
-    logger.info("Building store...")
+    logger.info("Building store (lazy HF + optional Drive cache)...")
+
+    # 1) Load sequence length lookup
     seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
-    local_dir = snapshot_download(
-        repo_id="secilozksen/esm-embeddings",
-        repo_type="dataset",
-        revision="main",
-        allow_patterns=["*.pt", "*.json", "*.faiss"]  # yapına göre
+
+    # 2) HF lazy cache root
+    hub_repo_id = getattr(args, "hub_repo_id", None) or "secilozksen/esm-embeddings"
+    hub_revision = getattr(args, "hub_revision", None) or "main"
+    hub_local_dir = getattr(args, "hub_local_dir", None) or "/content/hf_cache"
+    Path(hub_local_dir).mkdir(parents=True, exist_ok=True)
+
+    # Route HF cache to a controlled location to avoid filling /root
+    os.environ.setdefault("HF_HOME", hub_local_dir)
+
+    # 3) embed_dir selection
+    # If user didn't pass embed_dir, make it the same as hub_local_dir (so relative manifest resolves here)
+    embed_dir = getattr(args, "embed_dir", None) or hub_local_dir
+    Path(embed_dir).mkdir(parents=True, exist_ok=True)
+
+    # 4) Toggle Drive cache based on embed_dir
+    # If embed_dir points to Google Drive, keep old Drive LRU behavior; otherwise disable.
+    gdrive_cache = str(embed_dir).startswith("/content/drive/")
+
+    # 5) Cache toggles
+    cache_shards = not getattr(args, "no_cache_shards", False)
+    prefer_fp16  = True
+
+    # 6) Log summary
+    logger.info(
+        "Store config:\n"
+        f"  hub_repo_id = {hub_repo_id}\n"
+        f"  hub_revision = {hub_revision}\n"
+        f"  hub_local_dir = {hub_local_dir}\n"
+        f"  embed_dir = {embed_dir}\n"
+        f"  gdrive_cache = {gdrive_cache}\n"
+        f"  cache_shards = {cache_shards}\n"
+        f"  prefer_fp16 = {prefer_fp16}"
     )
+
+    # 7) Build store (NO snapshot_download)
     store = ESMResidueStore(
-        embed_dir=args.embed_dir,
+        embed_dir=embed_dir,
         seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
-        cache_shards=(not args.no_cache_shards),
-        pro_manifest_file=args.pro_manifest if args.pro_manifest else None,
+        cache_shards=cache_shards,
+        gdrive_cache=gdrive_cache,          # Drive yolundaysan True; değilse False
+        prefer_fp16=prefer_fp16,
+        # HF lazy fetch params
+        hub_repo_id=hub_repo_id,
+        hub_revision=hub_revision,
+        hub_repo_type="dataset",
+        hub_local_dir=hub_local_dir,
+        hub_symlinks=getattr(args, "hub_symlinks", True),
+        hub_cache_max_gb=50.0,
+        hub_cache_reserve_gb=5.0,
     )
-    return store
 
+    logger.info("Store ready (lazy HF enabled; snapshot disabled).")
+    return store
 
 def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
@@ -770,6 +823,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         seq_len_lookup=Path(stores.get("seq_len_lookup_dir", P_SEQ_LEN_LOOKUP)),
         pro_manifest=Path(stores.get("protein_manifest_file", GOOGLE_DRIVE_MANIFEST_CACHE)),
         go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
+        hub_local_dir=Path(stores.get("hub_local_dir", None)),
 
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),

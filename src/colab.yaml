@@ -103,8 +103,8 @@ stores:
   pid2pos_path: /content/protein-go-semantic-align/src/data/training_ready/proteins/pid_to_positives.json
   val_ids_path: /content/protein-go-semantic-align/src/data/training_ready/proteins/protein_val_ids.txt
 
-  embed_dir: /content/drive/MyDrive/esm-output/embeddings
-
+   #embed_dir: /content/drive/MyDrive/esm-output/embeddings
+  hub_local_dir: /content/hf-hub
   # protein seq len lookup
   seq_len_lookup_dir: /content/protein-go-semantic-align/src/data/training_ready/proteins/seq_len_lookup.pkl
   protein_manifest_file: /content/protein-go-semantic-align/src/data/training_ready/manifest_cache/esm_manifest.pkl

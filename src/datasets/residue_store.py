@@ -43,6 +43,49 @@ from typing import Dict, Optional, Tuple, Any
 
 import torch
 from src.configs.paths import GOOGLE_DRIVE_MANIFEST_CACHE
+from huggingface_hub import hf_hub_download
+
+
+class DiskLRU:
+    """
+    Cap total size of a directory to max_gb by evicting least-recently-used files.
+    Uses atime (last access). Works on /content/hf_cache (HF_HOME) or hub_local_dir.
+    """
+    def __init__(self, root: str, max_gb: float = 12.0, reserve_gb: float = 1.0):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = int(max_gb * (1024**3))
+        self.reserve_bytes = int(reserve_gb * (1024**3))  # emniyet payı
+
+    def _scan(self):
+        files = []
+        total = 0
+        for p in self.root.rglob("*"):
+            if p.is_file():
+                try:
+                    st = p.stat()
+                    files.append((p, st.st_size, st.st_atime))
+                    total += st.st_size
+                except FileNotFoundError:
+                    pass
+        return files, total
+
+    def make_room(self):
+        files, total = self._scan()
+        limit = max(0, self.max_bytes - self.reserve_bytes)
+        if total <= limit:
+            return
+        # LRU sırala (en eski atan en önce silinsin)
+        files.sort(key=lambda x: x[2])  # by atime
+        i = 0
+        while total > limit and i < len(files):
+            p, sz, _ = files[i]
+            try:
+                p.unlink()
+                total -= sz
+            except FileNotFoundError:
+                pass
+            i += 1
 
 
 # ------------------------- Local LRU Shard Cache ------------------------- #
@@ -141,6 +184,14 @@ class ESMResidueStore:
         cache_dir: str = "/content/esm_cache",
         cache_gb: float = 12.0,
         prefer_fp16: bool = True,
+        # ---- NEW: HF repo info ----
+        hub_repo_id: Optional[str] = None,  # "secilozksen/esm-embeddings"
+        hub_revision: str = "main",
+        hub_repo_type: str = "dataset",  # "model"/"dataset"/"space"
+        hub_local_dir: Optional[str] = None,  # cached local path
+        hub_symlinks: bool = False,
+        hub_cache_max_gb: float = 50.0,
+        hub_cache_reserve_gb: float = 10.0,
     ):
         self.embed_dir = embed_dir
         self.seq_len_lookup = seq_len_lookup or {}
@@ -148,6 +199,11 @@ class ESMResidueStore:
         self.overlap = overlap
         self.cache_shards = bool(cache_shards)
         self.prefer_fp16 = bool(prefer_fp16)
+        self.hub_repo_id = hub_repo_id
+        self.hub_revision = hub_revision
+        self.hub_repo_type = hub_repo_type
+        self.hub_local_dir = hub_local_dir
+        self.hub_symlinks = hub_symlinks
 
         # load manifest mapping protein_id -> shard path (absolute or relative)
         with open(pro_manifest_file, 'rb') as f:
@@ -162,49 +218,158 @@ class ESMResidueStore:
         # local file LRU cache for Drive paths
         self._file_cache = LocalShardCache(cache_dir, cache_gb) if gdrive_cache else None
 
+        cache_root = self.hub_local_dir or os.environ.get("HF_HOME", "/root/.cache/huggingface")
+        self._hub_lru = DiskLRU(cache_root, max_gb=hub_cache_max_gb, reserve_gb=hub_cache_reserve_gb)
+
     # -------------------------- path utilities -------------------------- #
     def _abspath(self, p: str) -> str:
         if os.path.isabs(p):
             return p
         return str(Path(self.embed_dir) / p)
 
-    def _resolve_local_path(self, shard_path: str) -> str:
+    def _maybe_hf_fetch(self, rel_path: str) -> Optional[str]:
+        if not self.hub_repo_id:
+            return None
+        # İndirmeden önce yer aç (proaktif)
+        self._hub_lru.make_room()
+        try:
+            lp = hf_hub_download(
+                repo_id=self.hub_repo_id,
+                repo_type=self.hub_repo_type,
+                revision=self.hub_revision,
+                filename=rel_path,
+                local_dir=self.hub_local_dir,  # None ise HF_HOME kullanır
+                local_dir_use_symlinks=self.hub_symlinks,
+            )
+            return lp
+        except OSError as e:
+            # Disk dolu yakalandıysa: agresif temizle ve tekrar dene
+            self._hub_lru.make_room()
+            lp = hf_hub_download(
+                repo_id=self.hub_repo_id,
+                repo_type=self.hub_repo_type,
+                revision=self.hub_revision,
+                filename=rel_path,
+                local_dir=self.hub_local_dir,
+                local_dir_use_symlinks=self.hub_symlinks,
+            )
+            return lp
+
+    def _resolve_local_path(self, path_like: str) -> str:
         """
-        If shard is on Drive and gdrive_cache is enabled, return local cached path.
-        Otherwise return the original path.
+        Unified resolver:
+          1) If Google Drive path and Drive cache enabled -> copy into local LRU cache, return that.
+          2) Else, compute absolute path w.r.t. embed_dir.
+             - If exists -> return abs path.
+             - If not exists and we have HF repo info -> lazy download just this file into HF cache and return its local path.
+          3) Otherwise -> return abs path (may not exist; caller will raise on load).
+
+        Accepts either a relative path (e.g., 'embeddings/esm_embed_0123.pt')
+        or an absolute path (e.g., '/content/drive/.../esm_embed_0123.pt').
         """
-        if self._file_cache is not None and shard_path.startswith("/content/drive/"):
+        from pathlib import Path
+        import os
+
+        raw = str(path_like)
+
+        # ---- 1) Old behavior: Google Drive -> local LRU cache
+        if self._file_cache is not None and raw.startswith("/content/drive/"):
             try:
-                return self._file_cache.ensure_local(shard_path)
+                return self._file_cache.ensure_local(raw)
             except Exception:
-                # best effort fallback
-                return shard_path
-        return shard_path
+                # best-effort; continue with other strategies
+                pass
+
+        # ---- 2) Compute absolute path relative to embed_dir (for relative inputs)
+        abs_path = raw if os.path.isabs(raw) else str(Path(self.embed_dir) / raw)
+
+        # If already present locally, we're done.
+        if os.path.exists(abs_path):
+            return abs_path
+
+        # ---- 2b) Not present -> try lazy fetch from HF (relative key)
+        # We need a REL path to ask the Hub for this file:
+        #  - if the input was relative, use it as-is
+        #  - if the input was absolute, try to relativize to embed_dir; fallback to basename
+        try:
+            rel = raw if not os.path.isabs(raw) else str(Path(abs_path).relative_to(self.embed_dir))
+        except Exception:
+            rel = Path(raw).name  # last resort
+
+        hf_local = self._maybe_hf_fetch(rel)  # uses hf_hub_download under the hood
+        if hf_local and os.path.exists(hf_local):
+            return hf_local
+
+        # ---- 3) Give back the absolute path (may still not exist; caller will handle)
+        return abs_path
 
     # --------------------------- shard loading -------------------------- #
     def _load_shard(self, path: str) -> dict:
-        # RAM cache hit?
-        if self.cache_shards and path in self._shard_ram_cache:
-            return self._shard_ram_cache[path]
+        """
+        Drive akışını _resolve_local_path içinde korur.
+        - RAM cache: çözülmüş yerel path'e göre tutulur (duplicate yüklemeyi önler)
+        - Disk doluysa (ENOSPC) LRU temizlikten sonra bir kez daha dener
+        - atime güncellenir (DiskLRU için yararlı)
+        """
+        import os
+        import errno
+        import torch
 
-        # Drive-aware resolution
+        # 1) Yol çöz: (Drive ise LRU cache'e kopyalar; HF ise lazy download yapar)
         local_path = self._resolve_local_path(path)
 
+        # 2) RAM cache kontrolü (çözümlenmiş path ile)
+        if self.cache_shards and local_path in self._shard_ram_cache:
+            return self._shard_ram_cache[local_path]
+
+        if not os.path.exists(local_path):
+            raise FileNotFoundError(f"Shard not found: {local_path}")
+
+        # 3) Yükleme (disk dolu ise bir kez LRU temizliği sonrası tekrar dene)
+        def _torch_load(p):
+            # weights_only bazı torch sürümlerinde yoksa sessizce ignore edelim
+            try:
+                return torch.load(p, map_location="cpu", weights_only=False)
+            except TypeError:
+                return torch.load(p, map_location="cpu")
+
         try:
-            shard = torch.load(local_path, map_location="cpu", weights_only=False)
+            shard = _torch_load(local_path)
+        except OSError as e:
+            if getattr(e, "errno", None) in (errno.ENOSPC,):  # No space left on device
+                try:
+                    # HF cache/belirlediğin cache için LRU varsa yer aç
+                    if hasattr(self, "_hub_lru") and self._hub_lru is not None:
+                        self._hub_lru.make_room()
+                except Exception:
+                    pass
+                # tekrar dene
+                shard = _torch_load(local_path)
+            else:
+                raise
         except Exception as e:
             raise RuntimeError(f"Error loading shard {local_path}: {e}")
 
-        # Optional: convert ndarray tensors to desired dtype (fp16) on load
+        # 4) (Opsiyonel) fp16 cast
         if self.prefer_fp16:
             for k, v in list(shard.items()):
-                if isinstance(v, torch.Tensor):
-                    if v.dtype == torch.float32:
-                        shard[k] = v.half()
-                # numpy arrays will be cast later at item access
+                if isinstance(v, torch.Tensor) and v.dtype == torch.float32:
+                    shard[k] = v.half()
+                # numpy array ise, erişimde torch.as_tensor ile fp16'a dönüştürülebilir
 
+        # 5) RAM cache’e koy (çözümlenmiş path anahtar)
         if self.cache_shards:
-            self._shard_ram_cache[path] = shard
+            self._shard_ram_cache[local_path] = shard
+            # İstersen orijinal 'path' anahtarını da aynı objeye işaret ettir:
+            if path != local_path:
+                self._shard_ram_cache[path] = shard
+
+        # 6) atime güncelle (DiskLRU için)
+        try:
+            os.utime(local_path, None)
+        except Exception:
+            pass
+
         return shard
 
     # ---------------------- overlap stitching logic --------------------- #
