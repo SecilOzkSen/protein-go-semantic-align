@@ -206,7 +206,7 @@ def build_store(args) -> ESMResidueStore:
         seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
-        cache_shards=cache_shards,
+        cache_shards=True,
         gdrive_cache=gdrive_cache,          # Drive yolundaysan True; değilse False
         prefer_fp16=prefer_fp16,
         # HF lazy fetch params
@@ -215,8 +215,8 @@ def build_store(args) -> ESMResidueStore:
         hub_repo_type="dataset",
         hub_local_dir=hub_local_dir,
         hub_symlinks=getattr(args, "hub_symlinks", True),
-        hub_cache_max_gb=50.0,
-        hub_cache_reserve_gb=5.0,
+        hub_cache_max_gb=90.0,
+        hub_cache_reserve_gb=12.0,
     )
 
     logger.info("Store ready (lazy HF enabled; snapshot disabled).")
@@ -254,6 +254,7 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dic
 
     train_ds = ProteinEmbDataset(protein_ids=train_ids, **ds_kwargs)
     val_ds = ProteinEmbDataset(protein_ids=val_ids, **ds_kwargs) if val_ids else None
+
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds}
 
