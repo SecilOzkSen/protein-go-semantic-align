@@ -173,7 +173,7 @@ def build_store(args) -> ESMResidueStore:
     Path(hub_local_dir).mkdir(parents=True, exist_ok=True)
 
     # Route HF cache to a controlled location to avoid filling /root
-    os.environ.setdefault("HF_HOME", hub_local_dir)
+    os.environ.setdefault("HF_HOME", str(hub_local_dir))
 
     # 3) embed_dir selection
     # If user didn't pass embed_dir, make it the same as hub_local_dir (so relative manifest resolves here)
