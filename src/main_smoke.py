@@ -66,7 +66,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 def get_allowed_pids(target_shard = "esm_embed_00000.pt", store: Optional[ESMResidueStore] = None):
 
-    allowed_pids = {pid for pid, rel in store.pid2rel.items()
+    allowed_pids = {pid for pid, rel in store.pid2shard.items()
                     if Path(rel).name == target_shard}
 
     print(f"[subset] {target_shard} -> {len(allowed_pids)} protein")
