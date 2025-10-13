@@ -230,11 +230,47 @@ def build_store(args) -> ESMResidueStore:
     logger.info("Store ready (lazy HF enabled; snapshot disabled).")
     return store
 
+def _get_z2i(go_cache):
+    """
+    GoLookupCache içinden etiket->indeks haritasını güvenli şekilde çıkar.
+    Sırasıyla şu isimleri dener: z2i, label2idx, go2idx, term_to_idx.
+    Eğer method dönerse çağırıp dict bekler. labels/list varsa enumerate eder.
+    """
+    # 1) Yaygın attribute/alias isimleri
+    candidate_names = ("z2i", "label2idx", "go2idx", "term_to_idx")
+    for name in candidate_names:
+        if hasattr(go_cache, name):
+            mapping = getattr(go_cache, name)
+            # method ise deneyip sözlük bekleyelim
+            if callable(mapping):
+                try:
+                    mapping = mapping()
+                except Exception:
+                    pass
+            if isinstance(mapping, dict):
+                return mapping
+
+    # 2) labels/list/terms dizisi varsa enumerate et
+    for name in ("labels", "terms", "gos", "id_list"):
+        if hasattr(go_cache, name):
+            seq = getattr(go_cache, name)
+            try:
+                return {k: i for i, k in enumerate(seq)}
+            except Exception:
+                pass
+
+    # 3) Olmadıysa açık hata
+    raise TypeError(
+        "GoLookupCache içinde 'z2i' (veya eşdeğeri) bulunamadı. "
+        "Beklenen: attr {z2i|label2idx|go2idx|term_to_idx} veya labels benzeri bir liste."
+    )
+
+
 def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowed_pids=None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
-    # --- load splits & aux ---
+    # --- split & aux yükleri ---
     pid2pos = load_raw_json(PID_TO_POSITIVES)
     train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
     val_ids = load_raw_txt(PROTEIN_VAL_IDS)
@@ -242,8 +278,12 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     zs = load_go_set(ZERO_SHOT_TERMS_ID_ONLY_JSON)
     fs = load_go_set(FEW_SHOT_IC_TERMS_ID_ONLY_JSON)
     common = load_go_set(COMMON_IC_GO_TERMS_ID_ONLY_JSON)
-    fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs, common_terms=common,
-                       fs_target_ratio=args.fs_target_ratio)
+    fz = FewZeroConfig(
+        zero_shot_terms=zs,
+        few_shot_terms=fs,
+        common_terms=common,
+        fs_target_ratio=args.fs_target_ratio,
+    )
 
     dag_parents = load_go_parents()
     ancestor_stoplist = load_raw_txt(GO_ANCESTOR_STOPLIST)
@@ -264,7 +304,7 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     train_ds = ProteinEmbDataset(protein_ids=train_ids, **ds_kwargs)
     val_ds = ProteinEmbDataset(protein_ids=val_ids, **ds_kwargs) if val_ids else None
 
-    # --- ALLOWED PIDS (smoke subset) ---
+    # --- allowed_pids (smoke subset) güvenli filtre ---
     if allowed_pids is not None:
         allow = set(allowed_pids)
         # train
@@ -272,7 +312,6 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
             t_idxs = [i for i, pid in enumerate(train_ds.pids) if pid in allow]
             train_ds = Subset(train_ds, t_idxs)
         else:
-            # dataset içinde pids listesi yoksa fall-back: identity indeksleri filtrele
             t_idxs = list(range(len(train_ds)))
             train_ds = Subset(train_ds, t_idxs)
         # val
@@ -287,26 +326,25 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
             v_idxs = []
         print(f"[subset] train={len(t_idxs)}, val={len(v_idxs)}")
     else:
-        t_idxs, v_idxs = None, None
         print(f"[subset] train={len(train_ds)}, val={len(val_ds) if val_ds is not None else 0}")
 
-    # --- Build zs_mask_vec for collator (fixes None.bool() crash) ---
-    # go_cache.z2i is mapping label -> index (dict-like)
-    z2i = go_cache.z2i if hasattr(go_cache, "z2i") else go_cache["z2i"]
+    # --- zs_mask_vec üret (None.bool hatasını önler) ---
+    import torch as _torch
+    z2i = _get_z2i(go_cache)
     num_labels = len(z2i)
 
-    import torch as _torch
     zs_mask_vec = _torch.zeros(num_labels, dtype=_torch.bool)
-    if zs:  # zero-shot terim listesi doluysa sadece onları işaretle
+    if zs:
+        # listedeki terimlerden repo'da olanları işaretle
         for term in zs:
-            idx = z2i.get(term) if isinstance(z2i, dict) else (z2i[term] if term in z2i else None)
+            idx = z2i.get(term)
             if idx is not None:
                 zs_mask_vec[idx] = True
-        # Eğer listedeki hiçbiri mevcut değilse, smoke’ta her şeyi açık bırakalım:
         if zs_mask_vec.sum() == 0:
+            # smoke'ta hiçbir eşleşme yoksa hepsini aç
             zs_mask_vec[:] = True
     else:
-        # smoke / default: hepsi açık (collate None.bool patlamasın)
+        # smoke/default: tüm label’lar açık
         zs_mask_vec[:] = True
 
     logger.info(
@@ -320,8 +358,7 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache, allowe
     return {
         "train": train_ds,
         "val": val_ds,
-        # collate için ekler:
-        "zs_mask_vec": zs_mask_vec,   # torch.BoolTensor [num_labels]
+        "zs_mask_vec": zs_mask_vec,   # collate için
         "num_labels": num_labels,
     }
 
