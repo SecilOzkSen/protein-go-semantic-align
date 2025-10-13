@@ -1,7 +1,7 @@
 data:
   overlap: 256
   max_len: 1024
-  no_cache_shards: false
+  no_cache_shards: true
 
   # DAG & expansion
   use_dag_in_ds: true

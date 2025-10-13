@@ -137,10 +137,10 @@ class ESMResidueStore:
         cache_shards: bool = True,
         pro_manifest_file: str = GOOGLE_DRIVE_MANIFEST_CACHE,
         # New (Drive & perf)
-        gdrive_cache: bool = True,
+        gdrive_cache: bool = False,
         cache_dir: str = "/content/esm_cache",
         cache_gb: float = 12.0,
-        prefer_fp16: bool = False,
+        prefer_fp16: bool = True,
     ):
         self.embed_dir = embed_dir
         self.seq_len_lookup = seq_len_lookup or {}

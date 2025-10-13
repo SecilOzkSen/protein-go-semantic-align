@@ -18,6 +18,7 @@ import glob
 import types
 import signal, traceback, time as _time
 import itertools
+from huggingface_hub import snapshot_download
 
 import wandb
 
@@ -148,7 +149,15 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
 
 
 def build_store(args) -> ESMResidueStore:
+    logger = logging.getLogger("build_store")
+    logger.info("Building store...")
     seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
+    local_dir = snapshot_download(
+        repo_id="secilozksen/esm-embeddings",
+        repo_type="dataset",
+        revision="main",
+        allow_patterns=["*.pt", "*.json", "*.faiss"]  # yapına göre
+    )
     store = ESMResidueStore(
         embed_dir=args.embed_dir,
         seq_len_lookup=seq_len_lookup,
