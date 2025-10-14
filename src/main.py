@@ -185,7 +185,7 @@ def build_store(args) -> ESMResidueStore:
     gdrive_cache = str(embed_dir).startswith("/content/drive/")
 
     # 5) Cache toggles
-    cache_shards = not getattr(args, "no_cache_shards", False)
+    cache_shards = getattr(args, "no_cache_shards", False)
     prefer_fp16  = True
 
     # 6) Log summary
