@@ -105,7 +105,7 @@ stores:
   pid2pos_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/pid_to_positives.json
   val_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_val_ids.txt
 
-  embed_dir: /workspace/esm-embeddings
+  embed_dir: /workspace/esm-embeddings/embeddings
   hub_local_dir: /workspace/.cache/huggingface/hub
 
   seq_len_lookup_dir: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/seq_len_lookup.pkl
