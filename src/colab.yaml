@@ -101,9 +101,9 @@ wandb:
   mode: online
 
 stores:
-  train_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_train_ids.txt
+  train_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_train_ids.filtered.txt
   pid2pos_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/pid_to_positives.json
-  val_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_val_ids.txt
+  val_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_val_ids.filtered.txt
 
   embed_dir: /workspace/esm-embeddings
   hub_local_dir: /workspace/.cache/huggingface/hub
