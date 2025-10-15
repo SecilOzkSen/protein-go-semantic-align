@@ -186,7 +186,7 @@ def build_store(args) -> ESMResidueStore:
 
     # 5) Cache toggles
     cache_shards = getattr(args, "no_cache_shards", False)
-    prefer_fp16  = True
+    prefer_fp16  = False
 
     # 6) Log summary
     logger.info(
