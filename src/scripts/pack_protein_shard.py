@@ -10,10 +10,10 @@ Toplu protein embedding paketleme (PT -> concat npz + mmap npy + meta json)
 - Başarılı doğrulama sonrası .pt silinir (resume-safe).
 """
 
-import os, sys, json, argparse, traceback
-from typing import Any, List, Tuple
-import numpy as np
-import torch
+import sys, argparse, traceback
+from typing import Any, List
+import os, json, numpy as np, torch, tempfile
+from pathlib import Path
 
 # ---------- low-RAM dönüşüm: dict-by-pid veya {"pid_list","embs"} destekler ----------
 def _load_shard_any(path: str) -> dict:
@@ -30,78 +30,110 @@ def _as_numpy_2d(x: Any, dtype) -> np.ndarray:
         arr = arr.astype(dtype, copy=False)
     return arr
 
-def pack_to_concat(shard_path: str, out_npz: str, out_json: str, *, dtype=np.float16) -> Tuple[str, str, str]:
+def pack_to_concat(src_pt: str, out_npz: str, out_json: str, dtype: str = "float16"):
     """
-    PT -> (concat.npz, embeddings.npy, meta.json)
-    Dönüş: (out_npz, emb_path, out_json)
+    src_pt -> {'prot_id': tensor [L,D], ...}
+    üret:   out_npz = concat memmap bundle (.npz)
+            out_json = index metadata
+    Atomic write + tmp dosya aynı klasörde.
     """
-    sh = _load_shard_any(shard_path)
-    if isinstance(sh, dict) and sh.get("__format__") == "concat":
-        raise RuntimeError("Input shard already in concat format.")
-    # Kaynaktan (pid_list, arrays) çıkar
-    if isinstance(sh, dict) and ("pid_list" in sh and "embs" in sh):
-        pid_list = [str(x) for x in sh["pid_list"]]
-        arr_iter = (sh["embs"][i] for i in range(len(pid_list)))
-    elif isinstance(sh, dict):
-        # dict-by-pid (str key)
-        pid_list = []
-        keys = [k for k in sh.keys() if isinstance(k, str)]
-        # deterministik için sort (opsiyonel)
-        keys.sort()
-        pid_list = keys
-        arr_iter = (sh[k] for k in keys)
-    else:
-        raise RuntimeError("Unsupported shard payload; expected dict-like.")
+    out_dir = os.path.dirname(out_npz) or "."
+    os.makedirs(out_dir, exist_ok=True)
 
-    # ilk array'dan D boyutunu belirlemek için bir kez okuyoruz
-    arr_iter = iter(arr_iter)
-    first = _as_numpy_2d(next(arr_iter), dtype)
-    D = int(first.shape[1])
+    # 1) yükle
+    try:
+        blob = torch.load(src_pt, map_location="cpu")
+    except TypeError:
+        blob = torch.load(src_pt, map_location="cpu")
 
-    arrays: List[np.ndarray] = [first]
-    lengths: List[int] = [int(first.shape[0])]
-    for a in arr_iter:
-        a = _as_numpy_2d(a, dtype)
-        if a.shape[1] != D:
-            raise ValueError(f"Inconsistent D: got {a.shape[1]}, expected {D}")
-        arrays.append(a)
-        lengths.append(int(a.shape[0]))
+    # 2) tensörleri normalize etme YOK (sadece dtype/np çevirisi)
+    entries = []
+    total_rows = 0
+    D = None
+    np_dtype = np.float16 if dtype == "float16" else np.float32
 
-    N_tot = int(sum(lengths))
-    offsets = np.zeros(len(lengths) + 1, dtype=np.int64)
-    offsets[1:] = np.cumsum(lengths, dtype=np.int64)
+    # sıralı, deterministic: ada göre
+    for k in sorted(blob.keys()):
+        arr = blob[k]
+        if isinstance(arr, torch.Tensor):
+            a = arr.detach().cpu().numpy()
+        else:
+            a = np.asarray(arr)
+        if a.dtype not in (np.float16, np.float32, np.float64):
+            a = a.astype(np_dtype, copy=False)
+        elif dtype == "float16":
+            a = a.astype(np.float16, copy=False)
+        else:
+            a = a.astype(np.float32, copy=False)
 
-    emb_path = out_npz.replace(".npz", ".embeddings.npy")
-    # atomic yazım için tmp uzantı
-    emb_tmp = emb_path + ".tmp"
-    npz_tmp = out_npz + ".tmp"
-    json_tmp = out_json + ".tmp"
+        if a.ndim != 2:
+            raise ValueError(f"{src_pt}:{k} beklenen [L,D], geldi {a.shape}")
 
-    # büyük tek dosyaya sırayla dök (memmap)
-    mm = np.memmap(emb_tmp, mode="w+", dtype=dtype, shape=(N_tot, D))
-    pos = 0
-    for a in arrays:
-        mm[pos:pos + a.shape[0]] = a
-        pos += a.shape[0]
-    mm.flush(); del mm
+        if D is None:
+            D = int(a.shape[1])
+        elif D != int(a.shape[1]):
+            raise ValueError(f"{src_pt}:{k} D tutarsız: beklenen {D}, gelen {a.shape[1]}")
 
-    # npz kapsayıcı (sadece meta + tekil path)
-    np.savez(npz_tmp,
-             __format__=np.array(["concat"], dtype=object),
-             embeddings_path=np.array([os.path.basename(emb_path)], dtype=object),
-             offsets=offsets)
+        L = int(a.shape[0])
+        entries.append((k, a, L))
+        total_rows += L
 
-    pid2row = {pid: i for i, pid in enumerate(pid_list)}
-    with open(json_tmp, "w", encoding="utf-8") as f:
-        json.dump({"pid2row": pid2row, "row2pid": pid_list}, f)
+    if D is None:
+        raise RuntimeError(f"Boş shard: {src_pt}")
 
-    # atomic rename
-    os.replace(emb_tmp, emb_path)
-    os.replace(npz_tmp, out_npz)
-    os.replace(json_tmp, out_json)
+    # 3) concat array’i RAM AYIRMADAN diske yaz (memmap + npz)
+    #    - .npz içinde tek büyük 'concat' array’i ve id->slice index’i taşıyoruz.
+    index = {}
+    # npz içine doğrudan memmap yazamayız; bu yüzden geçici .npy (memmap) + npz:
+    #   a) tmp .npy’yi yaz
+    fd_npy, npy_tmp = tempfile.mkstemp(prefix=Path(out_npz).name, suffix=".concat.npy.tmp", dir=out_dir)
+    os.close(fd_npy)
+    try:
+        mm = np.memmap(npy_tmp, mode="w+", dtype=np_dtype, shape=(total_rows, D))
+        cursor = 0
+        for pid, a, L in entries:
+            mm[cursor:cursor+L] = a
+            index[pid] = [int(cursor), int(cursor+L)]  # [start, end)
+            cursor += L
+        mm.flush()
+        del mm  # file handle kapansın
 
-    return out_npz, emb_path, out_json
+        #   b) tmp .npz’yi yaz (concat’ı memory-map’lenen .npy’den okuyup ekleyelim)
+        fd_npz, npz_tmp = tempfile.mkstemp(prefix=Path(out_npz).name, suffix=".tmp", dir=out_dir)
+        os.close(fd_npz)
+        try:
+            # Büyük dosyalarda pickle kapalı tut
+            concat_arr = np.load(npy_tmp, mmap_mode="r")
+            # Not: savez_compressed çok CPU kullanır; hız istiyorsak savez kullan
+            np.savez(npz_tmp,
+                     concat=concat_arr,
+                     dtype=str(np_dtype),
+                     dim=int(D),
+                     n_rows=int(total_rows))
+            #   c) meta json’u tmp yaz
+            fd_json, json_tmp = tempfile.mkstemp(prefix=Path(out_json).name, suffix=".tmp", dir=out_dir)
+            os.close(fd_json)
+            try:
+                with open(json_tmp, "w", encoding="utf-8") as f:
+                    json.dump({"index": index, "dim": D, "dtype": str(np_dtype), "rows": total_rows}, f)
+                #   d) atomik replace
+                os.replace(npz_tmp, out_npz)
+                os.replace(json_tmp, out_json)
+            finally:
+                # json tmp cleanup (replace başarısızsa kalabilir)
+                if os.path.exists(json_tmp):
+                    try: os.remove(json_tmp)
+                    except: pass
+        finally:
+            if os.path.exists(npz_tmp):
+                try: os.remove(npz_tmp)
+                except: pass
+    finally:
+        if os.path.exists(npy_tmp):
+            try: os.remove(npy_tmp)
+            except: pass
 
+    return out_npz, out_npz.replace(".npz", ".npy"), out_json
 def _verify(out_npz: str, emb_path: str, out_json: str) -> bool:
     try:
         meta = np.load(out_npz, allow_pickle=False)
