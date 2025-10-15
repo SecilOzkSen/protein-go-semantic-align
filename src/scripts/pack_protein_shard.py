@@ -98,13 +98,17 @@ def pack_to_concat(src_pt: str, out_npz: str, out_json: str, dtype: str = "float
         mm.flush()
         del mm  # file handle kapansın
 
-        #   b) tmp .npz’yi yaz (concat’ı memory-map’lenen .npy’den okuyup ekleyelim)
+        #   b) tmp .npz’yi yaz (concat’ı np.memmap ile oku, np.load KULLANMA)
         fd_npz, npz_tmp = tempfile.mkstemp(prefix=Path(out_npz).name, suffix=".tmp", dir=out_dir)
         os.close(fd_npz)
         try:
-            # Büyük dosyalarda pickle kapalı tut
-            concat_arr = np.load(npy_tmp, mmap_mode="r")
-            # Not: savez_compressed çok CPU kullanır; hız istiyorsak savez kullan
+            # HATA VEREN SATIRDI:
+            # concat_arr = np.load(npy_tmp, mmap_mode="r")
+
+            # YERİNE ŞUNU KULLAN:
+            concat_arr = np.memmap(npy_tmp, mode="r", dtype=np_dtype, shape=(total_rows, D))
+
+            # Not: sıkıştırmasız hızlı; disk alanı kısıtlıysa savez_compressed kullanabilirsin
             np.savez(npz_tmp,
                      concat=concat_arr,
                      dtype=str(np_dtype),
@@ -120,14 +124,17 @@ def pack_to_concat(src_pt: str, out_npz: str, out_json: str, dtype: str = "float
                 os.replace(npz_tmp, out_npz)
                 os.replace(json_tmp, out_json)
             finally:
-                # json tmp cleanup (replace başarısızsa kalabilir)
                 if os.path.exists(json_tmp):
-                    try: os.remove(json_tmp)
-                    except: pass
+                    try:
+                        os.remove(json_tmp)
+                    except:
+                        pass
         finally:
             if os.path.exists(npz_tmp):
-                try: os.remove(npz_tmp)
-                except: pass
+                try:
+                    os.remove(npz_tmp)
+                except:
+                    pass
     finally:
         if os.path.exists(npy_tmp):
             try: os.remove(npy_tmp)
