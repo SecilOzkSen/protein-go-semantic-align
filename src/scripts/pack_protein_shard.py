@@ -163,7 +163,7 @@ def find_pt_files(root: str, pattern: str = ".pt") -> List[str]:
 
 def main():
     p = argparse.ArgumentParser(description="Bulk pack PT shards to concat format and delete originals on success.")
-    p.add_argument("--root", default="/workspace/embeddings", help="Search root directory")
+    p.add_argument("--root", default="/workspace/esm-embeddings", help="Search root directory")
     p.add_argument("--ext", default=".pt", help="Shard file extension to convert")
     p.add_argument("--dtype", default="fp16", choices=["fp16","fp32"], help="Target dtype for embeddings.npy")
     p.add_argument("--overwrite", action="store_true", help="Overwrite if outputs exist")
