@@ -11,18 +11,17 @@ import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 import torch.multiprocessing as mp
 from datetime import datetime
 import glob
 import types
-import signal, traceback, time as _time
+import signal, traceback
 import itertools
-from huggingface_hub import snapshot_download
 
 import wandb
 
-from src.datasets import ESMResidueStore, GoTextStore, VectorResources, GoMemoryBank
+from src.datasets import ESMResidueStore, GoTextStore, VectorResources
 from src.datasets.protein_dataset import ProteinEmbDataset
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
@@ -36,12 +35,12 @@ from src.utils import (
     load_go_set, load_raw_pickle, load_raw_json, load_raw_txt, load_go_texts_by_phase
 )
 from src.encoders import BioMedBERTEncoder
+from math import inf
 
 from src.configs.paths import (
     PROTEIN_TRAIN_IDS,
     PROTEIN_VAL_IDS,
     PID_TO_POSITIVES,
-    GOOGLE_DRIVE_ESM3B_EMBEDDINGS,
     ZERO_SHOT_TERMS_ID_ONLY_JSON,
     FEW_SHOT_IC_TERMS_ID_ONLY_JSON,
     P_SEQ_LEN_LOOKUP,
@@ -65,7 +64,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 # ============== Utilities ==============
 
 def _sigint_handler(signum, frame):
-    print(f"\n[DBG] Caught SIGINT at {_time.strftime('%H:%M:%S')}")
+    print(f"\n[DBG] Caught SIGINT at {time.strftime('%H:%M:%S')}")
     traceback.print_stack(frame)
 signal.signal(signal.SIGINT, _sigint_handler)
 
@@ -142,10 +141,22 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int = 3):
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
     logger.info("Loading GO cache: %s", go_cache_path)
+
+    # 1) memmap yolunu türet (aynı klasörde .npy arıyoruz)
+    memmap_npy = Path(go_cache_path).with_suffix(".npy")
+    if memmap_npy.exists():
+        blob = torch.load(go_cache_path, map_location="cpu")
+        blob = {
+            "memmap_path": str(memmap_npy),
+            "id2row": blob.get("id2row"),
+            "row2id": blob.get("row2id") or blob.get("ids")
+        }
+        return GoLookupCache(blob)
+
+    # 2) memmap yoksa klasik yol
     blob = torch.load(go_cache_path, map_location="cpu")
     blob['embs'] = F.normalize(blob['embs'], p=2, dim=1)
-    cache = GoLookupCache(blob)
-    return cache
+    return GoLookupCache(blob)
 
 
 def build_store(args) -> ESMResidueStore:
@@ -186,7 +197,6 @@ def build_store(args) -> ESMResidueStore:
 
     # 5) Cache toggles
     cache_shards = getattr(args, "no_cache_shards", False)
-    prefer_fp16  = False
 
     # 6) Log summary
     logger.info(
@@ -197,7 +207,7 @@ def build_store(args) -> ESMResidueStore:
         f"  embed_dir = {embed_dir}\n"
         f"  gdrive_cache = {gdrive_cache}\n"
         f"  cache_shards = {cache_shards}\n"
-        f"  prefer_fp16 = {prefer_fp16}"
+        f"  prefer_fp16 = {args.fp16}"
     )
 
     # 7) Build store (NO snapshot_download)
@@ -206,9 +216,9 @@ def build_store(args) -> ESMResidueStore:
         seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
-        cache_shards=True,
+        cache_shards=cache_shards,
         gdrive_cache=gdrive_cache,          # Drive yolundaysan True; değilse False
-        prefer_fp16=prefer_fp16,
+        prefer_fp16=args.fp16,
         # HF lazy fetch params
     #    hub_repo_id=hub_repo_id,
     #    hub_revision=hub_revision,
@@ -349,32 +359,6 @@ def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
     return cfg
 
 
-# ============== W&B helpers ==============
-def build_wandb_config(args, schedule: TrainSchedule) -> Dict[str, Any]:
-    return {
-        "data": {
-            "train_ids": str(args.train_ids),
-            "val_ids": str(args.val_ids),
-            "embed_dir": str(args.embed_dir),
-            "pid2pos": str(args.pid2pos),
-            "zero_shot_terms": str(args.zero_shot_terms),
-            "few_shot_terms": str(args.few_shot_terms),
-            "seq_len_lookup": str(args.seq_len_lookup),
-            "overlap": args.overlap,
-            "pro_manifest": str(args.pro_manifest),
-        },
-        "schedule": {
-            "phase_breaks": list(schedule.phase_breaks),
-            "stageA_mix": list(schedule.stageA_mix),
-            "stageB_mix": list(schedule.stageB_mix),
-            "stageC_mix": list(schedule.stageC_mix),
-            "stageD_mix": list(schedule.stageD_mix),
-            "lambda_attr_start": schedule.lambda_attr_start,
-            "lambda_attr_max": schedule.lambda_attr_max,
-        },
-    }
-
-
 def wandb_preview_curriculum(wandb_mod, args, total_steps: int):
     mode = args.curriculum_mode
     T = max(1, total_steps - 1)
@@ -450,7 +434,8 @@ def run_training(args, schedule: TrainSchedule):
     logger = logging.getLogger("main")
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     logger.info("Device: %s", device)
-    wandb.login()
+    if args.wandb:
+        wandb.login()
 
     # Phase 0 resources
     phase0 = 0
@@ -489,17 +474,10 @@ def run_training(args, schedule: TrainSchedule):
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
-    # Memory bank (initial GO cache)
-    memory_bank = None
+    # Memory bank (unified – GoLookupCache’i aynen kullan)
+    memory_bank = go_cache if args.use_go_memory_bank else None
     if args.use_go_memory_bank:
-        logger.info("Using GoMemoryBank for training (CPU fp16).")
-        embs_cpu16 = go_cache.embs.half().cpu()
-        memory_bank = GoMemoryBank(
-            init_embs=embs_cpu16,
-            row2id=getattr(go_cache, 'row2id', None)
-        )
-   #     logger.info("Using GoMemoryBank for training.")
-   #     memory_bank = GoMemoryBank(init_embs=go_cache.embs, row2id=getattr(go_cache, 'row2id', None))
+        logger.info("Using unified GoLookupCache as MemoryBank (GPU fp32, no copies).")
 
     seen_go_ids_prev: set = set()
 
@@ -534,7 +512,8 @@ def run_training(args, schedule: TrainSchedule):
         dag_children=dag_children,
         scheduler=scheduler,
         go_text_store=go_text_store,
-        use_queue_miner=True
+        use_queue_miner=True,
+        fp16_enabled=args.fp16,
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -546,17 +525,7 @@ def run_training(args, schedule: TrainSchedule):
         gospec_topk=32,
     )
 
-    # VectorResources backend’i MemoryBank ile hizala (FAISS yok)
-  #  try:
-  #      training_context.vres.set_backends(None, training_context.memory_bank.embs)
-  #  except Exception:
-  #      pass
-
-    # VectorResources backend seçimi (FAISS yok)
-    if training_context.memory_bank is not None:
-        training_context.vres.set_backends(None, training_context.memory_bank.embs)  # CPU bank
-    else:
-        training_context.vres.set_backends(None, training_context.go_cache.embs)  # fallback: cache embs
+    training_context.vres.set_backends(None, training_context.go_cache.embs)
 
     def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
         new_phase = training_context.schedule.phase_for_epoch(current_epoch)
@@ -578,27 +547,9 @@ def run_training(args, schedule: TrainSchedule):
 
             new_go_path = training_context.schedule.resolve_go_cache_path(new_phase)
             new_go_cache = build_go_cache(new_go_path)
-
             training_context.go_cache = new_go_cache
-
-            # MemoryBank’i yeni cache ile yenile (CPU + fp16)
-            if args.use_go_memory_bank:
-                try:
-                    embs_cpu16 = new_go_cache.embs.half().cpu()
-                    training_context.memory_bank = GoMemoryBank(
-                        init_embs=embs_cpu16,
-                        row2id=getattr(new_go_cache, 'row2id', None)
-                    )
-                except Exception:
-                    training_context.memory_bank = None
-            else:
-                training_context.memory_bank = None
-
-            # Backend seçim
-            if training_context.memory_bank is not None:
-                training_context.vres.set_backends(None, training_context.memory_bank.embs)
-            else:
-                training_context.vres.set_backends(None, training_context.go_cache.embs)
+            training_context.memory_bank = new_go_cache if args.use_go_memory_bank else None
+            training_context.vres.set_backends(None, training_context.go_cache.embs)
 
             # GoTextStore fazı
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
@@ -663,7 +614,10 @@ def run_training(args, schedule: TrainSchedule):
     logger.info("Start training for %d epochs", args.epochs)
     training_context.maybe_refresh_phase_resources(current_epoch=0, force=False)
 
-    best_val = None
+    best_val = -inf if args.monitor_mode == "max" else inf
+    best_step = 0
+    no_improve_epochs = 0
+    EPS = 1e-6
     global_step = 0
 
     # (opsiyonel) dataloader hız ping
@@ -676,7 +630,7 @@ def run_training(args, schedule: TrainSchedule):
     for epoch in range(args.epochs):
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
         try:
-            if wandb_run is not None and global_step == 1:
+            if args.wandb and (wandb.run is not None) and global_step == 1:
                 try:
                     wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
                     wandb_dataset_quickstats(wandb, datasets["train"], sample_n=256)
@@ -689,12 +643,7 @@ def run_training(args, schedule: TrainSchedule):
                     new_embs = go_encoder(input_ids=toks['input_ids'].to(device),
                                           attention_mask=toks['attention_mask'].to(device)).detach().cpu()
                 new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
-                training_context.memory_bank.update(ids_to_update, new_embs)
-                # Backend’i güncelle (sadece bank embs)
-                try:
-                    training_context.vres.set_backends(None, training_context.memory_bank.embs)
-                except Exception:
-                    pass
+                training_context.go_cache.update(ids_to_update, new_embs)
             seen_go_ids = set()
         except Exception as _e:
             logging.getLogger('bank').warning('Partial refresh failed: %r', _e)
@@ -761,6 +710,34 @@ def run_training(args, schedule: TrainSchedule):
             val_logs = trainer.eval_epoch(val_loader, epoch)
             msg = " | ".join([f"{k}: {val_logs[k]:.4f}" for k in val_logs])
             logger.info(f"[val]   epoch {epoch} :: {msg}")
+
+            # --- monitor ---
+            metric_name = args.monitor_metric
+            if metric_name not in val_logs:
+                # fallback: total loss’u minimize et
+                metric_name = "total"
+            score = float(val_logs[metric_name])
+
+            improved = (score > best_val + EPS) if args.monitor_mode == "max" else (score < best_val - EPS)
+
+            if improved:
+                best_val = score
+                best_step = global_step
+                no_improve_epochs = 0
+                # en iyi modeli ayrı etiketle kaydet
+                save_checkpoint(out_dir, tag="best", trainer=trainer, args=args, epoch=epoch, step=global_step)
+                logger.info(f"[ckpt] new BEST {metric_name}={best_val:.4f} @ epoch {epoch} step {global_step}")
+                # W&B özetine yazmak istersen:
+                if args.wandb and (wandb.run is not None):
+                    wandb.summary[f"best/{metric_name}"] = best_val
+                    wandb.summary["best/step"] = best_step
+                    wandb.summary["best/epoch"] = epoch
+            else:
+                no_improve_epochs += 1
+                if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
+                    logger.info(f"[early-stop] no improvement in {no_improve_epochs} epochs; stopping.")
+                    raise SystemExit(f"Stopped early at epoch {epoch} (best {metric_name}={best_val:.4f})")
+
 
         # Persist seen GO ids for next epoch's partial refresh
         try:
@@ -848,7 +825,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         batch_size=int(training.get("batch_size", 4)),
         eval_batch_size=training.get("eval_batch_size"),
         num_workers=int(training.get("num_workers", 4)),
-        fp16=bool(training.get("fp16", False)),
+        fp16=bool(training.get("fp16", True)),
         cpu=bool(training.get("cpu", False)),
         seed=int(training.get("seed", 42)),
         output_dir=training.get("output_dir", "outputs/run1"),
@@ -857,6 +834,9 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         resume=training.get("resume"),
         log_every=int(training.get("log_every", 50)),
         log_level=training.get("log_level", "INFO"),
+        monitor_metric=training.get("monitor_metric", "cafa_fmax"),
+        monitor_mode=training.get("monitor_mode", "max"),
+        early_stop_patience=int(training.get("early_stop_patience", 0)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

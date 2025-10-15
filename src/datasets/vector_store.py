@@ -1,7 +1,10 @@
 from __future__ import annotations
-from typing import List, Optional
+from typing import Optional, Sequence, Union, Tuple
 import torch
 import torch.nn.functional as F
+import numpy as np
+
+Tensor = torch.Tensor
 
 class VectorResources:
     def __init__(self,
@@ -110,17 +113,3 @@ class VectorResources:
             return torch.stack(out, dim=0)
         else:
             raise ValueError(f"ids shape {ids.shape} not supported")
-
-class GoMemoryBank:
-    def __init__(self, init_embs: torch.Tensor, row2id: List[int]):
-        self.id2row = {int(i): int(r) for r, i in enumerate(row2id)}
-        self.embs = F.normalize(torch.as_tensor(init_embs).cpu(), p=2, dim=1)
-
-    def lookup(self, ids):
-        rows = [self.id2row[int(i)] for i in ids]
-        return self.embs[rows]
-
-    def update(self, ids, new_embs):  # new_embs: (len(ids), d) CPU bekleriz
-        new_embs = F.normalize(new_embs.cpu(), p=2, dim=1)
-        for j, i in enumerate(ids):
-            self.embs[self.id2row[int(i)]] = new_embs[j]

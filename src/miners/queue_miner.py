@@ -2,60 +2,36 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-class QueueMiner:
+class MoCoQueue(torch.nn.Module):
     """
     Lightweight miner in the style of MoCo/CLIP.
     - Stores the latest G/O (GO text) embeddings in a fixed-size queue (memory bank).
     - At each step: queries @ queue^T → returns the hardest k negatives.
     Note: You choose which modality to keep in the queue (usually the GO text side).
     """
-    def __init__(self, dim: int, K: int = 8192, device: str = "cuda", normalize: bool = True):
+
+    def __init__(self, dim: int, K: int = 131072, device="cuda"):
+        super().__init__()  # <— super init
         self.K = int(K)
-        self.device = device
-        self.normalize = normalize
-        self.queue = torch.empty(self.K, dim, device=device)
-        torch.nn.init.normal_(self.queue, std=0.02)
-        self.queue = F.normalize(self.queue, dim=1)
-        self.ptr = 0
-        self.total = 0
+        self.register_buffer("queue", torch.zeros(dim, K, dtype=torch.float32, device=device))
+        self.register_buffer("ptr", torch.zeros(1, dtype=torch.long, device=device))
+        self.register_buffer("filled", torch.zeros(1, dtype=torch.long, device=device))
 
     @torch.no_grad()
-    def enqueue(self, keys: torch.Tensor) -> None:
-        """
-        keys: [N, D] (usually GO text embeddings). Does not require grad (detach).
-        """
-        if self.normalize:
-            keys = F.normalize(keys, dim=1)
-        n = keys.shape[0]
-        if n >= self.K:
-            self.queue.copy_(keys[-self.K:])
-            self.ptr = 0
-            self.total = self.K
-            return
-        end = (self.ptr + n) % self.K
-        if end > self.ptr:
-            self.queue[self.ptr:end].copy_(keys)
+    def enqueue(self, keys: torch.Tensor):
+        keys = F.normalize(keys.float(), dim=1)
+        b, d = keys.shape
+        ptr = int(self.ptr.item())
+        if ptr + b <= self.K:
+            self.queue[:, ptr:ptr + b] = keys.T
         else:
-            remain = self.K - self.ptr
-            self.queue[self.ptr:].copy_(keys[:remain])
-            self.queue[:end].copy_(keys[remain:])
-        self.ptr = end
-        self.total = min(self.total + n, self.K)
+            first = self.K - ptr
+            self.queue[:, ptr:] = keys[:first].T
+            self.queue[:, :b - first] = keys[first:].T
+        self.ptr[0] = (ptr + b) % self.K
+        self.filled[0] = torch.clamp(self.filled + b, max=self.K)
 
     @torch.no_grad()
-    def get_negatives(self, queries: torch.Tensor, k_hard: int = 32) -> torch.Tensor:
-        """
-        queries: [B, D] (usually protein embeddings)
-        return: neg_embs [B, k_hard, D] (hard negatives selected from the queue)
-        """
-        if self.total == 0:
-            # If the queue is empty, return None so the trainer falls back to in-batch negatives
-            return None
-        Q = self.queue[:self.total]  # [T, D]
-        if self.normalize:
-            queries = F.normalize(queries, dim=1)
-        sims = queries @ Q.T   # [B, T]
-        k = min(int(k_hard), Q.shape[0])
-        vals, idx = sims.topk(k, dim=1)  # [B, k]
-        negs = Q[idx]                     # [B, k, D]
-        return negs
+    def get_all_neg(self) -> torch.Tensor:
+        Kf = int(self.filled.item())
+        return self.queue[:, :Kf].T  # [Kf, dim]

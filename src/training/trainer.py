@@ -1,4 +1,3 @@
-# src/training/trainer.py
 from typing import Dict, Any, List, Tuple, Optional
 import copy
 import torch
@@ -8,7 +7,7 @@ import time
 from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss, windowed_attr_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
-from src.miners.queue_miner import QueueMiner
+from src.miners.queue_miner import MoCoQueue
 
 # Wandb
 import wandb
@@ -19,12 +18,21 @@ from src.metrics.cafa import compute_fmax, compute_term_aupr
 
 
 # ------------- Helpers -------------
-def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:
-    return x / (x.norm(p=2, dim=dim, keepdim=True) + eps)
+def to_f32(x: torch.Tensor) -> torch.Tensor:
+    return x if x.dtype == torch.float32 else x.float()
 
-def mean_pool(pad: torch.Tensor, mask_valid: torch.Tensor) -> torch.Tensor:
-    m = mask_valid.float()
-    return (pad * m.unsqueeze(-1)).sum(1) / m.sum(1).clamp_min(1.0).unsqueeze(-1)
+def norm_f32(x: torch.Tensor, p: int = 2, dim: int = -1) -> torch.Tensor:
+    return F.normalize(to_f32(x), p=p, dim=dim)
+
+def clone_as_target(module: torch.nn.Module) -> torch.nn.Module:
+    k = copy.deepcopy(module).eval()
+    for p in k.parameters():
+        p.requires_grad_(False)
+    return k
+@torch.no_grad()
+def ema_update(q: torch.nn.Module, k: torch.nn.Module, m: float):
+    for p_q, p_k in zip(q.parameters(), k.parameters()):
+        p_k.data.mul_(m).add_(p_q.data, alpha=1.0 - m)
 
 def entropy_regularizer(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     a = alpha.clamp_min(eps)
@@ -134,6 +142,10 @@ class OppTrainer:
         self.cfg, self.attr, self.ctx = cfg, attr, ctx
         self.device = torch.device(self.cfg.device)
 
+        torch.backends.cuda.matmul.allow_tf32 = False if ctx.fp16_enabled else True
+        self.normalizer = norm_f32 if ctx.fp16_enabled else F.normalize
+        self.to_f32 = to_f32 if ctx.fp16_enabled else None
+
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=None,
@@ -142,6 +154,13 @@ class OppTrainer:
             normalize=True,
         ).to(self.device)
 
+        # --- ADD: EMA (momentum) key encoder: follow GO side ---
+        self.m_ema = float(getattr(cfg, "m_ema", 0.999))  # MoCo momentum
+        self.go_encoder_k = None
+        if getattr(self.model, "go_encoder", None) is not None:
+            self.go_encoder_k = clone_as_target(self.model.go_encoder).to(self.device)
+
+        # --- OPT ---
         self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr)
         self._global_step = 0
 
@@ -150,20 +169,16 @@ class OppTrainer:
         self.ctx.vres.align_dim = self.cfg.d_z
         self.ctx.vres.query_projector = self.index_projector
 
-        # --- Queue miner (FAISS tamamen kaldırıldı) ---
-        self.use_queue_miner: bool = True
-        self.queue_K: int = int(getattr(cfg, "queue_K", getattr(ctx, "queue_K", 8192)))
-        self.k_hard_queue: int = int(getattr(cfg, "k_hard", getattr(ctx, "k_hard", 32)))
-        self.queue_miner: Optional[QueueMiner] = None
+        # --- Queue config (büyüt) ---
+        self.use_moco_miner: bool = True
+        self.queue_K: int = int(getattr(cfg, "queue_K", getattr(ctx, "queue_K", 131072)))  # 131k
+        self.k_hard_queue: int = int(getattr(cfg, "k_hard", getattr(ctx, "k_hard", 128)))  # top-k neg
+        self.queue_miner: Optional[MoCoQueue] = None
 
         # W&B
         self._wandb_configs(wandb_run=wandb_run, wlogger=wlogger)
         self._phase_acc = defaultdict(lambda: defaultdict(list))
         self._current_phase_id = None
-
-        self._mb_embs = getattr(self.ctx, "memory_bank", None)
-        if self._mb_embs is not None:
-            self._mb_embs = self.ctx.memory_bank.embs.to(self.device)
 
     # ---------- robust mask helper ----------
     def _valid_and_pad_masks(self, batch):
@@ -224,8 +239,8 @@ class OppTrainer:
             wandb.log({f"phase_summary/phase_{phase_id}": table}, step=step)
 
     def _maybe_init_queue_miner(self, Dg: int):
-        if self.queue_miner is None:
-            self.queue_miner = QueueMiner(dim=int(Dg), K=int(self.queue_K), device=str(self.device))
+        if self.queue_miner is None and self.use_moco_miner:
+            self.queue_miner = MoCoQueue(dim=int(Dg), K=int(self.queue_K), device=str(self.device))
             print(f"[Trainer] QueueMiner enabled (K={self.queue_K}, k_hard={self.k_hard_queue}, Dg={Dg}).")
 
     def _build_candidates_with_queue(self,
@@ -280,8 +295,8 @@ class OppTrainer:
             eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long, device=device)
             rows = torch.as_tensor([self.ctx.go_cache.id2row[int(g)] for g in eval_ids.tolist()],
                                    dtype=torch.long, device=device)
-            mb = self._mb_embs if self._mb_embs is not None else self.ctx.memory_bank.embs.to(device)
-            G_eval_once = mb.index_select(0, rows)  # (Geval, Dg)
+            bank = self.ctx.go_cache.embs.to(self.device)
+            G_eval_once = bank.index_select(0, rows)  # (Geval, Dg)
         else:
             eval_ids = batch["uniq_go_ids"].to(device)  # (Geval,)
             if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
@@ -290,7 +305,7 @@ class OppTrainer:
                     input_ids=toks["input_ids"].to(device),
                     attention_mask=toks["attention_mask"].to(device),
                 )
-                G_eval_once = F.normalize(G_eval_once, p=2, dim=1)
+                G_eval_once = self.normalizer(G_eval_once, p=2, dim=1)
             else:
                 G_eval_once = batch["uniq_go_embs"].to(device)
 
@@ -340,6 +355,8 @@ class OppTrainer:
         # --- Protein & mask ---
         H = batch["prot_emb_pad"].to(device)               # (B, Lmax, Dh)
         attn_valid, pad_mask = self._valid_and_pad_masks(batch)
+        if self.to_f32 is not None:
+            H = self.to_f32(H)
         pos_local: List[torch.Tensor] = batch["pos_go_local"]
         B = H.size(0)
 
@@ -355,7 +372,7 @@ class OppTrainer:
                 attention_mask=toks["attention_mask"].to(device),
             )  # [G, Dg]
             try:
-                uniq_go_embs = F.normalize(uniq_go_embs, p=2, dim=1)
+                uniq_go_embs = self.normalizer(uniq_go_embs, p=2, dim=1)
             except Exception:
                 pass
         else:
@@ -393,14 +410,22 @@ class OppTrainer:
         prot_query = vt_for_miner
 
         # --- get hard negatives from queue ---
-        neg_from_queue = self.queue_miner.get_negatives(
-            prot_query.detach(), k_hard=self.k_hard_queue
-        ) if (self.queue_miner is not None) else None
+        neg_from_queue = None
+        if self.queue_miner is not None:
+            # Tüm queue vektörlerini al ( [K, Dg] ), hepsi fp32 normalize
+            all_neg = self.queue_miner.get_all_neg()  # sınıf adın ne ise
+            if all_neg is not None and all_neg.numel() > 0:
+                Q = self.normalizer(prot_query.detach(), dim=1)  # [B, Dg] fp32
+                Kmat = self.normalizer(all_neg.to(device), dim=1)  # [K, Dg] fp32
+                sims = Q @ Kmat.T  # [B, K] GPU matmul
+                k = min(int(self.k_hard_queue), Kmat.size(0))
+                vals, idx = sims.topk(k, dim=1)
+                neg_from_queue = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
 
         # --- (optional) mix easy in-batch negatives by hard_frac ---
         if neg_from_queue is not None and hard_frac is not None:
-            all_neg = F.normalize(uniq_go_embs.detach(), dim=1)              # [G, Dg]
-            sims = F.normalize(prot_query, dim=1) @ all_neg.T                # [B, G]
+            all_neg = self.normalizer(uniq_go_embs.detach(), dim=1)              # [G, Dg]
+            sims = self.normalizer(prot_query, dim=1) @ all_neg.T                # [B, G]
             # mask positives
             for b, loc in enumerate(pos_local):
                 if loc.numel() > 0:
@@ -421,10 +446,13 @@ class OppTrainer:
         # ====================== Teacher (v_true) → KL DISTILLATION ======================
         v_true = v_true_early
         vt = vt_for_miner
-        vt = F.normalize(vt, dim=-1)                 # [B, Dg]
-        Gn = F.normalize(G_cand, dim=-1)             # [B, K, Dg]
+        vt = self.normalizer(vt, dim=-1)                 # [B, Dg]
+        Gn = self.normalizer(G_cand, dim=-1)             # [B, K, Dg]
 
         # ---- Student scores + InfoNCE ----
+        if self.to_f32 is not None:
+            H = self.to_f32(H)
+            G_cand = self.to_f32(G_cand)
         scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)  # (B, K)
         l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
 
@@ -449,6 +477,8 @@ class OppTrainer:
             if t > 0:
                 G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
 
+        if self.to_f32 is not None:
+            G_pos = self.to_f32(G_pos)
         scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=use_attr)
 
         if alpha_info is not None and "alpha_full" in alpha_info:
@@ -483,17 +513,36 @@ class OppTrainer:
         # === Step / logging ===
         self._global_step += 1
 
-        # --- Update the queue: enqueue all positive GO embeddings from the batch ---
+        # --- EMA (momentum) güncellemesi: key encoder (GO tarafı) ---
+        if self.go_encoder_k is not None:
+            with torch.no_grad():
+                ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
+
+        # --- Enqueue: sadece momentum encoder ile üretilen POS GO embs ---
         if self.queue_miner is not None:
             with torch.no_grad():
-                pos_list = []
+                if ("pos_go_tokens" in batch) and (self.go_encoder_k is not None):
+                    toks = batch["pos_go_tokens"]
+                    go_pos_all = self.go_encoder_k(
+                        input_ids=toks["input_ids"].to(device),
+                        attention_mask=toks["attention_mask"].to(device),
+                    )
+                    go_pos_all = norm_f32(go_pos_all, dim=1)  # fp32
+                else:
+                    # fallback: student uniq_go_embs (zaten fp32/normalized)
+                    go_pos_all = uniq_go_embs
+
+                # sadece bu batch’teki pozitifleri seç
+                pos_rows = []
                 for loc in pos_local:
                     if loc.numel() > 0:
-                        pos_list.append(uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device)))
-                if len(pos_list) > 0:
-                    go_pos_all = torch.cat(pos_list, dim=0)   # [sum_t, Dg]
-                    self.queue_miner.enqueue(go_pos_all.detach())
-        torch.cuda.synchronize()  # doğru süre için
+                        pos_rows.append(go_pos_all.index_select(0, loc.to(device)))
+                if len(pos_rows) > 0:
+                    Kpos = torch.cat(pos_rows, dim=0).contiguous()  # [sum_t, Dg]
+                    self.queue_miner.enqueue(Kpos.detach())
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # doğru süre için
         dt = time.time() - t0
         # TODO: Quick eval - to be erased!
 
@@ -596,6 +645,8 @@ class OppTrainer:
 
         for batch in loader:
             H = batch["prot_emb_pad"].to(device)
+            if self.to_f32:
+                H = self.to_f32(H)
             attn_valid, pad_mask = self._valid_and_pad_masks(batch)
             pos_local: List[torch.Tensor] = batch["pos_go_local"]
 
@@ -607,7 +658,7 @@ class OppTrainer:
                     attention_mask=toks["attention_mask"].to(device),
                 )
                 try:
-                    uniq_go_embs = F.normalize(uniq_go_embs, p=2, dim=1)
+                    uniq_go_embs = self.normalizer(uniq_go_embs, p=2, dim=1)
                 except Exception:
                     pass
             else:
@@ -621,13 +672,24 @@ class OppTrainer:
                     vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
                 except Exception:
                     pass
-                prot_query = vt_for_miner
-                neg_from_queue = self.queue_miner.get_negatives(prot_query.detach(), k_hard=self.k_hard_queue)
-                G_cand, pos_mask = self._build_candidates_with_queue(
+                all_neg = self.queue_miner.get_all_neg()
+                if all_neg is not None and all_neg.numel() > 0:
+                    Q = self.normalizer(vt_for_miner, dim=1)
+                    Kmat = self.normalizer(all_neg.to(device), dim=1)
+                    sims = Q @ Kmat.T
+                    k = min(int(self.k_hard_queue), Kmat.size(0))
+                    _, idx = sims.topk(k, dim=1)
+                    neg_from_queue = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
+                    G_cand, pos_mask = self._build_candidates_with_queue(
                     uniq_go_embs=uniq_go_embs,
                     pos_go_local=pos_local,
-                    neg_from_queue=neg_from_queue
-                )
+                    neg_from_queue=neg_from_queue)
+                else:
+                    G_cand, pos_mask = self._build_candidates_with_queue(
+                        uniq_go_embs=uniq_go_embs,
+                        pos_go_local=pos_local,
+                        neg_from_queue=None
+                    )
             else:
                 # Fallback: only positives if queue empty
                 G_cand, pos_mask = self._build_candidates_with_queue(

@@ -40,6 +40,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any
+import numpy as np
+import json, errno
 
 import torch
 from src.configs.paths import GOOGLE_DRIVE_MANIFEST_CACHE
@@ -306,72 +308,124 @@ class ESMResidueStore:
     # --------------------------- shard loading -------------------------- #
     def _load_shard(self, path: str) -> dict:
         """
-        Drive akışını _resolve_local_path içinde korur.
-        - RAM cache: çözülmüş yerel path'e göre tutulur (duplicate yüklemeyi önler)
-        - Disk doluysa (ENOSPC) LRU temizlikten sonra bir kez daha dener
-        - atime güncellenir (DiskLRU için yararlı)
+        Sharp mode:
+          - .npy/.npz -> np.memmap ile KOPYASIZ yükleme (RAM'e kopyalama yok)
+          - .pt       -> torch.load (gerekirse fp16 cast)
+        Drive/HF çözümlemesi, ENOSPC LRU temizliği, RAM cache ve atime korunur.
+        Dönen nesne hep 'dict' olur ki üst katman tek tipe göre davransın.
+          .npy: {'__format__':'npy', 'array': np.memmap}
+          .npz: {'__format__':'npz', 'arrays': {name: np.memmap, ...}}
+          .pt : {'__format__':'pt',  **orijinal_pt_içeriği**}
         """
-        import os
-        import errno
-        import torch
-
-        # 1) Yol çöz: (Drive ise LRU cache'e kopyalar; HF ise lazy download yapar)
+        # 1) Yol çöz (Drive -> local kopya/HF indirme)
         local_path = self._resolve_local_path(path)
 
-        # 2) RAM cache kontrolü (çözümlenmiş path ile)
+        # 2) RAM cache
         if self.cache_shards and local_path in self._shard_ram_cache:
             return self._shard_ram_cache[local_path]
 
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"Shard not found: {local_path}")
 
-        # 3) Yükleme (disk dolu ise bir kez LRU temizliği sonrası tekrar dene)
+        # 3) Yükleme (disk doluysa bir kez LRU sonrası tekrar dene)
         def _torch_load(p):
-            # weights_only bazı torch sürümlerinde yoksa sessizce ignore edelim
             try:
                 return torch.load(p, map_location="cpu", weights_only=False)
             except TypeError:
                 return torch.load(p, map_location="cpu")
 
+        def _np_load(p):
+            # .npy: tek array
+            arr = np.load(p, mmap_mode="r")  # zero-copy memmap
+            return {"__format__": "npy", "array": arr}
+
+        def _npz_load(p):
+            z = np.load(p, mmap_mode="r")  # lazy file; alt arrays memmap
+            arrays = {k: z[k] for k in z.files}  # bunlar da memmap/ndarray
+            return {"__format__": "npz", "arrays": arrays, "_npz_file": z}
+
         try:
-            shard = _torch_load(local_path)
+            if local_path.endswith(".npy"):
+                shard = _np_load(local_path)
+            elif local_path.endswith(".npz"):
+                meta = np.load(local_path, allow_pickle=False)
+                fmt = str(meta["__format__"][0]) if "__format__" in meta.files else None
+
+                if fmt == "concat":
+                    offsets_np = meta["offsets"]
+                    emb_rel_path = str(meta["embeddings_path"][0])
+                    emb_path = os.path.join(os.path.dirname(local_path), emb_rel_path)
+                    memmap = np.load(emb_path, mmap_mode="r")
+
+                    # pid2row bilgisini oku
+                    json_path = local_path.replace(".npz", ".json")
+                    with open(json_path, "r") as f:
+                        pid2row_dict = json.load(f)["pid2row"]
+
+                    shard = {
+                        "__format__": "concat",
+                        "arrays": {
+                            "embeddings": memmap,
+                            "offsets": offsets_np,
+                        },
+                        "pid2row": pid2row_dict,
+                    }
+                    return shard
+
+                shard = _npz_load(local_path)
+            else:
+                payload = _torch_load(local_path)
+                # her zaman dict dön: format etiketi ekle
+                if isinstance(payload, dict):
+                    shard = {"__format__": "pt", **payload}
+                else:
+                    shard = {"__format__": "pt", "payload": payload}
         except OSError as e:
-            if getattr(e, "errno", None) in (errno.ENOSPC,):  # No space left on device
+            if getattr(e, "errno", None) in (errno.ENOSPC,):
                 try:
-                    # HF cache/belirlediğin cache için LRU varsa yer aç
                     if hasattr(self, "_hub_lru") and self._hub_lru is not None:
                         self._hub_lru.make_room()
                 except Exception:
                     pass
                 # tekrar dene
-                shard = _torch_load(local_path)
+                if local_path.endswith(".npy"):
+                    shard = _np_load(local_path)
+                elif local_path.endswith(".npz"):
+                    shard = _npz_load(local_path)
+                else:
+                    payload = _torch_load(local_path)
+                    shard = {"__format__": "pt", **payload} if isinstance(payload, dict) else {"__format__": "pt",
+                                                                                               "payload": payload}
             else:
                 raise
         except Exception as e:
             raise RuntimeError(f"Error loading shard {local_path}: {e}")
 
-        # 4) (Opsiyonel) fp16 cast
-        if self.prefer_fp16:
+        # 4) (Opsiyonel) fp16 cast — SADECE .pt içindeki Tensörler için
+        if self.prefer_fp16 and shard.get("__format__") == "pt":
             for k, v in list(shard.items()):
+                if k == "__format__":
+                    continue
                 if isinstance(v, torch.Tensor) and v.dtype == torch.float32:
                     shard[k] = v.half()
-                # numpy array ise, erişimde torch.as_tensor ile fp16'a dönüştürülebilir
+
+        # Not: .npy/.npz için cast etme — mmap kopyasız kalsın.
+        # Slice anında: torch.from_numpy(view) -> .to(device, non_blocking=True)
+        # ve gerekiyorsa .half()
 
         # 5) RAM cache’e koy (çözümlenmiş path anahtar)
         if self.cache_shards:
             self._shard_ram_cache[local_path] = shard
-            # İstersen orijinal 'path' anahtarını da aynı objeye işaret ettir:
             if path != local_path:
                 self._shard_ram_cache[path] = shard
 
-        # 6) atime güncelle (DiskLRU için)
+        # 6) atime güncelle (DiskLRU)
         try:
             os.utime(local_path, None)
         except Exception:
             pass
 
         return shard
-
     # ---------------------- overlap stitching logic --------------------- #
     def _stitch_with_overlap(self, H: torch.Tensor, L_seq: int) -> torch.Tensor:
         """
@@ -433,27 +487,90 @@ class ESMResidueStore:
 
         shard = self._load_shard(path)
 
-        arr: Any = shard.get(pid, None)
-        if arr is None:
-            # some shards might have non-str keys; attempt fallback
-            arr = shard.get(protein_id, None)
-        if arr is None:
-            raise KeyError(f"Protein '{pid}' missing in shard {path}")
+        # ---- mmap/satır tabanlı formatları destekle ----
+        fmt = shard.get("__format__", None)
 
-        # Convert to tensor (and dtype)
-        if isinstance(arr, torch.Tensor):
-            H = arr
+        # Yardımcı: pid -> row index haritası gerektiğinde kur
+        def _ensure_pid2row():
+            # Eğer zaten varsa, kullan
+            if hasattr(self, "_pid2row") and isinstance(self._pid2row, dict):
+                return
+            # Şard'da pid->row veya row->pid ipuçları varsa onları kullan
+            if "pid2row" in shard and isinstance(shard["pid2row"], dict):
+                self._pid2row = shard["pid2row"]
+            elif "row_index" in shard and isinstance(shard["row_index"], dict):
+                # row_index: pid -> row
+                self._pid2row = shard["row_index"]
+            elif "row2pid" in shard and isinstance(shard["row2pid"], (list, tuple)):
+                self._pid2row = {str(p): i for i, p in enumerate(shard["row2pid"])}
+            else:
+                # Son çare: manifest'in global indeksinden üretmeye çalış (varsa)
+                # Yoksa eski "dict by pid" yoluna düşeceğiz.
+                self._pid2row = None
+
+        H = None
+        if fmt == "concat":
+            # pid index’ini al
+            pid2row = shard.get("pid2row", None)
+            if not pid2row or (protein_id not in pid2row and str(protein_id) not in pid2row):
+                raise KeyError(f"Protein '{pid}' not indexed in concat shard {path}")
+            i = int(pid2row.get(protein_id, pid2row.get(str(protein_id))))
+
+            arrays = shard["arrays"]
+            offsets = arrays["offsets"]  # np.ndarray int64
+            embs_mm = arrays["embeddings"]  # np.memmap [N_total_res, D]
+            start = int(offsets[i]);
+            end = int(offsets[i + 1])
+
+            # kopyasız slice -> torch
+            view = embs_mm[start:end]  # np.memmap view
+            H = torch.from_numpy(view)  # CPU tensor (no copy)
+
+        elif fmt in ("npy", "npz", "pt"):
+            _ensure_pid2row()
+            if not self._pid2row:
+                # pid->row yoksa eski yola dön (dict-by-pid)
+                arr = shard.get(pid, shard.get(protein_id, None))
+                if arr is None:
+                    raise KeyError(f"Protein '{pid}' missing in shard {path}")
+                H = torch.as_tensor(arr) if not isinstance(arr, torch.Tensor) else arr
+            else:
+                # satır tabanlı okuma
+                if pid not in self._pid2row:
+                    raise KeyError(f"Protein '{pid}' not indexed in shard {path}")
+                row = int(self._pid2row[pid])
+
+                if fmt == "npy":
+                    # shard["array"] -> np.memmap [N, L(or L_concat), D] veya [N, ...]
+                    np_arr = shard["array"]
+                    view = np_arr[row]  # memmap slice, kopyasız
+                    H = torch.from_numpy(view)  # CPU, zero-copy
+                elif fmt == "npz":
+                    # shard["arrays"]["embeddings"] -> np.memmap
+                    np_arr = shard["arrays"]["embeddings"]
+                    view = np_arr[row]
+                    H = torch.from_numpy(view)
+                else:  # fmt == "pt" satır tabanlı tensor
+                    # shard["embs"] -> torch.Tensor [N, L_concat, D] veya [N, D]
+                    H = shard["embs"][row]
         else:
-            # numpy array path
-            H = torch.as_tensor(arr)
+            # --- Eski davranış: dict-by-pid ---
+            arr = shard.get(pid, None)
+            if arr is None:
+                # some shards might have non-str keys; attempt fallback
+                arr = shard.get(protein_id, None)
+            if arr is None:
+                raise KeyError(f"Protein '{pid}' missing in shard {path}")
+            H = torch.as_tensor(arr) if not isinstance(arr, torch.Tensor) else arr
 
-        # dtype cast
+        # ---- dtype cast (eski davranış korunur) ----
         if self.prefer_fp16 and H.dtype == torch.float32:
             H = H.half()
         else:
-            H = H.float() if H.dtype not in (torch.float32, torch.float16, torch.bfloat16) else H
+            if H.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                H = H.float()
 
-        # Post-hoc stitching (if needed)
+        # ---- overlap stitch (eski davranış korunur) ----
         L_concat = int(H.shape[0])
         L_seq = int(self.seq_len_lookup.get(pid, 0))
         if L_seq > 0 and L_concat != L_seq:
