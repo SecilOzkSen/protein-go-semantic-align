@@ -125,41 +125,58 @@ class GoLookupCache:
                  row2id: Optional[Sequence[int]] = None,
                  device: str = "cuda",
                  already_normalized: bool = False):
-        # Eski imzayı destekle: dict blob gelebilir
+
+        # Güvenli başlangıç
+        _id2row = id2row
+        _row2id = row2id
+        _embs_in = None  # GoMemoryBank'e geçeceğimiz tek kaynak
+        self._mm = None  # np.memmap handle (varsa)
+
         if isinstance(embs_or_blob, Mapping):
             b = embs_or_blob
-            memmap_path = b.get("memmap_path", None)
+            memmap_path = b.get("memmap_path")
+
+            # id eşlemeleri (blob > param > None)
+            _id2row = b.get("id2row", _id2row)
+            _row2id = b.get("row2id", b.get("ids", _row2id))
+
             if memmap_path is not None:
-                meta = torch.load(str(memmap_path) + ".meta.pt", map_location="cpu")
+                # Memmap'i meta'dan yükle
+                meta = torch.load(str(memmap_path) + ".meta.pt", map_location="cpu", weights_only=False)
                 shape = tuple(meta["shape"])
                 np_dtype = np.dtype(meta["dtype"])
+                # r+ ile açarsak ileride update() kalıcı yazabilir
                 self._mm = np.memmap(memmap_path, dtype=np_dtype, mode="r+", shape=shape)
-                self.embs = torch.from_numpy(self._mm)  # paylaşılabilir view
-                self.id2row = b.get("id2row", id2row)
-                _row2id = b.get("row2id", b.get("ids", row2id))
+                _embs_in = self._mm  # GoMemoryBank np.memmap alabilir
             else:
-                self.embs = b["embs"]
-                self.id2row = b.get("id2row", id2row)
-                _row2id = b.get("row2id", b.get("ids", row2id))
+                # Doğrudan tensör/dizi bekliyoruz
+                _embs_in = b["embs"]
         else:
-            embs = embs_or_blob
-            _id2row = id2row
-            _row2id = row2id
+            # Eski imza: doğrudan tensör/np.memmap
+            _embs_in = embs_or_blob
+            # _id2row / _row2id parametrelerden gelecek (varsa)
 
+        # Zorunlu: row2id olmalı
         assert _row2id is not None, "GoLookupCache: row2id gerekli."
-        # id2row uyumu
+
+        # id2row yoksa row2id'den türet
         if _id2row is None:
             _id2row = {int(i): int(r) for r, i in enumerate(_row2id)}
 
-        # backend
-        self._mb = GoMemoryBank(embs, row2id=_row2id, device=device, to_device=True,
-                              already_normalized=already_normalized)
+        # Backend – normalize & device yönetimi GoMemoryBank'te
+        self._mb = GoMemoryBank(
+            _embs_in,
+            row2id=_row2id,
+            device=device,
+            to_device=True,
+            already_normalized=already_normalized,
+        )
 
-        # --- Eski alan adlarını dışarı yansıt ---
-        self.embs   = self._mb.embs                # Tensor [G,D] (fp32, L2, device)
-        self.id2row = self._mb.id2row              # dict
-        self.row2id = self._mb.row2id              # LongTensor [G]
-        self.n_go   = self._mb.n_go
+        # Dış API alanları
+        self.embs = self._mb.embs
+        self.id2row = self._mb.id2row
+        self.row2id = self._mb.row2id
+        self.n_go = self._mb.n_go
 
     # Eski metodlar: doğrudan MemoryBank'e delege
     def __call__(self, go_ids: Sequence[int]) -> torch.Tensor:
