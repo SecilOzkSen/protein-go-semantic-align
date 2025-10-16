@@ -215,10 +215,11 @@ class TrainingContext:
     batch_builder: Any = None
     go_text_store: Any = None
     run_name: str = None
+    fp16_enabled: bool = True
     logging: LoggingConfig = None
     use_queue_miner: bool = True
     attribute_loss_enabled = False
-    fp16_enabled = True
+
 
     def to_dict(self):
         d = dict(

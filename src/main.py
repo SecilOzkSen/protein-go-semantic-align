@@ -571,7 +571,7 @@ def run_training(args, schedule: TrainSchedule):
         scheduler=scheduler,
         go_text_store=go_text_store,
         use_queue_miner=True,
-        fp16_enabled=args.fp16,
+        fp16_enabled=args.fp16
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
