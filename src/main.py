@@ -138,31 +138,83 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int = 3):
 
 
 # ============== Builders ==============
+from pathlib import Path
+import logging
+import json
+import numpy as np
+import torch
+import torch.nn.functional as F
+
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
-    logger.info("Loading GO cache: %s", go_cache_path)
+    p = Path(go_cache_path)
+    logger.info("Loading GO cache: %s", str(p))
 
-    # 1) memmap yolunu türet (aynı klasörde .npy arıyoruz)
-    memmap_npy = Path(go_cache_path).with_suffix(".npy")
-    if memmap_npy.exists():
-        arr = np.load(go_cache_path, mmap_mode="r", allow_pickle=False)
-        if isinstance(arr, np.memmap) or isinstance(arr, np.ndarray):
+    # ---- 1) MEMMAP / NPY yolu ----
+    memmap_path = None
+    if p.suffix.lower() == ".npy" and p.exists():
+        memmap_path = p
+    else:
+        cand = p.with_suffix(".npy")
+        if cand.exists():
+            memmap_path = cand
+        else:
+            # Common fallback: go_text_embeddings.npy aynı klasörde olabilir
+            alt = p.parent / "go_text_embeddings.npy"
+            if alt.exists():
+                memmap_path = alt
+
+    if memmap_path is not None:
+        # Eşlemleri opsiyonel yan dosyalardan yükle (varsa)
+        id2row = row2id = None
+        for fname in ("id2row.json", "row2id.json", "ids.json", "ids.txt"):
+            f = memmap_path.with_name(fname)
+            if f.exists():
+                if f.suffix == ".json":
+                    with open(f, "r") as fp:
+                        data = json.load(fp)
+                    if "id2row" in data and id2row is None:
+                        id2row = data["id2row"]
+                    if "row2id" in data and row2id is None:
+                        row2id = data["row2id"]
+                    if "ids" in data and (id2row is None or row2id is None):
+                        ids = data["ids"]
+                        id2row = {pid: i for i, pid in enumerate(ids)}
+                        row2id = {i: pid for i, pid in enumerate(ids)}
+                else:
+                    # ids.txt (satır başına bir id)
+                    with open(f, "r") as fp:
+                        ids = [line.strip() for line in fp if line.strip()]
+                    id2row = {pid: i for i, pid in enumerate(ids)}
+                    row2id = {i: pid for i, pid in enumerate(ids)}
+
+        # Yan dosyalar yoksa: boyutu okumadan basit map üret (isteğe bağlı)
+        if id2row is None or row2id is None:
             try:
-                blob = torch.from_numpy(np.asarray(arr))
+                # Sadece shape öğrenmek için memmap aç (RAM'e yüklemez)
+                arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
+                n = int(arr.shape[0])
+                id2row = {str(i): i for i in range(n)}
+                row2id = {i: str(i) for i in range(n)}
             except Exception:
-                blob = arr
+                # Eşlemeleri boş bırak; GoLookupCache içi tolere edebiliyorsa
+                id2row = None
+                row2id = None
 
         blob = {
-            "memmap_path": str(memmap_npy),
-            "id2row": blob.get("id2row"),
-            "row2id": blob.get("row2id") or blob.get("ids")
+            "memmap_path": str(memmap_path),
+            "id2row": id2row,
+            "row2id": row2id,
         }
         return GoLookupCache(blob)
 
-    # 2) memmap yoksa klasik yol
-    blob = torch.load(go_cache_path, map_location="cpu")
-    blob['embs'] = F.normalize(blob['embs'], p=2, dim=1)
+    # ---- 2) Torch (.pt/.pth) yolu ----
+    # PyTorch 2.6: weights_only default True → pickle içeren dict'ler için False gerekli
+    blob = torch.load(str(p), map_location="cpu", weights_only=False)
+    if isinstance(blob, dict) and "embs" in blob and isinstance(blob["embs"], torch.Tensor):
+        blob["embs"] = F.normalize(blob["embs"].float(), p=2, dim=1)
     return GoLookupCache(blob)
+
 
 
 def build_store(args) -> ESMResidueStore:
