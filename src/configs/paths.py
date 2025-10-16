@@ -87,27 +87,27 @@ FEW_SHOT_IC_TERMS_ID_ONLY_JSON     = TRAINING_READY / "go_few_zero_common" / "ic
 COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic_common_terms_id_only.json"
 
 # ---- GO indexes by phase -----------------------------
-_GO_IDX = lambda p: TRAINING_READY / "go_indexes" / f"phase{p}"
+_GO_IDX = lambda p: TRAINING_READY / "go_indexes" / "memmap" / f"phase{p}"
 GO_INDEX = {
     1: {
-        "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.pt",
+        "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(1) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(1) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(1) / "go_text_embeddings.npy.meta.pt",
     },
     2: {
-        "TEXT_EMB": _GO_IDX(2) / "go_text_embeddings.pt",
+        "TEXT_EMB": _GO_IDX(2) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(2) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(2) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(2) / "go_text_embeddings.npy.meta.pt",
     },
     3: {
-        "TEXT_EMB": _GO_IDX(3) / "go_text_embeddings.pt",
+        "TEXT_EMB": _GO_IDX(3) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(3) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(3) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(3) / "go_text_embeddings.npy.meta.pt",
     },
     4: {
         "TEXT_EMB": _GO_IDX(4) / "go_text_embeddings.pt",
         "FAISS_IP":  _GO_IDX(4) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(4) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(4) / "go_text_embeddings.npy.meta.pt",
     },
 }
 
@@ -124,8 +124,8 @@ GO_ANCESTOR_STOPLIST = TRAINING_READY / "go_dag" / "ancestor_stoplist.txt"
 # PROTEINS
 PID_TO_POSITIVES    = TRAINING_READY / "proteins" / "pid_to_positives.json"
 P_SEQ_LEN_LOOKUP    = TRAINING_READY / "proteins" / "seq_len_lookup.pkl"
-PROTEIN_TRAIN_IDS   = TRAINING_READY / "proteins" / "protein_train_ids.filtered.txt"
-PROTEIN_VAL_IDS     = TRAINING_READY / "proteins" / "protein_val_ids.filtered.txt"
+PROTEIN_TRAIN_IDS   = TRAINING_READY / "proteins" / "protein_train_ids.txt"
+PROTEIN_VAL_IDS     = TRAINING_READY / "proteins" / "protein_val_ids.txt"
 
 # GOOGLE DRIVE (opsiyonel) — env ile override edilebilir
 # Colab’da: export ESM3B_DRIVE_DIR="/content/drive/MyDrive/esm3b_embeddings"
@@ -136,7 +136,7 @@ else:
     GOOGLE_DRIVE_ESM3B = TRAINING_READY / "esm3b_embeddings"  # repo içi default
 
 GOOGLE_DRIVE_ESM3B_EMBEDDINGS = GOOGLE_DRIVE_ESM3B / "embeddings"  # symlink edebilirsin
-GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest_runpod.pkl"
+GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest.pkl"
 
 # CONFIG
 TRAINING_CONFIG = SRC_DIR / "colab.yaml"

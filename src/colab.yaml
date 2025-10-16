@@ -104,17 +104,17 @@ wandb:
   mode: online
 
 stores:
-  train_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_train_ids.filtered.txt
-  pid2pos_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/pid_to_positives.json
-  val_ids_path: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/protein_val_ids.filtered.txt
+  train_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_train_ids.txt
+  pid2pos_path: /content/drive/MyDrive/data/training_ready/proteins/pid_to_positives.json
+  val_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_val_ids.txt
 
-  embed_dir: /workspace/esm-embeddings
-  hub_local_dir: /workspace/.cache/huggingface/hub
+  embed_dir: /content/drive/MyDrive/esm_embeddings_npy
+  hub_local_dir: /content/.cache/huggingface/hub
 
-  seq_len_lookup_dir: /workspace/protein-go-semantic-align/src/data/training_ready/proteins/seq_len_lookup.pkl
-  protein_manifest_file: /workspace/protein-go-semantic-align/src/data/training_ready/manifest_cache/esm_manifest_runpod.pkl
+  seq_len_lookup_dir: /content/drive/MyDrive/data/training_ready/proteins/seq_len_lookup.pkl
+  protein_manifest_file: /content/drive/MyDrive/data/training_ready/manifest_cache/esm_manifest.pkl
 
-  output_dir: /workspace/protein-go-align-outputs
-  logs: /workspace/protein-go-align-logs
+  output_dir: /content/protein-go-align-outputs
+  logs: /content/protein-go-align-logs
 
-  go_text_folder: /workspace/protein-go-semantic-align/src/data/processed/go_terms/go_phases
+  go_text_folder: /content/drive/MyDrive/data/processed/go_terms/go_phases
