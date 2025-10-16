@@ -83,7 +83,7 @@ class BioMedBERTEncoder(nn.Module):
         self.device = device
         self.max_length = max_length
         # Base model and tokenizer
-        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False, use_safetensors=False)
+        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
         self.model.resize_token_embeddings(len(self.tokenizer))
