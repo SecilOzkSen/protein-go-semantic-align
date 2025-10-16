@@ -145,7 +145,13 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
     # 1) memmap yolunu türet (aynı klasörde .npy arıyoruz)
     memmap_npy = Path(go_cache_path).with_suffix(".npy")
     if memmap_npy.exists():
-        blob = torch.load(go_cache_path, map_location="cpu")
+        arr = np.load(go_cache_path, mmap_mode="r", allow_pickle=False)
+        if isinstance(arr, np.memmap) or isinstance(arr, np.ndarray):
+            try:
+                blob = torch.from_numpy(np.asarray(arr))
+            except Exception:
+                blob = arr
+
         blob = {
             "memmap_path": str(memmap_npy),
             "id2row": blob.get("id2row"),
