@@ -95,8 +95,6 @@ class ProteinGoAligner(nn.Module):
             if pos_w is not None and i < len(pos_w) and pos_w[i] is not None:
                 w = pos_w[i].to(uniq_G.device)
             g_i = self._weighted_avg(uniq_G, idx, w=w)  # [d_g]
-            if self.normalize:
-                g_i = F.normalize(g_i, dim=-1)
             G_list.append(g_i)
 
         # Stack to [B, d_g] then broadcast to [B, T, d_g]

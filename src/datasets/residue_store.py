@@ -308,15 +308,18 @@ class ESMResidueStore:
     # --------------------------- shard loading -------------------------- #
     def _load_shard(self, path: str) -> dict:
         """
-        Sharp mode:
-          - .npy/.npz -> np.memmap ile KOPYASIZ yükleme (RAM'e kopyalama yok)
-          - .pt       -> torch.load (gerekirse fp16 cast)
+        Sharp mode (minimal):
+          - .npy -> np.memmap (dict sarmal: {'__format__':'npy', 'array': memmap})
+          - .pt  -> torch.load (dict sarmal: {'__format__':'pt', ...})
         Drive/HF çözümlemesi, ENOSPC LRU temizliği, RAM cache ve atime korunur.
-        Dönen nesne hep 'dict' olur ki üst katman tek tipe göre davransın.
-          .npy: {'__format__':'npy', 'array': np.memmap}
-          .npz: {'__format__':'npz', 'arrays': {name: np.memmap, ...}}
-          .pt : {'__format__':'pt',  **orijinal_pt_içeriği**}
+        Dönen nesne her zaman dict.
         """
+        import errno
+        import json
+        import os
+        import numpy as np
+        import torch
+
         # 1) Yol çöz (Drive -> local kopya/HF indirme)
         local_path = self._resolve_local_path(path)
 
@@ -327,60 +330,30 @@ class ESMResidueStore:
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"Shard not found: {local_path}")
 
-        # 3) Yükleme (disk doluysa bir kez LRU sonrası tekrar dene)
+        # 3) Yükleyiciler
         def _torch_load(p):
             try:
                 return torch.load(p, map_location="cpu", weights_only=False)
             except TypeError:
                 return torch.load(p, map_location="cpu")
 
-        def _np_load(p):
+        def _npy_load(p):
+            # NPY magic kontrolü (HTML/bozuk dosyayı erken yakala)
             with open(p, "rb") as f:
                 if f.read(6) != b"\x93NUMPY":
                     raise RuntimeError(f"Not a valid NPY: {p}")
-            return np.load(p, mmap_mode="r")  # allow_pickle=False by default
+            # KOPYASIZ yükleme
+            return np.load(p, mmap_mode="r")  # allow_pickle=False default
 
-        def _npz_load(p):
-            z = np.load(p, mmap_mode="r")  # lazy file; alt arrays memmap
-            arrays = {k: z[k] for k in z.files}  # bunlar da memmap/ndarray
-            return {"__format__": "npz", "arrays": arrays, "_npz_file": z}
-
+        # 4) Yükleme (disk doluysa LRU sonrası tek tekrar)
         try:
             if local_path.endswith(".npy"):
-                shard = _np_load(local_path)
-            elif local_path.endswith(".npz"):
-                meta = np.load(local_path, allow_pickle=False)
-                fmt = str(meta["__format__"][0]) if "__format__" in meta.files else None
-
-                if fmt == "concat":
-                    offsets_np = meta["offsets"]
-                    emb_rel_path = str(meta["embeddings_path"][0])
-                    emb_path = os.path.join(os.path.dirname(local_path), emb_rel_path)
-                    memmap = np.load(emb_path, mmap_mode="r")
-
-                    # pid2row bilgisini oku
-                    json_path = local_path.replace(".npz", ".json")
-                    with open(json_path, "r") as f:
-                        pid2row_dict = json.load(f)["pid2row"]
-
-                    shard = {
-                        "__format__": "concat",
-                        "arrays": {
-                            "embeddings": memmap,
-                            "offsets": offsets_np,
-                        },
-                        "pid2row": pid2row_dict,
-                    }
-                    return shard
-
-                shard = _npz_load(local_path)
+                arr = _npy_load(local_path)
+                shard = {"__format__": "npy", "array": arr}
             else:
                 payload = _torch_load(local_path)
-                # her zaman dict dön: format etiketi ekle
-                if isinstance(payload, dict):
-                    shard = {"__format__": "pt", **payload}
-                else:
-                    shard = {"__format__": "pt", "payload": payload}
+                shard = {"__format__": "pt", **payload} if isinstance(payload, dict) else \
+                    {"__format__": "pt", "payload": payload}
         except OSError as e:
             if getattr(e, "errno", None) in (errno.ENOSPC,):
                 try:
@@ -390,43 +363,39 @@ class ESMResidueStore:
                     pass
                 # tekrar dene
                 if local_path.endswith(".npy"):
-                    shard = _np_load(local_path)
-                elif local_path.endswith(".npz"):
-                    shard = _npz_load(local_path)
+                    arr = _npy_load(local_path)
+                    shard = {"__format__": "npy", "array": arr}
                 else:
                     payload = _torch_load(local_path)
-                    shard = {"__format__": "pt", **payload} if isinstance(payload, dict) else {"__format__": "pt",
-                                                                                               "payload": payload}
+                    shard = {"__format__": "pt", **payload} if isinstance(payload, dict) else \
+                        {"__format__": "pt", "payload": payload}
             else:
                 raise
         except Exception as e:
             raise RuntimeError(f"Error loading shard {local_path}: {e}")
 
-        # 4) (Opsiyonel) fp16 cast — SADECE .pt içindeki Tensörler için
-        if self.prefer_fp16 and shard.get("__format__") == "pt":
+        # 5) (Opsiyonel) fp16 cast — SADECE .pt içindeki Tensörler için
+        if getattr(self, "prefer_fp16", False) and shard.get("__format__") == "pt" and torch.cuda.is_available():
             for k, v in list(shard.items()):
                 if k == "__format__":
                     continue
                 if isinstance(v, torch.Tensor) and v.dtype == torch.float32:
                     shard[k] = v.half()
 
-        # Not: .npy/.npz için cast etme — mmap kopyasız kalsın.
-        # Slice anında: torch.from_numpy(view) -> .to(device, non_blocking=True)
-        # ve gerekiyorsa .half()
-
-        # 5) RAM cache’e koy (çözümlenmiş path anahtar)
+        # 6) RAM cache’e koy (çözümlenmiş path anahtar)
         if self.cache_shards:
             self._shard_ram_cache[local_path] = shard
             if path != local_path:
                 self._shard_ram_cache[path] = shard
 
-        # 6) atime güncelle (DiskLRU)
+        # 7) atime güncelle (DiskLRU)
         try:
             os.utime(local_path, None)
         except Exception:
             pass
 
         return shard
+
     # ---------------------- overlap stitching logic --------------------- #
     def _stitch_with_overlap(self, H: torch.Tensor, L_seq: int) -> torch.Tensor:
         """
