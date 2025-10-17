@@ -335,9 +335,10 @@ class ESMResidueStore:
                 return torch.load(p, map_location="cpu")
 
         def _np_load(p):
-            # .npy: tek array
-            arr = np.load(p, mmap_mode="r")  # zero-copy memmap
-            return {"__format__": "npy", "array": arr}
+            with open(p, "rb") as f:
+                if f.read(6) != b"\x93NUMPY":
+                    raise RuntimeError(f"Not a valid NPY: {p}")
+            return np.load(p, mmap_mode="r")  # allow_pickle=False by default
 
         def _npz_load(p):
             z = np.load(p, mmap_mode="r")  # lazy file; alt arrays memmap

@@ -1,7 +1,7 @@
 data:
   overlap: 256
   max_len: 1024
-  no_cache_shards: true
+  no_cache_shards: false
 
   # DAG & expansion
   use_dag_in_ds: true
@@ -108,7 +108,7 @@ stores:
   pid2pos_path: /content/drive/MyDrive/data/training_ready/proteins/pid_to_positives.json
   val_ids_path: /content/drive/MyDrive/data/training_ready/proteins/protein_val_ids.txt
 
-  embed_dir: /content/drive/MyDrive/esm_embeddings_npy
+  embed_dir: /content/drive/MyDrive/esm_embeddings_npy_1
   hub_local_dir: /content/.cache/huggingface/hub
 
   seq_len_lookup_dir: /content/drive/MyDrive/data/training_ready/proteins/seq_len_lookup.pkl
