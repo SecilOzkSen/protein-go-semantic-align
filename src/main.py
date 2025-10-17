@@ -251,7 +251,7 @@ def build_store(args) -> ESMResidueStore:
 
     # 4) Toggle Drive cache based on embed_dir
     # If embed_dir points to Google Drive, keep old Drive LRU behavior; otherwise disable.
-    gdrive_cache = str(embed_dir).startswith("/content/drive/")
+    gdrive_cache = False
 
     # 5) Cache toggles
     cache_shards = getattr(args, "no_cache_shards", False)
