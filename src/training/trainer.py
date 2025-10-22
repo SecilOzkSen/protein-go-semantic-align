@@ -356,12 +356,15 @@ class OppTrainer:
 
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
+        import time
+        import torch
+        import torch.nn.functional as F
         t0 = time.time()
         self.model.train()
         device = self.device
 
         # --- Protein & mask ---
-        H = batch["prot_emb_pad"].to(device)               # (B, Lmax, Dh)
+        H = batch["prot_emb_pad"].to(device)  # (B, Lmax, Dh)
         attn_valid, pad_mask = self._valid_and_pad_masks(batch)
         if self.to_f32 is not None:
             H = self.to_f32(H)
@@ -370,7 +373,10 @@ class OppTrainer:
 
         # Use attribution loss only during early curriculum epochs
         use_attr = (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
-        wandb.log({"debug/use_attr": int(use_attr), "epoch": epoch_idx}, step=self._global_step)
+        try:
+            wandb.log({"debug/use_attr": int(use_attr), "epoch": epoch_idx}, step=self._global_step)
+        except Exception:
+            pass
 
         # --- POSITIVES (GoEncoder → uniq_go_embs) ---
         if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
@@ -384,7 +390,10 @@ class OppTrainer:
             except Exception:
                 pass
         else:
-            uniq_go_embs = batch["uniq_go_embs"].to(device)
+            uniq_go_embs = batch["uniq_go_embs"].to(device)  # [G, Dg] on device
+
+        # uniq_go_ids'u tek seferde cihaza al (tüm index_select'lerde bunu kullanacağız)
+        uniq_go_ids = batch["uniq_go_ids"].to(device)  # [G] on device
 
         # --- Queue miner init (once we know Dg) ---
         self._maybe_init_queue_miner(uniq_go_embs.size(1))
@@ -409,11 +418,10 @@ class OppTrainer:
             self.curriculum_params = curr
 
         # --- prot_query = vt (teacher) projected to GO space ---
-        # Prefer fused bank if available (teacher/query vectors)
         prot_ids = batch.get("protein_ids", None)
         vt_for_miner = None
         if prot_ids is not None and hasattr(self.ctx, "fused_bank") and self.ctx.fused_bank is not None:
-            id2row = self.ctx.fused_bank["id2row"]
+            id2row = self.ctx.fused_bank["id2row"]  # dict(pid->row), CPU
             rows = []
             miss = 0
             for pid in prot_ids:
@@ -423,106 +431,114 @@ class OppTrainer:
                 else:
                     rows.append(j)
             if rows and miss == 0:
-                idx = torch.as_tensor(rows, dtype=torch.long, device=self.device)
-                vecs_cpu = self.ctx.fused_bank["vecs"]  # CPU
-                idx_cpu = idx.to(vecs_cpu.device)  # index to CPU
-                vt_for_miner = vecs_cpu.index_select(0, idx_cpu).to(self.device, non_blocking=True)
+                # fused vecs CPU'da tutuluyor; index de CPU'da olmalı
+                vecs_cpu = self.ctx.fused_bank["vecs"]  # torch.FloatTensor on CPU
+                idx_cpu = torch.as_tensor(rows, dtype=torch.long, device=vecs_cpu.device)
+                vt_for_miner = vecs_cpu.index_select(0, idx_cpu).to(device, non_blocking=True)
                 vt_for_miner = F.normalize(vt_for_miner.float(), p=2, dim=1)
+
         if vt_for_miner is None:
             # fallback: residue-based teacher
-            v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)        # [B, Dh]
+            v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh] on device
             vt_for_miner = v_true_early
             try:
-                vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
+                vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg] on device
             except Exception:
                 pass
 
-        prot_query = vt_for_miner
+        prot_query = vt_for_miner  # [B, Dg] (proj varsa) ya da [B, Dh]
 
         # --- get hard negatives from queue (vecs + ids) ---
         neg_from_queue = None
         neg_ids_from_queue = None
         if self.queue_miner is not None:
-            all_neg_vecs, all_neg_ids = self.queue_miner.get_all_neg()  # [K,Dg], [K] or (None,None)
-            if all_neg_vecs is not None and all_neg_vecs.numel() > 0:
-                Q = self.normalizer(prot_query.detach(), dim=1)  # [B,Dg]
-                Kmat = self.normalizer(all_neg_vecs.to(device), dim=1)  # [K,Dg]
-                sims = Q @ Kmat.T  # [B,K]
+            res = self.queue_miner.get_all_neg()  # may be None OR (vecs, ids)
+            if res is not None:
+                all_neg_vecs, all_neg_ids = res  # [K,Dg] (CPU/CUDA?), [K] long
+                if all_neg_vecs is not None and all_neg_vecs.numel() > 0:
+                    Q = self.normalizer(prot_query.detach(), dim=1)  # [B,Dg] on device
+                    Kmat = self.normalizer(all_neg_vecs.to(device), dim=1)  # [K,Dg] on device
+                    sims = Q @ Kmat.T  # [B,K]
 
-                # === FALSE-NEG MASK (her protein için kendi pozitif GO id’lerini -inf yap) ===
-                if all_neg_ids is not None:
-                    pos_gid_sets = []
-                    for b, loc in enumerate(pos_local):
-                        if loc.numel() > 0:
-                            gids = batch["uniq_go_ids"].index_select(0, loc.to(device))
-                            pos_gid_sets.append(set(map(int, gids.tolist())))
-                        else:
-                            pos_gid_sets.append(set())
-                    mask = torch.zeros_like(sims, dtype=torch.bool)
-                    neg_ids_list = all_neg_ids.tolist()
-                    for b in range(B):
-                        if pos_gid_sets[b]:
-                            for j, gid in enumerate(neg_ids_list):
-                                if gid in pos_gid_sets[b]:
-                                    mask[b, j] = True
-                    sims = sims.masked_fill(mask, float('-inf'))
+                    # === FALSE-NEG MASK ===
+                    if all_neg_ids is not None:
+                        # her örnek için pozitif GO id seti
+                        pos_gid_sets = []
+                        for b, loc in enumerate(pos_local):
+                            if loc.numel() > 0:
+                                gids = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))
+                                pos_gid_sets.append(set(map(int, gids.tolist())))
+                            else:
+                                pos_gid_sets.append(set())
+                        mask = torch.zeros_like(sims, dtype=torch.bool)  # [B,K]
+                        ids_list = all_neg_ids.tolist()
+                        for b in range(B):
+                            if pos_gid_sets[b]:
+                                for j, gid in enumerate(ids_list):
+                                    if gid in pos_gid_sets[b]:
+                                        mask[b, j] = True
+                        sims = sims.masked_fill(mask, float('-inf'))
 
-                # Top-k per-row negative seçim (hard)
-                k = min(int(self.k_hard_queue), Kmat.size(0))
-                _, idx = sims.topk(k, dim=1)
-                neg_from_queue = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
-                neg_ids_from_queue = all_neg_ids.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k).contiguous()
+                    # Top-k per-row hard negatives
+                    k = min(int(self.k_hard_queue), Kmat.size(0))
+                    if k > 0:
+                        _, idx = sims.topk(k, dim=1)  # [B,k]
+                        neg_from_queue = Kmat.index_select(0, idx.reshape(-1))  # [B*k,Dg] (flat)
+                        neg_from_queue = neg_from_queue.reshape(idx.size(0), k, -1).contiguous()  # [B,k,Dg]
+                        if all_neg_ids is not None:
+                            neg_ids_from_queue = all_neg_ids.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k)
 
-        # --- (optional) easy negatives from in-batch uniq_go_embs (pozitifleri hariç) ---
+        # --- (optional) easy negatives from in-batch uniq_go_embs ---
         easy_ids = None
         easy_vecs = None
-        if hard_frac is not None and neg_from_queue is not None:
-            all_neg_pool = self.normalizer(uniq_go_embs.detach(), dim=1)  # [G,Dg]
-            sims_all = self.normalizer(prot_query, dim=1) @ all_neg_pool.T  # [B,G]
+        if (hard_frac is not None) and (neg_from_queue is not None):
+            all_neg_pool = self.normalizer(uniq_go_embs.detach(), dim=1)  # [G,Dg] on device
+            sims_all = self.normalizer(prot_query, dim=1) @ all_neg_pool.T  # [B,G] on device
             for b, loc in enumerate(pos_local):
                 if loc.numel() > 0:
-                    sims_all[b, loc.to(device)] = -1e9
+                    sims_all[b, loc.to(sims_all.device)] = -1e9
             k_easy = max(0, int(neg_from_queue.size(1) * (1 - float(hard_frac))))
             if k_easy > 0:
                 _, idx_easy = sims_all.topk(k_easy, dim=1)  # [B,k_easy]
                 easy_vecs = all_neg_pool.index_select(0, idx_easy.reshape(-1)).reshape(idx_easy.size(0),
                                                                                        idx_easy.size(1), -1)
-                easy_ids = batch["uniq_go_ids"].index_select(0, idx_easy.reshape(-1)).reshape_as(idx_easy)
+                easy_ids = uniq_go_ids.index_select(0, idx_easy.reshape(-1)).reshape_as(idx_easy)
 
         # --- === GLOBAL CANDIDATE POOL === ---
-        # 1) Batch pozitiflerinin global id’leri (uniq_go_ids zaten batch pozitifi evreni)
-        batch_pos_ids = batch["uniq_go_ids"].to(device)       # (G,)
-        batch_pos_vecs = self.normalizer(uniq_go_embs, dim=1) # (G,Dg)
+        # 1) Batch pozitifi id/vektörler
+        batch_pos_ids = uniq_go_ids  # (G,) already on device
+        batch_pos_vecs = self.normalizer(uniq_go_embs, dim=1)  # (G,Dg) on device
 
-        # 2) Tüm satırlarda seçilen hard (ve varsa easy) negatif id’lerini **union** yap
+        # 2) Tüm satırlarda seçilen negatif id’lerinin union'ı ve benzersiz vektörleri
         neg_id_list = []
         if neg_ids_from_queue is not None:
-            neg_id_list.append(neg_ids_from_queue.reshape(-1))
+            neg_id_list.append(neg_ids_from_queue.reshape(-1).to(device))
         if easy_ids is not None:
-            neg_id_list.append(easy_ids.reshape(-1))
+            neg_id_list.append(easy_ids.reshape(-1).to(device))
 
         if neg_id_list:
-            all_neg_ids_selected = torch.unique(torch.cat(neg_id_list, dim=0))
-            # id -> vec sözlüğü oluştur (queue tarafı + easy tarafı)
+            all_neg_ids_selected = torch.unique(torch.cat(neg_id_list, dim=0))  # [Kneg]
+            # id -> vec haritası (önce queue, sonra easy ile overwrite)
             id2vec = {}
-            if neg_ids_from_queue is not None:
+            if neg_ids_from_queue is not None and neg_from_queue is not None:
                 flat_ids = neg_ids_from_queue.reshape(-1).tolist()
                 flat_vecs = neg_from_queue.reshape(-1, neg_from_queue.size(-1))
                 for gid, v in zip(flat_ids, flat_vecs):
                     id2vec[int(gid)] = v
-            if easy_ids is not None:
+            if easy_ids is not None and easy_vecs is not None:
                 flat_ids_e = easy_ids.reshape(-1).tolist()
                 flat_vecs_e = easy_vecs.reshape(-1, easy_vecs.size(-1))
                 for gid, v in zip(flat_ids_e, flat_vecs_e):
                     id2vec[int(gid)] = v
-            neg_vecs_unique = torch.stack([id2vec[int(g.item())] for g in all_neg_ids_selected], dim=0)
+            # benzersiz sıraya göre topla
+            neg_vecs_unique = torch.stack([id2vec[int(g.item())] for g in all_neg_ids_selected], dim=0).to(device)
         else:
             all_neg_ids_selected = torch.empty(0, dtype=torch.long, device=device)
             neg_vecs_unique = torch.empty(0, batch_pos_vecs.size(1), dtype=batch_pos_vecs.dtype, device=device)
 
-        # 3) Global havuz: [G_batch_pos  ∪ selected_neg]  (tek liste)
-        G_ids_global = torch.cat([batch_pos_ids, all_neg_ids_selected], dim=0)            # [K]
-        G_vecs_global = torch.cat([batch_pos_vecs, neg_vecs_unique], dim=0)               # [K,Dg]
+        # 3) Global havuz
+        G_ids_global = torch.cat([batch_pos_ids, all_neg_ids_selected], dim=0)  # [K]
+        G_vecs_global = torch.cat([batch_pos_vecs, neg_vecs_unique], dim=0)  # [K,Dg]
 
         # 4) Per-row multi-pozitif maskesi: [B,K]
         id2col = {int(G_ids_global[i].item()): i for i in range(G_ids_global.size(0))}
@@ -530,15 +546,14 @@ class OppTrainer:
         for b, loc in enumerate(pos_local):
             if loc.numel() == 0:
                 continue
-            glob = batch["uniq_go_ids"].index_select(0, loc.to(device))  # bu protein için global GO id'ler
+            glob = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))  # [T_pos] on device
             for g in glob.tolist():
                 j = id2col.get(int(g), None)
                 if j is not None:
                     pos_mask[b, j] = True
 
-        # 5) Model skorları: G_global’i tüm batch’e yayınla ve ölçekle (AMP içinde TEK hesap)
+        # 5) Skorlar (AMP)
         G_cand = G_vecs_global.unsqueeze(0).expand(B, -1, -1).contiguous()  # [B,K,Dg]
-
         from contextlib import nullcontext
         amp_ctx = torch.cuda.amp.autocast(enabled=self.ctx.fp16_enabled) if torch.cuda.is_available() else nullcontext()
         with amp_ctx:
@@ -546,14 +561,14 @@ class OppTrainer:
             scale = self.logit_scale.exp().clamp(max=100.0)
             scores_cand = scores_cand * scale
 
-            # InfoNCE — tek hesap
+            # InfoNCE
             l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=1.0)
 
             # ---- KL distillation (teacher → student) ----
             lambda_v = float(getattr(self.attr, "lambda_vtrue", 0.0))
             if lambda_v > 0.0:
-                vt = self.normalizer(prot_query, dim=1)         # [B, Dg]
-                Gn = self.normalizer(G_cand, dim=2)             # [B, K, Dg]
+                vt = self.normalizer(prot_query, dim=1)  # [B, Dg]
+                Gn = self.normalizer(G_cand, dim=2)  # [B, K, Dg]
                 scores_teacher = torch.einsum("bd,bkd->bk", vt, Gn)  # [B,K]
                 tau = float(self.attr.tau_distill)
                 with torch.no_grad():
@@ -583,25 +598,32 @@ class OppTrainer:
                 l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
                 l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
             else:
-                l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
+                l_attr = torch.zeros((), device=device);
+                l_ent = torch.zeros((), device=device)
         elif alpha_info is not None and all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
-            AW = alpha_info["alpha_windows"]; Ww = alpha_info["win_weights"]; spans = alpha_info["spans"]
+            AW = alpha_info["alpha_windows"];
+            Ww = alpha_info["win_weights"];
+            spans = alpha_info["spans"]
             if use_attr:
                 delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
-                B_, T_, W, win = AW.shape
                 delta_win = torch.zeros_like(AW)
                 for wi, (s, e) in enumerate(spans):
                     delta_win[:, :, wi, :e - s] = delta_full[:, :, s:e]
                 l_attr = windowed_attr_loss(AW, Ww, spans, delta_win)
                 l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(AW)
             else:
-                l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
+                l_attr = torch.zeros((), device=device);
+                l_ent = torch.zeros((), device=device)
         else:
-            wandb.log({"warn/no_alpha_info": 1}, step=self._global_step)
-            l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
+            try:
+                wandb.log({"warn/no_alpha_info": 1}, step=self._global_step)
+            except Exception:
+                pass
+            l_attr = torch.zeros((), device=device);
+            l_ent = torch.zeros((), device=device)
 
-        uniq_go_ids = batch['uniq_go_ids'].to(device)
-        l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents, margin=0.0, scale=1.0)
+        l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents, margin=0.0,
+                                         scale=1.0)
 
         total = (l_con + lambda_v * l_con_teacher) + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
@@ -626,7 +648,7 @@ class OppTrainer:
                         input_ids=toks["input_ids"].to(device),
                         attention_mask=toks["attention_mask"].to(device),
                     )
-                    go_pos_all = norm_f32(go_pos_all, dim=1)  # fp32
+                    go_pos_all = F.normalize(go_pos_all.float(), dim=1)  # fp32, norm
                 else:
                     go_pos_all = self.normalizer(uniq_go_embs, dim=1)
 
@@ -637,12 +659,12 @@ class OppTrainer:
                         local_idx_list.append(loc.to(device))
                 if local_idx_list:
                     local_cat = torch.unique(torch.cat(local_idx_list, dim=0))
-                    pos_vecs = go_pos_all.index_select(0, local_cat)                 # [P,Dg]
-                    pos_ids = batch["uniq_go_ids"].index_select(0, local_cat)        # [P]
+                    pos_vecs = go_pos_all.index_select(0, local_cat)  # [P,Dg]
+                    pos_ids = uniq_go_ids.index_select(0, local_cat)  # [P]
                     self.queue_miner.enqueue(pos_vecs.detach(), pos_ids.detach())
 
         if torch.cuda.is_available():
-            torch.cuda.synchronize()  # doğru süre için
+            torch.cuda.synchronize()
         dt = time.time() - t0
 
         # --- Quick on-batch retrieval metrics (cheap) ---
@@ -658,8 +680,10 @@ class OppTrainer:
                 try:
                     pos_scores = scores_cand[pos_mask]
                     neg_scores = scores_cand[~pos_mask]
-                    hard_gap = (pos_scores.mean() - neg_scores.mean()).item() if pos_scores.numel() and neg_scores.numel() else float('nan')
-                except:
+                    hard_gap = (
+                                pos_scores.mean() - neg_scores.mean()).item() if pos_scores.numel() and neg_scores.numel() else float(
+                        'nan')
+                except Exception:
                     hard_gap = float('nan')
             else:
                 hit1 = hit5 = mean_pos_rank = hard_gap = float('nan')
@@ -685,13 +709,14 @@ class OppTrainer:
             cp = self.curriculum_params
             source = getattr(cp, "cfg", cp)
             sched = dict(
-                hard_frac=float(getattr(source, "hard_frac", getattr(source, "hard_frac_start", 0.0))) if hasattr(source, "hard_frac") or hasattr(source, "hard_frac_start") else None,
+                hard_frac=float(getattr(source, "hard_frac", getattr(source, "hard_frac_start", 0.0))) if hasattr(
+                    source, "hard_frac") or hasattr(source, "hard_frac_start") else None,
                 k_hard=int(getattr(source, "k_hard", 0)) if hasattr(source, "k_hard") else None,
             )
 
         phase = dict(
             id=getattr(self, "phase_id", getattr(self.ctx, "phase_id", -1)),
-            name=getattr(self, "phase_name", getattr(self.ctx, "phase_name", f"phase{getattr(self,'phase_id',-1)}"))
+            name=getattr(self, "phase_name", getattr(self.ctx, "phase_name", f"phase{getattr(self, 'phase_id', -1)}"))
         )
 
         self.wlogger.log_losses(losses_log, step=self._global_step, epoch=epoch_idx, phase=phase, sched=sched)
@@ -718,9 +743,10 @@ class OppTrainer:
             "attr": l_attr,
             "entropy": l_ent
         }
-
     @torch.no_grad()
     def eval_epoch(self, loader, epoch_idx: int):
+        import torch
+        from typing import List
         self.model.eval()
         device = self.device
         logs = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
@@ -729,136 +755,152 @@ class OppTrainer:
         all_pred_blocks: List[torch.Tensor] = []
         all_true_blocks: List[torch.Tensor] = []
 
-        for batch in loader:
-            H = batch["prot_emb_pad"].to(device)
-            if self.to_f32:
-                H = self.to_f32(H)
-            attn_valid, pad_mask = self._valid_and_pad_masks(batch)
-            pos_local: List[torch.Tensor] = batch["pos_go_local"]
+        with torch.no_grad():
+            for batch in loader:
+                # --- inputs & masks ---
+                H = batch["prot_emb_pad"].to(device)  # (B, Lmax, Dh)
+                if self.to_f32 is not None:
+                    H = self.to_f32(H)
+                attn_valid, pad_mask = self._valid_and_pad_masks(batch)
+                pos_local: List[torch.Tensor] = batch["pos_go_local"]
 
-            # POSITIVES
-            if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
-                toks = batch["pos_go_tokens"]
-                uniq_go_embs = self.model.go_encoder(
-                    input_ids=toks["input_ids"].to(device),
-                    attention_mask=toks["attention_mask"].to(device),
-                )
-                try:
-                    uniq_go_embs = self.normalizer(uniq_go_embs, p=2, dim=1)
-                except Exception:
-                    pass
-            else:
-                uniq_go_embs = batch["uniq_go_embs"].to(device)
-
-            # Queue negatives in eval (no enqueue), **ID'li ve maskeli**
-            if self.queue_miner is not None:
-                v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh]
-                vt_for_miner = v_true_early
-                try:
-                    vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
-                except Exception:
-                    pass
-                all_neg_vecs, all_neg_ids = self.queue_miner.get_all_neg()
-                if all_neg_vecs is not None and all_neg_vecs.numel() > 0:
-                    Q = self.normalizer(vt_for_miner, dim=1)
-                    Kmat = self.normalizer(all_neg_vecs.to(device), dim=1)
-                    sims = Q @ Kmat.T
-                    # false-negative mask
-                    if all_neg_ids is not None:
-                        pos_gid_sets = []
-                        for b, loc in enumerate(pos_local):
-                            if loc.numel() > 0:
-                                gids = batch["uniq_go_ids"].index_select(0, loc.to(batch["uniq_go_ids"].device))
-                                pos_gid_sets.append(set(map(int, gids.tolist())))
-                            else:
-                                pos_gid_sets.append(set())
-                        mask = torch.zeros_like(sims, dtype=torch.bool)
-                        ids_list = all_neg_ids.tolist()
-                        for b in range(H.size(0)):
-                            if pos_gid_sets[b]:
-                                for j, gid in enumerate(ids_list):
-                                    if gid in pos_gid_sets[b]:
-                                        mask[b, j] = True
-                        sims = sims.masked_fill(mask, float('-inf'))
-
-                    k = min(int(self.k_hard_queue), Kmat.size(0))
-                    _, idx = sims.topk(k, dim=1)
-                    neg_from_queue = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
-                    G_cand, pos_mask = self._build_candidates_with_queue(
-                        uniq_go_embs=uniq_go_embs,
-                        pos_go_local=pos_local,
-                        neg_from_queue=neg_from_queue)
+                # --- POSITIVE GO embs (encoder varsa, yoksa hazır) ---
+                if ("pos_go_tokens" in batch) and (
+                        hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
+                    toks = batch["pos_go_tokens"]
+                    uniq_go_embs = self.model.go_encoder(
+                        input_ids=toks["input_ids"].to(device),
+                        attention_mask=toks["attention_mask"].to(device),
+                    )  # [G,Dg] (device)
+                    try:
+                        uniq_go_embs = self.normalizer(uniq_go_embs, p=2, dim=1)
+                    except Exception:
+                        pass
                 else:
-                    G_cand, pos_mask = self._build_candidates_with_queue(
-                        uniq_go_embs=uniq_go_embs,
-                        pos_go_local=pos_local,
-                        neg_from_queue=None
-                    )
-            else:
+                    uniq_go_embs = batch["uniq_go_embs"].to(device)  # [G,Dg]
+
+                # GO id’leri bir kez cihaza al
+                uniq_go_ids = batch["uniq_go_ids"].to(device)  # [G]
+
+                # --- Queue negatives in eval (no enqueue), **ID'li ve maskeli** ---
+                neg_from_queue = None
+                if self.queue_miner is not None:
+                    # prot_öğretmen (vt) = residue tabanlı teacher (proj varsa GO uzayı)
+                    v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh] on device
+                    vt_for_miner = v_true_early
+                    try:
+                        vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
+                    except Exception:
+                        pass
+
+                    res = self.queue_miner.get_all_neg()  # may be None OR (vecs, ids)
+                    if res is not None:
+                        all_neg_vecs, all_neg_ids = res
+                        if all_neg_vecs is not None and all_neg_vecs.numel() > 0:
+                            Q = self.normalizer(vt_for_miner, dim=1)  # [B,Dg] on device
+                            Kmat = self.normalizer(all_neg_vecs.to(device), dim=1)  # [K,Dg] on device
+                            sims = Q @ Kmat.T  # [B,K]
+
+                            # false-negative mask
+                            if all_neg_ids is not None:
+                                pos_gid_sets = []
+                                for b, loc in enumerate(pos_local):
+                                    if loc.numel() > 0:
+                                        gids = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))
+                                        pos_gid_sets.append(set(map(int, gids.tolist())))
+                                    else:
+                                        pos_gid_sets.append(set())
+                                mask = torch.zeros_like(sims, dtype=torch.bool)
+                                ids_list = all_neg_ids.tolist()
+                                for b in range(H.size(0)):
+                                    if pos_gid_sets[b]:
+                                        for j, gid in enumerate(ids_list):
+                                            if gid in pos_gid_sets[b]:
+                                                mask[b, j] = True
+                                sims = sims.masked_fill(mask, float('-inf'))
+
+                            k = min(int(self.k_hard_queue), Kmat.size(0))
+                            if k > 0:
+                                _, idx = sims.topk(k, dim=1)
+                                neg_from_queue = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k,
+                                                                                               -1).contiguous()
+
+                # --- global candidate’lar (pozitifler + varsa kuyruk negatifleri) ---
                 G_cand, pos_mask = self._build_candidates_with_queue(
-                    uniq_go_embs=uniq_go_embs,
-                    pos_go_local=pos_local,
-                    neg_from_queue=None
+                    uniq_go_embs=uniq_go_embs,  # [G,Dg] on device
+                    pos_go_local=pos_local,  # List[LongTensor(cpu or cuda?)] — içeride .to yapılmalı
+                    neg_from_queue=neg_from_queue  # None veya [B,k,Dg] on device
                 )
 
-            scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)
-            l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, self.attr.temperature)
+                # --- skorlar ve InfoNCE (eval’da tek head, temp=self.attr.temperature) ---
+                scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)  # (B,K)
+                l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=float(self.attr.temperature))
 
-            # Positives-only for attribution
-            B = H.size(0)
-            T_max = max((int(x.numel()) for x in pos_local), default=1)
-            Dg = uniq_go_embs.size(1)
-            G_pos = torch.zeros(B, T_max, Dg, device=device, dtype=uniq_go_embs.dtype)
-            for b, loc in enumerate(pos_local):
-                t = int(loc.numel())
-                if t > 0:
-                    G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
+                # --- Positives-only for attribution & DAG ---
+                B = H.size(0)
+                T_max = max((int(x.numel()) for x in pos_local), default=1)
+                Dg = uniq_go_embs.size(1)
+                G_pos = torch.zeros(B, T_max, Dg, device=device, dtype=uniq_go_embs.dtype)
+                for b, loc in enumerate(pos_local):
+                    t = int(loc.numel())
+                    if t > 0:
+                        G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
 
-            scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask)
+                # eval’de attribution'ı sadece forward_scores içinde hesaplat (grad yok)
+                scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask)
 
-            if "alpha_full" in alpha_info:
-                alpha = alpha_info["alpha_full"]
-                delta = topk_maskout_full(H, G_pos, alpha, k=self.attr.topk_per_window, model=self.model, pad_mask=pad_mask)
-                l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
-                l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
-            elif all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
-                AW = alpha_info["alpha_windows"]; Ww = alpha_info["win_weights"]; spans = alpha_info["spans"]
-                delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
-                delta_win = torch.zeros_like(AW)
-                for wi, (s, e) in enumerate(spans):
-                    delta_win[:, :, wi, :e - s] = delta_full[:, :, s:e]
-                l_attr = windowed_attr_loss(AW, Ww, spans, delta_win)
-                l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(AW)
-            else:
-                l_attr = torch.zeros((), device=device); l_ent = torch.zeros((), device=device)
+                if alpha_info is not None and ("alpha_full" in alpha_info):
+                    alpha = alpha_info["alpha_full"]
+                    delta = topk_maskout_full(H, G_pos, alpha, k=self.attr.topk_per_window,
+                                              model=self.model, pad_mask=pad_mask)
+                    l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
+                    l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
+                elif (alpha_info is not None) and all(
+                        k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
+                    AW = alpha_info["alpha_windows"];
+                    Ww = alpha_info["win_weights"];
+                    spans = alpha_info["spans"]
+                    delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
+                    delta_win = torch.zeros_like(AW)
+                    for wi, (s, e) in enumerate(spans):
+                        delta_win[:, :, wi, :e - s] = delta_full[:, :, s:e]
+                    l_attr = windowed_attr_loss(AW, Ww, spans, delta_win)
+                    l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(AW)
+                else:
+                    l_attr = torch.zeros((), device=device);
+                    l_ent = torch.zeros((), device=device)
 
-            uniq_go_ids = batch['uniq_go_ids'].to(device)
-            l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents, margin=0.0, scale=1.0)
-            total = l_con + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
+                l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents,
+                                                 margin=0.0, scale=1.0)
 
-            # ---- CAFA eval space & predictions ----
-            G_eval, y_true_b, _ = self._build_eval_space(batch)
-            scores_eval = self.forward_scores(H, G_eval, pad_mask, return_alpha=False)
-            probs_eval = torch.sigmoid(scores_eval)
+                total = l_con + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
-            all_pred_blocks.append(probs_eval.detach().cpu())
-            all_true_blocks.append(y_true_b.detach().cpu())
+                # ---- CAFA eval space & predictions ----
+                G_eval, y_true_b, _ = self._build_eval_space(batch)  # G_eval: (B,Keval,Dg) or (B,Keval)
+                G_eval = G_eval.to(device)
+                scores_eval = self.forward_scores(H, G_eval, pad_mask, return_alpha=False)
+                probs_eval = torch.sigmoid(scores_eval)
 
-            logs["total"] += float(total.detach().item())
-            logs["contrastive"] += float(l_con.detach().item())
-            logs["dag"] += float(l_dag.detach().item())
-            logs["attr"] += float(l_attr.detach().item())
-            logs["entropy"] += float(l_ent.detach().item())
-            n += 1
+                all_pred_blocks.append(probs_eval.detach().cpu())
+                all_true_blocks.append(y_true_b.detach().cpu())
 
+                logs["total"] += float(total.detach().item())
+                logs["contrastive"] += float(l_con.detach().item())
+                logs["dag"] += float(l_dag.detach().item())
+                logs["attr"] += float(l_attr.detach().item())
+                logs["entropy"] += float(l_ent.detach().item())
+                n += 1
+
+        # ---- average logs ----
         for k in logs:
             logs[k] /= max(1, n)
 
+        # ---- CAFA metrics ----
         if all_pred_blocks:
             y_pred = torch.cat(all_pred_blocks, dim=0).numpy()
             y_true = torch.cat(all_true_blocks, dim=0).numpy()
             fmax, _ = compute_fmax(y_true, y_pred)
-            aupr    = compute_term_aupr(y_true, y_pred)
+            aupr = compute_term_aupr(y_true, y_pred)
             logs["cafa_fmax"] = float(fmax)
             logs["cafa_aupr"] = float(aupr)
         else:
