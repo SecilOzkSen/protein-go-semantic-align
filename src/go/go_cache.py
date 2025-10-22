@@ -123,7 +123,7 @@ class GoLookupCache:
                  embs_or_blob: Union[torch.Tensor, Mapping, np.memmap],
                  id2row: Optional[dict] = None,
                  row2id: Optional[Sequence[int]] = None,
-                 device: str = "cuda",
+                 device: str = "cpu",
                  already_normalized: bool = False):
 
         # Güvenli başlangıç
