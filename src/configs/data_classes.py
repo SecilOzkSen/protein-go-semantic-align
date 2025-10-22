@@ -255,3 +255,5 @@ class TrainerConfig:
     max_epochs: int = 20,
     cand_chunk_k: int = 8
     pos_chunk_t: int = 128
+    k_hard_queue: int = 128
+    queue_K:int = 65536

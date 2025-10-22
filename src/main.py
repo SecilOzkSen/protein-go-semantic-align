@@ -20,6 +20,7 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
+import argparse
 
 import wandb
 
@@ -672,7 +673,7 @@ def run_training(args, schedule: TrainSchedule):
         scheduler=scheduler,
         go_text_store=go_text_store,
         use_queue_miner=bool(args.use_queue_miner),
-        fp16_enabled=args.fp16
+        fp16_enabled=args.fp16,
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -742,7 +743,9 @@ def run_training(args, schedule: TrainSchedule):
         lr=args.lr,
         max_epochs=args.epochs,
         cand_chunk_k=args.cand_chunk_k,
-        pos_chunk_t=args.pos_chunk_t
+        pos_chunk_t=args.pos_chunk_t,
+        k_hard_queue=args.k_hard_queue,
+        queue_K=args.queue_K
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1006,6 +1009,8 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         early_stop_patience=int(training.get("early_stop_patience", 0)),
         cand_chunk_k=int(training.get("cand_chunk_k", 8)),
         pos_chunk_t=int(training.get("pos_chunk_t", 128)),
+        k_hard_queue=int(training.get("k_hard_queue", 128)),
+        queue_K=int(training.get("queue_K"), 65536),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
@@ -1075,9 +1080,26 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
     return args, schedule
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Protein–GO Alignment Training")
+
+    # --- temel ayarlar ---
+    parser.add_argument("--config", type=str, default=None,
+                        help="YAML config file path (örn: src/configs/colab.yaml)")
+
+    args = parser.parse_args()
+    if not args.config:
+        args.config = TRAINING_CONFIG
+        print(f"[main] No --config passed, defaulting to {args.config}")
+
+    args, schedule = load_structured_cfg(args.config)
+
+    return args, schedule
+
 def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    args, schedule = load_structured_cfg(TRAINING_CONFIG)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CON", "expandable_segments:True")
+    args, schedule = parse_args()
     out = Path(args.output_dir)
     setup_logging(out, level=args.log_level)
     set_seed(args.seed)

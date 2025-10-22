@@ -182,7 +182,7 @@ class OppTrainer:
         # --- Queue config ---
         self.use_moco_miner: bool = True
         self.queue_K: int = int(getattr(cfg, "queue_K", getattr(ctx, "queue_K", 131072)))
-        self.k_hard_queue: int = int(getattr(cfg, "k_hard", getattr(ctx, "k_hard", 128)))
+        self.k_hard_queue: int = int(getattr(cfg, "k_hard_queue", getattr(ctx, "k_hard", 128)))
         self.queue_miner: Optional[MoCoQueue] = None
 
         # === Learnable logit scale (CLIP) ===

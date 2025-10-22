@@ -139,6 +139,7 @@ GOOGLE_DRIVE_ESM3B_EMBEDDINGS = GOOGLE_DRIVE_ESM3B / "embeddings"  # symlink ede
 GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest.pkl"
 
 # CONFIG
+
 TRAINING_CONFIG = SRC_DIR / "colab.yaml"
 
 def create_data_folders() -> None:
