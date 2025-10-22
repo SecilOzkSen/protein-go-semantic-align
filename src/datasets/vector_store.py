@@ -21,7 +21,7 @@ class VectorResources:
                  go_embs: torch.Tensor,
                  align_dim: int = 768,
                  query_projector: Optional[torch.nn.Module] = None,
-                 device = "cuda"):
+                 device = "cuda:0"):
         # FAISS is deprecated
         self.faiss_index = None
         self.align_dim = int(align_dim)

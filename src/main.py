@@ -592,7 +592,7 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
 def run_training(args, schedule: TrainSchedule):
     signal.signal(signal.SIGINT, _sigint_handler)
     logger = logging.getLogger("main")
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() and not args.cpu else "cpu")
     logger.info("Device: %s", device)
     if args.wandb:
         wandb.login()
@@ -651,7 +651,7 @@ def run_training(args, schedule: TrainSchedule):
     scheduler = CurriculumScheduler(cur_cfg)
 
     # Vector resources — FAISS YOK: sadece bank embs ile
-    vres = VectorResources(faiss_index=None, go_embs=go_cache.embs)
+    vres = VectorResources(faiss_index=None, go_embs=go_cache.embs, device=device)
 
     out_dir = Path(args.output_dir)
 
@@ -1086,6 +1086,8 @@ def parse_args():
     # --- temel ayarlar ---
     parser.add_argument("--config", type=str, default=None,
                         help="YAML config file path (örn: src/configs/colab.yaml)")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="cuda device")
 
     args = parser.parse_args()
     if not args.config:

@@ -13,7 +13,7 @@ class GoMemoryBank:
         self,
         init_embs: Union[torch.Tensor, np.memmap],
         row2id: Sequence[int],
-        device: str = "cuda",
+        device: str = "cuda:0",
         to_device: bool = True,
         already_normalized: bool = False,
         device_dtype: torch.dtype = torch.float16,   # <= SHARP: GPU'da fp16 varsayılan
@@ -43,7 +43,7 @@ class GoMemoryBank:
             t = t.to(self.device, non_blocking=True)
             if device_dtype is not None:
                 # sadece GPU'da half'a çevir (CPU memmap'le karışmasın)
-                if t.device.type == "cuda":
+                if t.device.type == "cuda:0":
                     t = t.to(device_dtype)
         self._embs = t.contiguous()
 
@@ -95,7 +95,7 @@ class GoMemoryBank:
 
         # normalize + cihaz
         new_embs = F.normalize(new_embs.float(), p=2, dim=1).to(self._embs.device, non_blocking=True)
-        if self._device_dtype is not None and self._embs.device.type == "cuda":
+        if self._device_dtype is not None and self._embs.device.type == "cuda:0":
             new_embs = new_embs.to(self._device_dtype)
 
         rows = self.to_local(ids, drop_missing=False)
