@@ -424,7 +424,9 @@ class OppTrainer:
                     rows.append(j)
             if rows and miss == 0:
                 idx = torch.as_tensor(rows, dtype=torch.long, device=self.device)
-                vt_for_miner = self.ctx.fused_bank["vecs"].index_select(0, idx).to(self.device)  # [B, Dfused]
+                vecs_cpu = self.ctx.fused_bank["vecs"]  # CPU
+                idx_cpu = idx.to(vecs_cpu.device)  # index to CPU
+                vt_for_miner = vecs_cpu.index_select(0, idx_cpu).to(self.device, non_blocking=True)
                 vt_for_miner = F.normalize(vt_for_miner.float(), p=2, dim=1)
         if vt_for_miner is None:
             # fallback: residue-based teacher
@@ -766,7 +768,7 @@ class OppTrainer:
                         pos_gid_sets = []
                         for b, loc in enumerate(pos_local):
                             if loc.numel() > 0:
-                                gids = batch["uniq_go_ids"].index_select(0, loc.to(device))
+                                gids = batch["uniq_go_ids"].index_select(0, loc.to(batch["uniq_go_ids"].device))
                                 pos_gid_sets.append(set(map(int, gids.tolist())))
                             else:
                                 pos_gid_sets.append(set())
