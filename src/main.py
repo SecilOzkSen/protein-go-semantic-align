@@ -63,6 +63,12 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"   # çok önemli
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # senkron stacktrace için
+torch.cuda.init()           # context’i erken aç
+torch.cuda.set_device(0)    # cihazı net seç
+print("CUDA check ->", torch.cuda.is_available(), torch.cuda.get_device_name(0))
 
 # ============== Utilities ==============
 
