@@ -274,7 +274,6 @@ def build_stores(args):
       #  seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
-        cache_shards=cache_shards,
         gdrive_cache=gdrive_cache,
         prefer_fp16=args.fp16,
         # HF lazy fetch paramlarını bilinçli olarak kapalı bırakıyoruz
