@@ -1,8 +1,7 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import Optional
 
 from src.models.projection import ProjectionHead
 from src.models.bucketed_watti import BucketedGoWatti
@@ -12,6 +11,10 @@ from src.encoders import BioMedBERTEncoder
 class ProteinGoAligner(nn.Module):
     """
     Two-branch aligner for Protein (residue-level) and GO (text) representations.
+
+    İki kip:
+      1) Pozitif kip:  G: [B, T, d_g]  -> scores: [B, T]  (+ opsiyonel alpha_info)
+      2) Aday kip:     G: [B, K, d_g]  -> scores: [B, K]  (chunk'lı, hafıza dostu)
     """
     def __init__(
         self,
@@ -30,12 +33,30 @@ class ProteinGoAligner(nn.Module):
             raise ValueError("d_g must be provided if go_encoder is None.")
 
         self.pooler = BucketedGoWatti(d_h=d_h, d_g=d_g)
-        self.proj_p = ProjectionHead(d_in=d_h, d_out=d_z)  # protein
-        self.proj_g = ProjectionHead(d_in=d_g, d_out=d_z)  # GO
+        self.proj_p = ProjectionHead(d_in=d_h, d_out=d_z)  # protein side
+        self.proj_g = ProjectionHead(d_in=d_g, d_out=d_z)  # GO text side
 
+    # ---- helpers ----
     def _norm(self, x: torch.Tensor, dim: int) -> torch.Tensor:
-        # daima fp32 normla → sayısal kararlılık
+        # sayısal kararlılık: önce fp32
         return F.normalize(x.float(), p=2, dim=dim)
+
+    def _pool(self, H: torch.Tensor, G: torch.Tensor, mask: torch.Tensor, return_alpha: bool):
+        """
+        BucketedGoWatti çıktılarını sağlamlaştırır:
+        - Z'yi her durumda döndürür
+        - alpha_info varsa dict, yoksa {}
+        """
+        out = self.pooler(H, G, attn_mask=mask, return_alpha=return_alpha)
+        if isinstance(out, tuple):
+            # En azından Z hep ilk eleman
+            Z = out[0]
+            # İkinci eleman dict değilse de, alpha_info'yu boş döndür
+            alpha_info = out[1] if (len(out) >= 2 and isinstance(out[1], dict)) else {}
+        else:
+            Z = out
+            alpha_info = {}
+        return Z, alpha_info
 
     def forward(
         self,
@@ -43,7 +64,7 @@ class ProteinGoAligner(nn.Module):
         G: torch.Tensor,         # [B, T, d_g]  veya  [B, K, d_g]
         mask: torch.Tensor,      # [B, T] bool
         return_alpha: bool = False,
-        cand_chunk_k: int = 256, # aday kipinde K'yi parça parça işle
+        cand_chunk_k: int = 512, # aday kipinde K'yi parça parça işle
     ):
         device = H.device
         B, T, d_h = H.shape
@@ -52,10 +73,9 @@ class ProteinGoAligner(nn.Module):
         # 1) POZİTİF KİP (G.shape[1] == T)
         # --------------------------
         if G.dim() == 3 and G.size(1) == T:
-            # standart yol: tek G dizisi için token skorları
-            Z, alpha_info = self.pooler(H, G, attn_mask=mask, return_alpha=return_alpha)  # [B, T, d_h]
-            Zp = self.proj_p(Z)  # [B, T, d_z]
-            Gz = self.proj_g(G)  # [B, T, d_z]
+            Z, alpha_info = self._pool(H, G, mask, return_alpha=return_alpha)  # [B, T, d_h], dict
+            Zp = self.proj_p(Z)                                               # [B, T, d_z]
+            Gz = self.proj_g(G)                                               # [B, T, d_z]
 
             if self.normalize:
                 Zp = self._norm(Zp, dim=-1)
@@ -63,7 +83,7 @@ class ProteinGoAligner(nn.Module):
 
             # token-başı kosinüs benzerliği → [B, T]
             scores = (Zp * Gz).sum(dim=-1)
-            return (scores, alpha_info) if return_alpha else (scores, {})
+            return (scores, alpha_info) if return_alpha else scores
 
         # --------------------------
         # 2) ADAY KİP (G.shape[1] == K)
@@ -73,18 +93,10 @@ class ProteinGoAligner(nn.Module):
         K = G.size(1)
         d_g = G.size(2)
 
-        # Hafızayı patlatmamak için K'yi chunk'la.
-        # Her chunk için:
-        #   - H ve mask 'k' kez tekrarlanır (B*k, T, *)
-        #   - G_chunk her aday için T boyunca yayınlanır (B*k, T, d_g)
-        #   - pooler + proj + skor hesaplanır
-        #   - token skorları T üzerinde ortalanıp [B, k] elde edilir
         scores_list = []
-        alpha_info_global = {}  # aday kipinde alpha sadece debug için gerekli değil -> boş döneceğiz
-
-        # TF32 / autocast üst düzeyde zaten aktif; burada ek bir şey gerekmiyor.
-
+        # Aday kipinde alpha gerekmiyor; boş döneceğiz.
         k_step = int(max(1, cand_chunk_k))
+
         for s in range(0, K, k_step):
             e = min(K, s + k_step)
             k = e - s  # bu chunk boyu
@@ -98,23 +110,24 @@ class ProteinGoAligner(nn.Module):
             # (B, k, d_g) -> (B, k, T, d_g) -> (B*k, T, d_g)
             G_rep = G_chunk.unsqueeze(2).expand(B, k, T, d_g).reshape(B * k, T, d_g)
 
-            # pooler + proj
-            Z_rep, _ = self.pooler(H_rep, G_rep, attn_mask=mask_rep, return_alpha=False)   # [B*k, T, d_h]
-            Zp = self.proj_p(Z_rep)                                                        # [B*k, T, d_z]
-            Gz = self.proj_g(G_rep)                                                        # [B*k, T, d_z]
+            # pooler + proj (alpha istemiyoruz)
+            Z_rep, _ = self._pool(H_rep, G_rep, mask_rep, return_alpha=False)  # [B*k, T, d_h], {}
+            Zp = self.proj_p(Z_rep)                                            # [B*k, T, d_z]
+            Gz = self.proj_g(G_rep)                                            # [B*k, T, d_z]
 
             if self.normalize:
                 Zp = self._norm(Zp, dim=-1)
                 Gz = self._norm(Gz, dim=-1)
 
-            # aday başına token skorlarını ortala → [B*k]
+            # aday başına token skorlarını ortala → [B*k] -> [B, k]
             s_tok = (Zp * Gz).sum(dim=-1)                  # [B*k, T]
             s_bk = s_tok.mean(dim=-1).reshape(B, k)        # [B, k]
             scores_list.append(s_bk)
 
             # ara tensörleri serbest bırak
             del H_rep, mask_rep, G_rep, Z_rep, Zp, Gz, s_tok, s_bk
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         scores = torch.cat(scores_list, dim=1)  # [B, K]
-        return (scores, alpha_info_global) if return_alpha else (scores, {})
+        return scores  # return_alpha=False olduğu için sadece scores
