@@ -407,7 +407,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         datasets.get("query_ds"),
         batch_size=1024,
         shuffle=False,
-        num_workers=args.workers,
+        num_workers=0,
         pin_memory=True,
         collate_fn=fused_collator)
 
