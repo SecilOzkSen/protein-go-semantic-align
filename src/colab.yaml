@@ -50,6 +50,7 @@ training:
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
   early_stop_patience: 3        # 0 veya negatif => kapalı
   cand_chunk_k: 8
+  pos_chunk_t: 128
 
 optim:
   lr: 0.0003

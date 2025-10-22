@@ -361,7 +361,8 @@ class OppTrainer:
           - else:            scores
         """
         cand_chunk_k = int(getattr(self.cfg, "cand_chunk_k", 16))
-        out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, cand_chunk_k=cand_chunk_k, **kwargs)
+        pos_chunk_t = int(getattr(self.cfg, "pos_chunk_t", 128))
+        out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
 
         if isinstance(out, tuple):
             if len(out) >= 2:

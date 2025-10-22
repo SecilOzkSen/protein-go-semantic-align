@@ -741,7 +741,8 @@ def run_training(args, schedule: TrainSchedule):
         device=str(device),
         lr=args.lr,
         max_epochs=args.epochs,
-        cand_chunk_k=args.cand_chunk_k
+        cand_chunk_k=args.cand_chunk_k,
+        pos_chunk_t=args.pos_chunk_t
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1004,6 +1005,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         monitor_mode=training.get("monitor_mode", "max"),
         early_stop_patience=int(training.get("early_stop_patience", 0)),
         cand_chunk_k=int(training.get("cand_chunk_k", 8)),
+        pos_chunk_t=int(training.get("pos_chunk_t", 128)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

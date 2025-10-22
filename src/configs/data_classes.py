@@ -254,3 +254,4 @@ class TrainerConfig:
     lr: float = 2e-4
     max_epochs: int = 20,
     cand_chunk_k: int = 8
+    pos_chunk_t: int = 128
