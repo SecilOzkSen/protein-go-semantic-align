@@ -350,15 +350,28 @@ class OppTrainer:
             pd.mul_(m).add_(ps, alpha=1 - m)
 
     # --------- Scoring (tensor path) ---------
-    def forward_scores(self, H, G, pad_mask, **kwargs):
-        return_alpha = kwargs.pop("return_alpha", False)
-        return self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, **kwargs)
+    def forward_scores(self, H, G, pad_mask, return_alpha: bool = False, **kwargs):
+        out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, **kwargs)
 
+        # Model kimi zaman sadece scores, kimi zaman (scores, alpha_info),
+        # kimi zaman (scores, alpha_info, spans, ...) döndürebilir.
+        if isinstance(out, tuple):
+            if len(out) >= 2:
+                scores, alpha_info = out[0], out[1]
+            elif len(out) == 1:
+                scores, alpha_info = out[0], {}
+            else:
+                # güvenlik: hiç bir şey gelmediyse
+                scores, alpha_info = out, {}
+        else:
+            scores, alpha_info = out, {}
+
+        if return_alpha:
+            return scores, (alpha_info or {})
+        else:
+            return scores
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
-        import time
-        import torch
-        import torch.nn.functional as F
         t0 = time.time()
         self.model.train()
         device = self.device
@@ -589,7 +602,13 @@ class OppTrainer:
 
         if self.to_f32 is not None:
             G_pos = self.to_f32(G_pos)
-        scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=use_attr)
+
+        # --- Positives-only for attribution / DAG ---
+        if use_attr:
+            scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=True)
+        else:
+            scores_pos = self.forward_scores(H, G_pos, pad_mask, return_alpha=False)
+            alpha_info = {}
 
         if alpha_info is not None and "alpha_full" in alpha_info:
             alpha = alpha_info["alpha_full"]
@@ -745,8 +764,6 @@ class OppTrainer:
         }
     @torch.no_grad()
     def eval_epoch(self, loader, epoch_idx: int):
-        import torch
-        from typing import List
         self.model.eval()
         device = self.device
         logs = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
@@ -847,7 +864,12 @@ class OppTrainer:
                         G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
 
                 # eval’de attribution'ı sadece forward_scores içinde hesaplat (grad yok)
-                scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask)
+                use_attr_eval = (self.attr.lambda_attr > 0.0)
+                if use_attr_eval:
+                    scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=True)
+                else:
+                    scores_pos = self.forward_scores(H, G_pos, pad_mask, return_alpha=False)
+                    alpha_info = {}
 
                 if alpha_info is not None and ("alpha_full" in alpha_info):
                     alpha = alpha_info["alpha_full"]
