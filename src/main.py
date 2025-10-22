@@ -249,11 +249,8 @@ def build_stores(args):
 
     # 3) embed dirs
     embed_dir_res = getattr(args, "embed_dir_res", None) or hub_local_dir
-    Path(embed_dir_res).mkdir(parents=True, exist_ok=True)
 
     embed_dir_fused = getattr(args, "embed_dir_fused", None)  # None olabilir
-    if embed_dir_fused:
-        Path(embed_dir_fused).mkdir(parents=True, exist_ok=True)
 
     # 4) toggles
     gdrive_cache = False
