@@ -240,7 +240,7 @@ def build_stores(args):
     logger.info("Building residue+fused stores (lazy, no snapshot)...")
 
     # 1) seq len lookup
-    seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
+ #   seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
 
     # 2) HF cache kökü (opsiyonel; şu an lazy fetch kapalı)
     hub_local_dir = getattr(args, "hub_local_dir", None) or "/content/hf_cache"
@@ -271,7 +271,7 @@ def build_stores(args):
     # 5) Build residue
     res_store = ESMResidueStore(
         embed_dir=embed_dir_res,
-        seq_len_lookup=seq_len_lookup,
+      #  seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
         cache_shards=cache_shards,
