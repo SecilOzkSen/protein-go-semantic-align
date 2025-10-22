@@ -266,7 +266,6 @@ class ESMResidueStore(_BaseStore):
         res_data = {}
         for p in res_indices:
             shard_id = int(p.stem.split("_")[-1])
-            print(shard_id)
             data_path = p.with_name(f"res_esm1b_{shard_id:05d}.data.npy")
             res_data[shard_id] = data_path
         print(res_data)

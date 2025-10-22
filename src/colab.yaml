@@ -109,8 +109,8 @@ stores:
   val_ids_path: /content/data/training_ready/proteins/protein_val_ids.txt
 
   embed_dir: /content/drive/MyDrive/esm_output #ESM3b
-  embed_dir_res: /content/drive/MyDrive/esm_1b_output_fused_res
-  embed_dir_fused: /content/drive/MyDrive/esm_1b_output_fused
+  embed_dir_res: /content/drive/MyDrive/esm1b_output_fused_res
+  embed_dir_fused: /content/drive/MyDrive/esm1b_output_fused
   hub_local_dir: /content/drive/MyDrive/.cache/huggingface/hub
 
   seq_len_lookup_dir: /content/data/training_ready/proteins/seq_len_lookup.pkl
