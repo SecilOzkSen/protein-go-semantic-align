@@ -29,7 +29,7 @@ class VectorResources:
         # keep GO bank on CPU, L2-normalized
         self.go_embs = F.normalize(go_embs.float().cpu(), p=2, dim=1) if go_embs.numel() > 0 else go_embs
         self.device = device
-        self.queue = MoCoQueue(dim=self.align_dim, device=self.device)
+        self.queue = MoCoQueue(dim=self.align_dim, device=self.device, K=65536)
         # optional MoCo queue
 
 
