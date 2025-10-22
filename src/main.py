@@ -6,9 +6,6 @@ import math
 import yaml
 import torch
 import random
-import logging
-import numpy as np
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, Any, List
@@ -17,13 +14,18 @@ from datetime import datetime
 import glob
 import types
 import signal, traceback
-import itertools
+from pathlib import Path
+import logging
+import json
+import numpy as np
+import torch
+import torch.nn.functional as F
 
 import wandb
 
-from src.datasets import ESMResidueStore, GoTextStore, VectorResources
-from src.datasets.protein_dataset import ProteinEmbDataset
-from src.training.collate import ContrastiveEmbCollator
+from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore, VectorResources
+from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
+from src.training.collate import ContrastiveEmbCollator, fused_collator
 from src.training.trainer import OppTrainer
 from src.configs.data_classes import (
     FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
@@ -112,6 +114,20 @@ def save_checkpoint(output_dir: Path, tag: str, trainer, args, epoch: int, step:
         "epoch": epoch,
         "global_step": step,
     }
+    # --- MoCoQueue state (if present) ---
+
+    if hasattr(trainer, "queue_miner") and trainer.queue_miner is not None:
+        try:
+            q = trainer.queue_miner
+            state["queue"] = {
+                        "queue": q.queue.detach().cpu(),  # [dim,K] float32
+                        "ptr": q.ptr.detach().cpu(),
+                        "filled": q.filled.detach().cpu(),
+                        "dim": int(q.queue.size(0)),
+                        "K": int(q.queue.size(1)),
+            }
+        except Exception as e:
+                logging.getLogger("ckpt").warning("Queue state export failed: %r", e)
     if hasattr(trainer, "scaler") and trainer.scaler is not None:
         state["scaler"] = trainer.scaler.state_dict()
     if hasattr(trainer, "sched") and trainer.sched is not None:
@@ -138,19 +154,13 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int = 3):
 
 
 # ============== Builders ==============
-from pathlib import Path
-import logging
-import json
-import numpy as np
-import torch
-import torch.nn.functional as F
+
 
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
     p = Path(go_cache_path)
     logger.info("Loading GO cache: %s", str(p))
 
-    # ---- 1) MEMMAP / NPY yolu ----
     memmap_path = None
     if p.suffix.lower() == ".npy" and p.exists():
         memmap_path = p
@@ -159,7 +169,6 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
         if cand.exists():
             memmap_path = cand
         else:
-            # Common fallback: go_text_embeddings.npy aynı klasörde olabilir
             alt = p.parent / "go_text_embeddings.npy"
             if alt.exists():
                 memmap_path = alt
@@ -208,8 +217,6 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
         }
         return GoLookupCache(blob)
 
-    # ---- 2) Torch (.pt/.pth) yolu ----
-    # PyTorch 2.6: weights_only default True → pickle içeren dict'ler için False gerekli
     blob = torch.load(str(p), map_location="cpu", weights_only=False)
     if isinstance(blob, dict) and "embs" in blob and isinstance(blob["embs"], torch.Tensor):
         blob["embs"] = F.normalize(blob["embs"].float(), p=2, dim=1)
@@ -217,80 +224,95 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
 
 
 
-def build_store(args) -> ESMResidueStore:
+def build_stores(args):
     """
-    Build an ESMResidueStore that:
-      - DOES NOT snapshot the whole repo
-      - Lazily downloads shards from HF Hub into a bounded local cache
-      - Optionally uses Google Drive LRU caching if embed_dir points to Drive
-    Expected args:
-      - seq_len_lookup: path to pickle
-      - embed_dir: base dir for relative manifest paths (optional; default=hub_local_dir)
-      - max_len, overlap, no_cache_shards (bool flag)
-      - hub_repo_id (optional), hub_revision (optional), hub_local_dir (optional), hub_symlinks (bool)
+    Returns:
+      res_store:  ESMResidueStore  ([L,D])
+      fused_store: ESMFusedStore or None  ([D])
+    CLI/args beklenen alanlar:
+      - args.seq_len_lookup (pickle path)
+      - args.embed_dir_res (residue kökü)   [zorunlu]
+      - args.embed_dir_fused (fused kökü)   [opsiyonel]
+      - args.fp16 (bool), args.max_len, args.overlap
     """
-    logger = logging.getLogger("build_store")
-    logger.info("Building store (lazy HF + optional Drive cache)...")
+    import logging, os
+    logger = logging.getLogger("build_stores")
+    logger.info("Building residue+fused stores (lazy, no snapshot)...")
 
-    # 1) Load sequence length lookup
+    # 1) seq len lookup
     seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
 
-    # 2) HF lazy cache root
-    hub_repo_id = getattr(args, "hub_repo_id", None) or "secilozksen/esm-embeddings"
-    hub_revision = getattr(args, "hub_revision", None) or "main"
+    # 2) HF cache kökü (opsiyonel; şu an lazy fetch kapalı)
     hub_local_dir = getattr(args, "hub_local_dir", None) or "/content/hf_cache"
     Path(hub_local_dir).mkdir(parents=True, exist_ok=True)
-
-    # Route HF cache to a controlled location to avoid filling /root
     os.environ.setdefault("HF_HOME", str(hub_local_dir))
 
-    # 3) embed_dir selection
-    # If user didn't pass embed_dir, make it the same as hub_local_dir (so relative manifest resolves here)
-    embed_dir = getattr(args, "embed_dir", None) or hub_local_dir
-    Path(embed_dir).mkdir(parents=True, exist_ok=True)
+    # 3) embed dirs
+    embed_dir_res = getattr(args, "embed_dir_res", None) or hub_local_dir
+    Path(embed_dir_res).mkdir(parents=True, exist_ok=True)
 
-    # 4) Toggle Drive cache based on embed_dir
-    # If embed_dir points to Google Drive, keep old Drive LRU behavior; otherwise disable.
+    embed_dir_fused = getattr(args, "embed_dir_fused", None)  # None olabilir
+    if embed_dir_fused:
+        Path(embed_dir_fused).mkdir(parents=True, exist_ok=True)
+
+    # 4) toggles
     gdrive_cache = False
-
-    # 5) Cache toggles
     cache_shards = getattr(args, "no_cache_shards", False)
 
-    # 6) Log summary
     logger.info(
         "Store config:\n"
-        f"  hub_repo_id = {hub_repo_id}\n"
-        f"  hub_revision = {hub_revision}\n"
-        f"  hub_local_dir = {hub_local_dir}\n"
-        f"  embed_dir = {embed_dir}\n"
-        f"  gdrive_cache = {gdrive_cache}\n"
-        f"  cache_shards = {cache_shards}\n"
-        f"  prefer_fp16 = {args.fp16}"
+        f"  embed_dir_res   = {embed_dir_res}\n"
+        f"  embed_dir_fused = {embed_dir_fused}\n"
+        f"  cache_shards    = {cache_shards}\n"
+        f"  prefer_fp16     = {args.fp16}\n"
+        f"  max_len/overlap = {getattr(args,'max_len',None)}/{getattr(args,'overlap',None)}"
     )
 
-    # 7) Build store (NO snapshot_download)
-    store = ESMResidueStore(
-        embed_dir=embed_dir,
+    # 5) Build residue
+    res_store = ESMResidueStore(
+        embed_dir=embed_dir_res,
         seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
         cache_shards=cache_shards,
-        gdrive_cache=gdrive_cache,          # Drive yolundaysan True; değilse False
+        gdrive_cache=gdrive_cache,
         prefer_fp16=args.fp16,
-        # HF lazy fetch params
-    #    hub_repo_id=hub_repo_id,
-    #    hub_revision=hub_revision,
-    #    hub_repo_type="dataset",
-    #    hub_local_dir=hub_local_dir,
-    #    hub_symlinks=getattr(args, "hub_symlinks", True),
-    #    hub_cache_max_gb=90.0,
-    #    hub_cache_reserve_gb=12.0,
+        # HF lazy fetch paramlarını bilinçli olarak kapalı bırakıyoruz
     )
 
-    logger.info("Store ready (lazy HF enabled; snapshot disabled).")
-    return store
+    # 6) Build fused (opsiyonel)
+    fused_store = None
+    if embed_dir_fused:
+        fused_store = ESMFusedStore(
+            embed_dir=embed_dir_fused,
+            gdrive_cache=gdrive_cache,
+            prefer_fp16=args.fp16,
+        )
 
-def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dict[str, torch.utils.data.Dataset]:
+    logger.info("Stores ready.")
+    return res_store, fused_store
+
+def build_val_dataset(
+    val_pids,
+    pid2pos_val,
+    go_cache,
+    fewzero_cfg,
+    dag_parents,
+    residue_store: ESMResidueStore,
+):
+    ds_val = ProteinEmbDataset(
+        protein_ids=val_pids,
+        pid2pos=pid2pos_val,
+        go_cache=go_cache,
+        fewzero=fewzero_cfg,
+        dag_parents=dag_parents,
+        store=residue_store,
+        fused_store=None,
+        include_fused=False,   # validation için fused gereksiz
+    )
+    return ds_val
+
+def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, go_cache: GoLookupCache) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
@@ -305,26 +327,27 @@ def build_datasets(args, store: ESMResidueStore, go_cache: GoLookupCache) -> Dic
                        fs_target_ratio=args.fs_target_ratio)
 
     dag_parents = load_go_parents()
-    ancestor_stoplist = load_raw_txt(GO_ANCESTOR_STOPLIST)
+    #ancestor_stoplist = load_raw_txt(GO_ANCESTOR_STOPLIST)
 
-    ds_kwargs = dict(
+    train_ds = ProteinEmbDataset(
+        protein_ids=train_ids,
         pid2pos=pid2pos,
         go_cache=go_cache,
         fewzero=fz,
-        dag_parents=dag_parents if args.use_dag_in_ds else None,
-        min_pos_for_expand=args.min_pos_for_expand,
-        max_ancestor_add=args.max_ancestor_add,
-        max_hops=args.max_hops,
-        ancestor_gamma=args.ancestor_gamma,
-        ancestor_stoplist=ancestor_stoplist,
-        store=store,
+        dag_parents=dag_parents,
+        store=res_store,
+        fused_store=None,  # eğitimde gerekmez
+        include_fused=False
     )
 
-    train_ds = ProteinEmbDataset(protein_ids=train_ids, **ds_kwargs)
-    val_ds = ProteinEmbDataset(protein_ids=val_ids, **ds_kwargs) if val_ids else None
+    val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_cache=go_cache, fewzero_cfg=fz,
+                              dag_parents=dag_parents, residue_store=res_store)
+    if fused_store is None:
+        raise RuntimeError("Query search için fused_store zorunlu.")
+    query_ds = ProteinFusedQueryDataset(train_ids+val_ids, fused_store=fused_store)
 
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
-    return {"train": train_ds, "val": val_ds}
+    return {"train": train_ds, "val": val_ds, "query_ds": query_ds}
 
 
 def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore):
@@ -346,7 +369,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
 
     collate = ContrastiveEmbCollator(
         go_lookup=go_cache,
-        go_text_store=go_text_store,
+        go_text_store=go_text_store, #tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
         neg_k=args.neg_k
@@ -364,6 +387,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
     #    prefetch_factor=2,
         collate_fn=collate,
     )
+    b = next(iter(train_loader))
+    assert "protein_ids" in b and isinstance(b["protein_ids"], list) and len(b["protein_ids"]) == b["prot_emb_pad"].shape[0]
     val_loader = None
     if datasets.get("val") is not None:
         val_loader = DataLoader(
@@ -378,8 +403,20 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             worker_init_fn=_worker_init,
             drop_last=False
         )
+
+    if datasets.get("query_ds") is None:
+        raise RuntimeError("Query dataset is required for retrieval/indexing.")
+
+    query_loader = DataLoader(
+        datasets.get("query_ds"),
+        batch_size=1024,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+        collate_fn=fused_collator)
+
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
-    return train_loader, val_loader, collate
+    return train_loader, val_loader, query_loader, collate
 
 
 def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
@@ -415,6 +452,44 @@ def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
         warmup=warmup,
     )
     return cfg
+
+# === Add near the other utils in main.py ===
+def materialize_fused_bank(query_loader, *, device: str = "cpu"):
+    """
+    Consume query_loader (ProteinFusedQueryDataset) once and build:
+      - ids:   List[str]               length N
+      - vecs:  torch.FloatTensor [N,D] on CPU (or device)
+      - id2row: Dict[str, int]
+    """
+    import logging
+    logger = logging.getLogger("fused_bank")
+    ids_all: List[str] = []
+    vecs_all: List[torch.Tensor] = []
+
+    with torch.no_grad():
+        for batch in query_loader:
+            # fused_collator -> {"protein_ids": [...], "prot_fused": [B,D]}
+            ids = batch["protein_ids"]
+            Z = batch["prot_fused"]  # [B,D] float32
+            if device and device != "cpu":
+                Z = Z.to(device, non_blocking=True)
+            ids_all.extend(ids)
+            vecs_all.append(Z.cpu() if device == "cpu" else Z)
+
+    if not vecs_all:
+        raise RuntimeError("query_loader yielded no fused vectors.")
+
+    vecs = torch.cat(vecs_all, dim=0).contiguous()  # [N,D]
+    if device != "cpu":  # keep one canonical CPU copy for indexing by row
+        vecs_cpu = vecs.detach().cpu()
+    else:
+        vecs_cpu = vecs
+    if len(ids_all) != vecs_cpu.size(0):
+        raise RuntimeError(f"IDs and vectors length mismatch: {len(ids_all)} vs {vecs_cpu.size(0)}")
+
+    id2row = {pid: i for i, pid in enumerate(ids_all)}
+    logger.info("Fused bank built: N=%d, D=%d", vecs_cpu.size(0), vecs_cpu.size(1))
+    return {"ids": ids_all, "vecs": vecs_cpu, "id2row": id2row}
 
 
 def wandb_preview_curriculum(wandb_mod, args, total_steps: int):
@@ -509,8 +584,8 @@ def run_training(args, schedule: TrainSchedule):
     for ph in range(total_phases):
         go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
 
-    store = build_store(args)
-    datasets = build_datasets(args, store, go_cache)
+    res_store, fused_store = build_stores(args)
+    datasets = build_datasets(args, res_store, fused_store, go_cache)
     n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
     # Text encoder (GO)
@@ -530,9 +605,9 @@ def run_training(args, schedule: TrainSchedule):
     # GoTextStore + dataloaders
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
-    train_loader, val_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
+    train_loader, val_loader, query_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
-    # Memory bank (unified – GoLookupCache’i aynen kullan)
+    # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
     memory_bank = go_cache if args.use_go_memory_bank else None
     if args.use_go_memory_bank:
         logger.info("Using unified GoLookupCache as MemoryBank (GPU fp32, no copies).")
@@ -558,19 +633,19 @@ def run_training(args, schedule: TrainSchedule):
         device=device,
         schedule=schedule,
         go_cache=go_cache,
-        faiss_index=None,              # FAISS kaldırıldı
-        vres=vres,
+        faiss_index=None,
+        vres=vres, #For similarity searches etc.
         memory_bank=memory_bank,
         current_phase=None,
         last_refresh_epoch=None,
         last_refresh_reason=None,
-        batch_builder=None,            # FAISS akışı yok
+        batch_builder=None,
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
         scheduler=scheduler,
         go_text_store=go_text_store,
-        use_queue_miner=True,
+        use_queue_miner=bool(args.use_queue_miner),
         fp16_enabled=args.fp16
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
@@ -582,8 +657,11 @@ def run_training(args, schedule: TrainSchedule):
         gospec_tau=0.02,
         gospec_topk=32,
     )
+    fused_bank = materialize_fused_bank(query_loader, device=str(device))
+    training_context.fused_bank = fused_bank
 
-    training_context.vres.set_backends(None, training_context.go_cache.embs)
+    assert isinstance(fused_bank, dict) and {"ids", "vecs", "id2row"} <= fused_bank.keys()
+    assert len(fused_bank["ids"]) == fused_bank["vecs"].shape[0] > 0, "fused bank boş/eksik"
 
     def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
         new_phase = training_context.schedule.phase_for_epoch(current_epoch)
@@ -614,8 +692,7 @@ def run_training(args, schedule: TrainSchedule):
 
             # Dataloader’ları yeniden kur
             nonlocal train_loader, val_loader, collate
-            train_loader, val_loader, collate = build_dataloaders(
-                datasets, args, training_context.go_cache, training_context.go_text_store)
+            train_loader, val_loader, collate = build_dataloaders(datasets=datasets, args=args, go_cache=training_context.go_cache, go_text_store=training_context.go_text_store)
 
             training_context.current_phase = new_phase
             training_context.last_refresh_epoch = current_epoch
@@ -623,23 +700,6 @@ def run_training(args, schedule: TrainSchedule):
 
     # expose refresher
     training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources
-
-    # W&B
-  #  wandb_run = None
-  #  wandb_logger = None
-  #  if args.wandb:
-  #      os.environ.setdefault("WANDB_MODE", args.wandb_mode)
-  #      cfg = build_wandb_config(args, schedule)
-  #      wandb_run = wandb.init(project=args.wandb_project,
-  #                             entity=args.wandb_entity or None,
-  #                             name=args.wandb_run_name or None,
-    #                           config=cfg,
-    #                           dir=args.output_dir)
-    #    wandb.define_metric("global_step")
-    #    wandb.define_metric("*", step_metric="global_step")
-        # İstersen aç:
-        # wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
-        # wandb_dataset_quickstats(wandb, datasets["train"], sample_n=512)
 
     # infer dims
     with torch.no_grad():
@@ -667,6 +727,32 @@ def run_training(args, schedule: TrainSchedule):
         tau_distill=getattr(args, "tau_distill", 1.5),
     )
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
+    if bool(args.use_queue_miner):
+        trainer._maybe_init_queue_miner(d_g)
+    # Resume
+    if getattr(args, "resume", None):
+        ckpt_path = str(args.resume)
+        try:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            trainer.model.load_state_dict(ckpt["model"], strict=True)
+            try:
+                trainer.opt.load_state_dict(ckpt["optimizer"])
+            except Exception as e:
+                logging.getLogger("ckpt").warning("Optimizer state load failed: %r", e)
+            if "queue" in ckpt and hasattr(trainer, "queue_miner") and trainer.queue_miner is not None:
+                qstate = ckpt["queue"]
+                q = trainer.queue_miner
+                if int(q.queue.size(0)) == int(qstate.get("dim", q.queue.size(0))) and int(q.queue.size(1)) == int(qstate.get("K", q.queue.size(1))):
+                    with torch.no_grad():
+                        q.queue.copy_(qstate["queue"].to(q.queue.device))
+                        q.ptr.copy_(qstate["ptr"].to(q.ptr.device))
+                        q.filled.copy_(qstate["filled"].to(q.filled.device))
+                else:
+                    logging.getLogger("ckpt").warning("Queue shape mismatch; skipping queue restore.")
+
+                logging.getLogger("ckpt").info("Resumed from %s", ckpt_path)
+        except Exception as e:
+            logging.getLogger("ckpt").warning("Queue state load failed: %r", e)
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
@@ -677,13 +763,6 @@ def run_training(args, schedule: TrainSchedule):
     no_improve_epochs = 0
     EPS = 1e-6
     global_step = 0
-
-    # (opsiyonel) dataloader hız ping
-    t0 = time.time()
-    for i, b in enumerate(itertools.islice(train_loader, 5)):
-        dt = time.time() - t0
-        print(f"[DL] batch {i} hazırlandı: {dt:.2f}s")
-        t0 = time.time()
 
     for epoch in range(args.epochs):
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
@@ -856,6 +935,8 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),
         val_ids=Path(stores.get("val_ids_path", PROTEIN_VAL_IDS)),
         embed_dir=Path(stores.get("embed_dir", None) or stores.get("hub_local_dir", None)),
+        embed_dir_res=Path(stores.get("embed_dir_res", None)),
+        embed_dir_fused=Path(stores.get("embed_dir_fused", None)),
         seq_len_lookup=Path(stores.get("seq_len_lookup_dir", P_SEQ_LEN_LOOKUP)),
         pro_manifest=Path(stores.get("protein_manifest_file", GOOGLE_DRIVE_MANIFEST_CACHE)),
         go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,

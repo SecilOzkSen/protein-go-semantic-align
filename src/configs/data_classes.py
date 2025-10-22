@@ -219,6 +219,7 @@ class TrainingContext:
     logging: LoggingConfig = None
     use_queue_miner: bool = True
     attribute_loss_enabled = False
+    fused_bank: Any = None
 
 
     def to_dict(self):
