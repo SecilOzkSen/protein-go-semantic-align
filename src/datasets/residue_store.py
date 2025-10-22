@@ -263,6 +263,7 @@ class ESMResidueStore(_BaseStore):
         res_indices = sorted(root.glob("res_esm1b_*.index.tsv"))
         res_data = {int(p.stem.split("_")[-1]): root / f"res_esm1b_{int(p.stem.split('_')[-1]):05d}.data.npy"
                     for p in res_indices}
+        print(res_data)
         if res_indices and all(p.exists() for p in res_data.values()):
             self._backend = "NEW_RESIDX"
             for idx_path in res_indices:
