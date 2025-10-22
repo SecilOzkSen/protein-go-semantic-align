@@ -258,6 +258,7 @@ class ESMResidueStore(_BaseStore):
 
     def _detect_and_build(self):
         root = Path(self.embed_dir)
+        print(self.embed_dir)
 
         # --- NEW FORMAT: res_esm1b_*.index.tsv + .data.npy
         res_indices = sorted(root.glob("res_esm1b_*.index.tsv"))
