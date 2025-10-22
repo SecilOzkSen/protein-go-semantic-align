@@ -262,8 +262,11 @@ class ESMResidueStore(_BaseStore):
 
         # --- NEW FORMAT: res_esm1b_*.index.tsv + .data.npy
         res_indices = sorted(root.glob("res_esm1b_*.index.tsv"))
-        res_data = {int(p.stem.split("_")[-1]): root / f"res_esm1b_{int(p.stem.split('_')[-1]):05d}.data.npy"
-                    for p in res_indices}
+        res_data = {}
+        for p in res_indices:
+            shard_id = int(p.stem.split("_")[-1])
+            data_path = p.with_name(f"res_esm1b_{shard_id:05d}.data.npy")
+            res_data[shard_id] = data_path
         print(res_data)
         if res_indices and all(p.exists() for p in res_data.values()):
             self._backend = "NEW_RESIDX"
