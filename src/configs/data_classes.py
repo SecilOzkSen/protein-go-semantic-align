@@ -252,4 +252,5 @@ class TrainerConfig:
     d_z: int = 512
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
-    max_epochs: int = 20
+    max_epochs: int = 20,
+    cand_chunk_k: int = 8

@@ -360,7 +360,8 @@ class OppTrainer:
           - if return_alpha: (scores, alpha_info_dict)
           - else:            scores
         """
-        out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, **kwargs)
+        cand_chunk_k = int(getattr(self.cfg, "cand_chunk_k", 16))
+        out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, cand_chunk_k=cand_chunk_k, **kwargs)
 
         if isinstance(out, tuple):
             if len(out) >= 2:

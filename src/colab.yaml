@@ -49,6 +49,7 @@ training:
   monitor_metric: "cafa_fmax"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
   early_stop_patience: 3        # 0 veya negatif => kapalı
+  cand_chunk_k: 8
 
 optim:
   lr: 0.0003

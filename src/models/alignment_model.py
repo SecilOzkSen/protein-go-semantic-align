@@ -59,48 +59,40 @@ class ProteinGoAligner(nn.Module):
         return Z, alpha_info
 
     def forward(
-        self,
-        H: torch.Tensor,         # [B, T, d_h]
-        G: torch.Tensor,         # [B, T, d_g]  veya  [B, K, d_g]
-        mask: torch.Tensor,      # [B, T] bool
-        return_alpha: bool = False,
-        cand_chunk_k: int = 512, # aday kipinde K'yi parça parça işle
+            self,
+            H: torch.Tensor,  # [B, T, d_h]
+            G: torch.Tensor,  # [B, T, d_g]  veya  [B, K, d_g]
+            mask: torch.Tensor,  # [B, T] bool
+            return_alpha: bool = False,
+            cand_chunk_k: int = 16,  # <<< daha küçük, OOM güvenli default
     ):
         device = H.device
         B, T, d_h = H.shape
 
-        # --------------------------
-        # 1) POZİTİF KİP (G.shape[1] == T)
-        # --------------------------
+        # ---- Pozitif kip: G ikinci boyutu T ise ----
         if G.dim() == 3 and G.size(1) == T:
             Z, alpha_info = self._pool(H, G, mask, return_alpha=return_alpha)  # [B, T, d_h], dict
-            Zp = self.proj_p(Z)                                               # [B, T, d_z]
-            Gz = self.proj_g(G)                                               # [B, T, d_z]
-
+            Zp = self.proj_p(Z)  # [B, T, d_z]
+            Gz = self.proj_g(G)  # [B, T, d_z]
             if self.normalize:
                 Zp = self._norm(Zp, dim=-1)
                 Gz = self._norm(Gz, dim=-1)
-
-            # token-başı kosinüs benzerliği → [B, T]
-            scores = (Zp * Gz).sum(dim=-1)
+            scores = (Zp * Gz).sum(dim=-1)  # [B, T]
             return (scores, alpha_info) if return_alpha else scores
 
-        # --------------------------
-        # 2) ADAY KİP (G.shape[1] == K)
-        # --------------------------
+        # ---- Aday kip: G ikinci boyutu K ise ----
         if G.dim() != 3:
             raise ValueError("G must be 3D: [B, T, d_g] or [B, K, d_g].")
-        K = G.size(1)
-        d_g = G.size(2)
+
+        K = int(G.size(1))
+        d_g = int(G.size(2))
+        k_step = max(1, int(cand_chunk_k))  # sağlamlaştır
 
         scores_list = []
         # Aday kipinde alpha gerekmiyor; boş döneceğiz.
-        k_step = int(max(1, cand_chunk_k))
-
         for s in range(0, K, k_step):
             e = min(K, s + k_step)
-            k = e - s  # bu chunk boyu
-
+            k = e - s
             G_chunk = G[:, s:e, :]  # [B, k, d_g]
 
             # (B, T, d_h) -> (B, k, T, d_h) -> (B*k, T, d_h)
@@ -110,24 +102,22 @@ class ProteinGoAligner(nn.Module):
             # (B, k, d_g) -> (B, k, T, d_g) -> (B*k, T, d_g)
             G_rep = G_chunk.unsqueeze(2).expand(B, k, T, d_g).reshape(B * k, T, d_g)
 
-            # pooler + proj (alpha istemiyoruz)
-            Z_rep, _ = self._pool(H_rep, G_rep, mask_rep, return_alpha=False)  # [B*k, T, d_h], {}
-            Zp = self.proj_p(Z_rep)                                            # [B*k, T, d_z]
-            Gz = self.proj_g(G_rep)                                            # [B*k, T, d_z]
-
+            # pool + proj (alpha yok)
+            Z_rep, _ = self._pool(H_rep, G_rep, mask_rep, return_alpha=False)  # [B*k, T, d_h]
+            Zp = self.proj_p(Z_rep)  # [B*k, T, d_z]
+            Gz = self.proj_g(G_rep)  # [B*k, T, d_z]
             if self.normalize:
                 Zp = self._norm(Zp, dim=-1)
                 Gz = self._norm(Gz, dim=-1)
 
-            # aday başına token skorlarını ortala → [B*k] -> [B, k]
-            s_tok = (Zp * Gz).sum(dim=-1)                  # [B*k, T]
-            s_bk = s_tok.mean(dim=-1).reshape(B, k)        # [B, k]
+            s_tok = (Zp * Gz).sum(dim=-1)  # [B*k, T]
+            s_bk = s_tok.mean(dim=-1).reshape(B, k)  # [B, k]
             scores_list.append(s_bk)
 
-            # ara tensörleri serbest bırak
+            # agresif temizlik
             del H_rep, mask_rep, G_rep, Z_rep, Zp, Gz, s_tok, s_bk
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
         scores = torch.cat(scores_list, dim=1)  # [B, K]
-        return scores  # return_alpha=False olduğu için sadece scores
+        return scores
