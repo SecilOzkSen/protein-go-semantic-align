@@ -1010,7 +1010,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         cand_chunk_k=int(training.get("cand_chunk_k", 8)),
         pos_chunk_t=int(training.get("pos_chunk_t", 128)),
         k_hard_queue=int(training.get("k_hard_queue", 128)),
-        queue_K=int(training.get("queue_K"), 65536),
+        queue_K=int(training.get("queue_K", 65536)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
