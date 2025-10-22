@@ -27,7 +27,7 @@ caches:
 
 training:
   epochs: 5
-  batch_size: 4
+  batch_size: 1
   eval_batch_size: 4
 
   num_workers: 8
