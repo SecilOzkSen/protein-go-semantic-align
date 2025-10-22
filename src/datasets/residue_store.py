@@ -24,12 +24,25 @@ from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 import numpy as np
 import torch
+import re
 
 # -------- env/path config (senin projenden) --------
 try:
     from src.configs.paths import GOOGLE_DRIVE_MANIFEST_CACHE
 except Exception:
     GOOGLE_DRIVE_MANIFEST_CACHE = None
+
+# ---helpers
+
+def _parse_shard_id_from_index(p):
+    """
+    p: Path('.../res_esm1b_00000.index.tsv') veya '.../res_esm1b_00000.index'
+    -> 0 tabanlı veya 00000 gibi bir sayı döndürür (int)
+    """
+    m = re.search(r"res_esm1b_(\d+)\.index(?:\.tsv)?$", p.name)
+    if not m:
+        raise ValueError(f"Cannot parse shard id from index filename: {p.name}")
+    return int(m.group(1))
 
 # ---------------------------- DiskLRU ----------------------------
 class DiskLRU:
@@ -262,21 +275,28 @@ class ESMResidueStore(_BaseStore):
 
         # --- NEW FORMAT: res_esm1b_*.index.tsv + .data.npy
         res_indices = sorted(root.glob("res_esm1b_*.index.tsv"))
-        print(res_indices)
+        if not res_indices:
+            res_indices = sorted(root.glob("res_esm1b_*.index"))  # bazı ortamlarda .tsv yok
+
         res_data = {}
         for p in res_indices:
-            shard_id = int(p.stem.split("_")[-1])
+            shard_id = _parse_shard_id_from_index(p)  # <-- DÜZELTİLEN KISIM
             data_path = p.with_name(f"res_esm1b_{shard_id:05d}.data.npy")
+            if not data_path.exists():
+                # alt klasörlerde olabilir → kökten ara (opsiyonel güvenlik)
+                cand = list(root.rglob(f"res_esm1b_{shard_id:05d}.data.npy"))
+                if cand:
+                    data_path = cand[0]
             res_data[shard_id] = data_path
-        print(res_data)
+
         if res_indices and all(p.exists() for p in res_data.values()):
             self._backend = "NEW_RESIDX"
             for idx_path in res_indices:
-                sid = int(idx_path.stem.split("_")[-1])
+                sid = _parse_shard_id_from_index(idx_path)  # <-- DÜZELTİLEN KISIM
                 data_path = res_data[sid]
-                arr = np.load(data_path, mmap_mode="r")  # [cap,D] fp16/32
+                arr = np.load(data_path, mmap_mode="r")
                 used = arr.shape[0]
-                meta_path = root / f"res_esm1b_{sid:05d}.meta.json"
+                meta_path = idx_path.with_name(f"res_esm1b_{sid:05d}.meta.json")
                 if meta_path.exists():
                     try:
                         m = json.load(open(meta_path, "r"))
@@ -290,7 +310,7 @@ class ESMResidueStore(_BaseStore):
                         pid, s, e = ln.strip().split("\t")
                         s, e = int(s), int(e)
                         assert 0 <= s < e <= used, f"Index out of bounds in {idx_path}"
-                        self._pid2span[pid] = (len(self._res_shards)-1, s, e)
+                        self._pid2span[pid] = (len(self._res_shards) - 1, s, e)
             return
 
         # --- LEGACY MANIFEST (residue tarafı)
