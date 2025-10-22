@@ -65,6 +65,17 @@ os.environ["MKL_NUM_THREADS"] = "1"
 
 # ============== Utilities ==============
 
+def _collect_fused_ids(fused_dir: str) -> set:
+    fused_dir = Path(fused_dir)
+    have = set()
+    for p in sorted(fused_dir.glob("fused_esm1b_*.ids.txt")):
+        with p.open("r") as fh:
+            for line in fh:
+                pid = line.strip()
+                if pid:
+                    have.add(pid)
+    return have
+
 def _sigint_handler(signum, frame):
     print(f"\n[DBG] Caught SIGINT at {time.strftime('%H:%M:%S')}")
     traceback.print_stack(frame)
@@ -315,6 +326,25 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
     pid2pos = load_raw_json(PID_TO_POSITIVES)
     train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
     val_ids = load_raw_txt(PROTEIN_VAL_IDS)
+
+    fused_dir = str(Path(args.embed_dir_fused))  # senin kullandığın yol
+    have_fused = _collect_fused_ids(fused_dir)
+
+    def _filter_existing(ids):
+        kept = [pid for pid in ids if pid in have_fused]
+        missing = len(ids) - len(kept)
+        return kept, missing
+
+    train_ids_kept, train_missing = _filter_existing(train_ids)
+    val_ids_kept, val_missing = _filter_existing(val_ids)
+
+    if train_missing or val_missing:
+        logging.getLogger("build_datasets").warning(
+            "Fused bank'te olmayan ID'ler elendi: train_missing=%d, val_missing=%d",
+            train_missing, val_missing
+        )
+    train_ids = train_ids_kept
+    val_ids = val_ids_kept
 
     zs = load_go_set(ZERO_SHOT_TERMS_ID_ONLY_JSON)
     fs = load_go_set(FEW_SHOT_IC_TERMS_ID_ONLY_JSON)
