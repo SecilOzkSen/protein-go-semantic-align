@@ -74,6 +74,7 @@ class ProteinGoAligner(nn.Module):
         device = H.device
         B, T, d_h = H.shape
 
+
         # =========================
         #   POZİTİF YOL (G ~ [B,T,*])
         # =========================

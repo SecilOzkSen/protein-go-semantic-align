@@ -429,7 +429,7 @@ class OppTrainer:
                                      G=Gc_flat,
                                      mask=mask_rep,
                                      return_alpha=False,  # adaylarda alpha yok
-                                     cand_chunk_k=None,  # pooler içi K-chunk gerekmez
+                                     cand_chunk_k=0,  # pooler içi K-chunk gerekmez
                                      pos_chunk_t=pos_chunk_t,
                                      **kwargs)
 
