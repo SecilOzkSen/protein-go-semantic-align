@@ -1,149 +1,93 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import nullcontext
 
-class AttnPool1D(nn.Module):
-    """Z: [B, T, Dh] üzerinde T-boyunca öğrenilebilir havuzlama."""
-    def __init__(self, d_in: int, d_hidden: int = 0, dropout: float = 0.0):
-        super().__init__()
-        self.use_mlp = d_hidden > 0
-        if self.use_mlp:
-            self.proj1 = nn.Linear(d_in, d_hidden, bias=True)
-            self.proj2 = nn.Linear(d_hidden, 1, bias=False)
-        else:
-            self.proj = nn.Linear(d_in, 1, bias=False)
-        self.dropout = nn.Dropout(dropout)
+from src.models.pooling import GoSpecificWattiPooling
 
-    def forward(self, Z: torch.Tensor, t_mask: Optional[torch.Tensor] = None):
-        # Z: [B,T,D], t_mask: [B,T] (1=keep, 0=pad)
-        if self.use_mlp:
-            x = torch.tanh(self.proj1(Z))
-            x = self.dropout(x)
-            logits = self.proj2(x).squeeze(-1)  # [B,T]
-        else:
-            logits = self.proj(Z).squeeze(-1)   # [B,T]
-        if t_mask is not None:
-            logits = logits.masked_fill(t_mask == 0, float("-inf"))
-        w = torch.softmax(logits, dim=-1)       # [B,T]
-        pooled = torch.bmm(w.unsqueeze(1), Z).squeeze(1)  # [B,D]
-        return pooled, w
-
-
-class GoSpecificWattiPooling(nn.Module):
+class BucketedGoWatti(nn.Module):
     """
-    GO(token) x Protein(residue) cross-attention:
-      - Projeksiyonlar: Q=Wq*G, K=Wk*H
-      - Logits = Q K^T / sqrt(P), alpha=softmax(logits, L)
-      - Z = alpha H   (B,T,Dh)
-    Bellek için:
-      - T ekseninde q_chunk,
-      - L ekseninde k_chunk ile çalışır; dev [B,T,L] oluşturmaz.
-    Opsiyonel:
-      - reduce: "none" | "mean" | "attn"  (T boyunca)
+    Bucket-aware wrapper:
+      - L <= short_thr: full-length pooling
+      - short_thr < L <= mid_thr: small windows
+      - L > mid_thr: large windows
+    Returns either full-length alpha or windowed alpha metadata depending on path.
     """
-    def __init__(
-        self,
-        d_h: int,
-        d_g: int,
-        d_proj: int = 256,
-        dropout: float = 0.0,
-        k_chunk: int = 2048,             # L boyunca parça
-        reduce: str = "none",            # "none" | "mean" | "attn"
-        attn_t_hidden: int = 0,
-        attn_t_dropout: float = 0.0,
-    ):
+    def __init__(self,
+                 d_h: int,
+                 d_g: int,
+                 short_thr: int = 2048,
+                 mid_thr: int = 8192,
+                 win_small: int = 1024,
+                 stride_small: int = 256,
+                 win_large: int = 2048,
+                 stride_large: int = 512):
         super().__init__()
-        self.Wk = nn.Linear(d_h, d_proj, bias=False)
-        self.Wq = nn.Linear(d_g, d_proj, bias=False)
-        self.scale = (d_proj ** -0.5)
-        self.k_chunk = k_chunk
-        self.reduce = reduce
-        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.core = GoSpecificWattiPooling(d_h=d_h, d_g=d_g, d_proj=256, dropout=0.1)
+        self.short_thr = short_thr
+        self.mid_thr = mid_thr
+        self.win_small, self.stride_small = win_small, stride_small
+        self.win_large, self.stride_large = win_large, stride_large
 
-        self.t_pool = None
-        if self.reduce == "attn":
-            self.t_pool = AttnPool1D(d_in=d_h, d_hidden=attn_t_hidden, dropout=attn_t_dropout)
+        # GO-conditional window aggregator
+        self.win_query = nn.Linear(d_g, d_h, bias=False)
+        self.win_key   = nn.Linear(d_h, d_h, bias=False)
+        self.scale = d_h ** -0.5
 
-    @torch.cuda.amp.autocast(enabled=False)  # dtype’ı dışarıdan (bf16/fp16) kontrol etmek daha güvenli
-    def forward(
-        self,
-        H: torch.Tensor,                           # [B,L,Dh]
-        G: torch.Tensor,                           # [B,T,Dg]
-        mask: Optional[torch.Tensor] = None,       # [B,L] (True=PAD)  <-- BucketedGoWatti ile uyumlu
-        return_alpha: bool = False,
-        q_chunk: Optional[int] = None,             # T boyunca dilim; None -> otomatik makul
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        B, L, Dh = H.shape
-        T = G.shape[1]
-        device = H.device
+    def _window_spans(self, L: int, win: int, stride: int):
+        s = 0
+        while s < L:
+            e = min(s + win, L)
+            yield (s, e)
+            if e == L:
+                break
+            s += stride
 
-        # Projeksiyonlar her zaman fp32'de; dışarıda autocast ediyorsan karışmasın
-        K = self.Wk(H)              # [B,L,P]
-        Q = self.Wq(G)              # [B,T,P]
-
-        # mask: True=PAD --> -inf atacağız
-        key_mask = None
-        if mask is not None:
-            if mask.dtype != torch.bool:
-                mask = mask.bool()
-            key_mask = mask.unsqueeze(1)          # [B,1,L]
-
-        # T boyunca dilim büyüklüğü
-        t_step = q_chunk or max(1, min(T, 1024))
-
-        Z_parts = []                 # her t-diliminin Z'si (B,t,Dh)
-        alpha_parts = [] if return_alpha else None
-
-        for ts in range(0, T, t_step):
-            te = min(T, ts + t_step)
-            Qc = Q[:, ts:te, :]                  # [B,t,P]
-
-            # --- L boyunca parça parça logits inşa et ---
-            logits_chunks = []
-            for ls in range(0, L, self.k_chunk):
-                le = min(L, ls + self.k_chunk)
-                Kc = K[:, ls:le, :]              # [B,ℓ,P]
-                # [B,t,ℓ] = [B,t,P] @ [B,P,ℓ]
-                lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale
-                if key_mask is not None:
-                    km = key_mask[:, :, ls:le]   # [B,1,ℓ]
-                    lc = lc.masked_fill(km, float("-inf"))
-                logits_chunks.append(lc)
-
-                # free
-                del Kc, lc
-                torch.cuda.empty_cache()
-
-            # [B,t,L]
-            logits = torch.cat(logits_chunks, dim=-1)
-            # Dropout logits’e değil, istersen alpha sonrası uygulanır
-            alpha = torch.softmax(logits, dim=-1)           # [B,t,L]
-            # Zc = alpha @ H  -> [B,t,Dh]
-            Zc = torch.bmm(alpha, H)
-
-            Z_parts.append(Zc)
+    def forward(self,
+                H: torch.Tensor,        # (B,L,D)
+                G: torch.Tensor,        # (B,T,Gd)
+                attn_mask: Optional[torch.Tensor] = None,  # (B,L) bool where True=PAD
+                return_alpha: bool = False):
+        B, L, D = H.shape
+        print(f"Forward call: Return Alpha: {return_alpha}")
+        if L <= self.short_thr:
+            Z, A = self.core(H, G, mask=attn_mask, return_alpha=return_alpha)  # (B,T,D), (B,T,L)
             if return_alpha:
-                alpha_parts.append(alpha)
+                return Z, {"alpha_full": A}
+            return Z
 
-            # free
-            del logits, alpha, Qc, logits_chunks, Zc
-            torch.cuda.empty_cache()
-
-        # [B,T,Dh]
-        Z = torch.cat(Z_parts, dim=1)
-        A = torch.cat(alpha_parts, dim=1) if return_alpha else None
-
-        # --- T boyunca reduce (opsiyonel) ---
-        if self.reduce == "none":
-            return (Z, A) if return_alpha else Z
-        elif self.reduce == "mean":
-            Zp = Z.mean(dim=1)                     # [B,Dh]
-            return (Zp, A) if return_alpha else Zp
-        elif self.reduce == "attn":
-            # Buraya istersen GO paddings için t_mask [B,T] geçebilirsin (şu an None)
-            Zp, _ = self.t_pool(Z, t_mask=None)    # [B,Dh]
-            return (Zp, A) if return_alpha else Zp
+        # choose window config
+        if L <= self.mid_thr:
+            win, stride = self.win_small, self.stride_small
         else:
-            raise ValueError(f"Unknown reduce='{self.reduce}'")
+            win, stride = self.win_large, self.stride_large
+
+        spans = list(self._window_spans(L, win, stride))
+        win_Z = []
+        win_A = [] if return_alpha else None
+
+        for s, e in spans:
+            Hk = H[:, s:e, :]
+            mk = attn_mask[:, s:e] if attn_mask is not None else None
+            Zk, Ak = self.core(Hk, G, mask=mk, return_alpha=return_alpha)  # (B,T,D), (B,T,e-s)
+            win_Z.append(Zk)
+            if return_alpha:
+                if (e - s) < win:
+                    pad = win - (e - s)
+                    Ak = F.pad(Ak, (0, pad), value=0.0)
+                win_A.append(Ak)
+
+        # stack windows
+        ZW = torch.stack(win_Z, dim=2)  # (B,T,W,D)
+        # window-level attention
+        q_t = self.win_query(G)                   # (B,T,D)
+        k_w = self.win_key(ZW)                    # (B,T,W,D)
+        logits = torch.einsum("btd,btwd->btw", q_t, k_w) * self.scale
+        w = torch.softmax(logits, dim=-1)         # (B,T,W)
+        Z = torch.einsum("btw,btwd->btd", w, ZW)  # (B,T,D)
+
+        if not return_alpha:
+            return Z
+
+        AW = torch.stack(win_A, dim=2) if win_A is not None else None  # (B,T,W,win)
+        return Z, {"alpha_windows": AW, "win_weights": w, "spans": spans}
