@@ -48,7 +48,7 @@ class GoSpecificWattiPooling(nn.Module):
         d_g: int,
         d_proj: int = 256,
         dropout: float = 0.0,
-        k_chunk: int = 256,            # L boyunca parça
+        k_chunk: int = 128,            # L boyunca parça
         reduce: str = "none",           # "none" | "mean" | "attn"
         attn_t_hidden: int = 0,
         attn_t_dropout: float = 0.0,
@@ -73,92 +73,91 @@ class GoSpecificWattiPooling(nn.Module):
         G: torch.Tensor,                           # [B,T,Dg]
         mask: Optional[torch.Tensor] = None,       # [B,L] (True=PAD)
         return_alpha: bool = False,
-        q_chunk: Optional[int] = None,             # T boyunca dilim; None -> q_chunk_default
+        q_chunk: Optional[int] = None,             # T boyunca dilim
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         B, L, Dh = H.shape
         T = G.shape[1]
         device = H.device
 
-        # Projeksiyonları fp32'de tut (stabilite)
+        # Projeksiyonlar fp32 (stabilite)
         K_full = self.Wk(H)              # [B,L,P] fp32
         Q_full = self.Wq(G)              # [B,T,P] fp32
 
-        # mask: True=PAD -> -inf uygulanacak
         key_mask = None
         if mask is not None:
             key_mask = mask.bool().unsqueeze(1)  # [B,1,L]
 
-        # T boyunca dilim büyüklüğü
         t_step = int(q_chunk) if q_chunk is not None else self.q_chunk_default
         t_step = max(1, min(T, t_step))
 
-        # Akümülatörler fp32
+        # Çıktı ve akümülatör dtype’ları
         Z_out = torch.zeros(B, T, Dh, device=device, dtype=torch.float32)   # [B,T,Dh]
-
-        # Streaming softmax akışı için "running" değerler
-        # Not: bunlar her t-dilimi için sıfırlanacak (global T boyunca birleştirip yazıyoruz).
         comp_dtype = torch.bfloat16 if torch.cuda.is_available() else H.dtype
+
+        # Numerator için mikro-parça (H üzerinden) boyutu
+        # Büyükse OOM’a sebep olmasın diye makul küçük tutuyoruz.
+        h_sub = min(self.k_chunk, 256)
 
         for ts in range(0, T, t_step):
             te = min(T, ts + t_step)
             Qc = Q_full[:, ts:te, :].to(comp_dtype)           # [B,t,P] bf16
-            # t-dilimi için akümülatörleri sıfırla (fp32)
+
+            # running log-sum-exp parçalı softmax değişkenleri (fp32)
             m = torch.full((B, te - ts), -float('inf'), device=device, dtype=torch.float32)  # [B,t]
             s = torch.zeros(B, te - ts, device=device, dtype=torch.float32)                  # [B,t]
             z = torch.zeros(B, te - ts, Dh, device=device, dtype=torch.float32)             # [B,t,Dh]
 
             for ls in range(0, L, self.k_chunk):
                 le = min(L, ls + self.k_chunk)
+
+                # K dilimi bf16 (logits için)
                 Kc = K_full[:, ls:le, :].to(comp_dtype)        # [B,ℓ,P] bf16
-                Hc = H[:, ls:le, :].to(comp_dtype)             # [B,ℓ,Dh] bf16
 
                 # logits: [B,t,ℓ] (bf16)
                 lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale
-
                 if key_mask is not None:
                     km = key_mask[:, :, ls:le]                 # [B,1,ℓ]
                     lc = lc.masked_fill(km, float("-inf"))
 
-                # chunk maksimumu (fp32'ye taşı)
+                # chunk maksimumu (fp32'ye)
                 lc_max = lc.max(dim=-1).values.to(torch.float32)             # [B,t]
                 m_new = torch.maximum(m, lc_max)                              # [B,t]
 
                 # önceki katkıları yeniden ölçekle
-                # s,z: fp32 (broadcast)
                 exp_scale_prev = torch.exp(m - m_new)                         # [B,t]
                 s = s * exp_scale_prev
                 z = z * exp_scale_prev.unsqueeze(-1)
 
-                # yeni chunk katkısı: exp(lc - m_new)
-                # not: exp ve bmm bf16'da; sonra fp32'ye eklenir
-                exp_chunk = torch.exp(lc.to(comp_dtype) - m_new.unsqueeze(-1).to(comp_dtype))   # [B,t,ℓ] bf16
+                # --- payda katkısı: sum exp(lc - m_new) ---
+                exp_chunk_den = torch.exp(lc.to(comp_dtype) - m_new.unsqueeze(-1).to(comp_dtype))  # [B,t,ℓ] bf16
+                s = s + exp_chunk_den.sum(dim=-1).to(torch.float32)          # [B,t]
 
-                # payda katkısı
-                s = s + exp_chunk.sum(dim=-1).to(torch.float32)              # [B,t]
-
-                # pay katkısı: [B,t,ℓ] @ [B,ℓ,Dh] -> [B,t,Dh]
-                num = torch.bmm(exp_chunk, Hc)                                # bf16
-                z = z + num.to(torch.float32)                                 # fp32 akümülatör
+                # --- pay (numerator) katkısı: mikro-parça ile ---
+                # H için KOPYA/KAST yok -> H_sub fp32 kalır; exp_sub fp32'ye cast edilip bmm yapılır.
+                for mls in range(ls, le, h_sub):
+                    mle = min(le, mls + h_sub)
+                    # logits alt parçasının exp'i: [B,t,h]
+                    exp_sub = exp_chunk_den[:, :, (mls - ls):(mle - ls)]
+                    # H alt parçası: [B,h,Dh] (fp32)
+                    H_sub = H[:, mls:mle, :]  # fp32, kopya yok (view)
+                    # bmm için aynı dtype olmalı -> exp_sub'ı fp32’ye çeviriyoruz (küçük h için güvenli)
+                    z = z + torch.bmm(exp_sub.to(torch.float32), H_sub)       # [B,t,Dh] fp32 akümüle
 
                 # güncelle
                 m = m_new
 
                 # serbest bırak
-                del Kc, Hc, lc, lc_max, m_new, exp_scale_prev, exp_chunk, num
+                del Kc, lc, lc_max, m_new, exp_scale_prev, exp_chunk_den
                 torch.cuda.empty_cache()
 
-            # t-diliminde softmax-normalize edilmiş çıktı: z / s (güvenlik için eps)
+            # t-diliminde normalize edilmiş çıktı
             eps = 1e-12
             Zc = z / (s.clamp_min(eps).unsqueeze(-1))                         # [B,t,Dh] fp32
-
-            # dropout (eğer istenirse) ve type cast (orijinal dtype’ına)
             Zc = self.dropout(Zc).to(H.dtype)
 
-            # çıktıya yaz
             Z_out[:, ts:te, :] = Zc
 
-            # clean
             del Qc, m, s, z, Zc
             torch.cuda.empty_cache()
 
