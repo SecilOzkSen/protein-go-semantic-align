@@ -353,67 +353,111 @@ class OppTrainer:
         return G_eval, y_true, eval_ids
 
     # --------- Scoring (tensor path) ---------
-    # --- ESKİSİ (özet) ---
-    # out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, ...)
-    # return out  # muhtemelen B*K’yi tek kerede yapıyordu ve grafiğe alıyordu
-
-    # --- YENİSİ ---
     def forward_scores(self, H, G, pad_mask, return_alpha=False,
-                       cand_chunk_k: int = 512,  # küçük tut
-                       pos_chunk_t: int = 256,  # GO token boyutu için küçük tut
+                       cand_chunk_k: int = 512,
+                       pos_chunk_t: int = 256,
                        **kwargs):
         """
-        H: [B, L, Dh]
-        G_all: [B, K, T, Dg] veya [K, T, Dg] (sende nasılsa)  --> aşağıda uyarlıyoruz
-        pad_mask: [B, L] (True=PAD)
+        Wrap model forward with candidate-chunking and no-graph for negatives.
+
+        Returns:
+          - if return_alpha: (scores, alpha_info_dict)
+          - else:            scores
         """
+
+        # --- Ayarlar (cfg’den oku, alt sınır koy) ---
+        cand_chunk_k = max(64, int(getattr(self.cfg, "cand_chunk_k", cand_chunk_k)))
+        pos_chunk_t = max(64, int(getattr(self.cfg, "pos_chunk_t", pos_chunk_t)))
+
         B = H.size(0)
-        # G_all: (B,K,...) bekliyorsa, ilk ekseni B olanı koru; değilse broadcast edeceğiz.
-        if G.dim() == 3:  # [K, T, Dg]
-            K = G.size(0)
+        alpha_dummy: dict = {}
 
-            def get_chunk(start, end):
-                Gc = G[start:end]  # [k, T, Dg]
-                Gc = Gc.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B,k,T,Dg]
-                return Gc
-        else:  # [B, K, T, Dg]
-            K = G.size(1)
+        # Küçük yardımcı: model çıktısını (tuple/non-tuple) skora indirgeme
+        def _unpack_to_scores(out):
+            if isinstance(out, tuple):
+                if len(out) >= 2:
+                    return out[0], (out[1] or {})
+                elif len(out) == 1:
+                    return out[0], {}
+                else:
+                    return out, {}
+            else:
+                return out, {}
 
-            def get_chunk(start, end):
-                return G[:, start:end, :, :]  # [B,k,T,Dg]
+        # -------------------------------
+        # 1) ADAY MODU: [B,K,T,Dg] veya [K,T,Dg]
+        # -------------------------------
+        if G.dim() == 4 or (G.dim() == 3 and G.size(0) != B):
+            # Şekli normalize et
+            if G.dim() == 4:
+                # [B,K,T,Dg]
+                K = G.size(1)
 
-        scores_list = []
-        # Negatif/aday forward'ı: GRAFİKSİZ + CHUNK'LI
-        # not: pozitif forward’ı ayrı fonksiyonda grad ile yapılıyor olmalı.
-        with torch.inference_mode():
-            for ks in range(0, K, cand_chunk_k):
-                ke = min(K, ks + cand_chunk_k)
-                Gc = get_chunk(ks, ke)  # [B,k,T,Dg]
+                def get_chunk(ks, ke):
+                    return G[:, ks:ke, :, :]  # [B,k,T,Dg]
 
-                # (B,k,T,Dg) -> (B*k,T,Dg) flatten
-                Bk, k = B * (ke - ks), (ke - ks)
-                Gc_flat = Gc.view(Bk, Gc.size(2), Gc.size(3))
+                expand_B = False
+            else:
+                # [K,T,Dg]  -> B’ye broadcast edeceğiz
+                K = G.size(0)
 
-                # H’yi de k kadar tekrarla (view/kopya hafif)
-                H_rep = H.unsqueeze(1).expand(B, k, -1, -1).contiguous().view(Bk, H.size(1), H.size(2))
-                mask_rep = pad_mask.unsqueeze(1).expand(B, k, -1).contiguous().view(Bk, pad_mask.size(1))
+                def get_chunk(ks, ke):
+                    Gc = G[ks:ke]  # [k,T,Dg]
+                    return Gc.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B,k,T,Dg]
 
-                # model forward: return_alpha=False ve kısa T-chunk (pos_chunk_t)
-                out = self.model(H=H_rep, G=Gc_flat, mask=mask_rep,
-                                 return_alpha=False, cand_chunk_k=256, pos_chunk_t=pos_chunk_t)
+                expand_B = True  # H’yi ve mask’ı k kadar tekrar edeceğiz
 
-                # out: [Bk, T', Dh] ise kendi skor fonksiyonun neyse uygula;
-                # çoğunlukla Z->proj->skor gibi. Eğer out zaten skor ise reshape et:
-                # örnek: out = self.head(out).mean(dim=1)  # [Bk]
-                scores = self.scorer(out)  # sende nasılsa
-                scores = scores.view(B, k)  # [B,k]
-                scores_list.append(scores)
+            scores_all = []
+            # Adaylar grafiksiz ve chunk'lı
+            with torch.inference_mode():
+                for ks in range(0, K, cand_chunk_k):
+                    ke = min(K, ks + cand_chunk_k)
+                    Gc = get_chunk(ks, ke)  # [B,k,T,Dg]
+                    k = ke - ks
+                    Bk = B * k
 
-                del Gc, Gc_flat, H_rep, mask_rep, out, scores
-                torch.cuda.empty_cache()
+                    # Flatten: (B,k,...) -> (Bk,...)
+                    Gc_flat = Gc.view(Bk, Gc.size(2), Gc.size(3))  # [Bk,T,Dg]
+                    if expand_B:
+                        H_rep = H.unsqueeze(1).expand(B, k, -1, -1).contiguous().view(Bk, H.size(1), H.size(2))
+                        mask_rep = pad_mask.unsqueeze(1).expand(B, k, -1).contiguous().view(Bk, pad_mask.size(1))
+                    else:
+                        H_rep = H.repeat_interleave(k, dim=0)  # [Bk,L,Dh]
+                        mask_rep = pad_mask.repeat_interleave(k, dim=0)  # [Bk,L]
 
-        scores_all = torch.cat(scores_list, dim=1)  # [B,K]
-        return scores_all
+                    out = self.model(H=H_rep,
+                                     G=Gc_flat,
+                                     mask=mask_rep,
+                                     return_alpha=False,  # adaylarda alpha yok
+                                     cand_chunk_k=None,  # pooler içi K-chunk gerekmez
+                                     pos_chunk_t=pos_chunk_t,
+                                     **kwargs)
+
+                    sc, _ = _unpack_to_scores(out)  # [Bk] veya [Bk,*]
+                    # Eğer sc [Bk, T', Dh] gibi ara temsilse, sende zaten bir scorer var:
+                    # sc = self.scorer(sc)  # gerektiğinde aç
+                    sc = sc.view(B, k)  # [B,k]
+                    scores_all.append(sc)
+
+                    # temizlik
+                    del Gc, Gc_flat, H_rep, mask_rep, out, sc
+                    torch.cuda.empty_cache()
+
+            scores = torch.cat(scores_all, dim=1)  # [B,K]
+            return (scores, alpha_dummy) if return_alpha else scores
+
+        # -------------------------------
+        # 2) POZİTİF / TEK G MODU: [B,T,Dg] veya [1,T,Dg]
+        # -------------------------------
+        # Burada grad açık kalır; alpha istiyorsan döner.
+        out = self.model(H=H, G=G, mask=pad_mask,
+                         return_alpha=return_alpha,
+                         cand_chunk_k=None,
+                         pos_chunk_t=pos_chunk_t,
+                         **kwargs)
+
+        scores, alpha_info = _unpack_to_scores(out)
+        return (scores, alpha_info) if return_alpha else scores
 
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
