@@ -131,6 +131,7 @@ class GoLookupCache:
         _row2id = row2id
         _embs_in = None  # GoMemoryBank'e geçeceğimiz tek kaynak
         self._mm = None  # np.memmap handle (varsa)
+        self.device = device
 
         if isinstance(embs_or_blob, Mapping):
             b = embs_or_blob
