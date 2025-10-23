@@ -71,6 +71,9 @@ torch.cuda.set_device(0)    # cihazı net seç
 print("CUDA check ->", torch.cuda.is_available(), torch.cuda.get_device_name(0))
 torch.set_float32_matmul_precision("high")  # TF32’yi etkin kullan
 torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8"
 
 # ============== Utilities ==============
 
@@ -386,11 +389,6 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
 
 
 def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore):
-    def _worker_init(_):
-        import os, random, torch
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        torch.set_num_threads(1)
-        random.seed(torch.initial_seed() % 2 ** 32)
     logger = logging.getLogger("build_dataloaders")
 
     train_ds = datasets["train"]
@@ -417,8 +415,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         num_workers=0,
         persistent_workers=False,
 #        multiprocessing_context="forkserver",
-        pin_memory=False,
-        worker_init_fn=_worker_init,
+        pin_memory=True,
     #    prefetch_factor=2,
         collate_fn=collate,
     )
@@ -435,7 +432,6 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             pin_memory=False,
             collate_fn=collate,
 #            multiprocessing_context="forkserver",
-            worker_init_fn=_worker_init,
             drop_last=False
         )
 
@@ -1117,8 +1113,6 @@ def parse_args():
     return args, schedule
 
 def main():
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CON", "expandable_segments:True")
     args, schedule = parse_args()
     out = Path(args.output_dir)
     setup_logging(out, level=args.log_level)

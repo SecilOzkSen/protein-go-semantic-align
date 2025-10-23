@@ -52,7 +52,7 @@ training:
   cand_chunk_k: 8
   pos_chunk_t: 128
   k_hard_queue: 128
-  queue_K: 65536
+  queue_K: 8192
 
 optim:
   lr: 0.0003

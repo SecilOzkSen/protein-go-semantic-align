@@ -22,8 +22,8 @@ class BucketedGoWatti(nn.Module):
                  mid_thr: int = 8192,
                  win_small: int = 1536,
                  stride_small: int = 384,
-                 win_large: int = 2048,
-                 stride_large: int = 512):
+                 win_large: int = 3072,
+                 stride_large: int = 768):
         super().__init__()
         # Çekirdek cross-attn (zaten bellek-dostu, chunked)
         self.core = GoSpecificWattiPooling(d_h=d_h, d_g=d_g, d_proj=256, dropout=0.0)

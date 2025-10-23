@@ -353,28 +353,67 @@ class OppTrainer:
         return G_eval, y_true, eval_ids
 
     # --------- Scoring (tensor path) ---------
-    def forward_scores(self, H, G, pad_mask, return_alpha: bool = False, **kwargs):
-        """
-        Wrap model forward; accept variable return shapes.
-        Always returns:
-          - if return_alpha: (scores, alpha_info_dict)
-          - else:            scores
-        """
-        cand_chunk_k = int(getattr(self.cfg, "cand_chunk_k", 16))
-        pos_chunk_t = int(getattr(self.cfg, "pos_chunk_t", 128))
-        out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
+    # --- ESKİSİ (özet) ---
+    # out = self.model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha, ...)
+    # return out  # muhtemelen B*K’yi tek kerede yapıyordu ve grafiğe alıyordu
 
-        if isinstance(out, tuple):
-            if len(out) >= 2:
-                scores, alpha_info = out[0], (out[1] or {})
-            elif len(out) == 1:
-                scores, alpha_info = out[0], {}
-            else:
-                scores, alpha_info = out, {}
-        else:
-            scores, alpha_info = out, {}
+    # --- YENİSİ ---
+    def forward_scores(self, H, G, pad_mask, return_alpha=False,
+                       cand_chunk_k: int = 512,  # küçük tut
+                       pos_chunk_t: int = 256,  # GO token boyutu için küçük tut
+                       **kwargs):
+        """
+        H: [B, L, Dh]
+        G_all: [B, K, T, Dg] veya [K, T, Dg] (sende nasılsa)  --> aşağıda uyarlıyoruz
+        pad_mask: [B, L] (True=PAD)
+        """
+        B = H.size(0)
+        # G_all: (B,K,...) bekliyorsa, ilk ekseni B olanı koru; değilse broadcast edeceğiz.
+        if G.dim() == 3:  # [K, T, Dg]
+            K = G.size(0)
 
-        return (scores, alpha_info) if return_alpha else scores
+            def get_chunk(start, end):
+                Gc = G[start:end]  # [k, T, Dg]
+                Gc = Gc.unsqueeze(0).expand(B, -1, -1, -1).contiguous()  # [B,k,T,Dg]
+                return Gc
+        else:  # [B, K, T, Dg]
+            K = G.size(1)
+
+            def get_chunk(start, end):
+                return G[:, start:end, :, :]  # [B,k,T,Dg]
+
+        scores_list = []
+        # Negatif/aday forward'ı: GRAFİKSİZ + CHUNK'LI
+        # not: pozitif forward’ı ayrı fonksiyonda grad ile yapılıyor olmalı.
+        with torch.inference_mode():
+            for ks in range(0, K, cand_chunk_k):
+                ke = min(K, ks + cand_chunk_k)
+                Gc = get_chunk(ks, ke)  # [B,k,T,Dg]
+
+                # (B,k,T,Dg) -> (B*k,T,Dg) flatten
+                Bk, k = B * (ke - ks), (ke - ks)
+                Gc_flat = Gc.view(Bk, Gc.size(2), Gc.size(3))
+
+                # H’yi de k kadar tekrarla (view/kopya hafif)
+                H_rep = H.unsqueeze(1).expand(B, k, -1, -1).contiguous().view(Bk, H.size(1), H.size(2))
+                mask_rep = pad_mask.unsqueeze(1).expand(B, k, -1).contiguous().view(Bk, pad_mask.size(1))
+
+                # model forward: return_alpha=False ve kısa T-chunk (pos_chunk_t)
+                out = self.model(H=H_rep, G=Gc_flat, mask=mask_rep,
+                                 return_alpha=False, cand_chunk_k=None, pos_chunk_t=pos_chunk_t)
+
+                # out: [Bk, T', Dh] ise kendi skor fonksiyonun neyse uygula;
+                # çoğunlukla Z->proj->skor gibi. Eğer out zaten skor ise reshape et:
+                # örnek: out = self.head(out).mean(dim=1)  # [Bk]
+                scores = self.scorer(out)  # sende nasılsa
+                scores = scores.view(B, k)  # [B,k]
+                scores_list.append(scores)
+
+                del Gc, Gc_flat, H_rep, mask_rep, out, scores
+                torch.cuda.empty_cache()
+
+        scores_all = torch.cat(scores_list, dim=1)  # [B,K]
+        return scores_all
 
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
