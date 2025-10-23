@@ -2,8 +2,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import amp
-
 
 class AttnPool1D(nn.Module):
     """Z: [B, T, Dh] üzerinde T-boyunca öğrenilebilir havuzlama."""
@@ -34,19 +32,15 @@ class AttnPool1D(nn.Module):
 
 class GoSpecificWattiPooling(nn.Module):
     """
-    GO(token) x Protein(residue) cross-attention:
-      - Q = Wq*G, K = Wk*H
-      - logits = Q K^T / sqrt(P), alpha = softmax(logits, L)
-      - Z = alpha H  (B,T,Dh)
+    GO(token) x Protein(residue) cross-attention (H:[B,L,Dh], G:[B,T,Dg]).
 
-    Bellek dostu:
-      - T ekseninde q_chunk
-      - L ekseninde k_chunk
-      - streaming softmax: (B,t,L) logits/alpha'yı TAM boy asla tutmaz.
+    Bellek güvenli "streaming" softmax:
+      - T ekseninde q_chunk (t_step) ile,
+      - L ekseninde k_chunk ile çalışır.
+    Büyük [B,T,L] tensörleri oluşturmaz.
+    Logit ve exp hesapları bf16'da; akümülatörler fp32'de tutulur.
 
-    Opsiyonel:
-      - reduce: "none" | "mean" | "attn"  (T boyunca)
-      - return_alpha=True ise yalnızca küçük örneklerde full alpha döner, aksi halde None.
+    reduce: "none" | "mean" | "attn"  -> T boyunca indirgeme seçeneği.
     """
     def __init__(
         self,
@@ -54,142 +48,134 @@ class GoSpecificWattiPooling(nn.Module):
         d_g: int,
         d_proj: int = 256,
         dropout: float = 0.0,
-        k_chunk: int = 2048,               # L boyunca parça
-        reduce: str = "none",              # "none" | "mean" | "attn"
+        k_chunk: int = 256,            # L boyunca parça
+        reduce: str = "none",           # "none" | "mean" | "attn"
         attn_t_hidden: int = 0,
         attn_t_dropout: float = 0.0,
-        allow_full_alpha_tokens: int = 2_000_000,  # B*T*L bundan küçükse alpha döndür (güvenli)
+        q_chunk_default: int = 32,     # T boyunca varsayılan parça
     ):
         super().__init__()
         self.Wk = nn.Linear(d_h, d_proj, bias=False)
         self.Wq = nn.Linear(d_g, d_proj, bias=False)
         self.scale = (d_proj ** -0.5)
-
         self.k_chunk = int(k_chunk)
         self.reduce = reduce
-        self.allow_full_alpha_tokens = int(allow_full_alpha_tokens)
-
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.q_chunk_default = int(q_chunk_default)
 
         self.t_pool = None
         if self.reduce == "attn":
             self.t_pool = AttnPool1D(d_in=d_h, d_hidden=attn_t_hidden, dropout=attn_t_dropout)
 
-    @amp.autocast("cuda", enabled=False)  # AMP uyarısı giderildi; dtype kontrolü eğitim döngüsünde
     def forward(
         self,
         H: torch.Tensor,                           # [B,L,Dh]
         G: torch.Tensor,                           # [B,T,Dg]
-        mask: Optional[torch.Tensor] = None,       # [B,L] (True=PAD)  <-- BucketedGoWatti ile uyumlu
+        mask: Optional[torch.Tensor] = None,       # [B,L] (True=PAD)
         return_alpha: bool = False,
-        q_chunk: Optional[int] = None,             # T boyunca dilim; None -> otomatik
+        q_chunk: Optional[int] = None,             # T boyunca dilim; None -> q_chunk_default
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
         B, L, Dh = H.shape
         T = G.shape[1]
         device = H.device
-        dtype = H.dtype
 
-        # Projeksiyonlar (fp32/compute dtype dışarıdan yönetilsin diye burada autocast kapalı)
-        K = self.Wk(H).to(dtype)              # [B,L,P]
-        Q = self.Wq(G).to(dtype)              # [B,T,P]
+        # Projeksiyonları fp32'de tut (stabilite)
+        K_full = self.Wk(H)              # [B,L,P] fp32
+        Q_full = self.Wq(G)              # [B,T,P] fp32
 
-        # mask: True=PAD --> -inf
+        # mask: True=PAD -> -inf uygulanacak
         key_mask = None
         if mask is not None:
-            if mask.dtype is not torch.bool:
-                mask = mask.bool()
-            key_mask = mask                   # [B,L]
+            key_mask = mask.bool().unsqueeze(1)  # [B,1,L]
 
         # T boyunca dilim büyüklüğü
-        t_step = int(q_chunk) if q_chunk is not None else max(1, min(T, 512))
+        t_step = int(q_chunk) if q_chunk is not None else self.q_chunk_default
+        t_step = max(1, min(T, t_step))
 
-        # Küçük örnekler için tam alpha yolu (güvenliyse)
-        total_tokens = B * T * L
-        can_full_alpha = return_alpha and (total_tokens <= self.allow_full_alpha_tokens) and (L <= self.k_chunk) and (T <= t_step)
+        # Akümülatörler fp32
+        Z_out = torch.zeros(B, T, Dh, device=device, dtype=torch.float32)   # [B,T,Dh]
 
-        Z_parts = []                           # [B,t,Dh] parçaları
-        alpha_parts = [] if can_full_alpha else None
+        # Streaming softmax akışı için "running" değerler
+        # Not: bunlar her t-dilimi için sıfırlanacak (global T boyunca birleştirip yazıyoruz).
+        comp_dtype = torch.bfloat16 if torch.cuda.is_available() else H.dtype
 
-        # ---- Sorgu ekseninde (T) ilerle ----
         for ts in range(0, T, t_step):
             te = min(T, ts + t_step)
-            t = te - ts
-            Qc = Q[:, ts:te, :]                        # [B,t,P]
-
-            if can_full_alpha:
-                # logits'i L boyunca birleştir, alpha üret (sadece küçük örneklerde)
-                logits_chunks = []
-                for ls in range(0, L, self.k_chunk):
-                    le = min(L, ls + self.k_chunk)
-                    Kc = K[:, ls:le, :]                # [B,ℓ,P]
-                    lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale   # [B,t,ℓ]
-                    if key_mask is not None:
-                        mk = key_mask[:, ls:le]        # [B,ℓ]
-                        lc = lc.masked_fill(mk.unsqueeze(1), float("-inf"))
-                    logits_chunks.append(lc)
-                    del Kc, lc
-                logits = torch.cat(logits_chunks, dim=-1)                 # [B,t,L]
-                alpha = torch.softmax(logits, dim=-1)                     # [B,t,L]
-                Zc = torch.bmm(alpha, H)                                  # [B,t,Dh]
-                Zc = self.dropout(Zc)
-                Z_parts.append(Zc)
-                alpha_parts.append(alpha)
-
-                del logits, alpha, Qc, logits_chunks, Zc
-                torch.cuda.empty_cache()
-                continue
-
-            # ---- Büyük örnekler: streaming softmax (logits/alpha full tutulmaz) ----
-            # Online softmax istatistikleri
-            # m: running max, s: running sumexp, n: running numerator (exp * H)
-            m = torch.full((B, t, 1), -float("inf"), device=device, dtype=dtype)  # [B,t,1]
-            s = torch.zeros((B, t, 1), device=device, dtype=dtype)                # [B,t,1]
-            n = torch.zeros((B, t, Dh), device=device, dtype=dtype)               # [B,t,Dh]
+            Qc = Q_full[:, ts:te, :].to(comp_dtype)           # [B,t,P] bf16
+            # t-dilimi için akümülatörleri sıfırla (fp32)
+            m = torch.full((B, te - ts), -float('inf'), device=device, dtype=torch.float32)  # [B,t]
+            s = torch.zeros(B, te - ts, device=device, dtype=torch.float32)                  # [B,t]
+            z = torch.zeros(B, te - ts, Dh, device=device, dtype=torch.float32)             # [B,t,Dh]
 
             for ls in range(0, L, self.k_chunk):
                 le = min(L, ls + self.k_chunk)
-                Kc = K[:, ls:le, :]                          # [B,ℓ,P]
-                Hc = H[:, ls:le, :]                          # [B,ℓ,Dh]
+                Kc = K_full[:, ls:le, :].to(comp_dtype)        # [B,ℓ,P] bf16
+                Hc = H[:, ls:le, :].to(comp_dtype)             # [B,ℓ,Dh] bf16
 
-                lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale   # [B,t,ℓ]
+                # logits: [B,t,ℓ] (bf16)
+                lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale
+
                 if key_mask is not None:
-                    mk = key_mask[:, ls:le]                  # [B,ℓ]
-                    lc = lc.masked_fill(mk.unsqueeze(1), float("-inf"))
+                    km = key_mask[:, :, ls:le]                 # [B,1,ℓ]
+                    lc = lc.masked_fill(km, float("-inf"))
 
-                # Online max+sumexp güncellemesi
-                m_chunk = lc.max(dim=-1, keepdim=True).values            # [B,t,1]
-                m_new = torch.maximum(m, m_chunk)                        # [B,t,1]
-                exp_prev = torch.exp(m - m_new)                          # [B,t,1]
-                exp_chunk = torch.exp(lc - m_new)                        # [B,t,ℓ]
+                # chunk maksimumu (fp32'ye taşı)
+                lc_max = lc.max(dim=-1).values.to(torch.float32)             # [B,t]
+                m_new = torch.maximum(m, lc_max)                              # [B,t]
 
-                s = s * exp_prev + exp_chunk.sum(dim=-1, keepdim=True)   # [B,t,1]
-                # numerator güncelle: sum(exp * H)
-                n = n * exp_prev + torch.bmm(exp_chunk, Hc)              # [B,t,Dh]
+                # önceki katkıları yeniden ölçekle
+                # s,z: fp32 (broadcast)
+                exp_scale_prev = torch.exp(m - m_new)                         # [B,t]
+                s = s * exp_scale_prev
+                z = z * exp_scale_prev.unsqueeze(-1)
+
+                # yeni chunk katkısı: exp(lc - m_new)
+                # not: exp ve bmm bf16'da; sonra fp32'ye eklenir
+                exp_chunk = torch.exp(lc.to(comp_dtype) - m_new.unsqueeze(-1).to(comp_dtype))   # [B,t,ℓ] bf16
+
+                # payda katkısı
+                s = s + exp_chunk.sum(dim=-1).to(torch.float32)              # [B,t]
+
+                # pay katkısı: [B,t,ℓ] @ [B,ℓ,Dh] -> [B,t,Dh]
+                num = torch.bmm(exp_chunk, Hc)                                # bf16
+                z = z + num.to(torch.float32)                                 # fp32 akümülatör
+
+                # güncelle
                 m = m_new
 
-                del Kc, Hc, lc, m_chunk, m_new, exp_prev, exp_chunk
+                # serbest bırak
+                del Kc, Hc, lc, lc_max, m_new, exp_scale_prev, exp_chunk, num
                 torch.cuda.empty_cache()
 
-            Zc = n / s.clamp_min(1e-12)     # [B,t,Dh]
-            Zc = self.dropout(Zc)
-            Z_parts.append(Zc)
+            # t-diliminde softmax-normalize edilmiş çıktı: z / s (güvenlik için eps)
+            eps = 1e-12
+            Zc = z / (s.clamp_min(eps).unsqueeze(-1))                         # [B,t,Dh] fp32
 
-            del Qc, m, s, n, Zc
+            # dropout (eğer istenirse) ve type cast (orijinal dtype’ına)
+            Zc = self.dropout(Zc).to(H.dtype)
+
+            # çıktıya yaz
+            Z_out[:, ts:te, :] = Zc
+
+            # clean
+            del Qc, m, s, z, Zc
             torch.cuda.empty_cache()
 
-        # Çıktı birleştir
-        Z = torch.cat(Z_parts, dim=1)               # [B,T,Dh]
-        A = torch.cat(alpha_parts, dim=1) if alpha_parts is not None else None  # [B,T,L] | None
-
-        # ---- T boyunca reduce (opsiyonel) ----
+        # --- T boyunca reduce (opsiyonel) ---
         if self.reduce == "none":
-            return (Z, A) if return_alpha else Z
+            if return_alpha:
+                return Z_out, None
+            return Z_out
         elif self.reduce == "mean":
-            Zp = Z.mean(dim=1)                      # [B,Dh]
-            return (Zp, A) if return_alpha else Zp
+            Zp = Z_out.mean(dim=1)                     # [B,Dh]
+            if return_alpha:
+                return Zp, None
+            return Zp
         elif self.reduce == "attn":
-            # İstersen GO paddings için t_mask [B,T] geçebilirsin (şu an None)
-            Zp, _ = self.t_pool(Z, t_mask=None)     # [B,Dh]
-            return (Zp, A) if return_alpha else Zp
+            Zp, _ = self.t_pool(Z_out, t_mask=None)    # [B,Dh]
+            if return_alpha:
+                return Zp, None
+            return Zp
         else:
             raise ValueError(f"Unknown reduce='{self.reduce}'")
