@@ -77,7 +77,8 @@ class BioMedBERTEncoder(nn.Module):
                  attn_dropout: float = 0.0,
                  special_token_weights: Optional[Dict[str, float]] = None, # Optional token weights to bias attention (e.g., {"[GOPATH]":0.45, "[PATH]":0.45, "[ISA]":0.95, "[PART]":0.85})
                  enable_lora: bool = True,
-                 lora_parameters: Optional[LoRAParameters] = None  # LoRA options (optional)
+                 lora_parameters: Optional[LoRAParameters] = None,  # LoRA options (optional)
+                 gradient_checkpointing: bool = True # re-calculate each activation instead of storing it -> huge space saver.
                  ):
         super().__init__()
         self.device = torch.device(device) if isinstance(device, str) else device
@@ -87,6 +88,8 @@ class BioMedBERTEncoder(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
         self.model.resize_token_embeddings(len(self.tokenizer))
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
 
         # Attention pooling head (Optional - nice to use)
         self.use_attention_pool = use_attention_pool

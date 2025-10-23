@@ -69,6 +69,8 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # senkron stacktrace için
 torch.cuda.init()           # context’i erken aç
 torch.cuda.set_device(0)    # cihazı net seç
 print("CUDA check ->", torch.cuda.is_available(), torch.cuda.get_device_name(0))
+torch.set_float32_matmul_precision("high")  # TF32’yi etkin kullan
+torch.backends.cuda.matmul.allow_tf32 = True
 
 # ============== Utilities ==============
 
@@ -598,7 +600,10 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
 def run_training(args, schedule: TrainSchedule):
     signal.signal(signal.SIGINT, _sigint_handler)
     logger = logging.getLogger("main")
-    device = torch.device("cuda:0" if torch.cuda.is_available() and not args.cpu else "cpu")
+    if args.device is not None:
+        device = args.device
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
     if args.wandb:
         wandb.login()
@@ -839,8 +844,9 @@ def run_training(args, schedule: TrainSchedule):
                 pass
 
             # forward + losses
-            losses = trainer.step_losses(batch, epoch)
-            loss = losses["total"]
+            with torch.autocast("cuda", dtype=torch.bfloat16): #TODO: autocast
+                losses = trainer.step_losses(batch, epoch)
+                loss = losses["total"]
 
             # backward
             trainer.opt.zero_grad(set_to_none=True)
@@ -961,6 +967,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
     sched = cfg.get("schedule", {})
     stores = cfg.get("stores", {})
     general = cfg.get("general", {})
+    memory_bank = cfg.get("memory_bank", {})
 
     args = types.SimpleNamespace(
         # general
@@ -1060,6 +1067,10 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         inbatch_easy_start=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[0]),
         inbatch_easy_end=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[1]),
         neg_k=int(curriculum.get("neg_k", 4)),
+
+        #memory_bank
+        memory_bank_device=str(memory_bank.get("device", "cuda")),
+        memory_bank_dtype=str(memory_bank.get("d_type", "fp16")),
 
 
         # wandb

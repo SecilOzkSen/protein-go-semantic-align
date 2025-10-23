@@ -18,6 +18,10 @@ general:
   use_go_memory_bank: True
   use_faiss: False
 
+memory_bank:
+  device: "cuda"
+  dtype: "fp16"
+
 caches:
   go_cache: null
   faiss_index: null
