@@ -1,7 +1,8 @@
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 class AttnPool1D(nn.Module):
     """Z: [B, T, Dh] üzerinde T-boyunca öğrenilebilir havuzlama."""
@@ -32,10 +33,17 @@ class AttnPool1D(nn.Module):
 
 class GoSpecificWattiPooling(nn.Module):
     """
-    GO(token) x Protein(residue) streaming cross-attention:
-      - Q = Wq(G_tchunk), K = Wk(H_kchunk)
-      - Softmax(L) ve numerator log-sum-exp ile streaming (full [B,T,L] yok)
-    reduce: "none" | "mean" | "attn"
+    GO(token) x Protein(residue) cross-attention (bellek-dostu, parçalı):
+      - Q = Wq * G  (GO tarafı)  [B,t,P]
+      - K = Wk * H  (Residue)    [B,ℓ,P]
+      - Logits = Q K^T / sqrt(P)
+      - α softmax'ı 'streaming' ve mikro-k bloklarıyla hesaplanır:
+          z  = Σ exp(lc - m_new) @ H_block      (fp32 akümülatör)
+          s  = Σ exp(lc - m_new)
+          out= z / s
+      Notlar:
+        * T'yi q_chunk ile, L'yi k_chunk ve inner_k ile dilimliyoruz.
+        * Projeksiyonlar autocast(bf16) içinde; akümülatörler fp32.
     """
     def __init__(
         self,
@@ -43,192 +51,127 @@ class GoSpecificWattiPooling(nn.Module):
         d_g: int,
         d_proj: int = 256,
         dropout: float = 0.0,
-        k_chunk: int = 256,             # L boyunca başlangıç parçası
-        reduce: str = "none",           # "none" | "mean" | "attn"
+        # Bellek kontrol parametreleri:
+        k_chunk: int = 512,         # L boyunca ana parça boyu
+        inner_k: int = 64,          # L parçası içinde mikro parça
+        q_chunk_default: int = 64,  # T boyunca parça boyu varsayılan
+        reduce: str = "none",        # "none" | "mean" | "attn"
         attn_t_hidden: int = 0,
         attn_t_dropout: float = 0.0,
-        q_chunk_default: int = 4,       # T boyunca başlangıç parçası
-        h_sub_init: int = 32,           # numerator için H alt-parçası
     ):
         super().__init__()
         self.Wk = nn.Linear(d_h, d_proj, bias=False)
         self.Wq = nn.Linear(d_g, d_proj, bias=False)
         self.scale = (d_proj ** -0.5)
-        self.k_chunk = k_chunk
-        self.q_chunk_default = q_chunk_default
-        self.h_sub_init = h_sub_init
-        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.k_chunk = int(k_chunk)
+        self.inner_k = int(inner_k)
+        self.q_chunk_default = int(q_chunk_default)
         self.reduce = reduce
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
         self.t_pool = None
         if self.reduce == "attn":
             self.t_pool = AttnPool1D(d_in=d_h, d_hidden=attn_t_hidden, dropout=attn_t_dropout)
 
-    @torch.amp.autocast('cuda', enabled=False)  # dtype kontrolünü içeride yapıyoruz
+    # autocast'ı açık tut: Lineerler ve bmm'ler bf16; akümülatörler fp32.
+    @torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
     def forward(
         self,
         H: torch.Tensor,                           # [B,L,Dh]
         G: torch.Tensor,                           # [B,T,Dg]
         mask: Optional[torch.Tensor] = None,       # [B,L] (True=PAD)
         return_alpha: bool = False,
-        q_chunk: Optional[int] = None,             # T boyunca dilim; None -> default
+        q_chunk: Optional[int] = None,             # T dilim boyu; None -> q_chunk_default
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
-        device = H.device
         B, L, Dh = H.shape
         T = G.shape[1]
+        device = H.device
 
-        # key mask (True=PAD)
+        # mask: True=PAD --> -inf atacağız
         key_mask = None
         if mask is not None:
-            key_mask = mask.bool().unsqueeze(1)      # [B,1,L]
+            key_mask = mask.bool().unsqueeze(1)  # [B,1,L]
 
-        # parça boyutları (OOM olursa küçülecek)
-        t_step = q_chunk or self.q_chunk_default
-        k_step = self.k_chunk
-        h_sub  = self.h_sub_init
+        t_step = int(q_chunk or self.q_chunk_default)
+        t_step = max(1, min(T, t_step))
 
-        Z_parts: List[torch.Tensor] = []
-        alpha_parts: List[torch.Tensor] = [] if return_alpha else None
+        Z_parts = []
+        # α'yı tam saklamak bellek-düşmanı; istenirse None döneceğiz.
+        alpha_parts = None
 
-        # ---- T boyunca dilimle ----
+        # --- T boyunca dilimle ---
         for ts in range(0, T, t_step):
             te = min(T, ts + t_step)
+            Gc = G[:, ts:te, :]                 # [B,t,Dg]
+            Qc = self.Wq(Gc)                    # [B,t,P] (bf16)
 
-            # Q: önce girişleri Wq.weight.dtype'a çevir, sonra linear, sonra fp32
-            Gc = G[:, ts:te, :]
-            Qc_lin = Gc.to(self.Wq.weight.dtype)
-            Qc32 = self.Wq(Qc_lin).to(torch.float32)             # [B,t,P] fp32
+            # fp32 akümülatörler (numerik stabilite)
+            t = Qc.shape[1]
+            z = torch.zeros(B, t, Dh, device=device, dtype=torch.float32)   # pay
+            s = torch.zeros(B, t, 1,  device=device, dtype=torch.float32)   # payda
+            m = torch.full((B, t, 1), -float("inf"), device=device, dtype=torch.float32)
 
-            # LSE akümülatörleri: m,s (denominator), z (numerator)
-            m = None
-            s = None
-            z = torch.zeros((B, te - ts, Dh), device=device, dtype=torch.float32)
+            # --- L boyunca ana parça ---
+            for ls in range(0, L, self.k_chunk):
+                le = min(L, ls + self.k_chunk)
 
-            # ---- L boyunca dilimle ----
-            ls = 0
-            while ls < L:
-                le = min(L, ls + k_step)
-                try:
-                    # H ve K: yine dtype hizalaması -> linear -> fp32
-                    Hc = H[:, ls:le, :]
-                    Hc_lin = Hc.to(self.Wk.weight.dtype)         # [B,ℓ,Dh] weight dtype
-                    Kc32 = self.Wk(Hc_lin).to(torch.float32)     # [B,ℓ,P] fp32
-                    # logits: [B,t,ℓ] = Qc32 [B,t,P] @ Kc32^T [B,P,ℓ]
-                    lc = torch.bmm(Qc32, Kc32.transpose(1, 2)) * self.scale  # fp32
-                except torch.cuda.OutOfMemoryError:
+                # --- bu ana parça içinde mikro-k döngüsü ---
+                for ks in range(ls, le, self.inner_k):
+                    ke = min(le, ks + self.inner_k)
+
+                    H_block = H[:, ks:ke, :]              # [B,ki,Dh] (bf16)
+                    K_block = self.Wk(H_block)            # [B,ki,P]  (bf16)
+
+                    # logits bloğu: [B,t,ki] -> fp32
+                    lc = torch.bmm(Qc, K_block.transpose(1, 2)) * self.scale  # bf16
+                    lc = lc.to(torch.float32)
+
+                    if key_mask is not None:
+                        km = key_mask[:, :, ks:ke]        # [B,1,ki]
+                        lc = lc.masked_fill(km, float("-inf"))
+
+                    # running log-sum-exp güncellemesi (blok bazında)
+                    block_max = lc.max(dim=-1, keepdim=True).values    # [B,t,1]
+                    m_new = torch.maximum(m, block_max)                # [B,t,1]
+
+                    # eski katkıyı yeni baza dönüştür
+                    exp_m = torch.exp(m - m_new)                       # [B,t,1]
+                    # yeni bloğun katkısı
+                    exp_block = torch.exp(lc - m_new)                  # [B,t,ki]
+
+                    # payda
+                    s = s * exp_m + exp_block.sum(dim=-1, keepdim=True)    # [B,t,1]
+                    # pay: (exp_block @ H_block)
+                    # exp_block fp32, H_block fp16/bf16 -> fp32 çarpıp ekle
+                    z = z * exp_m + torch.bmm(exp_block, H_block.to(torch.float32))  # [B,t,Dh]
+
+                    m = m_new  # güncelle
+
+                    # ara tensörleri serbest bırak
+                    del H_block, K_block, lc, block_max, m_new, exp_m, exp_block
                     torch.cuda.empty_cache()
-                    if k_step > 128:
-                        k_step = max(128, k_step // 2)
-                        continue
-                    else:
-                        raise
 
-                # mask uygula
-                if key_mask is not None:
-                    km = key_mask[:, :, ls:le]      # [B,1,ℓ]
-                    lc = lc.masked_fill(km, float("-inf"))
-
-                # ---- LSE streaming + numerator streaming (tamamı fp32) ----
-                lc_max = lc.max(dim=-1, keepdim=True).values  # [B,t,1]
-                if m is None:
-                    m = lc_max
-                    s = torch.exp(lc - m).sum(dim=-1, keepdim=True)  # [B,t,1]
-
-                    start = 0
-                    sub_size = h_sub
-                    while start < (le - ls):
-                        stop = min(le - ls, start + sub_size)
-                        H_sub32 = H[:, ls+start:ls+stop, :].to(torch.float32)  # [B,h,Dh]
-                        w_sub = torch.exp(lc[:, :, start:stop] - m)            # [B,t,h]
-                        try:
-                            z = z + torch.bmm(w_sub, H_sub32)                  # [B,t,Dh]
-                        except torch.cuda.OutOfMemoryError:
-                            torch.cuda.empty_cache()
-                            if sub_size > 16:
-                                sub_size = max(16, sub_size // 2)
-                                continue
-                            else:
-                                raise
-                        start = stop
-                else:
-                    m_new = torch.maximum(m, lc_max)                           # [B,t,1]
-                    scale_old = torch.exp(m - m_new)                           # [B,t,1]
-                    s = scale_old * s + torch.exp(lc - m_new).sum(-1, keepdim=True)
-
-                    start = 0
-                    sub_size = h_sub
-                    while start < (le - ls):
-                        stop = min(le - ls, start + sub_size)
-                        H_sub32 = H[:, ls+start:ls+stop, :].to(torch.float32)  # [B,h,Dh]
-                        w_sub = torch.exp(lc[:, :, start:stop] - m_new)        # [B,1,t,h] değil -> [B,t,h]
-                        try:
-                            z = z.mul_(scale_old).add_(torch.bmm(w_sub, H_sub32))
-                        except torch.cuda.OutOfMemoryError:
-                            torch.cuda.empty_cache()
-                            if sub_size > 16:
-                                sub_size = max(16, sub_size // 2)
-                                continue
-                            else:
-                                raise
-                        start = stop
-                    m = m_new
-
-                # free chunk
-                del Hc, Hc_lin, Kc32, lc
-                torch.cuda.empty_cache()
-                ls = le
-
-            # t-chunk sonucu
-            Zc = (z / s.clamp_min(1e-20))  # [B,t,Dh] fp32
-            Zc = self.dropout(Zc)
+            # bu T-dilimi için çıktı
+            Zc = (z / (s + 1e-8)).to(H.dtype)    # [B,t,Dh] tekrar bf16/fp16’e
             Z_parts.append(Zc)
 
-            if return_alpha:
-                # alpha üretimi (m ve s ile tekrar tarama)
-                alpha_chunks: List[torch.Tensor] = []
-                ls = 0
-                while ls < L:
-                    le = min(L, ls + k_step)
-                    with torch.no_grad():
-                        Hc = H[:, ls:le, :]
-                        Hc_lin = Hc.to(self.Wk.weight.dtype)
-                        Kc32 = self.Wk(Hc_lin).to(torch.float32)
-                        lc = torch.bmm(Qc32, Kc32.transpose(1, 2)) * self.scale
-                        if key_mask is not None:
-                            km = key_mask[:, :, ls:le]
-                            lc = lc.masked_fill(km, float("-inf"))
-                        alpha_sub = torch.exp(lc - m) / s
-                        alpha_chunks.append(alpha_sub)   # [B,t,ℓ]
-                        del Hc, Hc_lin, Kc32, lc, alpha_sub
-                        torch.cuda.empty_cache()
-                    ls = le
-                A_t = torch.cat(alpha_chunks, dim=-1)     # [B,t,L]
-                alpha_parts.append(A_t)
-
-            # free Q chunk & accumulators
-            del Gc, Qc_lin, Qc32, m, s, z, Zc
+            # serbest bırak
+            del Gc, Qc, z, s, m, Zc
             torch.cuda.empty_cache()
 
         # [B,T,Dh]
         Z = torch.cat(Z_parts, dim=1)
+        A = None  # alpha'yı full döndürmüyoruz (bellek dostu değil)
 
+        # --- T boyunca reduce (opsiyonel) ---
         if self.reduce == "none":
-            if return_alpha:
-                A = torch.cat(alpha_parts, dim=1)  # [B,T,L]
-                return Z, A
-            return Z
+            return (Z, A) if return_alpha else Z
         elif self.reduce == "mean":
             Zp = Z.mean(dim=1)                     # [B,Dh]
-            if return_alpha:
-                A = torch.cat(alpha_parts, dim=1)
-                return Zp, A
-            return Zp
+            return (Zp, A) if return_alpha else Zp
         elif self.reduce == "attn":
             Zp, _ = self.t_pool(Z, t_mask=None)    # [B,Dh]
-            if return_alpha:
-                A = torch.cat(alpha_parts, dim=1)
-                return Zp, A
-            return Zp
+            return (Zp, A) if return_alpha else Zp
         else:
             raise ValueError(f"Unknown reduce='{self.reduce}'")

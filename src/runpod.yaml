@@ -31,8 +31,8 @@ caches:
 
 training:
   epochs: 5
-  batch_size: 2
-  eval_batch_size: 2
+  batch_size: 1
+  eval_batch_size: 1
   device: "cuda:0"
 
   num_workers: 8
