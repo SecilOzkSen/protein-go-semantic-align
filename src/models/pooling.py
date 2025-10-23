@@ -12,7 +12,7 @@ class GoSpecificWattiPooling(nn.Module):
       - No full alpha kept in memory unless return_alpha=True
     """
     def __init__(self, d_h, d_g, d_proj=256, dropout=0.0,
-                 q_chunk: int = 32,   # <= T; 32 iyi bir başlangıç
+                 q_chunk: int = 24,   # <= T; 32 iyi bir başlangıç
                  use_autocast: bool = True,
                  use_bf16: bool = True):  # H100 için bf16 çok stabil
         super().__init__()

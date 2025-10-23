@@ -648,7 +648,7 @@ def run_training(args, schedule: TrainSchedule):
     # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
     memory_bank = go_cache if args.use_go_memory_bank else None
     if args.use_go_memory_bank:
-        logger.info("Using unified GoLookupCache as MemoryBank (GPU fp32, no copies).")
+        logger.info(f"Using unified GoLookupCache as MemoryBank ({go_cache.device} fp32, no copies).")
 
     seen_go_ids_prev: set = set()
 

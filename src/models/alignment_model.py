@@ -31,8 +31,27 @@ class ProteinGoAligner(nn.Module):
 
     # ---- helpers ----
     @staticmethod
-    def _norm(x: torch.Tensor, dim: int) -> torch.Tensor:
-        return F.normalize(x.float(), p=2, dim=dim)
+    def _norm(x, dim=-1, eps=1e-6, norm_chunk: int = 0):
+        """
+        L2 normalize without materializing a full fp32 copy.
+        - Compute norms in fp32 for stability, but per-chunk.
+        - Return in original dtype (bf16/fp16 friendly).
+        """
+        dtype = x.dtype
+        if norm_chunk is None or norm_chunk <= 0:
+            n = torch.linalg.vector_norm(x.to(torch.float32), dim=dim, keepdim=True).clamp_min(eps)
+            return x / n.to(dtype)
+
+        outs = []
+        # chunk along the first dimension that is "batch-like".
+        # Gz genelde (B, T, Dh). Burada ilk eksen B*T olabilir; cat edilen ekseni koruyoruz.
+        N = x.shape[0]
+        for s in range(0, N, norm_chunk):
+            xe = x[s:s + norm_chunk]
+            ne = torch.linalg.vector_norm(xe.to(torch.float32), dim=dim, keepdim=True).clamp_min(eps)
+            outs.append(xe / ne.to(dtype))
+            del xe, ne
+        return torch.cat(outs, dim=0)
 
     def _pool(self, H: torch.Tensor, G: torch.Tensor, mask: torch.Tensor, return_alpha: bool):
         out = self.pooler(H, G, attn_mask=mask, return_alpha=return_alpha)
@@ -76,8 +95,8 @@ class ProteinGoAligner(nn.Module):
                 Zp = self.proj_p(Zs)               # [B, t, d_z]
                 Gz = self.proj_g(Gs)               # [B, t, d_z]
                 if self.normalize:
-                    Zp = self._norm(Zp, dim=-1)
-                    Gz = self._norm(Gz, dim=-1)
+                    Zp = self._norm(Zp, dim=-1, norm_chunk=256)
+                    Gz = self._norm(Gz, dim=-1, norm_chunk=256)
                 scores_parts.append((Zp * Gz).sum(dim=-1))   # [B, t]
 
                 # alpha biriktir
