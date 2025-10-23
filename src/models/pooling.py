@@ -1,3 +1,4 @@
+# src/models/pooling.py
 from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
@@ -91,9 +92,16 @@ class GoSpecificWattiPooling(nn.Module):
         B, L, Dh = H.shape
         T = G.shape[1]
 
-        # dtype seçimi
+        # --- Hesaplama dtype'ı (CUDA'da bf16 tercih) ---
         bf16_ok = (device.type == "cuda")
         comp_dtype = torch.bfloat16 if bf16_ok else torch.float32
+
+        # *** KRİTİK DÜZELTME: Projeksiyon katmanlarını comp_dtype'a al ***
+        # Linear ağırlıkları ile input aynı dtype olmalı.
+        if self.Wk.weight.dtype != comp_dtype:
+            self.Wk.to(dtype=comp_dtype, device=device)
+        if self.Wq.weight.dtype != comp_dtype:
+            self.Wq.to(dtype=comp_dtype, device=device)
 
         # key mask (True=PAD)
         key_mask = None
@@ -113,11 +121,9 @@ class GoSpecificWattiPooling(nn.Module):
             te = min(T, ts + t_step)
 
             # Q'yu sadece bu t-chunk için projekte et
-            # Q: [B,t,P] (bf16)
-            Qc = self.Wq(G[:, ts:te, :]).to(comp_dtype)
+            Qc = self.Wq(G[:, ts:te, :].to(comp_dtype))   # [B,t,P] comp_dtype
 
             # LSE akümülatörleri: m,s (denominator), z (numerator)
-            # m,s: [B,t,1] fp32 ; z: [B,t,Dh] fp32
             m = None
             s = None
             z = torch.zeros((B, te - ts, Dh), device=device, dtype=torch.float32)
@@ -126,15 +132,14 @@ class GoSpecificWattiPooling(nn.Module):
             ls = 0
             while ls < L:
                 le = min(L, ls + k_step)
-                # H/K alt-dilim BF16 (gereken yerde kademeli küçült)
+                # H/K alt-dilim comp_dtype
                 try:
                     Hc = H[:, ls:le, :].to(comp_dtype)         # [B,ℓ,Dh]
-                    Kc = self.Wk(Hc)                           # [B,ℓ,P] (bf16)
+                    Kc = self.Wk(Hc)                           # [B,ℓ,P] (comp_dtype)
                     # logits: [B,t,ℓ] = Qc [B,t,P] @ Kc^T [B,P,ℓ]
-                    lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale  # bf16
+                    lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale  # comp_dtype
                     lc = lc.to(torch.float32)                               # LSE için fp32
                 except torch.cuda.OutOfMemoryError:
-                    # k_step'i yarıya indir ve tekrar dene
                     torch.cuda.empty_cache()
                     if k_step > 128:
                         k_step = max(128, k_step // 2)
@@ -147,18 +152,17 @@ class GoSpecificWattiPooling(nn.Module):
                     km = key_mask[:, :, ls:le]      # [B,1,ℓ]
                     lc = lc.masked_fill(km, float("-inf"))
 
-                # ---- LSE streaming (denominator) + numerator streaming ----
-                # exp(lc - m_new) @ H_sub (H_sub'u küçük alt parçalara böleceğiz)
+                # ---- LSE streaming + numerator streaming ----
                 lc_max = lc.max(dim=-1, keepdim=True).values  # [B,t,1]
                 if m is None:
                     m = lc_max
                     s = torch.exp(lc - m).sum(dim=-1, keepdim=True)  # [B,t,1]
-                    # numerator (H üzerinden alt-parçalar)
+
                     start = 0
                     sub_size = h_sub
                     while start < (le - ls):
                         stop = min(le - ls, start + sub_size)
-                        H_sub = Hc[:, start:stop, :]                         # [B,h,Dh] bf16
+                        H_sub = Hc[:, start:stop, :]                         # [B,h,Dh] comp_dtype
                         w_sub = torch.exp(lc[:, :, start:stop] - m)          # [B,t,h] fp32
                         try:
                             z = z + torch.bmm(w_sub.to(comp_dtype), H_sub).to(torch.float32)
@@ -175,16 +179,16 @@ class GoSpecificWattiPooling(nn.Module):
                     scale_old = torch.exp(m - m_new)                         # [B,t,1]
                     s = scale_old * s + torch.exp(lc - m_new).sum(-1, keepdim=True)
 
-                    # numerator update
                     start = 0
                     sub_size = h_sub
                     while start < (le - ls):
                         stop = min(le - ls, start + sub_size)
-                        H_sub = Hc[:, start:stop, :]                         # [B,h,Dh] bf16
+                        H_sub = Hc[:, start:stop, :]                         # [B,h,Dh] comp_dtype
                         w_sub = torch.exp(lc[:, :, start:stop] - m_new)      # [B,t,h] fp32
                         try:
-                            # z = z*scale_old + w_sub @ H_sub
-                            z = z.mul_(scale_old).add_( torch.bmm(w_sub.to(comp_dtype), H_sub).to(torch.float32) )
+                            z = z.mul_(scale_old).add_(
+                                torch.bmm(w_sub.to(comp_dtype), H_sub).to(torch.float32)
+                            )
                         except torch.cuda.OutOfMemoryError:
                             torch.cuda.empty_cache()
                             if sub_size > 16:
@@ -200,15 +204,13 @@ class GoSpecificWattiPooling(nn.Module):
                 torch.cuda.empty_cache()
                 ls = le
 
-            # t-chunk sonucu: Zc = z / s
+            # t-chunk sonucu
             Zc = (z / s.clamp_min(1e-20)).to(torch.float32)  # [B,t,Dh]
             Zc = self.dropout(Zc)
             Z_parts.append(Zc)
 
-            # alpha gerekiyorsa streaming ile üret (bellek maliyetli; L küçükken kullan)
             if return_alpha:
-                # ikinci geçiş: alpha'yı [B,t,L] olarak inşa et (chunk chunk)
-                # NOT: Büyük L için çok maliyetli olabilir; bucket wrapper uzunlarda zaten False gönderiyor.
+                # alpha üretimi (uzun L için pahalı; genelde False gönderin)
                 alpha_chunks: List[torch.Tensor] = []
                 ls = 0
                 while ls < L:
@@ -221,7 +223,6 @@ class GoSpecificWattiPooling(nn.Module):
                         if key_mask is not None:
                             km = key_mask[:, :, ls:le]
                             lc = lc.masked_fill(km, float("-inf"))
-                        # alpha_sub = exp(lc - m) / s
                         alpha_sub = torch.exp(lc - m) / s
                         alpha_chunks.append(alpha_sub)   # [B,t,ℓ]
                         del Hc, Kc, lc, alpha_sub
