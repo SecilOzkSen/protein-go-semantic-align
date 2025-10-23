@@ -15,7 +15,7 @@ class ProteinGoAligner(nn.Module):
         d_g: Optional[int] = None,
         d_z: int = 768,
         go_encoder: Optional[BioMedBERTEncoder] = None,
-        normalize: bool = True,
+        normalize: bool = True
     ):
         super().__init__()
         self.normalize = bool(normalize)
@@ -154,7 +154,7 @@ class ProteinGoAligner(nn.Module):
             # (B, k, d_g) -> (B, k, T, d_g) -> (B*k, T, d_g)
             G_rep = G_chunk.unsqueeze(2).expand(B, k, T, d_g).reshape(B * k, T, d_g)
 
-            Z_rep, _ = self._pool(H_rep, G_rep, mask_rep, return_alpha=False)  # [B*k, T, d_h]
+            Z_rep, _ = self._pool(H_rep, G_rep, mask_rep, return_alpha=return_alpha)  # [B*k, T, d_h]
             Zp = self.proj_p(Z_rep)                                            # [B*k, T, d_z]
             Gz = self.proj_g(G_rep)                                            # [B*k, T, d_z]
             if self.normalize:

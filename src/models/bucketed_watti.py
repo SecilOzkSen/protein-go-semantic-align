@@ -49,8 +49,9 @@ class BucketedGoWatti(nn.Module):
                 attn_mask: Optional[torch.Tensor] = None,  # (B,L) bool where True=PAD
                 return_alpha: bool = False):
         B, L, D = H.shape
+        print(f"Forward call: Return Alpha: {return_alpha}")
         if L <= self.short_thr:
-            Z, A = self.core(H, G, mask=attn_mask, return_alpha=True)  # (B,T,D), (B,T,L)
+            Z, A = self.core(H, G, mask=attn_mask, return_alpha=return_alpha)  # (B,T,D), (B,T,L)
             if return_alpha:
                 return Z, {"alpha_full": A}
             return Z
