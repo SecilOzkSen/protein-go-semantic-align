@@ -32,15 +32,11 @@ class AttnPool1D(nn.Module):
 
 class GoSpecificWattiPooling(nn.Module):
     """
-    GO(token) x Protein(residue) cross-attention (H:[B,L,Dh], G:[B,T,Dg]).
-
-    Bellek güvenli "streaming" softmax:
-      - T ekseninde q_chunk (t_step) ile,
-      - L ekseninde k_chunk ile çalışır.
-    Büyük [B,T,L] tensörleri oluşturmaz.
-    Logit ve exp hesapları bf16'da; akümülatörler fp32'de tutulur.
-
-    reduce: "none" | "mean" | "attn"  -> T boyunca indirgeme seçeneği.
+    GO(token) x Protein(residue) cross-attention (memory-safe):
+      - Q = Wq(G), K = Wk(H)
+      - logits parça parça (t_chunk x k_chunk), softmax L boyunca LSE ile
+      - Z = softmax(logits, L) @ H  (mikro-parçalarla, kopyasız)
+    Opsiyonel T-reduce: "none" | "mean" | "attn"
     """
     def __init__(
         self,
@@ -48,29 +44,34 @@ class GoSpecificWattiPooling(nn.Module):
         d_g: int,
         d_proj: int = 256,
         dropout: float = 0.0,
-        k_chunk: int = 128,            # L boyunca parça
-        reduce: str = "none",           # "none" | "mean" | "attn"
+        k_chunk: int = 1024,             # L boyunca ana parça
+        reduce: str = "none",            # "none" | "mean" | "attn"
         attn_t_hidden: int = 0,
         attn_t_dropout: float = 0.0,
-        q_chunk_default: int = 32,     # T boyunca varsayılan parça
+        q_chunk_default: int = 32,       # T boyunca varsayılan dilim
+        h_sub_init: int = 128            # L mikro-parça (OOM’da yarıya iner)
     ):
         super().__init__()
         self.Wk = nn.Linear(d_h, d_proj, bias=False)
         self.Wq = nn.Linear(d_g, d_proj, bias=False)
         self.scale = (d_proj ** -0.5)
+
         self.k_chunk = int(k_chunk)
         self.reduce = reduce
-        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
         self.q_chunk_default = int(q_chunk_default)
+        self.h_sub_init = int(h_sub_init)
+
+        self.dropout = nn.Dropout(dropout) if (dropout and dropout > 0) else nn.Identity()
 
         self.t_pool = None
         if self.reduce == "attn":
             self.t_pool = AttnPool1D(d_in=d_h, d_hidden=attn_t_hidden, dropout=attn_t_dropout)
 
+    @torch.cuda.amp.autocast(enabled=False)  # dışarıdan dtype kontrolü için
     def forward(
         self,
-        H: torch.Tensor,                           # [B,L,Dh]
-        G: torch.Tensor,                           # [B,T,Dg]
+        H: torch.Tensor,                           # [B,L,Dh] fp32
+        G: torch.Tensor,                           # [B,T,Dg] fp32
         mask: Optional[torch.Tensor] = None,       # [B,L] (True=PAD)
         return_alpha: bool = False,
         q_chunk: Optional[int] = None,             # T boyunca dilim
@@ -80,82 +81,88 @@ class GoSpecificWattiPooling(nn.Module):
         T = G.shape[1]
         device = H.device
 
-        # Projeksiyonlar fp32 (stabilite)
-        K_full = self.Wk(H)              # [B,L,P] fp32
-        Q_full = self.Wq(G)              # [B,T,P] fp32
+        # --- Projeksiyonlar: Q/K’yi bf16’a düşür, büyük fp32’yi tutma
+        comp_dtype = torch.bfloat16 if torch.cuda.is_available() else H.dtype
+        K_full = self.Wk(H).to(comp_dtype)     # [B,L,P] bf16
+        Q_full = self.Wq(G).to(comp_dtype)     # [B,T,P] bf16
 
         key_mask = None
         if mask is not None:
-            key_mask = mask.bool().unsqueeze(1)  # [B,1,L]
+            key_mask = mask.bool().unsqueeze(1)       # [B,1,L]
 
         t_step = int(q_chunk) if q_chunk is not None else self.q_chunk_default
         t_step = max(1, min(T, t_step))
 
-        # Çıktı ve akümülatör dtype’ları
-        Z_out = torch.zeros(B, T, Dh, device=device, dtype=torch.float32)   # [B,T,Dh]
-        comp_dtype = torch.bfloat16 if torch.cuda.is_available() else H.dtype
+        # Çıktı (fp32, stabilite)
+        Z_out = torch.zeros(B, T, Dh, device=device, dtype=torch.float32)
 
-        # Numerator için mikro-parça (H üzerinden) boyutu
-        # Büyükse OOM’a sebep olmasın diye makul küçük tutuyoruz.
-        h_sub = min(self.k_chunk, 256)
+        # adaptif mikro-parça
+        base_h_sub = max(16, min(self.k_chunk, self.h_sub_init))
 
         for ts in range(0, T, t_step):
             te = min(T, ts + t_step)
-            Qc = Q_full[:, ts:te, :].to(comp_dtype)           # [B,t,P] bf16
+            Qc = Q_full[:, ts:te, :]                         # [B,t,P] bf16
 
-            # running log-sum-exp parçalı softmax değişkenleri (fp32)
+            # LSE akümülatörleri (fp32)
             m = torch.full((B, te - ts), -float('inf'), device=device, dtype=torch.float32)  # [B,t]
             s = torch.zeros(B, te - ts, device=device, dtype=torch.float32)                  # [B,t]
             z = torch.zeros(B, te - ts, Dh, device=device, dtype=torch.float32)             # [B,t,Dh]
 
             for ls in range(0, L, self.k_chunk):
                 le = min(L, ls + self.k_chunk)
+                Kc = K_full[:, ls:le, :]                         # [B,ℓ,P] bf16
 
-                # K dilimi bf16 (logits için)
-                Kc = K_full[:, ls:le, :].to(comp_dtype)        # [B,ℓ,P] bf16
-
-                # logits: [B,t,ℓ] (bf16)
-                lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale
+                # logits bf16
+                lc = torch.bmm(Qc, Kc.transpose(1, 2)) * self.scale   # [B,t,ℓ] bf16
                 if key_mask is not None:
-                    km = key_mask[:, :, ls:le]                 # [B,1,ℓ]
-                    lc = lc.masked_fill(km, float("-inf"))
+                    lc = lc.masked_fill(key_mask[:, :, ls:le], float("-inf"))
 
-                # chunk maksimumu (fp32'ye)
-                lc_max = lc.max(dim=-1).values.to(torch.float32)             # [B,t]
-                m_new = torch.maximum(m, lc_max)                              # [B,t]
+                # LSE: yeni maksimum (fp32)
+                lc_max = lc.max(dim=-1).values.to(torch.float32)      # [B,t]
+                m_new = torch.maximum(m, lc_max)
 
                 # önceki katkıları yeniden ölçekle
-                exp_scale_prev = torch.exp(m - m_new)                         # [B,t]
-                s = s * exp_scale_prev
-                z = z * exp_scale_prev.unsqueeze(-1)
+                scale_prev = torch.exp(m - m_new)                      # [B,t]
+                s = s * scale_prev
+                z = z * scale_prev.unsqueeze(-1)
 
-                # --- payda katkısı: sum exp(lc - m_new) ---
-                exp_chunk_den = torch.exp(lc.to(comp_dtype) - m_new.unsqueeze(-1).to(comp_dtype))  # [B,t,ℓ] bf16
-                s = s + exp_chunk_den.sum(dim=-1).to(torch.float32)          # [B,t]
+                # payda katkısı (bf16) -> fp32’ye topla
+                exp_den = torch.exp(lc - m_new.unsqueeze(-1).to(comp_dtype))  # [B,t,ℓ] bf16
+                s = s + exp_den.sum(dim=-1).to(torch.float32)                  # [B,t]
 
-                # --- pay (numerator) katkısı: mikro-parça ile ---
-                # H için KOPYA/KAST yok -> H_sub fp32 kalır; exp_sub fp32'ye cast edilip bmm yapılır.
-                for mls in range(ls, le, h_sub):
-                    mle = min(le, mls + h_sub)
-                    # logits alt parçasının exp'i: [B,t,h]
-                    exp_sub = exp_chunk_den[:, :, (mls - ls):(mle - ls)]
-                    # H alt parçası: [B,h,Dh] (fp32)
-                    H_sub = H[:, mls:mle, :]  # fp32, kopya yok (view)
-                    # bmm için aynı dtype olmalı -> exp_sub'ı fp32’ye çeviriyoruz (küçük h için güvenli)
-                    z = z + torch.bmm(exp_sub.to(torch.float32), H_sub)       # [B,t,Dh] fp32 akümüle
+                # --- pay (numerator) katkısı: BF16 BMM, SONUÇ fp32 ---
+                # exp_sub’u fp32’ye döndürmek yerine H_sub’u bf16’a çeviriyoruz (küçük slice).
+                h_sub = base_h_sub
+                offset = 0
+                while offset < (le - ls):
+                    try:
+                        mls = ls + offset
+                        mle = min(le, mls + h_sub)
+                        # [B,t,h]
+                        exp_sub = exp_den[:, :, (mls - ls):(mle - ls)]
+                        # [B,h,Dh]  -> küçük dilim, bf16 kopyası makul
+                        H_sub_bf16 = H[:, mls:mle, :].to(comp_dtype, copy=True)
+                        # bmm bf16 -> bf16, sonra fp32 akümüle
+                        z = z + torch.bmm(exp_sub, H_sub_bf16).to(torch.float32)
+                        offset = mle - ls
+                    except torch.cuda.OutOfMemoryError:
+                        # adaptif küçültme
+                        if h_sub <= 16:
+                            raise
+                        h_sub = max(16, h_sub // 2)
+                        torch.cuda.empty_cache()
+                        continue
 
-                # güncelle
                 m = m_new
 
                 # serbest bırak
-                del Kc, lc, lc_max, m_new, exp_scale_prev, exp_chunk_den
+                del Kc, lc, lc_max, m_new, scale_prev, exp_den
                 torch.cuda.empty_cache()
 
-            # t-diliminde normalize edilmiş çıktı
+            # normalize et ve yaz
             eps = 1e-12
-            Zc = z / (s.clamp_min(eps).unsqueeze(-1))                         # [B,t,Dh] fp32
+            Zc = z / (s.clamp_min(eps).unsqueeze(-1))                 # [B,t,Dh] fp32
             Zc = self.dropout(Zc).to(H.dtype)
-
             Z_out[:, ts:te, :] = Zc
 
             del Qc, m, s, z, Zc
@@ -163,18 +170,12 @@ class GoSpecificWattiPooling(nn.Module):
 
         # --- T boyunca reduce (opsiyonel) ---
         if self.reduce == "none":
-            if return_alpha:
-                return Z_out, None
-            return Z_out
+            return (Z_out, None) if return_alpha else Z_out
         elif self.reduce == "mean":
-            Zp = Z_out.mean(dim=1)                     # [B,Dh]
-            if return_alpha:
-                return Zp, None
-            return Zp
+            Zp = Z_out.mean(dim=1)
+            return (Zp, None) if return_alpha else Zp
         elif self.reduce == "attn":
-            Zp, _ = self.t_pool(Z_out, t_mask=None)    # [B,Dh]
-            if return_alpha:
-                return Zp, None
-            return Zp
+            Zp, _ = self.t_pool(Z_out, t_mask=None)
+            return (Zp, None) if return_alpha else Zp
         else:
             raise ValueError(f"Unknown reduce='{self.reduce}'")
