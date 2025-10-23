@@ -400,7 +400,7 @@ class OppTrainer:
 
                 # model forward: return_alpha=False ve kısa T-chunk (pos_chunk_t)
                 out = self.model(H=H_rep, G=Gc_flat, mask=mask_rep,
-                                 return_alpha=False, cand_chunk_k=None, pos_chunk_t=pos_chunk_t)
+                                 return_alpha=False, cand_chunk_k=256, pos_chunk_t=pos_chunk_t)
 
                 # out: [Bk, T', Dh] ise kendi skor fonksiyonun neyse uygula;
                 # çoğunlukla Z->proj->skor gibi. Eğer out zaten skor ise reshape et:
