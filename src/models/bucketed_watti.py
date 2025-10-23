@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,47 +44,57 @@ class BucketedGoWatti(nn.Module):
             s += stride
 
     def forward(self,
-                H: torch.Tensor,        # (B,L,D)
-                G: torch.Tensor,        # (B,T,Gd)
+                H: torch.Tensor,        # (B,L,Dh)
+                G: torch.Tensor,        # (B,T,Dg)
                 attn_mask: Optional[torch.Tensor] = None,  # (B,L) bool where True=PAD
                 return_alpha: bool = False):
         B, L, D = H.shape
-        print(f"Forward call: Return Alpha: {return_alpha}")
-        if L <= self.short_thr:
-            Z, A = self.core(H, G, mask=attn_mask, return_alpha=return_alpha)  # (B,T,D), (B,T,L)
-            if return_alpha:
-                return Z, {"alpha_full": A}
-            return Z
 
-        # choose window config
+        # ---- Case 1: Kısa sekans, full attention ----
+        if L <= self.short_thr:
+            out = self.core(H, G, mask=attn_mask, return_alpha=return_alpha)
+            if return_alpha:
+                Z, A = out  # core burada (Z, alpha) döner
+                return Z, {"alpha_full": A}
+            else:
+                Z = out     # core burada sadece Z döner
+                return Z
+
+        # ---- Case 2/3: Pencereli yol ----
         if L <= self.mid_thr:
             win, stride = self.win_small, self.stride_small
         else:
             win, stride = self.win_large, self.stride_large
 
         spans = list(self._window_spans(L, win, stride))
-        win_Z = []
-        win_A = [] if return_alpha else None
+        win_Z: List[torch.Tensor] = []
+        win_A: List[torch.Tensor] = [] if return_alpha else None
 
         for s, e in spans:
             Hk = H[:, s:e, :]
             mk = attn_mask[:, s:e] if attn_mask is not None else None
-            Zk, Ak = self.core(Hk, G, mask=mk, return_alpha=return_alpha)  # (B,T,D), (B,T,e-s)
-            win_Z.append(Zk)
+
+            out = self.core(Hk, G, mask=mk, return_alpha=return_alpha)
             if return_alpha:
-                if (e - s) < win:
+                Zk, Ak = out                      # (B,T,D), (B,T,e-s)
+                if (e - s) < win:                 # son pencere pad'lenebilir
                     pad = win - (e - s)
                     Ak = F.pad(Ak, (0, pad), value=0.0)
                 win_A.append(Ak)
+            else:
+                Zk = out                           # sadece Z
 
-        # stack windows
-        ZW = torch.stack(win_Z, dim=2)  # (B,T,W,D)
-        # window-level attention
-        q_t = self.win_query(G)                   # (B,T,D)
-        k_w = self.win_key(ZW)                    # (B,T,W,D)
+            win_Z.append(Zk)
+
+        # (B,T,W,D)
+        ZW = torch.stack(win_Z, dim=2)
+
+        # Window-level attention (GO ile koşullanan)
+        q_t = self.win_query(G)           # (B,T,Dh)
+        k_w = self.win_key(ZW)            # (B,T,W,Dh)
         logits = torch.einsum("btd,btwd->btw", q_t, k_w) * self.scale
-        w = torch.softmax(logits, dim=-1)         # (B,T,W)
-        Z = torch.einsum("btw,btwd->btd", w, ZW)  # (B,T,D)
+        w = torch.softmax(logits, dim=-1) # (B,T,W)
+        Z = torch.einsum("btw,btwd->btd", w, ZW)
 
         if not return_alpha:
             return Z
