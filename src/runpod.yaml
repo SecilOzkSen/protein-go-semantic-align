@@ -33,6 +33,7 @@ training:
   epochs: 5
   batch_size: 4
   eval_batch_size: 4
+  device: "cuda:0"
 
   num_workers: 8
   val_num_workers: 4

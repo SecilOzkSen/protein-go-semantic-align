@@ -600,8 +600,8 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
 def run_training(args, schedule: TrainSchedule):
     signal.signal(signal.SIGINT, _sigint_handler)
     logger = logging.getLogger("main")
-    if args.device is not None:
-        device = args.device
+    if args.general_device is not None:
+        device = args.general_device
     else:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
@@ -1024,6 +1024,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         pos_chunk_t=int(training.get("pos_chunk_t", 128)),
         k_hard_queue=int(training.get("k_hard_queue", 128)),
         queue_K=int(training.get("queue_K", 65536)),
+        general_device=str(training.get("device", "cuda:0")),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
