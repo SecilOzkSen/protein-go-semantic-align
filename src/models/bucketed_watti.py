@@ -69,7 +69,7 @@ class BucketedGoWatti(nn.Module):
         for s, e in spans:
             Hk = H[:, s:e, :]
             mk = attn_mask[:, s:e] if attn_mask is not None else None
-            Zk, Ak = self.core(Hk, G, mask=mk, return_alpha=True)  # (B,T,D), (B,T,e-s)
+            Zk, Ak = self.core(Hk, G, mask=mk, return_alpha=return_alpha)  # (B,T,D), (B,T,e-s)
             win_Z.append(Zk)
             if return_alpha:
                 if (e - s) < win:
