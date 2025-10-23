@@ -876,7 +876,7 @@ class OppTrainer:
 
                 use_attr_eval = (self.attr.lambda_attr > 0.0)
                 if use_attr_eval:
-                    scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=True)
+                    scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=False)
                 else:
                     scores_pos = self.forward_scores(H, G_pos, pad_mask, return_alpha=False)
                     alpha_info = {}
