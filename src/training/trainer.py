@@ -452,7 +452,7 @@ class OppTrainer:
         # Burada grad açık kalır; alpha istiyorsan döner.
         out = self.model(H=H, G=G, mask=pad_mask,
                          return_alpha=return_alpha,
-                         cand_chunk_k=None,
+                         cand_chunk_k=0,
                          pos_chunk_t=pos_chunk_t,
                          **kwargs)
 
