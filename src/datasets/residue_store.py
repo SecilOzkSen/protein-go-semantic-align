@@ -373,7 +373,7 @@ class ESMResidueStore(_BaseStore):
             used = self._res_used[sidx]
             assert 0 <= s < e <= used
             view = self._res_shards[sidx][s:e]                 # np.memmap
-            H = torch.from_numpy(view).to(torch.float32)       # [L,D] float32 view
+            H = torch.from_numpy(view.copy()).to(torch.float32)       # [L,D] float32 view
             return H
 
         # Legacy yollar:
