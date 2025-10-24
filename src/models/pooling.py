@@ -144,6 +144,7 @@ class GoSpecificWattiPooling(nn.Module):
                     s = s * exp_m + exp_block.sum(dim=-1, keepdim=True)    # [B,t,1]
                     # pay: (exp_block @ H_block)
                     # exp_block fp32, H_block fp16/bf16 -> fp32 çarpıp ekle
+                    H_block = H_block.to(exp_block.dtype)
                     z = z * exp_m + torch.bmm(exp_block, H_block.to(torch.float32))  # [B,t,Dh]
 
                     m = m_new  # güncelle

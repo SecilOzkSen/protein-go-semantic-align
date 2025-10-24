@@ -1,14 +1,11 @@
-# src/main.py
 import os
 import sys
 import time
 import math
 import yaml
-import torch
 import random
 from torch.utils.data import DataLoader
-from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, List
 import torch.multiprocessing as mp
 from datetime import datetime
 import glob
@@ -27,7 +24,7 @@ import wandb
 from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore, VectorResources
 from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
 from src.training.collate import ContrastiveEmbCollator, fused_collator
-from src.training.trainer import OppTrainer
+from src.training.trainer import OppTrainer, ema_update
 from src.configs.data_classes import (
     FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
@@ -35,8 +32,9 @@ from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache
 from src.go import load_go_parents, load_go_children
 from src.utils import (
-    load_go_set, load_raw_pickle, load_raw_json, load_raw_txt, load_go_texts_by_phase
+    load_go_set, load_raw_json, load_raw_txt, load_go_texts_by_phase
 )
+from src.utils.checkpoint import save_checkpoint
 from src.encoders import BioMedBERTEncoder
 from math import inf
 
@@ -49,7 +47,6 @@ from src.configs.paths import (
     P_SEQ_LEN_LOOKUP,
     GOOGLE_DRIVE_MANIFEST_CACHE,
     TRAINING_CONFIG,
-    GO_ANCESTOR_STOPLIST,
     COMMON_IC_GO_TERMS_ID_ONLY_JSON,
 )
 
@@ -73,7 +70,7 @@ torch.set_float32_matmul_precision("high")  # TF32’yi etkin kullan
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64,garbage_collection_threshold:0.8"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
 
 # ============== Utilities ==============
 
@@ -125,45 +122,6 @@ def steps_per_epoch(n_items: int, batch_size: int) -> int:
 def _ckpt_path(output_dir: Path, tag: str):
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     return output_dir / f"ckpt_{tag}_{ts}.pt"
-
-
-def save_checkpoint(output_dir: Path, tag: str, trainer, args, epoch: int, step: int, extra: dict = None):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    path = _ckpt_path(output_dir, tag)
-    state = {
-        "model": trainer.model.state_dict(),
-        "optimizer": trainer.opt.state_dict(),
-        "args": vars(args),
-        "epoch": epoch,
-        "global_step": step,
-    }
-    # --- MoCoQueue state (if present) ---
-
-    if hasattr(trainer, "queue_miner") and trainer.queue_miner is not None:
-        try:
-            q = trainer.queue_miner
-            state["queue"] = {
-                        "queue": q.queue.detach().cpu(),  # [dim,K] float32
-                        "ptr": q.ptr.detach().cpu(),
-                        "filled": q.filled.detach().cpu(),
-                        "dim": int(q.queue.size(0)),
-                        "K": int(q.queue.size(1)),
-            }
-        except Exception as e:
-                logging.getLogger("ckpt").warning("Queue state export failed: %r", e)
-    if hasattr(trainer, "scaler") and trainer.scaler is not None:
-        state["scaler"] = trainer.scaler.state_dict()
-    if hasattr(trainer, "sched") and trainer.sched is not None:
-        try:
-            state["lr_scheduler"] = trainer.sched.state_dict()
-        except Exception:
-            pass
-    if extra:
-        state["extra"] = extra
-    torch.save(state, path)
-    logging.getLogger("ckpt").info("Saved checkpoint: %s", str(path))
-    return path
-
 
 def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int = 3):
     cks = sorted(glob.glob(str(output_dir / "ckpt_*.pt")))
@@ -726,7 +684,7 @@ def run_training(args, schedule: TrainSchedule):
 
             # Dataloader’ları yeniden kur
             nonlocal train_loader, val_loader, collate
-            train_loader, val_loader, collate = build_dataloaders(datasets=datasets, args=args, go_cache=training_context.go_cache, go_text_store=training_context.go_text_store)
+            train_loader, val_loader, query_loader, collate = build_dataloaders(datasets=datasets, args=args, go_cache=training_context.go_cache, go_text_store=training_context.go_text_store)
 
             training_context.current_phase = new_phase
             training_context.last_refresh_epoch = current_epoch
@@ -803,6 +761,8 @@ def run_training(args, schedule: TrainSchedule):
     global_step = 0
 
     for epoch in range(args.epochs):
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
         try:
             if args.wandb and (wandb.run is not None) and global_step == 1:
@@ -819,10 +779,11 @@ def run_training(args, schedule: TrainSchedule):
                                           attention_mask=toks['attention_mask'].to(device)).detach().cpu()
                 new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
                 training_context.go_cache.update(ids_to_update, new_embs)
-            seen_go_ids = set()
+
         except Exception as _e:
             logging.getLogger('bank').warning('Partial refresh failed: %r', _e)
 
+        seen_go_ids = set()
         training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
 
         trainer.model.train()
@@ -872,14 +833,19 @@ def run_training(args, schedule: TrainSchedule):
 
             # periodic checkpoint
             if (global_step % max(1, args.save_every)) == 0:
-                path = save_checkpoint(out_dir, tag=f"step{global_step}",
-                                       trainer=trainer, args=args,
-                                       epoch=epoch, step=global_step)
+                ckpt_path = save_checkpoint(
+                    out_dir=out_dir.name,
+                    tag=f"step{global_step}",
+                    trainer=trainer,
+                    args=args,
+                    epoch=epoch,
+                    step=global_step
+                )
                 cleanup_old_checkpoints(out_dir, keep_last_n=args.keep_last_n)
                 # (opsiyonel) wandb artifact
 
         # epoch finished - update ema
-        trainer.update_ema(trainer.index_projector, trainer.model.proj_p, m=0.995)
+        trainer.on_epoch_finish()
 
         # validation
         if val_loader is not None:
@@ -901,7 +867,14 @@ def run_training(args, schedule: TrainSchedule):
                 best_step = global_step
                 no_improve_epochs = 0
                 # en iyi modeli ayrı etiketle kaydet
-                save_checkpoint(out_dir, tag="best", trainer=trainer, args=args, epoch=epoch, step=global_step)
+                ckpt_path = save_checkpoint(
+                    out_dir=out_dir.name,
+                    tag=f"step{global_step}",
+                    trainer=trainer,
+                    args=args,
+                    epoch=epoch,
+                    step=global_step
+                )
                 logger.info(f"[ckpt] new BEST {metric_name}={best_val:.4f} @ epoch {epoch} step {global_step}")
                 # W&B özetine yazmak istersen:
                 if args.wandb and (wandb.run is not None):
@@ -923,15 +896,21 @@ def run_training(args, schedule: TrainSchedule):
 
         # epoch checkpoint
         try:
-            path = save_checkpoint(out_dir, tag=f"epoch{epoch + 1}", trainer=trainer,
-                                   args=args, epoch=epoch, step=global_step)
+            ckpt_path = save_checkpoint(
+                out_dir=out_dir.name,
+                tag=f"epoch{epoch + 1}",
+                trainer=trainer,
+                args=args,
+                epoch=epoch,
+                step=global_step
+            )
             cleanup_old_checkpoints(out_dir, keep_last_n=args.keep_last_n)
         except Exception:
             pass
 
     # final checkpoint
     try:
-        final_path = save_checkpoint(out_dir, tag="final", trainer=trainer,
+        final_path = save_checkpoint(out_dir.name, tag="final", trainer=trainer,
                                      args=args, epoch=epoch, step=global_step)
     except Exception:
         pass
