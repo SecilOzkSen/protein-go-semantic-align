@@ -257,6 +257,20 @@ class OppTrainer:
             return {k: self._to_device(v) for k, v in x.items()}
         return x
 
+    def _cpu_bank_gather(self, bank_cpu: torch.Tensor, idx: torch.Tensor, dev: torch.device) -> torch.Tensor:
+        """
+        CPU'daki vektör bankasından (bank_cpu) idx ile satır toplayıp
+        sonucu compute cihazına (dev) taşır.
+        """
+        if idx.device.type != "cpu":
+            idx = idx.to("cpu", non_blocking=True)
+        if idx.dtype != torch.long:
+            idx = idx.long()
+
+        out_cpu = bank_cpu.index_select(0, idx)          # CPU seçimi
+        return out_cpu.to(dev, non_blocking=True)        # GPU'ya taşı
+
+
     def _flush_phase_table(self, phase_id: int, step: int):
         import numpy as np
         rows = []
@@ -547,20 +561,31 @@ class OppTrainer:
                         k = min(int(self.k_hard_queue), K_all)
                         if k > 0:
                             _, idx = sims.topk(k, dim=1)  # [B,k] GPU
-                            # Seçilen negatifleri CPU’dan al (VRAM şişirmeden)
+                            # --- güvenli ve cihaz tutarlı seçim ---
                             neg_from_queue = []
                             neg_ids_from_queue = []
-                            idx_list = idx.tolist()
                             for b in range(B):
-                                take_ids = [all_neg_ids[i] for i in idx_list[b]]
-                                take_vecs = all_neg_vecs_cpu.index_select(0,
-                                                                          torch.tensor(idx_list[b], dtype=torch.long))
-                                neg_from_queue.append(take_vecs)  # CPU
-                                neg_ids_from_queue.append(torch.tensor(take_ids, dtype=torch.long))
+                                neg_idx_b = idx[b]  # [k] (GPU)
+                                # CPU bank’tan güvenli seçim (idx → CPU long, sonra seç, sonra CPU'da bırak)
+                                take_vecs_b = self._cpu_bank_gather(all_neg_vecs_cpu, neg_idx_b,
+                                                                    dev="cpu")  # [k,Dg] CPU
+
+                                # id’leri CPU long yap
+                                if neg_idx_b.device.type != "cpu":
+                                    neg_idx_cpu = neg_idx_b.to("cpu", non_blocking=True)
+                                else:
+                                    neg_idx_cpu = neg_idx_b
+                                if neg_idx_cpu.dtype != torch.long:
+                                    neg_idx_cpu = neg_idx_cpu.long()
+
+                                take_ids_b = all_neg_ids.index_select(0, neg_idx_cpu)  # [k] CPU long
+
+                                neg_from_queue.append(take_vecs_b)
+                                neg_ids_from_queue.append(take_ids_b)
+
                             # [B,k,Dg] CPU / [B,k] CPU
                             neg_from_queue = torch.stack(neg_from_queue, dim=0)
                             neg_ids_from_queue = torch.stack(neg_ids_from_queue, dim=0)
-
                         del sims, sim_chunks
                         torch.cuda.empty_cache()
 
@@ -589,7 +614,7 @@ class OppTrainer:
                     UG_cpu = uniq_go_embs.detach().to("cpu")
                     UID_cpu = uniq_go_ids.detach().to("cpu")
                     for b in range(B):
-                        take_idx = torch.tensor(idx_easy_list[b], dtype=torch.long)
+                        take_idx = torch.tensor(idx_easy_list[b], dtype=torch.long)  # CPU long
                         easy_vecs.append(UG_cpu.index_select(0, take_idx))
                         easy_ids.append(UID_cpu.index_select(0, take_idx))
                     easy_vecs = torch.stack(easy_vecs, dim=0)  # [B,k_easy,Dg] CPU

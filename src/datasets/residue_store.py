@@ -505,7 +505,7 @@ class ESMFusedStore(_BaseStore):
             sidx, r = self._pid2row[pid]
             used = self._used[sidx]; assert 0 <= r < used
             view = self._shards[sidx][r]                   # np.ndarray [D]
-            v = torch.from_numpy(view).to(torch.float32)
+            v = torch.from_numpy(view.copy()).to(torch.float32)
             if v.ndim != 1:
                 raise TypeError(f"Fused embedding must be [D], got {tuple(v.shape)} for '{pid}'")
             return v
