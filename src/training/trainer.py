@@ -257,6 +257,68 @@ class OppTrainer:
             return {k: self._to_device(v) for k, v in x.items()}
         return x
 
+    def _as_device_dtype(self, x: torch.Tensor, dev: torch.device | str,
+                         dtype: torch.dtype | None = None) -> torch.Tensor:
+        if isinstance(dev, str):
+            dev = torch.device(dev)
+        need_move = (x.device != dev)
+        need_cast = (dtype is not None and x.dtype != dtype)
+        return x.to(dev, dtype=dtype, non_blocking=True) if (need_move or need_cast) else x
+
+    def _stack_safe(self, tensors: List[torch.Tensor], dim: int = 0,
+                    dev: torch.device | str | None = None,
+                    dtype: torch.dtype | None = None) -> torch.Tensor:
+        if len(tensors) == 0:
+            if dev is None:  # boş liste durumu
+                dev = self.device if torch.cuda.is_available() else torch.device("cpu")
+            if isinstance(dev, str):
+                dev = torch.device(dev)
+            return torch.empty(0, device=dev, dtype=(dtype or torch.float32))
+        base = tensors[0]
+        target_dev = torch.device(dev) if dev is not None else base.device
+        target_dtype = dtype if dtype is not None else base.dtype
+        aligned = [self._as_device_dtype(t, target_dev, target_dtype) for t in tensors]
+        return torch.stack(aligned, dim=dim)
+
+    def _cat_safe(self, tensors: List[torch.Tensor], dim: int = 0,
+                  dev: torch.device | str | None = None,
+                  dtype: torch.dtype | None = None) -> torch.Tensor:
+        if len(tensors) == 0:
+            return self._stack_safe([], dim=dim, dev=dev, dtype=dtype)
+        base = tensors[0]
+        target_dev = torch.device(dev) if dev is not None else base.device
+        target_dtype = dtype if dtype is not None else base.dtype
+        aligned = [self._as_device_dtype(t, target_dev, target_dtype) for t in tensors]
+        return torch.cat(aligned, dim=dim)
+
+    def _gather_from_bank(self, bank: torch.Tensor, idx: torch.Tensor,
+                          out_dev: torch.device | str) -> torch.Tensor:
+        """
+        Bank nerede olursa olsun: index'i bank.device + long'a çevir,
+        seçimi bank.device'ta yap, sonucu out_dev'e taşı.
+        """
+        bdev = bank.device
+        idx_on_b = idx if idx.device == bdev else idx.to(bdev, non_blocking=True)
+        if idx_on_b.dtype != torch.long:
+            idx_on_b = idx_on_b.long()
+        out = bank.index_select(0, idx_on_b)
+        return self._as_device_dtype(out, out_dev, bank.dtype)
+
+    def _pick_bank_device(self, *candidates: torch.Tensor) -> torch.device:
+        """
+        Global aday havuzu cihazı:
+        1) ctx.bank_device (varsa)
+        2) İlk dolu tensörün cihazı
+        3) self.device
+        """
+        prefer = getattr(self.ctx, "bank_device", None)
+        if prefer is not None:
+            return torch.device(prefer)
+        for t in candidates:
+            if isinstance(t, torch.Tensor) and t.numel() > 0:
+                return t.device
+        return self.device
+
     def _cpu_bank_gather(self, bank: torch.Tensor, idx: torch.Tensor, dev: torch.device | str) -> torch.Tensor:
         """
         bank nerede olursa olsun CPU'ya al, index'i CPU long yap,
@@ -585,33 +647,24 @@ class OppTrainer:
                         k = min(int(self.k_hard_queue), K_all)
                         if k > 0:
                             _, idx = sims.topk(k, dim=1)  # [B,k] GPU
+                            bank_dev = self._pick_bank_device(uniq_go_embs)
                             # --- güvenli ve cihaz tutarlı seçim ---
                             neg_from_queue = []
                             neg_ids_from_queue = []
                             for b in range(B):
                                 neg_idx_b = idx[b]  # [k] (GPU)
-                                # CPU bank’tan güvenli seçim (idx → CPU long, sonra seç, sonra CPU'da bırak)
-                                take_vecs_b = self._cpu_bank_gather(all_neg_vecs_cpu, neg_idx_b,
-                                                                    dev=self.device)  # [k,Dg] CPU
-
-                                # id’leri CPU long yap
-                                if neg_idx_b.device.type != "cpu":
-                                    neg_idx_cpu = neg_idx_b.to("cpu", non_blocking=True)
-                                else:
-                                    neg_idx_cpu = neg_idx_b
-                                if neg_idx_cpu.dtype != torch.long:
-                                    neg_idx_cpu = neg_idx_cpu.long()
-
-                                take_vecs_b = self._cpu_bank_gather(all_neg_vecs_cpu, neg_idx_b,
-                                                                    dev=self.device)  # [k,Dg] CUDA
-                                take_ids_b = self._cpu_bank_gather_ids(all_neg_ids, neg_idx_b)
-
+                                take_vecs_b = self._gather_from_bank(all_neg_vecs_cpu, neg_idx_b,
+                                                                     out_dev=bank_dev)  # [k,Dg] bank_dev
+                                take_ids_b = self._gather_from_bank(all_neg_ids, neg_idx_b,
+                                                                    out_dev=bank_dev).long()  # [k] bank_dev
                                 neg_from_queue.append(take_vecs_b)
                                 neg_ids_from_queue.append(take_ids_b)
 
                             # [B,k,Dg] CPU / [B,k] CPU
-                            neg_from_queue = torch.stack(neg_from_queue, dim=0)
-                            neg_ids_from_queue = torch.stack(neg_ids_from_queue, dim=0)
+                            neg_from_queue = self._stack_safe(neg_from_queue, dim=0, dev=bank_dev,
+                                                              dtype=uniq_go_embs.dtype)  # [B,k,Dg]
+                            neg_ids_from_queue = self._stack_safe(neg_ids_from_queue, dim=0, dev=bank_dev,
+                                                                  dtype=torch.long)
                         del sims, sim_chunks
                         torch.cuda.empty_cache()
 
@@ -637,50 +690,58 @@ class OppTrainer:
                     easy_vecs = []
                     easy_ids = []
                     idx_easy_list = idx_easy.tolist()
-                    UG_cpu = uniq_go_embs.detach().to("cpu")
-                    UID_cpu = uniq_go_ids.detach().to("cpu")
                     for b in range(B):
-                        take_idx = torch.tensor(idx_easy_list[b], dtype=torch.long)  # CPU long
-                        easy_vecs.append(UG_cpu.index_select(0, take_idx))
-                        easy_ids.append(UID_cpu.index_select(0, take_idx))
-                    easy_vecs = torch.stack(easy_vecs, dim=0)  # [B,k_easy,Dg] CPU
-                    easy_ids = torch.stack(easy_ids, dim=0)  # [B,k_easy]    CPU
+                        take_idx = torch.as_tensor(idx_easy_list[b], dtype=torch.long, device=idx_easy.device)
+                        easy_vecs.append(
+                            self._gather_from_bank(uniq_go_embs, take_idx, out_dev=bank_dev))  # [k_easy,Dg] bank_dev
+                        easy_ids.append(
+                            self._gather_from_bank(uniq_go_ids, take_idx, out_dev=bank_dev).long())  # [k_easy] bank_dev
+                    easy_vecs = self._stack_safe(easy_vecs, dim=0, dev=bank_dev, dtype=uniq_go_embs.dtype)
+                    easy_ids = self._stack_safe(easy_ids, dim=0, dev=bank_dev, dtype=torch.long)
 
                 del sims_all
 
         # ========== GLOBAL CANDIDATE POOL (tamamen CPU) ==========
-        # 1) Batch pozitfileri (CPU'ya)
-        batch_pos_ids_cpu = uniq_go_ids.detach().to("cpu")  # [G]
-        batch_pos_vecs_cpu = self.normalizer(uniq_go_embs, dim=1).detach().to("cpu")  # [G,Dg]
+        # bank_dev zaten yukarıda seçildi (Queue bloğunda); orası yoksa fallback:
+        bank_dev = locals().get("bank_dev", self._pick_bank_device(uniq_go_embs))
 
-        # 2) Seçilmiş negatifler (queue + easy) → unique id'ye göre tekilleştir
-        id2vec = {}
+        # 1) batch pozitfileri → bank_dev
+        batch_pos_ids = self._as_device_dtype(uniq_go_ids.detach(), bank_dev, dtype=torch.long)  # [G]
+        batch_pos_vecs = self._as_device_dtype(self.normalizer(uniq_go_embs, dim=1).detach(),
+                                               bank_dev, dtype=uniq_go_embs.dtype)  # [G,Dg]
+
+        # 2) queue+easy negatifleri tekilleştir ve bank_dev'e hizala
+        id2vec: dict[int, torch.Tensor] = {}
         if neg_ids_from_queue is not None and neg_from_queue is not None:
-            flat_ids = neg_ids_from_queue.reshape(-1).tolist()
-            flat_vecs = neg_from_queue.reshape(-1, neg_from_queue.size(-1))
-            for gid, v in zip(flat_ids, flat_vecs):
-                id2vec[int(gid)] = v  # CPU tensor
+            flat_ids = self._as_device_dtype(neg_ids_from_queue.reshape(-1), bank_dev, dtype=torch.long)
+            flat_vecs = self._as_device_dtype(neg_from_queue.reshape(-1, neg_from_queue.size(-1)),
+                                              bank_dev, dtype=batch_pos_vecs.dtype)
+            for gid, v in zip(flat_ids.tolist(), flat_vecs):
+                id2vec[int(gid)] = v
 
         if (easy_ids is not None) and (easy_vecs is not None):
-            flat_ids_e = easy_ids.reshape(-1).tolist()
-            flat_vecs_e = easy_vecs.reshape(-1, easy_vecs.size(-1))
-            for gid, v in zip(flat_ids_e, flat_vecs_e):
-                id2vec[int(gid)] = v  # CPU tensor
+            flat_ids_e = self._as_device_dtype(easy_ids.reshape(-1), bank_dev, dtype=torch.long)
+            flat_vecs_e = self._as_device_dtype(easy_vecs.reshape(-1, easy_vecs.size(-1)),
+                                                bank_dev, dtype=batch_pos_vecs.dtype)
+            for gid, v in zip(flat_ids_e.tolist(), flat_vecs_e):
+                id2vec[int(gid)] = v
 
         if len(id2vec) > 0:
-            all_neg_ids_selected_cpu = torch.tensor(sorted(id2vec.keys()), dtype=torch.long)
-            neg_vecs_unique_cpu = torch.stack([id2vec[k] for k in all_neg_ids_selected_cpu.tolist()], dim=0)
+            neg_ids_unique = torch.tensor(sorted(id2vec.keys()), dtype=torch.long, device=bank_dev)  # [Kn]
+            neg_vecs_unique = self._stack_safe([id2vec[k] for k in neg_ids_unique.tolist()],
+                                               dim=0, dev=bank_dev, dtype=batch_pos_vecs.dtype)  # [Kn,Dg]
         else:
-            all_neg_ids_selected_cpu = torch.empty(0, dtype=torch.long)
-            neg_vecs_unique_cpu = torch.empty(0, batch_pos_vecs_cpu.size(1))
+            neg_ids_unique = torch.empty(0, dtype=torch.long, device=bank_dev)
+            neg_vecs_unique = torch.empty(0, batch_pos_vecs.size(1), dtype=batch_pos_vecs.dtype, device=bank_dev)
 
-        # 3) Global havuz (CPU)
-        G_ids_global_cpu = torch.cat([batch_pos_ids_cpu, all_neg_ids_selected_cpu], dim=0)  # [K]
-        G_vecs_global_cpu = torch.cat([batch_pos_vecs_cpu, neg_vecs_unique_cpu], dim=0)  # [K,Dg]
-        K_global = int(G_vecs_global_cpu.size(0))
+        # 3) Global havuz (tek cihaz)
+        G_ids_global = self._cat_safe([batch_pos_ids, neg_ids_unique], dim=0, dev=bank_dev, dtype=torch.long)  # [K]
+        G_vecs_global = self._cat_safe([batch_pos_vecs, neg_vecs_unique], dim=0, dev=bank_dev,
+                                       dtype=batch_pos_vecs.dtype)  # [K,Dg]
+        K_global = int(G_vecs_global.size(0))
 
         # 4) Per-row multi-pozitif maskesi: [B,K] (GPU'da lazım)
-        id2col = {int(G_ids_global_cpu[i].item()): i for i in range(K_global)}
+        id2col = {int(G_ids_global[i].item()): i for i in range(K_global)}
         pos_mask = torch.zeros(B, K_global, dtype=torch.bool, device=device)
         for b, loc in enumerate(pos_local):
             if loc.numel() == 0:
@@ -691,9 +752,8 @@ class OppTrainer:
                 if j is not None:
                     pos_mask[b, j] = True
 
-        # 5) Skorlar (CANDIDATES) — G_cand CPU, forward_scores chunk’lı
-        # CPU'da [B,K,Dg] görünümü oluşturalım; bu "expand" kopyasız view’dur; GPU’ya chunk ile taşınacak.
-        G_cand_cpu = G_vecs_global_cpu.unsqueeze(0).expand(B, -1, -1).contiguous()  # [B,K,Dg] CPU
+        # [B,K,Dg] bank_dev (kopyasız genişletme)
+        G_cand = G_vecs_global.unsqueeze(0).expand(B, -1, -1).contiguous()
 
         amp_ctx = torch.amp.autocast(device_type='cuda',
                                      enabled=(torch.cuda.is_available() and self.ctx.fp16_enabled)) \
@@ -701,7 +761,7 @@ class OppTrainer:
 
         with amp_ctx:
             scores_cand = self.forward_scores(
-                H, G_cand_cpu, pad_mask,
+                H, G_cand, pad_mask,
                 return_alpha=False,
                 cand_chunk_k=int(getattr(self.cfg, "cand_chunk_k", 32)),
                 pos_chunk_t=int(getattr(self.cfg, "pos_chunk_t", 128)),
@@ -716,7 +776,7 @@ class OppTrainer:
             lambda_v = float(getattr(self.attr, "lambda_vtrue", 0.0))
             if lambda_v > 0.0:
                 with torch.no_grad():
-                    Gn_cpu = self.normalizer(G_vecs_global_cpu, dim=1)  # [K,Dg] CPU
+                    Gn_bank = self.normalizer(G_vecs_global, dim=1)  # [K,Dg] CPU
                 # Öğrenci logits (scores_cand) zaten üstte var; teacher p_t'yi üret:
                 vt = self.normalizer(prot_query, dim=1)  # [B,Dg] GPU
                 # Gn'yi GPU'ya parça parça taşı ve teacher skorlarını oluştur
@@ -726,8 +786,8 @@ class OppTrainer:
                 with torch.no_grad():
                     for s in range(0, K_global, bk):
                         e = min(K_global, s + bk)
-                        Gn_part = Gn_cpu[s:e].to(device, non_blocking=True)  # [k,Dg] GPU
-                        scores_teacher_parts.append(vt @ Gn_part.T)  # [B,k]
+                        Gn_part = self._as_device_dtype(Gn_bank[s:e], self.device)  # compute cihazına al
+                        scores_teacher_parts.append(vt @ Gn_part.T)
                         del Gn_part
                     scores_teacher = torch.cat(scores_teacher_parts, dim=1)  # [B,K]
                     p_t = F.softmax(scores_teacher / tau, dim=1)
@@ -819,8 +879,14 @@ class OppTrainer:
                 local_idx_list = [loc.to(device) for loc in pos_local if loc.numel() > 0]
                 if local_idx_list:
                     local_cat = torch.unique(torch.cat(local_idx_list, dim=0))
-                    pos_vecs = go_pos_all.index_select(0, local_cat).detach().to("cpu")  # CPU
-                    pos_ids = uniq_go_ids.index_select(0, local_cat).detach().to("cpu")
+                    # YENİ – cihaz agnostik
+                    qm_dev = torch.device(getattr(self.queue_miner, "device", "cpu"))  # MoCoQueue hangi cihazdaysa
+                    pos_vecs = self._as_device_dtype(
+                        go_pos_all.index_select(0, local_cat).detach(), qm_dev, dtype=go_pos_all.dtype
+                    )
+                    pos_ids = self._as_device_dtype(
+                        uniq_go_ids.index_select(0, local_cat).detach(), qm_dev, dtype=torch.long
+                    )
                     self.queue_miner.enqueue(pos_vecs, pos_ids)
 
         if torch.cuda.is_available():
