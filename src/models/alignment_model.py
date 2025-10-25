@@ -62,6 +62,16 @@ class ProteinGoAligner(nn.Module):
             Z, alpha_info = out, {}
         return Z, alpha_info
 
+    # --- ADD: utility at class scope ---
+    def _module_device(self) -> torch.device:
+        # referans olarak proj_p ağırlığının cihazını kullan
+        return next(self.proj_p.parameters()).device
+
+    def _ensure_device(self, t: Optional[torch.Tensor], dev: torch.device):
+        if t is None:
+            return None
+        return t if t.device == dev else t.to(dev, non_blocking=True)
+
     def forward(
         self,
         H: torch.Tensor,         # [B, T, d_h]
@@ -71,9 +81,32 @@ class ProteinGoAligner(nn.Module):
         cand_chunk_k: int = 16,  # K-yönlü chunk
         pos_chunk_t: int = 256,  # T-yönlü chunk
     ):
-        device = H.device
-        B, T, d_h = H.shape
 
+        # === 0) cihazı belirle (model cihazı) ve girişleri hizala ===
+        dev = self._module_device()  # modelin gerçek cihazı
+        # Eğer H farklı bir cihazdaysa onu baz al (ör. DDP parçası vs.)
+        if isinstance(H, torch.Tensor) and H.is_cuda:
+            dev = H.device
+
+        # Giriş tensörlerini tek seferde doğru cihaza taşı
+        H = self._ensure_device(H, dev)
+        G = self._ensure_device(G, dev)
+        mask = self._ensure_device(mask, dev)
+
+        # (isteğe bağlı) mask tipi standardizasyonu
+        if mask is not None and mask.dtype != torch.bool:
+            # Pooler bool/float bekliyorsa ona göre seç — çoğu attention mask bool sever
+            mask = mask.to(torch.bool)
+
+        # Modüllerin de doğru cihazda olduğundan emin ol (dinamik yaratım ihtimaline karşı)
+        if next(self.pooler.parameters()).device != dev:
+            self.pooler.to(dev, non_blocking=True)
+        if next(self.proj_p.parameters()).device != dev:
+            self.proj_p.to(dev, non_blocking=True)
+        if next(self.proj_g.parameters()).device != dev:
+            self.proj_g.to(dev, non_blocking=True)
+
+        B, T, d_h = H.shape
 
         # =========================
         #   POZİTİF YOL (G ~ [B,T,*])
