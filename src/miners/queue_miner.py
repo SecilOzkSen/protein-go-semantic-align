@@ -10,6 +10,10 @@ class MoCoQueue(torch.nn.Module):
         self.register_buffer("valid", torch.zeros(self.K, dtype=torch.bool, device=device))          # [K]
         self._ptr = 0
 
+    @property
+    def device(self) -> torch.device:
+        return self.queue.device
+
     @torch.no_grad()
     def on_change_dim(self, new_dim: int):
         new_dim = int(new_dim)
@@ -25,6 +29,14 @@ class MoCoQueue(torch.nn.Module):
     @torch.no_grad()
     def enqueue(self, vecs: torch.Tensor, ids: torch.Tensor):
         # vecs: [N, D], ids: [N]
+        dev = self.device
+        # === cihaz + dtype hizalama ===
+        if vecs.device != dev:
+            vecs = vecs.to(dev, non_blocking=True)
+        if ids.device != dev:
+            ids = ids.to(dev, non_blocking=True)
+        if ids.dtype != torch.long:
+            ids = ids.long()
         n = vecs.size(0)
         idx = (torch.arange(n, device=vecs.device) + self._ptr) % self.K
         self.queue.index_copy_(0, idx, vecs)
@@ -39,3 +51,10 @@ class MoCoQueue(torch.nn.Module):
             return None, None
         m = self.valid
         return self.queue[m], self.ids[m]
+
+    @torch.no_grad()
+    def to_(self, dev: torch.device | str):
+        """ İsteğe bağlı: explicit taşıma kolaylığı """
+        self.queue = self.queue.to(dev, non_blocking=True)
+        self.ptr = self.ptr.to(dev, non_blocking=True)
+        return self
