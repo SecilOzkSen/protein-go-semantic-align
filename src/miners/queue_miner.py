@@ -56,5 +56,5 @@ class MoCoQueue(torch.nn.Module):
     def to_(self, dev: torch.device | str):
         """ İsteğe bağlı: explicit taşıma kolaylığı """
         self.queue = self.queue.to(dev, non_blocking=True)
-        self.ptr = self.ptr.to(dev, non_blocking=True)
+        self._ptr = self._ptr.to(dev, non_blocking=True)
         return self
