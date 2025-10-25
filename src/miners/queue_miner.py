@@ -45,11 +45,15 @@ class MoCoQueue(torch.nn.Module):
         self._ptr = int((self._ptr + n) % self.K)
 
     @torch.no_grad()
-    def get_all_neg(self):
+    def get_all_neg(self, convert_device: torch.device | str | None = None):
         # Her durumda tuple döndür!
         if not self.valid.any():
             return None, None
         m = self.valid
+        if convert_device is not None and convert_device != self.device:
+            return self.queue[m].to(convert_device, non_blocking=True), \
+                   self.ids[m].to(convert_device, non_blocking=True)
+
         return self.queue[m], self.ids[m]
 
     @torch.no_grad()

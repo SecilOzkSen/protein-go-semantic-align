@@ -259,32 +259,41 @@ class OppTrainer:
 
     def _cpu_bank_gather(self, bank: torch.Tensor, idx: torch.Tensor, dev: torch.device | str) -> torch.Tensor:
         """
-        Bank nerede olursa olsun CPU'ya al, index'i de CPU long yap,
+        bank nerede olursa olsun CPU'ya al, index'i CPU long yap,
         seçimi CPU'da yap ve sonucu hedef cihaza (dev) taşı.
         """
-        # --- bank → CPU ---
-        if bank.device.type != "cpu":
-            bank_cpu = bank.to("cpu", non_blocking=True)
-        else:
-            bank_cpu = bank
+        # bank → CPU
+        bank_cpu = bank if bank.device.type == "cpu" else bank.to("cpu", non_blocking=True)
         if not bank_cpu.is_contiguous():
             bank_cpu = bank_cpu.contiguous()
-
-        # --- idx → CPU long ---
-        if idx.device.type != "cpu":
-            idx_cpu = idx.to("cpu", non_blocking=True)
-        else:
-            idx_cpu = idx
+        # idx → CPU long
+        idx_cpu = idx if idx.device.type == "cpu" else idx.to("cpu", non_blocking=True)
         if idx_cpu.dtype != torch.long:
             idx_cpu = idx_cpu.long()
-
-        # --- seçim CPU'da ---
+        # seçim CPU'da
         out_cpu = bank_cpu.index_select(0, idx_cpu)
-
-        # --- hedef cihaza taşı ---
+        # hedef cihaza taşı
         if isinstance(dev, str):
             dev = torch.device(dev)
         return out_cpu.to(dev, non_blocking=True)
+
+    def _cpu_bank_gather_ids(self, ids_bank: torch.Tensor, idx: torch.Tensor, keep_on: str = "cpu") -> torch.Tensor:
+        """
+        ID bank için sürüm: seçim CPU'da yapılır, istenirse CPU'da bırakılır.
+        keep_on: "cpu" veya "cuda"
+        """
+        # ids_bank → CPU
+        ids_cpu = ids_bank if ids_bank.device.type == "cpu" else ids_bank.to("cpu", non_blocking=True)
+        if not ids_cpu.is_contiguous():
+            ids_cpu = ids_cpu.contiguous()
+        # idx → CPU long
+        idx_cpu = idx if idx.device.type == "cpu" else idx.to("cpu", non_blocking=True)
+        if idx_cpu.dtype != torch.long:
+            idx_cpu = idx_cpu.long()
+        out_ids = ids_cpu.index_select(0, idx_cpu)  # [k] CPU long
+        if keep_on == "cuda":
+            return out_ids.to(self.device, non_blocking=True)
+        return out_ids  # CPU long
 
     def _flush_phase_table(self, phase_id: int, step: int):
         import numpy as np
@@ -593,7 +602,9 @@ class OppTrainer:
                                 if neg_idx_cpu.dtype != torch.long:
                                     neg_idx_cpu = neg_idx_cpu.long()
 
-                                take_ids_b = all_neg_ids.index_select(0, neg_idx_cpu)  # [k] CPU long
+                                take_vecs_b = self._cpu_bank_gather(all_neg_vecs_cpu, neg_idx_b,
+                                                                    dev=self.device)  # [k,Dg] CUDA
+                                take_ids_b = self._cpu_bank_gather_ids(all_neg_ids, neg_idx_b)
 
                                 neg_from_queue.append(take_vecs_b)
                                 neg_ids_from_queue.append(take_ids_b)
