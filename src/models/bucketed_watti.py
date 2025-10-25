@@ -53,6 +53,13 @@ class BucketedGoWatti(nn.Module):
                 G: torch.Tensor,        # (B,T,Gd)
                 attn_mask: Optional[torch.Tensor] = None,  # (B,L) True=PAD
                 return_alpha: bool = False):
+
+        dev = self.win_query.weight.device  # modülün cihazı
+        if H.device != dev:   H = H.to(dev, non_blocking=True)
+        if G.device != dev:   G = G.to(dev, non_blocking=True)
+        if attn_mask is not None and attn_mask.device != dev:
+            attn_mask = attn_mask.to(dev, non_blocking=True)
+
         B, L, D = H.shape
         T = G.shape[1]
         device = H.device

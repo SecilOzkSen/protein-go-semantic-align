@@ -84,6 +84,12 @@ class GoSpecificWattiPooling(nn.Module):
         q_chunk: Optional[int] = None,             # T dilim boyu; None -> q_chunk_default
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
 
+        dev = self.Wq.weight.device  # modülün cihazı
+        if H.device != dev:   H = H.to(dev, non_blocking=True)
+        if G.device != dev:   G = G.to(dev, non_blocking=True)
+        if mask is not None and mask.device != dev:
+            mask = mask.to(dev, non_blocking=True)
+
         B, L, Dh = H.shape
         T = G.shape[1]
         device = H.device

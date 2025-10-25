@@ -9,6 +9,7 @@ from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss, windowed_attr_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
 from src.miners.queue_miner import MoCoQueue
+from contextlib import nullcontext
 
 # Wandb
 import wandb
@@ -246,6 +247,16 @@ class OppTrainer:
     def on_epoch_finish(self):
         ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
+    def _to_device(self, x):
+        import torch
+        if isinstance(x, torch.Tensor):
+            return x.to(self.device, non_blocking=True)
+        if isinstance(x, (list, tuple)):
+            return type(x)(self._to_device(v) for v in x)
+        if isinstance(x, dict):
+            return {k: self._to_device(v) for k, v in x.items()}
+        return x
+
     def _flush_phase_table(self, phase_id: int, step: int):
         import numpy as np
         rows = []
@@ -418,9 +429,6 @@ class OppTrainer:
 
     # --------- Training step (losses + logging) ---------
     def step_losses(self, batch: Dict[str, Any], epoch_idx: int) -> Dict[str, torch.Tensor]:
-        import time, math, torch
-        import torch.nn.functional as F
-        from contextlib import nullcontext
 
         t0 = time.time()
         self.model.train()
