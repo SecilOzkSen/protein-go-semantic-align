@@ -257,19 +257,34 @@ class OppTrainer:
             return {k: self._to_device(v) for k, v in x.items()}
         return x
 
-    def _cpu_bank_gather(self, bank_cpu: torch.Tensor, idx: torch.Tensor, dev: torch.device) -> torch.Tensor:
+    def _cpu_bank_gather(self, bank: torch.Tensor, idx: torch.Tensor, dev: torch.device | str) -> torch.Tensor:
         """
-        CPU'daki vektör bankasından (bank_cpu) idx ile satır toplayıp
-        sonucu compute cihazına (dev) taşır.
+        Bank nerede olursa olsun CPU'ya al, index'i de CPU long yap,
+        seçimi CPU'da yap ve sonucu hedef cihaza (dev) taşı.
         """
+        # --- bank → CPU ---
+        if bank.device.type != "cpu":
+            bank_cpu = bank.to("cpu", non_blocking=True)
+        else:
+            bank_cpu = bank
+        if not bank_cpu.is_contiguous():
+            bank_cpu = bank_cpu.contiguous()
+
+        # --- idx → CPU long ---
         if idx.device.type != "cpu":
-            idx = idx.to("cpu", non_blocking=True)
-        if idx.dtype != torch.long:
-            idx = idx.long()
+            idx_cpu = idx.to("cpu", non_blocking=True)
+        else:
+            idx_cpu = idx
+        if idx_cpu.dtype != torch.long:
+            idx_cpu = idx_cpu.long()
 
-        out_cpu = bank_cpu.index_select(0, idx)          # CPU seçimi
-        return out_cpu.to(dev, non_blocking=True)        # GPU'ya taşı
+        # --- seçim CPU'da ---
+        out_cpu = bank_cpu.index_select(0, idx_cpu)
 
+        # --- hedef cihaza taşı ---
+        if isinstance(dev, str):
+            dev = torch.device(dev)
+        return out_cpu.to(dev, non_blocking=True)
 
     def _flush_phase_table(self, phase_id: int, step: int):
         import numpy as np
@@ -568,7 +583,7 @@ class OppTrainer:
                                 neg_idx_b = idx[b]  # [k] (GPU)
                                 # CPU bank’tan güvenli seçim (idx → CPU long, sonra seç, sonra CPU'da bırak)
                                 take_vecs_b = self._cpu_bank_gather(all_neg_vecs_cpu, neg_idx_b,
-                                                                    dev="cpu")  # [k,Dg] CPU
+                                                                    dev=self.device)  # [k,Dg] CPU
 
                                 # id’leri CPU long yap
                                 if neg_idx_b.device.type != "cpu":
