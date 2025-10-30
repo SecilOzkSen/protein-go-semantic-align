@@ -18,6 +18,10 @@ general:
   use_go_memory_bank: True
   use_faiss: False
 
+memory_bank:
+  device: "cuda"
+  dtype: "fp16"
+
 caches:
   go_cache: null
   faiss_index: null
@@ -28,7 +32,8 @@ caches:
 training:
   epochs: 5
   batch_size: 1
-  eval_batch_size: 4
+  eval_batch_size: 1
+  device: "cuda:0"
 
   num_workers: 8
   val_num_workers: 4
@@ -49,10 +54,10 @@ training:
   monitor_metric: "cafa_fmax"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
   early_stop_patience: 3        # 0 veya negatif => kapalı
-  cand_chunk_k: 8
-  pos_chunk_t: 128
-  k_hard_queue: 128
-  queue_K: 8192
+  cand_chunk_k: 256
+  pos_chunk_t: 64
+  k_hard_queue: 32
+  queue_K: 1024
 
 optim:
   lr: 0.0003
@@ -108,19 +113,19 @@ wandb:
   mode: online
 
 stores:
-  train_ids_path: /content/data/training_ready/proteins/protein_train_ids.txt
-  pid2pos_path: /content/data/training_ready/proteins/pid_to_positives.json
-  val_ids_path: /content/data/training_ready/proteins/protein_val_ids.txt
+  train_ids_path: /workspace/data/training_ready/proteins/protein_train_ids.txt
+  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives.json
+  val_ids_path: /workspace/data/training_ready/proteins/protein_val_ids.txt
 
-  embed_dir: /content/drive/MyDrive/esm_output #ESM3b
-  embed_dir_res: /content/drive/MyDrive/esm1b_output_fused_res
-  embed_dir_fused: /content/drive/MyDrive/esm1b_output_fused
-  hub_local_dir: /content/drive/MyDrive/.cache/huggingface/hub
+  embed_dir: /workspace/esm_output #ESM3b
+  embed_dir_res: /workspace/protein/residues
+  embed_dir_fused: /workspace/protein/fused
+  hub_local_dir: /workspace/.cache/huggingface/hub
 
-  seq_len_lookup_dir: /content/data/training_ready/proteins/seq_len_lookup.pkl
-  protein_manifest_file: /content/data/training_ready/manifest_cache/esm_manifest.pkl
+  seq_len_lookup_dir: /workspace/data/training_ready/proteins/seq_len_lookup.pkl
+  protein_manifest_file: /workspace/data/training_ready/manifest_cache/esm_manifest.pkl
 
-  output_dir: /content/drive/MyDrive/protein-go-align-outputs
-  logs: /content/drive/MyDrive/protein-go-align-logs
+  output_dir: /workspace/protein-go-align-outputs
+  logs: /workspace/protein-go-align-logs
 
-  go_text_folder: /content/drive/MyDrive/data/processed/go_terms/go_phases
+  go_text_folder: /workspace/data/processed/go_terms/go_phases

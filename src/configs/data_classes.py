@@ -215,7 +215,12 @@ class TrainingContext:
     batch_builder: Any = None
     go_text_store: Any = None
     run_name: str = None
+    fp16_enabled: bool = True
     logging: LoggingConfig = None
+    use_queue_miner: bool = True
+    attribute_loss_enabled = False
+    fused_bank: Any = None
+
 
     def to_dict(self):
         d = dict(
@@ -229,7 +234,7 @@ class TrainingContext:
 
 @dataclass
 class AttrConfig:
-    lambda_attr: float = 0.1
+    lambda_attr: float = 0.0
     lambda_entropy_alpha: float = 0.05
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64
@@ -245,6 +250,10 @@ class TrainerConfig:
     d_h: int = 1024
     d_g: int = 768
     d_z: int = 512
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
-    max_epochs: int = 20
+    max_epochs: int = 20,
+    cand_chunk_k: int = 8
+    pos_chunk_t: int = 128
+    k_hard_queue: int = 64
+    queue_K:int = 65536

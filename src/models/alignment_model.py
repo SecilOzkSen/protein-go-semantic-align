@@ -1,105 +1,207 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import Optional, Dict, List
 
 from src.models.projection import ProjectionHead
 from src.models.bucketed_watti import BucketedGoWatti
 from src.encoders import BioMedBERTEncoder
 
+
 class ProteinGoAligner(nn.Module):
-    """
-    Two-branch aligner for Protein (residue-level) and GO (text) representations.
-    Backward compatible:
-      - Old mode: forward(H, G, mask)  -> uses given tensors directly
-      - New mode: forward(batch_dict)  -> encodes GO texts with GoEncoder (+LoRA)
-    """
     def __init__(
         self,
         d_h: int,
-        d_g: Optional[int] = None,          # if None, will be set from go_encoder hidden_size
+        d_g: Optional[int] = None,
         d_z: int = 768,
         go_encoder: Optional[BioMedBERTEncoder] = None,
-        normalize: bool = True,
+        normalize: bool = True
     ):
         super().__init__()
         self.normalize = bool(normalize)
         self.go_encoder: Optional[BioMedBERTEncoder] = go_encoder
         if self.go_encoder is not None and d_g is None:
-            # take hidden size from encoder
             d_g = int(self.go_encoder.model.config.hidden_size)
-
         if d_g is None:
             raise ValueError("d_g must be provided if go_encoder is None.")
 
-        # --- Pooler + projection heads ---
         self.pooler = BucketedGoWatti(d_h=d_h, d_g=d_g)
         self.proj_p = ProjectionHead(d_in=d_h, d_out=d_z)  # protein side
         self.proj_g = ProjectionHead(d_in=d_g, d_out=d_z)  # GO text side
 
-    # ------------------ Core tensor path ------------------
+    # ---- helpers ----
+    @staticmethod
+    def _norm(x, dim=-1, eps=1e-6, norm_chunk: int = 0):
+        """
+        L2 normalize without materializing a full fp32 copy.
+        - Compute norms in fp32 for stability, but per-chunk.
+        - Return in original dtype (bf16/fp16 friendly).
+        """
+        dtype = x.dtype
+        if norm_chunk is None or norm_chunk <= 0:
+            n = torch.linalg.vector_norm(x.to(torch.float32), dim=dim, keepdim=True).clamp_min(eps)
+            return x / n.to(dtype)
+
+        outs = []
+        # chunk along the first dimension that is "batch-like".
+        # Gz genelde (B, T, Dh). Burada ilk eksen B*T olabilir; cat edilen ekseni koruyoruz.
+        N = x.shape[0]
+        for s in range(0, N, norm_chunk):
+            xe = x[s:s + norm_chunk]
+            ne = torch.linalg.vector_norm(xe.to(torch.float32), dim=dim, keepdim=True).clamp_min(eps)
+            outs.append(xe / ne.to(dtype))
+            del xe, ne
+        return torch.cat(outs, dim=0)
+
+    def _pool(self, H: torch.Tensor, G: torch.Tensor, mask: torch.Tensor, return_alpha: bool):
+        out = self.pooler(H, G, attn_mask=mask, return_alpha=return_alpha)
+        if isinstance(out, tuple):
+            Z = out[0]
+            alpha_info = out[1] if (len(out) >= 2 and isinstance(out[1], dict)) else {}
+        else:
+            Z, alpha_info = out, {}
+        return Z, alpha_info
+
+    # --- ADD: utility at class scope ---
+    def _module_device(self) -> torch.device:
+        # referans olarak proj_p ağırlığının cihazını kullan
+        return next(self.proj_p.parameters()).device
+
+    def _ensure_device(self, t: Optional[torch.Tensor], dev: torch.device):
+        if t is None:
+            return None
+        return t if t.device == dev else t.to(dev, non_blocking=True)
+
     def forward(
         self,
-        H: torch.Tensor,          # [B, T, d_h]
-        G: torch.Tensor,          # [B, T, d_g]
-        mask: torch.Tensor,       # [B, T] bool
-        return_alpha: bool = False
+        H: torch.Tensor,         # [B, T, d_h]
+        G: torch.Tensor,         # [B, T, d_g]  veya  [B, K, d_g]
+        mask: torch.Tensor,      # [B, T] bool
+        return_alpha: bool = False,
+        cand_chunk_k: int = 16,  # K-yönlü chunk
+        pos_chunk_t: int = 256,  # T-yönlü chunk
     ):
-        Z, alpha_info = self.pooler(H, G, attn_mask=mask, return_alpha=True)  # (B, T, d_h), dict
-        Zp = self.proj_p(Z)  # (B, T, d_z)
-        Gz = self.proj_g(G)  # (B, T, d_z)
 
-        if self.normalize:
-            Zp = F.normalize(Zp, dim=-1)
-            Gz = F.normalize(Gz, dim=-1)
+        # === 0) cihazı belirle (model cihazı) ve girişleri hizala ===
+        dev = self._module_device()  # modelin gerçek cihazı
+        # Eğer H farklı bir cihazdaysa onu baz al (ör. DDP parçası vs.)
+        if isinstance(H, torch.Tensor) and H.is_cuda:
+            dev = H.device
 
-        scores = torch.einsum("btd,btd->bt", Zp, Gz)  # cosine per token, then summed along last dim
-        return (scores, alpha_info) if return_alpha else scores
+        # Giriş tensörlerini tek seferde doğru cihaza taşı
+        H = self._ensure_device(H, dev)
+        G = self._ensure_device(G, dev)
+        mask = self._ensure_device(mask, dev)
 
-    # ------------------ Helpers ------------------
-    @staticmethod
-    def _weighted_avg(
-        vecs: torch.Tensor,               # [N, d]
-        idx: torch.Tensor,                # [M] indices into vecs
-        w: Optional[torch.Tensor] = None  # [M] weights or None
-    ) -> torch.Tensor:
-        if idx.numel() == 0:
-            # edge case: no positives → return zero vec (will be normalized later in broadcast)
-            return torch.zeros(vecs.size(-1), device=vecs.device)
-        sel = vecs.index_select(0, idx)  # [M, d]
-        if w is None or w.numel() == 0:
-            return sel.mean(dim=0)
-        w = w.to(sel.device).float()
-        w = w / (w.sum().clamp_min(1e-6))
-        return (sel * w.unsqueeze(-1)).sum(dim=0)
+        # (isteğe bağlı) mask tipi standardizasyonu
+        if mask is not None and mask.dtype != torch.bool:
+            # Pooler bool/float bekliyorsa ona göre seç — çoğu attention mask bool sever
+            mask = mask.to(torch.bool)
 
-    def _broadcast_batch_go(
-        self,
-        uniq_G: torch.Tensor,                  # [G, d_g]
-        pos_local: List[torch.Tensor],         # len=B; each [Mi] (local indices into uniq)
-        pos_w: Optional[List[torch.Tensor]],   # len=B; each [Mi] weights (or None)
-        T: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """
-        For each protein i, compute weighted average of its positive GO vectors (from uniq_G),
-        producing g_i in R^{d_g}. Then repeat across T tokens: G[i] -> [T, d_g].
-        Returns: [B, T, d_g]
-        """
-        B = len(pos_local)
-        d_g = int(uniq_G.size(-1))
-        G_list: List[torch.Tensor] = []
-        for i in range(B):
-            idx = pos_local[i].to(uniq_G.device)
-            w = None
-            if pos_w is not None and i < len(pos_w) and pos_w[i] is not None:
-                w = pos_w[i].to(uniq_G.device)
-            g_i = self._weighted_avg(uniq_G, idx, w=w)  # [d_g]
+        # Modüllerin de doğru cihazda olduğundan emin ol (dinamik yaratım ihtimaline karşı)
+        if next(self.pooler.parameters()).device != dev:
+            self.pooler.to(dev, non_blocking=True)
+        if next(self.proj_p.parameters()).device != dev:
+            self.proj_p.to(dev, non_blocking=True)
+        if next(self.proj_g.parameters()).device != dev:
+            self.proj_g.to(dev, non_blocking=True)
+
+        B, T, d_h = H.shape
+
+        # =========================
+        #   POZİTİF YOL (G ~ [B,T,*])
+        # =========================
+        if G.dim() == 3 and G.size(1) == T:
+            # T ekseninde parça parça işle, alpha_info’yu da birleştir
+            scores_parts: List[torch.Tensor] = []
+            alpha_full_parts: List[torch.Tensor] = []
+            aw_parts: List[torch.Tensor] = []
+            spans: List = []
+            win_weights: Optional[torch.Tensor] = None
+
+            for s in range(0, T, max(1, int(pos_chunk_t))):
+                e = min(T, s + max(1, int(pos_chunk_t)))
+                Hs = H[:, s:e, :]                  # [B, t, d_h]
+                Gs = G[:, s:e, :]                  # [B, t, d_g]
+                ms = mask[:, s:e]                  # [B, t]
+
+                Zs, ainfo = self._pool(Hs, Gs, ms, return_alpha=return_alpha)
+                Zp = self.proj_p(Zs)               # [B, t, d_z]
+                Gz = self.proj_g(Gs)               # [B, t, d_z]
+                if self.normalize:
+                    Zp = self._norm(Zp, dim=-1, norm_chunk=256)
+                    Gz = self._norm(Gz, dim=-1, norm_chunk=256)
+                scores_parts.append((Zp * Gz).sum(dim=-1))   # [B, t]
+
+                # alpha biriktir
+                if return_alpha and isinstance(ainfo, dict):
+                    if "alpha_full" in ainfo:
+                        alpha_full_parts.append(ainfo["alpha_full"])  # [B, t, L]
+                    if all(k in ainfo for k in ["alpha_windows", "win_weights", "spans"]):
+                        aw_parts.append(ainfo["alpha_windows"])       # [B, t, W, win]
+                        if win_weights is None:
+                            win_weights = ainfo["win_weights"]
+                        if not spans:
+                            spans = ainfo["spans"]
+
+                # temizlik
+                del Hs, Gs, ms, Zs, Zp, Gz, ainfo
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            scores = torch.cat(scores_parts, dim=1)       # [B, T]
+
+            if not return_alpha:
+                return scores
+
+            alpha_info_out: Dict[str, torch.Tensor] = {}
+            if alpha_full_parts:
+                alpha_info_out["alpha_full"] = torch.cat(alpha_full_parts, dim=1)   # [B, T, L]
+            if aw_parts:
+                alpha_info_out["alpha_windows"] = torch.cat(aw_parts, dim=1)        # [B, T, W, win]
+                if win_weights is not None:
+                    alpha_info_out["win_weights"] = win_weights
+                if spans:
+                    alpha_info_out["spans"] = spans
+            return scores, alpha_info_out
+
+        # =========================
+        #   ADAY YOL (G ~ [B,K,*])
+        # =========================
+        if G.dim() != 3:
+            raise ValueError("G must be 3D: [B, T, d_g] or [B, K, d_g].")
+
+        K = int(G.size(1))
+        d_g = int(G.size(2))
+        k_step = max(1, int(cand_chunk_k))
+
+        scores_list = []
+        for s in range(0, K, k_step):
+            e = min(K, s + k_step)
+            k = e - s
+            G_chunk = G[:, s:e, :]                                   # [B, k, d_g]
+
+            # (B, T, d_h) -> (B, k, T, d_h) -> (B*k, T, d_h)
+            H_rep = H.unsqueeze(1).expand(B, k, T, d_h).reshape(B * k, T, d_h)
+            mask_rep = mask.unsqueeze(1).expand(B, k, T).reshape(B * k, T)
+
+            # (B, k, d_g) -> (B, k, T, d_g) -> (B*k, T, d_g)
+            G_rep = G_chunk.unsqueeze(2).expand(B, k, T, d_g).reshape(B * k, T, d_g)
+
+            Z_rep, _ = self._pool(H_rep, G_rep, mask_rep, return_alpha=return_alpha)  # [B*k, T, d_h]
+            Zp = self.proj_p(Z_rep)                                            # [B*k, T, d_z]
+            Gz = self.proj_g(G_rep)                                            # [B*k, T, d_z]
             if self.normalize:
-                g_i = F.normalize(g_i, dim=-1)
-            G_list.append(g_i)
+                Zp = self._norm(Zp, dim=-1)
+                Gz = self._norm(Gz, dim=-1)
 
-        # Stack to [B, d_g] then broadcast to [B, T, d_g]
-        G_b = torch.stack(G_list, dim=0).to(device)      # [B, d_g]
-        G_bt = G_b.unsqueeze(1).expand(B, T, d_g).contiguous()
-        return G_bt
+            s_tok = (Zp * Gz).sum(dim=-1)                                      # [B*k, T]
+            s_bk = s_tok.mean(dim=-1).reshape(B, k)                            # [B, k]
+            scores_list.append(s_bk)
+
+            del H_rep, mask_rep, G_rep, Z_rep, Zp, Gz, s_tok, s_bk, G_chunk
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        scores = torch.cat(scores_list, dim=1)  # [B, K]
+        return scores

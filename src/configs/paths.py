@@ -47,7 +47,7 @@ def _detect_project_root() -> Path:
 PLATFORM = os.getenv("PLATFORM", "local")  # local, colab, kaggle, ...
 PROJECT_ROOT = _detect_project_root()
 SRC_DIR = PROJECT_ROOT / "src"
-DATA_DIR = SRC_DIR / "data"             # mevcut yapına uyuyor
+DATA_DIR = PROJECT_ROOT.parent / "data"
 RAW_PATH = DATA_DIR / "raw"
 PROCESSED_PATH = DATA_DIR / "processed"
 TRAINING_READY = DATA_DIR / "training_ready"
@@ -87,27 +87,27 @@ FEW_SHOT_IC_TERMS_ID_ONLY_JSON     = TRAINING_READY / "go_few_zero_common" / "ic
 COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic_common_terms_id_only.json"
 
 # ---- GO indexes by phase -----------------------------
-_GO_IDX = lambda p: TRAINING_READY / "go_indexes" / f"phase{p}"
+_GO_IDX = lambda p: TRAINING_READY / "go_indexes" / "memmap" / f"phase{p}"
 GO_INDEX = {
     1: {
-        "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.pt",
+        "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(1) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(1) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(1) / "go_text_embeddings.npy.meta.pt",
     },
     2: {
-        "TEXT_EMB": _GO_IDX(2) / "go_text_embeddings.pt",
+        "TEXT_EMB": _GO_IDX(2) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(2) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(2) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(2) / "go_text_embeddings.npy.meta.pt",
     },
     3: {
-        "TEXT_EMB": _GO_IDX(3) / "go_text_embeddings.pt",
+        "TEXT_EMB": _GO_IDX(3) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(3) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(3) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(3) / "go_text_embeddings.npy.meta.pt",
     },
     4: {
         "TEXT_EMB": _GO_IDX(4) / "go_text_embeddings.pt",
         "FAISS_IP":  _GO_IDX(4) / "go_faiss_ip.faiss",
-        "META":      _GO_IDX(4) / "go_faiss_ip.meta.json",
+        "META":      _GO_IDX(4) / "go_text_embeddings.npy.meta.pt",
     },
 }
 
@@ -139,6 +139,7 @@ GOOGLE_DRIVE_ESM3B_EMBEDDINGS = GOOGLE_DRIVE_ESM3B / "embeddings"  # symlink ede
 GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest.pkl"
 
 # CONFIG
+
 TRAINING_CONFIG = SRC_DIR / "colab.yaml"
 
 def create_data_folders() -> None:
@@ -151,4 +152,4 @@ def create_data_folders() -> None:
     ]:
         path.mkdir(parents=True, exist_ok=True)
 
-create_data_folders()
+#create_data_folders()

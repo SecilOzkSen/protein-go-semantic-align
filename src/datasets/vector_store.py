@@ -1,147 +1,165 @@
 from __future__ import annotations
+from typing import Optional, List
 import torch
-from typing import List
 import torch.nn.functional as F
+from src.miners.queue_miner import MoCoQueue
+
+Tensor = torch.Tensor
 
 class VectorResources:
-    def __init__(self, faiss_index, go_embs: torch.Tensor, align_dim:int = 768, query_projector = None):
-        self.faiss_index = faiss_index    # FAISS flat/IP or IVF/HNSW; must expose .search
-        self.go_embs = go_embs.float()    # [G, d] (assumed L2-normalized upstream)
-        # ensure normalized
-        self.go_embs = torch.nn.functional.normalize(self.go_embs, p=2, dim=1)
-        self.align_dim = align_dim
+    """
+    Unified vector backend:
+      - Optional projector for queries (protein->GO space).
+      - Two negative/search sources:
+          (a) MoCoQueue (if attached and non-empty)  -> fast, freshest negatives
+          (b) go_embs dense bank on CPU              -> fallback / coarse retrieval
+    Backward compatible with your original API.
+    """
+
+    def __init__(self,
+                 faiss_index: Optional[object],
+                 go_embs: torch.Tensor,
+                 align_dim: int = 768,
+                 query_projector: Optional[torch.nn.Module] = None,
+                 device = "cuda:0"):
+        # FAISS is deprecated
+        self.faiss_index = None
+        self.align_dim = int(align_dim)
         self.query_projector = query_projector
+        # keep GO bank on CPU, L2-normalized
+        self.go_embs = F.normalize(go_embs.float().cpu(), p=2, dim=1) if go_embs.numel() > 0 else go_embs
+        self.device = device
+        self.queue = MoCoQueue(dim=self.align_dim, K=65536)
+        if self.queue.device != self.device:
+            self.queue.to_(self.device)
+        # optional MoCo queue
+
+
+    # ---------- attachments ----------
+    def set_query_projector(self, projector: torch.nn.Module) -> None:
+        self.query_projector = projector
+
+    def set_align_dim(self, dim: int) -> None:
+        self.align_dim = int(dim)
+        self.queue.on_change_dim(self.align_dim)
+
+    def attach_queue(self, queue: torch.nn.Module) -> None:
+        self.queue = queue
+
+    def detach_queue(self) -> None:
+        self.queue = None
 
     def set_backends(self, faiss_index, go_embs: torch.Tensor):
-        self.faiss_index = faiss_index
-        self.go_embs = torch.nn.functional.normalize(go_embs.float(), p=2, dim=1)
+        # keep signature; ignore faiss
+        self.faiss_index = None
+        if go_embs is not None and go_embs.numel() > 0:
+            self.go_embs = F.normalize(go_embs.float().cpu(), p=2, dim=1)
 
-
+    # ---------- query projection ----------
     @torch.no_grad()
     def project_queries_to_index(self, Q: torch.Tensor) -> torch.Tensor:
         """
-        Q: [B, 1280] or [B, 768]
-        - If Q is a single row, makes it [1, D].
-        - If Q's channel is not align_dim, projects it with self.query_projector.
-        - Before projection, moves Q to the projector's device (CPU/GPU compatibility).
-        - Result is L2 normalized.
+        Q: [B, d_q] or [d_q]; projector varsa uygular, yoksa align_dim'e kırpar.
+        Dönen tensör L2-normalize edilir.
         """
         if Q.dim() == 1:
             Q = Q.unsqueeze(0)
-        try:
+
+        d_q = Q.size(-1)
+        if self.query_projector is not None:
             proj_dev = next(self.query_projector.parameters()).device
-        except StopIteration:
-            proj_dev = getattr(self.query_projector, "weight", Q).device if hasattr(self.query_projector, "weight") else Q.device
-
-        if Q.device != proj_dev:
-            Q = Q.to(device=proj_dev, non_blocking=True,
-                     dtype=getattr(self.query_projector, 'weight', Q).dtype if hasattr(self.query_projector, 'weight') else None)
-
-        was_training = getattr(self.query_projector, "training", False)
-        try:
+            if Q.device != proj_dev:
+                Q = Q.to(proj_dev, non_blocking=True, dtype=Q.dtype)
+            was_train = self.query_projector.training
             self.query_projector.eval()
-        except Exception:
-            pass
-
-        with torch.no_grad():
             Q = self.query_projector(Q)
-
-        try:
-            if was_training:
+            if was_train:
                 self.query_projector.train()
-        except Exception:
-            pass
+        elif d_q != self.align_dim:
+            Q = Q[..., :self.align_dim]
 
         return F.normalize(Q, dim=1)
 
+    # ---------- unified coarse search ----------
     @torch.no_grad()
-    def coarse_prot_vecs(self, prot_emb_pad: torch.Tensor, prot_attn_mask: torch.Tensor) -> torch.Tensor:
-        # mean pooling with mask -> [B, d]
-        mask = prot_attn_mask.float()  # [B,L]
-        x = prot_emb_pad * mask.unsqueeze(-1)     # [B,L,D]
-        s = x.sum(dim=1)                           # [B,D]
-        denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        v = s / denom
-        v = torch.nn.functional.normalize(v, p=2, dim=1)
-        return v
+    def _search_queue(self, queries: torch.Tensor, topM: int):
+        # Use MoCoQueue if attached & ready
+        if self.queue is None or not hasattr(self.queue, "topk") or self.queue.size() == 0:
+            # empty result
+            B = queries.shape[0]
+            z = torch.empty(B, 0, device=queries.device, dtype=torch.float32)
+            i = torch.empty(B, 0, device=queries.device, dtype=torch.long)
+            return z, i
+        return self.queue.topk(queries, topM)
 
     @torch.no_grad()
-    def true_prot_vecs(self, prot_emb_pad: torch.Tensor, prot_attn_mask: torch.Tensor, watti_or_model=None) -> torch.Tensor:
-        # If a weighting provider is given, try to obtain weights; else fallback to mean
-        if watti_or_model is None:
-            return self.coarse_prot_vecs(prot_emb_pad, prot_attn_mask)
-        # Expect a callable: weights = f(emb, mask) -> [B, L] non-negative
-        try:
-            weights = watti_or_model(prot_emb_pad, prot_attn_mask)  # [B, L]
-            if not isinstance(weights, torch.Tensor):
-                weights = torch.as_tensor(weights, dtype=prot_emb_pad.dtype, device=prot_emb_pad.device)
-            weights = weights.clamp_min(0)
-            # apply masked weighted pooling
-            weights = weights * prot_attn_mask  # zero out pads
-            wsum = (prot_emb_pad * weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
-            denom = weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-            v = wsum / denom
-            v = torch.nn.functional.normalize(v, p=2, dim=1)
-            return v
-        except Exception:
-            # fallback to mean if anything goes wrong
-            return self.coarse_prot_vecs(prot_emb_pad, prot_attn_mask)
+    def _search_go_bank(self, queries: torch.Tensor, topM: int):
+        # cosine (both normalized)
+        if self.go_embs is None or self.go_embs.numel() == 0:
+            B = queries.shape[0]
+            z = torch.empty(B, 0, device=queries.device, dtype=torch.float32)
+            i = torch.empty(B, 0, device=queries.device, dtype=torch.long)
+            return z, i
+        G = self.go_embs.to(queries.device, non_blocking=True)  # [G, d]
+        S = queries @ G.t()                                     # [B, G]
+        k_eff = min(int(topM), S.size(1))
+        vals, idx = torch.topk(S, k=k_eff, dim=1, largest=True, sorted=True)
+        return vals.contiguous(), idx.contiguous()
+
+    @torch.no_grad()
+    def coarse_search(self, queries: torch.Tensor, topM: int):
+        """
+        Eski API korunur. Önce queue varsa oradan, yetmezse GO bank’tan tamamlar.
+        Dönen indeksler:
+          - önce queue (0..Kf-1) için negatif relative id'ler (kaynak ayrımı yapmıyoruz),
+          - sonra GO bank indeksleri.
+        Bu metodu doğrudan kullanıyorsan kaynak ayrımı gerekirse kendin tut.
+        """
+        # normalize edilmiş queries bekliyoruz; yine de güvenlik:
+        queries = F.normalize(queries.float(), dim=1)
+
+        # 1) queue
+        q_vals, q_idx = self._search_queue(queries, topM)
+        remain = max(0, int(topM) - q_idx.size(1))
+
+        if remain > 0:
+            g_vals, g_idx = self._search_go_bank(queries, remain)
+            vals = torch.cat([q_vals, g_vals], dim=1) if q_vals.numel() else g_vals
+            idx  = torch.cat([q_idx,  g_idx],  dim=1) if q_idx.numel() else g_idx
+        else:
+            vals, idx = q_vals, q_idx
+
+        return vals, idx
 
     @torch.no_grad()
     def query(self, Q: torch.Tensor, topM: int, return_scores: bool = False):
         """
-        Project (if needed), L2-normalize and retrieve topM GO indices.
-
-        Args:
-            Q: [B, d_q] protein queries. If d_q != align_dim, uses self.query_projector.
-            topM: shortlist size to retrieve.
-            return_scores: if True, also return FAISS distances/similarities (torch.float32).
-
-        Returns:
-            ids: LongTensor [B, topM] (indices into self.go_embs)
-            (optional) scores: FloatTensor [B, topM]
+        Protein query → projekte et → L2-normalize → (queue +/or GO bank) topM.
         """
-        # 1) project to index dim & normalize
-        Qp = self.project_queries_to_index(Q)  # [B, align_dim], L2 normed
-        # 2) FAISS search
-        D, I = self.coarse_search(Qp, topM)  # tensors (genelde CPU)
+        Qp = self.project_queries_to_index(Q)       # [B, align_dim], normed
+        D, I = self.coarse_search(Qp, topM)         # [B, topM]
         I = I.to(Q.device, dtype=torch.long)
         if return_scores:
-            return I, D.to(Q.device).contiguous()
+            return I, D.to(Q.device)
         return I
 
+    # ---------- protein vecs ----------
     @torch.no_grad()
-    def coarse_search(self, queries: torch.Tensor, topM: int):
-        # queries: [B, d] torch tensor (L2-normalized)
-        q_np = queries.detach().cpu().numpy().astype('float32')
-        D, I = self.faiss_index.search(q_np, topM)  # returns numpy arrays
-        return torch.from_numpy(D), torch.from_numpy(I)
+    def coarse_prot_vecs(self, prot_emb_pad: torch.Tensor, prot_attn_mask: torch.Tensor) -> torch.Tensor:
+        m = prot_attn_mask.float()
+        v = (prot_emb_pad * m.unsqueeze(-1)).sum(1) / m.sum(1, keepdim=True).clamp_min(1.0)
+        return F.normalize(v, p=2, dim=1)
 
     @torch.no_grad()
-    def gather_go_embs(self, ids: torch.Tensor) -> torch.Tensor:
-        # ids: [B,M] or [L]; return matching rows from go_embs
-        if ids.dim() == 1:
-            return self.go_embs.index_select(0, ids)
-        elif ids.dim() == 2:
-            out = []
-            for b in range(ids.size(0)):
-                out.append(self.go_embs.index_select(0, ids[b]))
-            return torch.stack(out, dim=0)
-        else:
-            raise ValueError(f"ids shape {ids.shape} not supported")
-
-class GoMemoryBank:
-    def __init__(self, init_embs: torch.Tensor, row2id: List[int]):
-
-        self.id2row = {int(i): int(r) for r,i in enumerate(row2id)}
-        self.embs = torch.as_tensor(init_embs).cpu()
-        self.embs = F.normalize(self.embs, p=2, dim=1)
-
-    def lookup(self, ids):
-        rows = [self.id2row[int(i)] for i in ids]
-        return self.embs[rows]
-
-    def update(self, ids, new_embs):  # new_embs: (len(ids), d) on CPU?
-        for j,i in enumerate(ids):
-            self.embs[self.id2row[int(i)]] = new_embs[j]
-
+    def true_prot_vecs(self, prot_emb_pad: torch.Tensor, prot_attn_mask: torch.Tensor, watti_or_model=None) -> torch.Tensor:
+        if watti_or_model is None:
+            return self.coarse_prot_vecs(prot_emb_pad, prot_attn_mask)
+        try:
+            weights = watti_or_model(prot_emb_pad, prot_attn_mask)  # [B, L]
+            if not isinstance(weights, torch.Tensor):
+                weights = torch.as_tensor(weights, dtype=prot_emb_pad.dtype, device=prot_emb_pad.device)
+            weights = weights.clamp_min(0) * prot_attn_mask
+            v = (prot_emb_pad * weights.unsqueeze(-1)).sum(1) / weights.sum(1, keepdim=True).clamp_min(1e-6)
+            return F.normalize(v, p=2, dim=1)
+        except Exception:
+            return self.coarse_prot_vecs(prot_emb_pad, prot_attn_mask)

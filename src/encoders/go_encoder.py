@@ -70,23 +70,26 @@ class BioMedBERTEncoder(nn.Module):
 
     def __init__(self,
                  model_name: str,
-                 device: torch.device,
+                 device: Union[str, torch.device],
                  max_length: int = 512,
                  use_attention_pool: bool = True,  # Attention pooling head
                  attn_hidden: int = 0,  # 0 = linear scoring; >0 = tanh-MLP hidden size
                  attn_dropout: float = 0.0,
                  special_token_weights: Optional[Dict[str, float]] = None, # Optional token weights to bias attention (e.g., {"[GOPATH]":0.45, "[PATH]":0.45, "[ISA]":0.95, "[PART]":0.85})
                  enable_lora: bool = True,
-                 lora_parameters: Optional[LoRAParameters] = None  # LoRA options (optional)
+                 lora_parameters: Optional[LoRAParameters] = None,  # LoRA options (optional)
+                 gradient_checkpointing: bool = True # re-calculate each activation instead of storing it -> huge space saver.
                  ):
         super().__init__()
-        self.device = device
+        self.device = torch.device(device) if isinstance(device, str) else device
         self.max_length = max_length
         # Base model and tokenizer
-        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False, use_safetensors=False)
+        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
         self.model.resize_token_embeddings(len(self.tokenizer))
+        if gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
 
         # Attention pooling head (Optional - nice to use)
         self.use_attention_pool = use_attention_pool
@@ -123,6 +126,9 @@ class BioMedBERTEncoder(nn.Module):
                        task_type=lora_parameters.task_type
                        )
             self.model = get_peft_model(self.model, self.lora_cfg, adapter_name=lora_parameters.adapter_name)
+            for name, param in self.model.named_parameters():
+                if "lora_" not in name:
+                    param.requires_grad = False
             try:
                 self.model.print_trainable_parameters()
             except Exception:
@@ -131,9 +137,13 @@ class BioMedBERTEncoder(nn.Module):
         self.to(device)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """x
+        """
             Returns pooled embeddings for a tokenized batch.
         """
+        if input_ids.device != self.device:
+            input_ids = input_ids.to(self.device, non_blocking=False)
+        if attention_mask.device != self.device:
+            attention_mask = attention_mask.to(self.device, non_blocking=False)
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
         H = out.last_hidden_state  # (B, L, H)
         if self.use_attention_pool and self.attn_head is not None:
@@ -174,6 +184,11 @@ class BioMedBERTEncoder(nn.Module):
                     attn_out.append(attn.detach().cpu())
                 else:
                     vec = self.attn_head(H, toks["attention_mask"], toks.get("input_ids"), self._id_weight_map)
+            else:
+                #Fallback: masked mean
+                m = toks["attention_mask"].unsqueeze(-1).float()
+                vec = (H*m).sum(1) / m.sum(1).clamp(min=1e-6)
+
             if normalize:
                 vec = F.normalize(vec, dim=-1)
             embs.append(vec)

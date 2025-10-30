@@ -1,0 +1,28 @@
+# === Core PyTorch stack (CUDA 12.4 build) ===
+torch==2.4.*+cu124
+torchvision==0.19.*+cu124
+torchaudio==2.4.*+cu124
+--index-url https://download.pytorch.org/whl/cu124
+
+# === Transformers & PEFT (LoRA) ===
+transformers==4.57.0
+peft==0.13.2
+accelerate==0.33.0
+
+# === Utilities & logging ===
+wandb==0.22.2
+tqdm==4.66.*
+scikit-learn==1.5.*
+pydantic==2.12.*
+pyyaml==6.0.*
+numpy==1.26.*
+
+# === Optional / bioinformatics ===
+faiss-cpu==1.8.0.post1   # use faiss-gpu only if cu124 wheel available
+datasets==3.0.1
+sentencepiece==0.2.0
+protobuf==5.28.*
+
+# === Dev & debugging ===
+ipython
+rich
