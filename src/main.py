@@ -671,7 +671,7 @@ def run_training(args, schedule: TrainSchedule):
     assert len(fused_bank["ids"]) == fused_bank["vecs"].shape[0] > 0, "fused bank boş/eksik"
 
     def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
-        if args.phase_change is False:
+        if phase0 == -1:
             return
         new_phase = training_context.schedule.phase_for_epoch(current_epoch)
         prev_phase = training_context.current_phase
