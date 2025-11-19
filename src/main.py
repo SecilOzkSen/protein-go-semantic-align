@@ -578,8 +578,11 @@ def run_training(args, schedule: TrainSchedule):
     # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
-    for ph in range(total_phases):
-        go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
+    if phase0 == -1:
+        go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
+    else:
+        for ph in range(total_phases):
+            go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
 
     res_store, fused_store = build_stores(args)
     datasets = build_datasets(args, res_store, fused_store, go_cache)
