@@ -55,7 +55,7 @@ def load_go_texts_by_phase(go_text_folder: str, phase: int = 0) -> Dict[int, str
             el = json.loads(line)
             go_id_str = el["go_id"]
             go_int = int(go_id_str.replace("GO:", "")) if "GO:" in go_id_str else int(go_id_str)
-            out[go_int] = el["text"].strip()
+            out[go_int] = el["text"].strip() if "text" in el else el["name"].strip()
     return out
 
 
