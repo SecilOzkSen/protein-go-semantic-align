@@ -58,13 +58,13 @@ def multi_positive_infonce_from_candidates(scores: torch.Tensor, pos_mask: torch
     loss = -(num - denom)                                     # (B,)
     return loss[pos_any].mean() if pos_any.any() else denom.mean() * 0.0
 
-def surrogate_delta_y_from_mask_grad(H, G, model, pad_mask=None) -> Tuple[torch.Tensor, dict]:
+def surrogate_delta_y_from_mask_grad(H, G, model, pad_mask=None, return_alpha = False) -> Tuple[torch.Tensor, dict]:
     """
     Quick surrogate for attribution: use ||dy/dH|| as importance proxy.
     Returns (proxy_deltas, alpha_info).
     """
     H = H.clone().detach().requires_grad_(True)
-    out = model(H=H, G=G, mask=pad_mask, return_alpha=True)
+    out = model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha)
     if isinstance(out, tuple) and len(out) >= 2:
         scores, alpha_info = out[0], (out[1] or {})
     else:
@@ -112,14 +112,14 @@ def dag_consistency_loss_pos(scores_pos: torch.Tensor,
         return torch.zeros((), device=scores_pos.device)
     return torch.stack(losses).mean()
 
-def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
+def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None, return_alpha = False):
     """
     Eval-time mask-out for full-length case.
     """
     B, T, L = alpha_full.shape
     device = H.device
     delta = torch.zeros_like(alpha_full)
-    out = model(H=H, G=G, mask=pad_mask, return_alpha=True)  # (scores, alpha_info)
+    out = model(H=H, G=G, mask=pad_mask, return_alpha=return_alpha)  # (scores, alpha_info)
     base_scores = out[0] if isinstance(out, tuple) else out   # (B, T)
 
     for b in range(B):
@@ -133,7 +133,7 @@ def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None):
                     H=Hminus,
                     G=G[b:b+1],
                     mask=pad_mask[b:b+1] if pad_mask is not None else None,
-                    return_alpha=True
+                    return_alpha=return_alpha
                 )
                 y_minus = out_m[0] if isinstance(out_m, tuple) else out_m  # (1, T)
                 delta[b, t, i] = (base_scores[b, t] - y_minus.squeeze(0)[t]).clamp_min(0.0)
@@ -156,6 +156,7 @@ class OppTrainer:
         # tek tip normalizer (fp16 olsa da olmasa da aynı imza)
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
+        self.return_alpha = ctx.return_alpha
 
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
@@ -163,6 +164,7 @@ class OppTrainer:
             d_z=cfg.d_z,          # e.g., 768
             go_encoder=go_encoder,
             normalize=True,
+            mean_pool=True if ctx.pooling_strategy == "mean" else False,
         ).to(self.device)
 
         # --- EMA (momentum) key encoder: GO tarafı ---
@@ -502,7 +504,7 @@ class OppTrainer:
 
                     out = self.model(
                         H=H, G=G_chunk, mask=pad_mask,
-                        return_alpha=False,
+                        return_alpha=return_alpha,
                         cand_chunk_k=None,
                         pos_chunk_t=pos_chunk_t,
                         **kwargs
@@ -543,7 +545,7 @@ class OppTrainer:
         B = H.size(0)
 
         # ---- curriculum / attribution flags ----
-        use_attr = (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
+        use_attr = self.ctx.attribute_loss_enabled or (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
         try:
             self.wlogger.log_scalar({"debug/use_attr": int(use_attr), "epoch": epoch_idx}, step=self._global_step)
         except Exception:
@@ -762,7 +764,7 @@ class OppTrainer:
         with amp_ctx:
             scores_cand = self.forward_scores(
                 H, G_cand, pad_mask,
-                return_alpha=False,
+                return_alpha=self.return_alpha,
                 cand_chunk_k=int(getattr(self.cfg, "cand_chunk_k", 32)),
                 pos_chunk_t=int(getattr(self.cfg, "pos_chunk_t", 128)),
             )  # (B,K) GPU
@@ -810,7 +812,7 @@ class OppTrainer:
             G_pos = self.to_f32(G_pos)
 
         if use_attr:
-            scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=True)
+            scores_pos, alpha_info = self.forward_scores(H, G_pos, pad_mask, return_alpha=self.return_alpha)
         else:
             scores_pos = self.forward_scores(H, G_pos, pad_mask, return_alpha=False)
             alpha_info = {}
@@ -819,18 +821,18 @@ class OppTrainer:
         if alpha_info is not None and "alpha_full" in alpha_info:
             alpha = alpha_info["alpha_full"]
             if use_attr:
-                delta, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
+                delta, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask, return_alpha=self.return_alpha)
                 l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
                 l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
             else:
-                l_attr = torch.zeros((), device=device);
+                l_attr = torch.zeros((), device=device)
                 l_ent = torch.zeros((), device=device)
         elif alpha_info is not None and all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
-            AW = alpha_info["alpha_windows"];
-            Ww = alpha_info["win_weights"];
+            AW = alpha_info["alpha_windows"]
+            Ww = alpha_info["win_weights"]
             spans = alpha_info["spans"]
             if use_attr:
-                delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
+                delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask, return_alpha=self.return_alpha)
                 delta_win = torch.zeros_like(AW)
                 for wi, (s, e) in enumerate(spans):
                     delta_win[:, :, wi, :e - s] = delta_full[:, :, s:e]
@@ -1078,7 +1080,7 @@ class OppTrainer:
                     l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
                 elif (alpha_info is not None) and all(k in alpha_info for k in ["alpha_windows", "win_weights", "spans"]):
                     AW = alpha_info["alpha_windows"]; Ww = alpha_info["win_weights"]; spans = alpha_info["spans"]
-                    delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask)
+                    delta_full, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, pad_mask, return_alpha=False)
                     delta_win = torch.zeros_like(AW)
                     for wi, (s, e) in enumerate(spans):
                         delta_win[:, :, wi, :e - s] = delta_full[:, :, s:e]

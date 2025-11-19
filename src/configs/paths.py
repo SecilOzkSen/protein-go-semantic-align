@@ -87,8 +87,13 @@ FEW_SHOT_IC_TERMS_ID_ONLY_JSON     = TRAINING_READY / "go_few_zero_common" / "ic
 COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic_common_terms_id_only.json"
 
 # ---- GO indexes by phase -----------------------------
+GO_INDEX_NON_PHASE = TRAINING_READY / "go_indexes" / "canonical"
 _GO_IDX = lambda p: TRAINING_READY / "go_indexes" / "memmap" / f"phase{p}"
 GO_INDEX = {
+    -1: {
+        "TEXT_EMB": GO_INDEX_NON_PHASE / "go_text_embeddings_canonical.npy",
+        "META":      GO_INDEX_NON_PHASE / "go_text_embeddings_canonical.npy.meta.pt",
+    },
     1: {
         "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(1) / "go_faiss_ip.faiss",

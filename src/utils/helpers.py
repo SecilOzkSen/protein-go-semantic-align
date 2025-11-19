@@ -39,7 +39,10 @@ def load_go_texts(path: str) -> Dict[int, str]:
 
 
 def load_go_texts_by_phase(go_text_folder: str, phase: int = 0) -> Dict[int, str]:
-    fname = f"go_texts_phase_{phase+1}.jsonl"
+    if phase < 0: #ablation 1
+        fname = "go_texts_canonical.jsonl"
+    else:
+        fname = f"go_texts_phase_{phase+1}.jsonl"
     path = os.path.join(go_text_folder, fname)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Phase file not found: {path}")

@@ -81,7 +81,10 @@ class TrainSchedule:
         return min(ramp, base_lambda_attr if base_lambda_attr is not None else self.lambda_attr_max)
 
     def resolve_go_cache_path(self, phase: int) -> Path:
-        p1 = int(phase) + 1
+        if phase >= 0:
+            p1 = int(phase) + 1
+        else:
+            p1 = phase
         return go_index_paths(p1)["TEXT_EMB"]
 
     def resolve_faiss_path(self, phase: int) -> Optional[Path]:
@@ -218,8 +221,10 @@ class TrainingContext:
     fp16_enabled: bool = True
     logging: LoggingConfig = None
     use_queue_miner: bool = True
-    attribute_loss_enabled = False
+    attribute_loss_enabled: bool = False
+    return_alpha: bool = False
     fused_bank: Any = None
+    pooling_strategy: str = "mean"
 
 
     def to_dict(self):

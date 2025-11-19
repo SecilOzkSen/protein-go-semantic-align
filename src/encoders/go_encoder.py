@@ -72,11 +72,11 @@ class BioMedBERTEncoder(nn.Module):
                  model_name: str,
                  device: Union[str, torch.device],
                  max_length: int = 512,
-                 use_attention_pool: bool = True,  # Attention pooling head
+                 use_attention_pool: bool = False,  # Attention pooling head
                  attn_hidden: int = 0,  # 0 = linear scoring; >0 = tanh-MLP hidden size
                  attn_dropout: float = 0.0,
                  special_token_weights: Optional[Dict[str, float]] = None, # Optional token weights to bias attention (e.g., {"[GOPATH]":0.45, "[PATH]":0.45, "[ISA]":0.95, "[PART]":0.85})
-                 enable_lora: bool = True,
+                 enable_lora: bool = False,
                  lora_parameters: Optional[LoRAParameters] = None,  # LoRA options (optional)
                  gradient_checkpointing: bool = True # re-calculate each activation instead of storing it -> huge space saver.
                  ):
@@ -86,8 +86,11 @@ class BioMedBERTEncoder(nn.Module):
         # Base model and tokenizer
         self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        self.enable_lora = enable_lora
+        if self.enable_lora:
+            print("[INFO] Lora Enabled. Adding GO special tokens for LoRA training.")
+            self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
+            self.model.resize_token_embeddings(len(self.tokenizer))
         if gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
@@ -95,6 +98,7 @@ class BioMedBERTEncoder(nn.Module):
         self.use_attention_pool = use_attention_pool
         self.attn_head: Optional[AttnPool] = None
         if self.use_attention_pool:
+            print("[INFO] Using attention pooling head with hidden size:", attn_hidden)
             self.attn_head = AttnPool(self.model.config.hidden_size, attn_hidden, attn_dropout)
             for p in self.attn_head.parameters():
                 p.requires_grad_(True)
@@ -112,7 +116,7 @@ class BioMedBERTEncoder(nn.Module):
                     self._id_weight_map[tid] = float(w)
 
         # LoRA
-        self.enable_lora = enable_lora
+        print("[INFO] LoRA enabled:", self.enable_lora)
         self.lora_cfg = None
         if self.enable_lora:
             self.lora_cfg = LoraConfig(r=lora_parameters.lora_r,

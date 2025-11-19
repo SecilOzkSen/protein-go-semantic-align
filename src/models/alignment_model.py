@@ -15,7 +15,8 @@ class ProteinGoAligner(nn.Module):
         d_g: Optional[int] = None,
         d_z: int = 768,
         go_encoder: Optional[BioMedBERTEncoder] = None,
-        normalize: bool = True
+        normalize: bool = True,
+        mean_pool: bool = False
     ):
         super().__init__()
         self.normalize = bool(normalize)
@@ -24,8 +25,11 @@ class ProteinGoAligner(nn.Module):
             d_g = int(self.go_encoder.model.config.hidden_size)
         if d_g is None:
             raise ValueError("d_g must be provided if go_encoder is None.")
-
-        self.pooler = BucketedGoWatti(d_h=d_h, d_g=d_g)
+        if mean_pool:
+            self.pooler = None
+        else:
+            self.pooler = BucketedGoWatti(d_h=d_h, d_g=d_g)
+        self.mean_pool = bool(mean_pool)
         self.proj_p = ProjectionHead(d_in=d_h, d_out=d_z)  # protein side
         self.proj_g = ProjectionHead(d_in=d_g, d_out=d_z)  # GO text side
 
@@ -54,6 +58,16 @@ class ProteinGoAligner(nn.Module):
         return torch.cat(outs, dim=0)
 
     def _pool(self, H: torch.Tensor, G: torch.Tensor, mask: torch.Tensor, return_alpha: bool):
+        if self.pooler is None:
+            if mask is not None:
+                w = mask.to(H.dtype).unsqueeze(-1)  # [B, T, 1]
+                denom = w.sum(dim=1, keepdim=True).clamp_min(1.0)  # [B, 1, 1]
+                Z = (H * w).sum(dim=1, keepdim=True) / denom
+            else:
+                Z = H.mean(dim=1, keepdim=True)
+            alpha_info = {}
+            return Z, alpha_info
+
         out = self.pooler(H, G, attn_mask=mask, return_alpha=return_alpha)
         if isinstance(out, tuple):
             Z = out[0]
@@ -174,6 +188,42 @@ class ProteinGoAligner(nn.Module):
         K = int(G.size(1))
         d_g = int(G.size(2))
         k_step = max(1, int(cand_chunk_k))
+
+        # ========= MEAN POOL MODU =========
+        if self.mean_pool:
+            # 1) Protein için global mean pool
+            # H: [B, T, d_h], mask: [B, T]
+            if mask is not None:
+                w = mask.to(H.dtype).unsqueeze(-1)  # [B, T, 1]
+                denom = w.sum(dim=1, keepdim=True).clamp_min(1.0)
+                Zmean = (H * w).sum(dim=1, keepdim=True) / denom  # [B, 1, d_h]
+            else:
+                Zmean = H.mean(dim=1, keepdim=True)  # [B, 1, d_h]
+
+            # 2) Protein tarafını projekte et
+            Zp_base = self.proj_p(Zmean)  # [B, 1, d_z]
+            if self.normalize:
+                Zp_base = self._norm(Zp_base, dim=-1)  # [B, 1, d_z]
+
+            # 3) GO chunklarını projekte et ve skorla
+            scores_list = []
+            for s in range(0, K, k_step):
+                e = min(K, s + k_step)
+                G_chunk = G[:, s:e, :]  # [B, k, d_g]
+
+                Gz = self.proj_g(G_chunk)  # [B, k, d_z]
+                if self.normalize:
+                    Gz = self._norm(Gz.view(-1, Gz.size(-1))).view_as(Gz)
+
+                # Zp_base: [B, 1, d_z] → repeat across K: [B, k, d_z]
+                Zp_rep = Zp_base.expand(-1, Gz.size(1), -1)
+
+                # Dot product skor
+                s_bk = (Zp_rep * Gz).sum(dim=-1)  # [B, k]
+                scores_list.append(s_bk)
+
+            scores = torch.cat(scores_list, dim=1)  # [B, K]
+            return scores
 
         scores_list = []
         for s in range(0, K, k_step):

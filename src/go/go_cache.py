@@ -16,9 +16,9 @@ class GoMemoryBank:
         device: str = "cuda:0",
         to_device: bool = True,
         already_normalized: bool = False,
-        device_dtype: torch.dtype = torch.float16,   # <= SHARP: GPU'da fp16 varsayılan
-        pin_memory: bool = False,                    # <= SHARP: dataloader uyumu
-        persist_back: bool = True                   # <= SHARP: update() memmap'e yazsın mı?
+        device_dtype: torch.dtype = torch.float16,   #  GPU'da fp16 varsayılan
+        pin_memory: bool = False,                    # dataloader uyumu
+        persist_back: bool = True                   # update() memmap'e yazsın mı?
     ):
         self.device = torch.device(device)
         self.id2row = {int(i): int(r) for r, i in enumerate(row2id)}

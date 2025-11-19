@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import argparse
 
 import wandb
-
+from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT
 from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore, VectorResources
 from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
 from src.training.collate import ContrastiveEmbCollator, fused_collator
@@ -48,6 +48,7 @@ from src.configs.paths import (
     GOOGLE_DRIVE_MANIFEST_CACHE,
     TRAINING_CONFIG,
     COMMON_IC_GO_TERMS_ID_ONLY_JSON,
+    GO_INDEX_NON_PHASE
 )
 
 # To prevent sigint (potential cause)
@@ -563,18 +564,21 @@ def run_training(args, schedule: TrainSchedule):
         wandb.login()
 
     # Phase 0 resources
-    phase0 = 0
-    go_cache_path = schedule.resolve_go_cache_path(phase0)
+    if schedule is not None:
+        phase0 = 0
+    else:
+        phase0 = -1 # ablation 1 - no phase
 
-    go_cache = build_go_cache(go_cache_path)
+    go_cache_path = schedule.resolve_go_cache_path(phase0)
+    go_cache = build_go_cache(str(go_cache_path))
     dag_parents = load_go_parents()
     dag_children = load_go_children()
 
     # GO text dict per phase
-    total_phases = (len(schedule.phase_breaks) + 1) if hasattr(schedule, "phase_breaks") else 1
+    total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
     for ph in range(total_phases):
-        go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
+        go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
 
     res_store, fused_store = build_stores(args)
     datasets = build_datasets(args, res_store, fused_store, go_cache)
@@ -586,11 +590,11 @@ def run_training(args, schedule: TrainSchedule):
         model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
         device=device,
         max_length=512,
-        use_attention_pool=True,
+        use_attention_pool=args.use_attention_pooling,
         attn_hidden=128,
         attn_dropout=0.1,
         special_token_weights=None,
-        enable_lora=True,
+        enable_lora=args.use_lora,
         lora_parameters=lora_params,
     )
 
@@ -612,8 +616,12 @@ def run_training(args, schedule: TrainSchedule):
         except Exception:
             pass
 
-    cur_cfg = build_scheduler_cfg(args, n_spe)
-    scheduler = CurriculumScheduler(cur_cfg)
+    if args.ablation_id == "A1":
+        scheduler = None
+    else:
+        cur_cfg = build_scheduler_cfg(args, n_spe)
+        scheduler = CurriculumScheduler(cur_cfg)
+
 
     # Vector resources — FAISS YOK: sadece bank embs ile
     vres = VectorResources(faiss_index=None, go_embs=go_cache.embs, device=device)
@@ -638,7 +646,10 @@ def run_training(args, schedule: TrainSchedule):
         scheduler=scheduler,
         go_text_store=go_text_store,
         use_queue_miner=bool(args.use_queue_miner),
+        attribute_loss_enabled=bool(args.use_attribution_loss),
+        return_alpha = bool(args.return_alpha),
         fp16_enabled=args.fp16,
+        pooling_strategy=args.pooling_strategy
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -656,6 +667,8 @@ def run_training(args, schedule: TrainSchedule):
     assert len(fused_bank["ids"]) == fused_bank["vecs"].shape[0] > 0, "fused bank boş/eksik"
 
     def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
+        if args.phase_change is False:
+            return
         new_phase = training_context.schedule.phase_for_epoch(current_epoch)
         prev_phase = training_context.current_phase
 
@@ -724,6 +737,7 @@ def run_training(args, schedule: TrainSchedule):
     )
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
     if bool(args.use_queue_miner):
+        print("[INFO] Using Queue Miner.")
         trainer._maybe_init_queue_miner(d_g)
     # Resume
     if getattr(args, "resume", None):
@@ -771,17 +785,25 @@ def run_training(args, schedule: TrainSchedule):
                     wandb_dataset_quickstats(wandb, datasets["train"], sample_n=256)
                 except Exception as e:
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
-            if len(seen_go_ids_prev) > 0:
-                ids_to_update = sorted(set(int(i) for i in seen_go_ids_prev))
-                toks = go_text_store.batch(ids_to_update)
-                with torch.no_grad():
-                    new_embs = go_encoder(input_ids=toks['input_ids'].to(device),
-                                          attention_mask=toks['attention_mask'].to(device)).detach().cpu()
-                new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
-                training_context.go_cache.update(ids_to_update, new_embs)
+
+            # A1'de GO cache SABİT, hiçbir refresh yok
+            if getattr(args, "ablation_id", None) == "A1":
+                pass
+            else:
+                if len(seen_go_ids_prev) > 0:
+                    ids_to_update = sorted(set(int(i) for i in seen_go_ids_prev))
+                    toks = go_text_store.batch(ids_to_update)
+                    with torch.no_grad():
+                        new_embs = go_encoder(
+                            input_ids=toks['input_ids'].to(device),
+                            attention_mask=toks['attention_mask'].to(device)
+                        ).detach().cpu()
+                    new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
+                    training_context.go_cache.update(ids_to_update, new_embs)
 
         except Exception as _e:
             logging.getLogger('bank').warning('Partial refresh failed: %r', _e)
+
 
         seen_go_ids = set()
         training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
@@ -926,7 +948,7 @@ def run_training(args, schedule: TrainSchedule):
 
 
 # ============== YAML parser ==============
-from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT
+
 def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
@@ -948,7 +970,13 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         # general
         use_queue_miner = bool(general.get("use_queue_miner", True)),
         use_go_memory_bank = bool(general.get("use_go_memory_bank", False)),
-        use_faiss = bool(general.get("use_faiss", False)),
+        use_attention_pooling = bool(general.get("use_attention_pooling", False)),
+        use_lora = bool(general.get("use_lora", False)),
+        use_attribution_loss = bool(general.get("use_attribution_loss", False)),
+        return_alpha = bool(general.get("return_alpha", False)),
+        phase_based = bool(general.get("phase_based", False)),
+        pooling_strategy = general.get("pooling_strategy", "mean"),
+        ablation_id = general.get("ablation_id", None),
         # paths / store
         train_ids=Path(stores.get("train_ids_path", PROTEIN_TRAIN_IDS)),
         pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),
@@ -1060,7 +1088,8 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         n_go=cfg.get("n_go", None),
     )
 
-    # ---- TrainSchedule from 'schedule' block ----
+    if args.phase_based is False:
+        return args, None
     schedule = TrainSchedule(
         phase_breaks=tuple(sched.get("phase_breaks", (5, 12, 25))),
         stageA_mix=tuple(sched.get("stageA_mix", (1.0, 0.0, 0.0))),
@@ -1071,7 +1100,6 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         lambda_attr_max=float(sched.get("lambda_attr_max", 0.2)),
     )
     return args, schedule
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Protein–GO Alignment Training")
@@ -1088,6 +1116,9 @@ def parse_args():
         print(f"[main] No --config passed, defaulting to {args.config}")
 
     args, schedule = load_structured_cfg(args.config)
+
+    if args.ablation_id is not None:
+        print("[Ablation] Applying ablation ID:", args.ablation_id)
 
     return args, schedule
 

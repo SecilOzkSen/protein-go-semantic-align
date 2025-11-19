@@ -13,15 +13,20 @@ data:
   # Few/Zero-shot
   fs_target_ratio: 0.3
 
-general:
-  use_queue_miner: True
-  use_go_memory_bank: True
-  use_faiss: False
+general: #Ablation Purposes
+  ablation_id: "A1"
+  use_queue_miner: False
+  use_go_memory_bank: False
+  use_attention_pooling: False
+  use_lora: False
+  use_attribution_loss: False
+  return_alpha: False
+  phase_based: False
+  pooling_strategy: "mean"
 
 caches:
   go_cache: null
   faiss_index: null
-
   go_cache_template: /workspace/cache/go_cache_phase{phase}.pt
   faiss_template: /workspace/cache/faiss_phase{phase}.index
 
@@ -30,8 +35,8 @@ training:
   batch_size: 1
   eval_batch_size: 4
 
-  num_workers: 8
-  val_num_workers: 4
+  num_workers: 1
+  val_num_workers: 1
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
@@ -123,4 +128,4 @@ stores:
   output_dir: /content/drive/MyDrive/protein-go-align-outputs
   logs: /content/drive/MyDrive/protein-go-align-logs
 
-  go_text_folder: /content/drive/MyDrive/data/processed/go_terms/go_phases
+  go_text_folder: /content/drive/MyDrive/data/processed/go_terms/go_phases # change this for ablation 1

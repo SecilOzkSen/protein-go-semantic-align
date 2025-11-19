@@ -13,30 +13,30 @@ data:
   # Few/Zero-shot
   fs_target_ratio: 0.3
 
-general:
-  use_queue_miner: True
-  use_go_memory_bank: True
-  use_faiss: False
-
-memory_bank:
-  device: "cuda"
-  dtype: "fp16"
+general: #Ablation Purposes
+  ablation_id: "A1"
+  use_queue_miner: False #CHECKED
+  use_go_memory_bank: False #CHECKED
+  use_attention_pooling: False #CHECKED
+  use_lora: False #CHECKED
+  use_attribution_loss: False #CHECKED
+  return_alpha: False
+  phase_based: False #CHECKED
+  pooling_strategy: "mean"
 
 caches:
   go_cache: null
   faiss_index: null
-
   go_cache_template: /workspace/cache/go_cache_phase{phase}.pt
   faiss_template: /workspace/cache/faiss_phase{phase}.index
 
 training:
   epochs: 5
   batch_size: 1
-  eval_batch_size: 1
-  device: "cuda:0"
+  eval_batch_size: 4
 
-  num_workers: 8
-  val_num_workers: 4
+  num_workers: 1
+  val_num_workers: 1
   pin_memory: true
   persistent_workers: true
   prefetch_factor: 2
@@ -54,10 +54,10 @@ training:
   monitor_metric: "cafa_fmax"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
   early_stop_patience: 3        # 0 veya negatif => kapalı
-  cand_chunk_k: 256
-  pos_chunk_t: 64
-  k_hard_queue: 32
-  queue_K: 1024
+  cand_chunk_k: 8
+  pos_chunk_t: 128
+  k_hard_queue: 128
+  queue_K: 8192
 
 optim:
   lr: 0.0003
@@ -128,4 +128,4 @@ stores:
   output_dir: /workspace/protein-go-align-outputs
   logs: /workspace/protein-go-align-logs
 
-  go_text_folder: /workspace/data/processed/go_terms/go_phases
+  go_text_folder: /workspace/data/processed/go_terms/canonical #ablation 1
