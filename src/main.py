@@ -20,7 +20,7 @@ import torch.nn.functional as F
 import argparse
 
 import wandb
-from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT
+from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT, GO_INDEX
 from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore, VectorResources
 from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
 from src.training.collate import ContrastiveEmbCollator, fused_collator
@@ -566,10 +566,11 @@ def run_training(args, schedule: TrainSchedule):
     # Phase 0 resources
     if schedule is not None:
         phase0 = 0
+        go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
         phase0 = -1 # ablation 1 - no phase
+        go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
 
-    go_cache_path = schedule.resolve_go_cache_path(phase0)
     go_cache = build_go_cache(str(go_cache_path))
     dag_parents = load_go_parents()
     dag_children = load_go_children()
