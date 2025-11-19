@@ -113,7 +113,7 @@ class ProteinGoAligner(nn.Module):
             mask = mask.to(torch.bool)
 
         # Modüllerin de doğru cihazda olduğundan emin ol (dinamik yaratım ihtimaline karşı)
-        if next(self.pooler.parameters()).device != dev:
+        if self.pooler is not None and next(self.pooler.parameters()).device != dev:
             self.pooler.to(dev, non_blocking=True)
         if next(self.proj_p.parameters()).device != dev:
             self.proj_p.to(dev, non_blocking=True)
