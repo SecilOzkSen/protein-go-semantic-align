@@ -618,6 +618,8 @@ def run_training(args, schedule: TrainSchedule):
     # GoTextStore + dataloaders
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
 
+    print("GoTextStore size:", len(go_text_store.id2tok))
+
     sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
 
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
