@@ -167,6 +167,19 @@ class OppTrainer:
             mean_pool=True if ctx.pooling_strategy == "mean" else False,
         ).to(self.device)
 
+        # TODO: for sanity checks, erase later.
+        # ======= Sanity: requires_grad kontrolü =======
+        print("=== PARAMETER GRAD CHECK (OppTrainer init) ===")
+        total = 0
+        frozen = 0
+        for n, p in self.model.named_parameters():
+            total += 1
+            if not p.requires_grad:
+                frozen += 1
+                print(f"FROZEN: {n}")
+        print(f"Total params: {total}, Frozen: {frozen}")
+        print("==============================================")
+
         # --- EMA (momentum) key encoder: GO tarafı ---
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))
         self.go_encoder_k = None
@@ -183,7 +196,8 @@ class OppTrainer:
         self.ctx.vres.set_query_projector(self.index_projector)
 
         # --- Queue config ---
-        self.use_moco_miner: bool = True
+        self.use_moco_miner: bool = ctx.use_queue_miner
+        print("[Trainer] Using MoCo Queue Miner:", self.use_moco_miner)
         self.queue_K: int = int(getattr(cfg, "queue_K", getattr(ctx, "queue_K", 4096)))
         self.k_hard_queue: int = int(getattr(cfg, "k_hard_queue", getattr(ctx, "k_hard", 32)))
         self.queue_miner: Optional[MoCoQueue] = None
@@ -470,6 +484,28 @@ class OppTrainer:
 
         return G_eval, y_true, eval_ids
 
+    def _log_scalar_safe(self, key: str, value: float, step: int, epoch: int = None):
+        # W&B varsa logla
+        try:
+            import wandb
+            if wandb.run is not None:
+                data = {key: value}
+                if epoch is not None:
+                    data["epoch"] = epoch
+                wandb.log(data, step=step)
+        except Exception:
+            pass
+
+        # wlogger varsa logla
+        if getattr(self, "wlogger", None) is not None:
+            try:
+                data = {key: value}
+                if epoch is not None:
+                    data["epoch"] = epoch
+                self.wlogger.log_scalar(data, step=step)
+            except Exception:
+                pass
+
     # --------- Scoring (tensor path) ---------
     def forward_scores(self, H, G, pad_mask, return_alpha=False,
                        cand_chunk_k: int = 32,
@@ -556,15 +592,24 @@ class OppTrainer:
         if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
             toks = batch["pos_go_tokens"]
             with torch.no_grad():
-                uniq_go_embs = self.model.go_encoder(
+                uniq_go_raw = self.model.go_encoder(
                     input_ids=toks["input_ids"].to(device, non_blocking=True),
                     attention_mask=toks["attention_mask"].to(device, non_blocking=True),
                 )  # [G, Dg]  (GPU)
-            uniq_go_embs = self.normalizer(uniq_go_embs, dim=1)  # [G, Dg] (GPU)
         else:
             # Zaten hazır embedding verilmişse kopyalamadan GPU'ya al, normalize et.
-            uniq_go_embs = batch["uniq_go_embs"].to(device, non_blocking=True)  # [G, Dg]
-            uniq_go_embs = self.normalizer(uniq_go_embs, dim=1)
+            uniq_go_raw = batch["uniq_go_embs"].to(device, non_blocking=True) # [G, Dg]
+
+        # --- DIAG: GO embedding norm istatistikleri (normalize ÖNCESİ) ---
+        with torch.no_grad():
+            go_norms = uniq_go_raw.norm(dim=1)  # [G]
+            go_mean = go_norms.mean().item()
+            go_std = go_norms.std().item()
+            self._log_scalar_safe("diag/go_norm_mean", go_mean, step=self._global_step, epoch=epoch_idx)
+            self._log_scalar_safe("diag/go_norm_std", go_std, step=self._global_step, epoch=epoch_idx)
+
+        # Sonra normalizer
+        uniq_go_embs = self.normalizer(uniq_go_raw, dim=1)  # [G, Dg]
 
         uniq_go_ids = batch["uniq_go_ids"].to(device, non_blocking=True)  # [G]
         Dg_batch = int(uniq_go_embs.size(1))
@@ -574,32 +619,40 @@ class OppTrainer:
         # Teacher vektörü (fused bank varsa oradan), yoksa residue-based teacher.
         with torch.no_grad():
             prot_ids = batch.get("protein_ids", None)
-            vt_for_miner = None
+            vt_for_miner_raw = None
             if prot_ids is not None and getattr(self.ctx, "fused_bank", None) is not None:
                 id2row = self.ctx.fused_bank["id2row"]  # CPU dict
                 rows = [id2row.get(pid, None) for pid in prot_ids]
                 if all(r is not None for r in rows) and len(rows) > 0:
                     vecs_cpu = self.ctx.fused_bank["vecs"]  # CPU tensor [N, D?]
                     idx_cpu = torch.as_tensor(rows, dtype=torch.long, device=vecs_cpu.device)
-                    vt_for_miner = vecs_cpu.index_select(0, idx_cpu).to(device, non_blocking=True)
-                    if vt_for_miner.size(1) != Dg_batch and hasattr(self.ctx.vres, "project_queries_to_index"):
+                    vt_for_miner_raw = vecs_cpu.index_select(0, idx_cpu).to(device, non_blocking=True)
+                    if vt_for_miner_raw.size(1) != Dg_batch and hasattr(self.ctx.vres, "project_queries_to_index"):
                         try:
-                            vt_for_miner = self.ctx.vres.project_queries_to_index(vt_for_miner)
+                            vt_for_miner_raw = self.ctx.vres.project_queries_to_index(vt_for_miner_raw)
                         except Exception:
                             pass
-                    vt_for_miner = self.normalizer(vt_for_miner, dim=1)
+           #         vt_for_miner_raw = self.normalizer(vt_for_miner_raw, dim=1)
 
-            if vt_for_miner is None:
+            if vt_for_miner_raw is None:
                 v_true_early = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh] GPU
                 vt_for_miner = v_true_early
                 if hasattr(self.ctx.vres, "project_queries_to_index"):
                     try:
-                        vt_for_miner = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
+                        vt_for_miner_raw = self.ctx.vres.project_queries_to_index(v_true_early)  # [B, Dg]
                     except Exception:
                         pass
-                if vt_for_miner.size(1) != Dg_batch:
-                    raise RuntimeError(f"prot_query dim mismatch: got {vt_for_miner.size(1)}, expected {Dg_batch}.")
-                vt_for_miner = self.normalizer(vt_for_miner, dim=1)
+                if vt_for_miner_raw.size(1) != Dg_batch:
+                    raise RuntimeError(f"prot_query dim mismatch: got {vt_for_miner_raw.size(1)}, expected {Dg_batch}.")
+
+            with torch.no_grad():
+                pq_norms = vt_for_miner_raw.norm(dim=1)  # [B]
+                pq_mean = pq_norms.mean().item()
+                pq_std = pq_norms.std().item()
+                self._log_scalar_safe("diag/prot_norm_mean", pq_mean, step=self._global_step, epoch=epoch_idx)
+                self._log_scalar_safe("diag/prot_norm_std", pq_std, step=self._global_step, epoch=epoch_idx)
+
+            vt_for_miner = self.normalizer(vt_for_miner_raw, dim=1)
         prot_query = vt_for_miner  # [B, Dg] (GPU)
 
         # ========== QUEUE MINER: hard negatives (chunklı ve no_grad) ==========
@@ -628,6 +681,15 @@ class OppTrainer:
                             del K_part
                         sims = torch.cat(sim_chunks, dim=1)  # [B,K_all] GPU
 
+                        with torch.no_grad():
+                            sims_flat = sims.detach()
+                            sim_mean = sims_flat.mean().item()
+                            sim_std = sims_flat.std().item()
+                            self._log_scalar_safe("diag/queue_sim_mean", sim_mean, step=self._global_step,
+                                                  epoch=epoch_idx)
+                            self._log_scalar_safe("diag/queue_sim_std", sim_std, step=self._global_step,
+                                                  epoch=epoch_idx)
+
                         # False-negative mask
                         if all_neg_ids is not None:
                             pos_gid_sets = []
@@ -644,6 +706,23 @@ class OppTrainer:
                                     for j, gid in enumerate(ids_list):
                                         if gid in pos_gid_sets[b]:
                                             mask[b, j] = True
+                            # --- DIAG 2: queue içindeki pozitif oranı (false negative potansiyeli) ---
+                            with torch.no_grad():
+                                # batch bazında, bu batch için queue'daki pozitif oranı
+                                fn_counts_batch = mask.sum(dim=1).float()  # [B]
+                                fn_ratio_batch = (fn_counts_batch / float(sims.size(1))).mean().item()
+                                self._log_scalar_safe("diag/queue_fn_ratio_batch", fn_ratio_batch,
+                                                      step=self._global_step, epoch=epoch_idx)
+
+                                # global olarak, queue'daki id'lerin yüzde kaçı bu batch'in herhangi bir pozitifine denk geliyor
+                                pos_union = set()
+                                for s in pos_gid_sets:
+                                    pos_union.update(s)
+                                overlap = sum(1 for gid in ids_list if gid in pos_union)
+                                global_ratio = float(overlap) / float(len(ids_list)) if len(ids_list) > 0 else 0.0
+                                self._log_scalar_safe("diag/queue_fn_ratio_global", global_ratio,
+                                                      step=self._global_step, epoch=epoch_idx)
+
                             sims = sims.masked_fill(mask, float('-inf'))
 
                         k = min(int(self.k_hard_queue), K_all)

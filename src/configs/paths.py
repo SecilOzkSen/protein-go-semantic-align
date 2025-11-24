@@ -127,7 +127,7 @@ GO_CHILDREN = TRAINING_READY / "go_dag" / "go_children.json"
 GO_ANCESTOR_STOPLIST = TRAINING_READY / "go_dag" / "ancestor_stoplist.txt"
 
 # PROTEINS
-PID_TO_POSITIVES    = TRAINING_READY / "proteins" / "pid_to_positives.json"
+PID_TO_POSITIVES    = TRAINING_READY / "proteins" / "pid_to_positives_canonical.json"
 P_SEQ_LEN_LOOKUP    = TRAINING_READY / "proteins" / "seq_len_lookup.pkl"
 PROTEIN_TRAIN_IDS   = TRAINING_READY / "proteins" / "protein_train_ids.txt"
 PROTEIN_VAL_IDS     = TRAINING_READY / "proteins" / "protein_val_ids.txt"

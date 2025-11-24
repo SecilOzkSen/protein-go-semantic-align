@@ -550,6 +550,19 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
     except Exception as e:
         logging.getLogger("wandb").warning("Dataset quickstats failed: %r", e)
 
+def sanity_check_go_text(train_ids, pid2pos, go_text_store):
+    used_terms = set()
+    for pid in train_ids:
+        gids = pid2pos.get(pid, [])
+        for g in gids:
+            used_terms.add(int(g))
+
+    missing = [g for g in used_terms if g not in go_text_store.id2tok]
+    if missing:
+        raise RuntimeError(
+            f"GoTextStore is missing {len(missing)} GO ids, e.g. {missing[:10]}"
+        )
+
 
 # ============== Runner ==============
 def run_training(args, schedule: TrainSchedule):
@@ -604,6 +617,9 @@ def run_training(args, schedule: TrainSchedule):
 
     # GoTextStore + dataloaders
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
+
+    sanity_check_go_text(datasets["train"].protein_ids, datasets["train"].pid2pos, go_text_store)
+
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     train_loader, val_loader, query_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 

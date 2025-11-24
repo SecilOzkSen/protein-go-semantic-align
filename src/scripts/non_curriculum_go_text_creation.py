@@ -28,6 +28,10 @@ def load_terms(path: str) -> Dict[str, Dict[str, Any]]:
     with open(path, "rb") as f:
         return pickle.load(f)
 
+def load_positives(path: str) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return json.load(f)
+
 
 def normalize_domain(ns: str) -> str:
     """
@@ -82,16 +86,27 @@ def write_jsonl(path: str, examples):
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
 
-def main(input_path: str, out_path: str):
+def main(input_path: str, out_path: str, pid_positives_path: str = "/Users/secilsen/PhD/protein-go-semantic-align/src/scripts/pid_to_positives_canonical.json"):
     terms = load_terms(input_path)
+    pid_positives = load_positives(pid_positives_path)
+
+    set_gid = set()
+    for gids in pid_positives.values():
+        for g in gids:
+            set_gid.add(f"GO:{g:07d}")
 
     examples = []
     for gid, data in terms.items():
+        if gid not in set_gid:
+            continue
         ex = build_entry(gid, data)
         examples.append(ex)
 
     # stabilite için GO ID'ye göre sırala
     examples.sort(key=lambda x: x["go_id"])
+
+    print(f"Total canonical GO terms to write: {len(examples)}")
+    print(f"Total pidpositives GO terms: {len(set_gid)}")
 
     write_jsonl(out_path, examples)
     print(f"Wrote {out_path} with {len(examples)} entries in canonical format.")
@@ -100,5 +115,5 @@ def main(input_path: str, out_path: str):
 if __name__ == "__main__":
     main(
         "/Users/secilsen/PhD/protein-go-semantic-align/src/data/raw/go_basic_obo_terms_v2.pkl",
-        "go_texts_canonical.jsonl",
+        "../data/processed/go_terms/canonical/go_texts_canonical.jsonl",
     )
