@@ -294,7 +294,11 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
-    pid2pos = load_raw_json(PID_TO_POSITIVES)
+    logger = logging.getLogger("build_datasets")
+    logger.info("Building datasets...")
+    logger.info(f"PID_TO_POSITIVES path = {args.pid2pos}")
+
+    pid2pos = load_raw_json(args.pid2pos)
     train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
     val_ids = load_raw_txt(PROTEIN_VAL_IDS)
 
