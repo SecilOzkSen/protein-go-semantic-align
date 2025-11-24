@@ -618,7 +618,7 @@ def run_training(args, schedule: TrainSchedule):
     # GoTextStore + dataloaders
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
 
-    sanity_check_go_text(datasets["train"].protein_ids, datasets["train"].pid2pos, go_text_store)
+    sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
 
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     train_loader, val_loader, query_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
