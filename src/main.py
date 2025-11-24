@@ -616,7 +616,8 @@ def run_training(args, schedule: TrainSchedule):
     )
 
     # GoTextStore + dataloaders
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=True)
+    lazy = True if phase0 >=0 else False
+    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=lazy)
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
