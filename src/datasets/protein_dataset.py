@@ -53,25 +53,71 @@ class ProteinEmbDataset(Dataset):
         self.fused_store = fused_store
         self.include_fused = bool(include_fused)
 
-        self.pid2pos: Dict[str, List[int]] = pid2pos
+        # === CANONICAL GO UNIVERSE ===
+        # GoLookupCache tarafında canonical id'ler nerede tutuluyorsa oradan çekiyoruz.
+        # Varsayım: go_cache.go_ids veya go_cache.id2idx mevcut.
+        if hasattr(go_cache, "go_ids"):
+            self.valid_go_ids: Set[int] = set(int(g) for g in go_cache.go_ids)
+        elif hasattr(go_cache, "id2idx"):
+            self.valid_go_ids = set(int(g) for g in go_cache.id2idx.keys())
+        else:
+            raise RuntimeError("GoLookupCache must expose canonical GO ids via 'go_ids' or 'id2idx'.")
+
+        # Bu mappingleri DAG + canonical filtre sonrasına göre dolduracağız
+        self.pid2pos: Dict[str, List[int]] = {}
         self.pos_weights_map: Dict[str, List[float]] = {}
         self.pos_is_generalized: Dict[str, List[bool]] = {}
 
+        new_pids: List[str] = []
+        dropped_prots = 0
+        dropped_terms: Set[int] = set()
+
         for pid in self.pids:
-            orig = self.pid2pos.get(pid, [])
-            # zero-shot sterilizasyon
-            pos = [g for g in orig if g not in fewzero.zero_shot_terms]
-            # az ise atalarla genişlet
+            orig = pid2pos.get(pid, [])
+            # ---- 1) Zero-shot sterilizasyon ----
+            pos = [int(g) for g in orig if int(g) not in fewzero.zero_shot_terms]
+            # ---- 2) DAG ile genişletme ----
             expanded, weights, is_gen_map = expand_with_ancestors(
-                pos_terms=pos, parents=dag_parents,
+                pos_terms=pos,
+                parents=dag_parents,
                 zs_blocklist=fewzero.zero_shot_terms,
-                min_pos=min_pos_for_expand, max_add=max_ancestor_add,
-                max_hops=max_hops, stoplist=ancestor_stoplist, gamma=ancestor_gamma,
-                allowed_rels=set(ALLOWED_RELS_FOR_DAG)
+                min_pos=min_pos_for_expand,
+                max_add=max_ancestor_add,
+                max_hops=max_hops,
+                stoplist=ancestor_stoplist,
+                gamma=ancestor_gamma,
+                allowed_rels=set(ALLOWED_RELS_FOR_DAG),
             )
-            self.pid2pos[pid] = expanded
-            self.pos_weights_map[pid] = [float(w) for w in weights]
-            self.pos_is_generalized[pid] = [bool(is_gen_map[int(t)]) for t in expanded]
+            # ---- 3) CANONICAL FILTRE: sadece GoTextStore / go_cache'in bildiği id'ler kalsın ----
+            expanded_filtered: List[int] = []
+            weights_filtered: List[float] = []
+            is_gen_filtered: List[bool] = []
+
+            for t, w in zip(expanded, weights):
+                t_int = int(t)
+                if t_int in self.valid_go_ids:
+                    expanded_filtered.append(t_int)
+                    weights_filtered.append(float(w))
+                    is_gen_filtered.append(bool(is_gen_map[int(t)]))
+                else:
+                    dropped_terms.add(t_int)
+
+            # Hiç label kalmadıysa bu proteini dataset'ten at
+            if not expanded_filtered:
+                dropped_prots += 1
+                continue
+
+            new_pids.append(pid)
+            self.pid2pos[pid] = expanded_filtered
+            self.pos_weights_map[pid] = weights_filtered
+            self.pos_is_generalized[pid] = is_gen_filtered
+
+        # Sadece en az bir canonical label'ı kalan proteinleri tut
+        self.pids = new_pids
+        print(
+            f"[ProteinEmbDataset] canonical filter: kept {len(self.pids)} proteins, "
+            f"dropped_proteins={dropped_prots}, dropped_terms={len(dropped_terms)}"
+        )
 
         # Few-shot bayrak
         self.is_fs: List[bool] = []
