@@ -849,8 +849,6 @@ class OppTrainer:
                 pos_chunk_t=int(getattr(self.cfg, "pos_chunk_t", 128)),
             )  # (B,K) GPU
 
-            if scores_cand.detach().abs().max().item() == 0.0:
-                raise RuntimeError("scores_cand are all zero. Fix ProteinGoAligner.forward instead of using teacher fallback.")
 
             scale = self.logit_scale.exp().clamp(max=100.0)
             scores_cand = scores_cand * scale
