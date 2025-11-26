@@ -12,17 +12,6 @@ from src.go.go_cache import GoLookupCache
 from .residue_store import ESMResidueStore, ESMFusedStore  # <-- fused import
 
 class ProteinEmbDataset(Dataset):
-    """
-    CLIP-style protein<->GO training dataset.
-    ZORUNLU: residue store (ESMResidueStore), opsiyonel: fused store (sadece yan bilgi).
-    Dönen:
-      - protein_id: str
-      - prot_emb:   FloatTensor [L,D]   (EĞİTİM)
-      - pos_go_ids: LongTensor  [P]
-      - pos_go_weights: FloatTensor [P]
-      - is_fs: bool
-      - (opsiyonel) prot_fused: FloatTensor [D]  -- include_fused=True ise
-    """
     def __init__(
         self,
         protein_ids: Sequence[str],
@@ -54,16 +43,9 @@ class ProteinEmbDataset(Dataset):
         self.include_fused = bool(include_fused)
 
         # === CANONICAL GO UNIVERSE ===
-        # GoLookupCache tarafında canonical id'ler nerede tutuluyorsa oradan çekiyoruz.
-        # Varsayım: go_cache.go_ids veya go_cache.id2idx mevcut.
-        if hasattr(go_cache, "go_ids"):
-            self.valid_go_ids: Set[int] = set(int(g) for g in go_cache.go_ids)
-        elif hasattr(go_cache, "id2idx"):
-            self.valid_go_ids = set(int(g) for g in go_cache.id2idx.keys())
-        else:
-            raise RuntimeError("GoLookupCache must expose canonical GO ids via 'go_ids' or 'id2idx'.")
+        # GoLookupCache row2id -> elimizde embedding/text olan global GO id'ler
+        valid_go_ids: Set[int] = set(int(g) for g in go_cache.row2id)
 
-        # Bu mappingleri DAG + canonical filtre sonrasına göre dolduracağız
         self.pid2pos: Dict[str, List[int]] = {}
         self.pos_weights_map: Dict[str, List[float]] = {}
         self.pos_is_generalized: Dict[str, List[bool]] = {}
@@ -95,7 +77,7 @@ class ProteinEmbDataset(Dataset):
 
             for t, w in zip(expanded, weights):
                 t_int = int(t)
-                if t_int in self.valid_go_ids:
+                if t_int in valid_go_ids:
                     expanded_filtered.append(t_int)
                     weights_filtered.append(float(w))
                     is_gen_filtered.append(bool(is_gen_map[int(t)]))
@@ -115,9 +97,14 @@ class ProteinEmbDataset(Dataset):
         # Sadece en az bir canonical label'ı kalan proteinleri tut
         self.pids = new_pids
         print(
-            f"[ProteinEmbDataset] canonical filter: kept {len(self.pids)} proteins, "
-            f"dropped_proteins={dropped_prots}, dropped_terms={len(dropped_terms)}"
+            f"[ProteinEmbDataset] canonical filter after DAG: "
+            f"kept {len(self.pids)} proteins, "
+            f"dropped_proteins={dropped_prots}, "
+            f"dropped_terms={len(dropped_terms)}"
         )
+        if dropped_terms:
+            sample = sorted(dropped_terms)[:10]
+            print(f"[ProteinEmbDataset] example dropped ancestor terms: {sample}")
 
         # Few-shot bayrak
         self.is_fs: List[bool] = []
