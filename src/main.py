@@ -948,6 +948,25 @@ def run_training(args, schedule: TrainSchedule):
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
 
+            # ==== DEBUG: grad norm ====
+            if global_step % 500 == 0:
+                with torch.no_grad():
+                    # Mesela projection head ya da logit_scale’den bir parametre seç
+                    some_param = None
+                    for p in trainer.model.parameters():
+                        if p.requires_grad and p.grad is not None:
+                            some_param = p
+                            break
+                    if some_param is not None:
+                        gnorm = float(some_param.grad.norm().item())
+                    else:
+                        gnorm = 0.0
+                    print(f"[debug] step={global_step} grad_norm={gnorm:.3e}")
+                    try:
+                        trainer._log_scalar_safe({"debug/grad_norm": gnorm}, step=global_step)
+                    except Exception:
+                        pass
+
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
                 torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), gc)

@@ -850,6 +850,21 @@ class OppTrainer:
             scale = self.logit_scale.exp().clamp(max=100.0)
             scores_cand = scores_cand * scale
 
+            # ==== DEBUG: pozitif sayısı ve skor istatistikleri ====
+            with torch.no_grad():
+                num_pos = int(pos_mask.sum().item())
+                max_score = float(scores_cand.max().item())
+                min_score = float(scores_cand.min().item())
+                if self._global_step % 500 == 0:
+                    print(f"[debug] step={self._global_step} num_pos={num_pos} "
+                          f"score_min={min_score:.4f} score_max={max_score:.4f}")
+                    self._log_scalar_safe("debug/num_pos", num_pos, step=self._global_step, epoch=epoch_idx)
+                    self._log_scalar_safe("debug/score_min", min_score, step=self._global_step, epoch=epoch_idx)
+                    self._log_scalar_safe("debug/score_max", max_score, step=self._global_step, epoch=epoch_idx)
+                if num_pos == 0:
+                    raise RuntimeError(
+                        "multi_positive_infonce_from_candidates: pos_mask has zero positives in this batch.")
+
             # InfoNCE (multi-positive)
             l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=1.0)
 
