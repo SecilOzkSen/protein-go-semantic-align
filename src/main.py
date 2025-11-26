@@ -5,7 +5,7 @@ import math
 import yaml
 import random
 from torch.utils.data import DataLoader
-from typing import Dict, List
+from typing import Dict, List, Set
 import torch.multiprocessing as mp
 from datetime import datetime
 import glob
@@ -554,6 +554,88 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
     except Exception as e:
         logging.getLogger("wandb").warning("Dataset quickstats failed: %r", e)
 
+def sanitize_dataset_with_go_text(train_ds, go_text_store) -> None:
+    """
+    ProteinEmbDataset'i GoTextStore domain'i ile hizalar.
+
+    - train_ds.pid2pos içindeki GO id'lerini, go_text_store.id2tok domainine intersect eder
+    - Buna paralel olarak pos_weights_map ve pos_is_generalized'ı da kırpar
+    - Label'ı tamamen boşalan proteinleri dataset'ten atar
+    - train_ds.pids ve train_ds.is_fs'i yeniden yazar
+    """
+
+    valid_ids: Set[int] = set(int(g) for g in go_text_store.id2tok.keys())
+
+    old_pids = list(train_ds.pids)
+    new_pids: List[str] = []
+
+    new_pid2pos: Dict[str, List[int]] = {}
+    new_pos_weights: Dict[str, List[float]] = {}
+    new_pos_is_gen: Dict[str, List[bool]] = {}
+    new_is_fs: List[bool] = []
+
+    dropped_prots = 0
+    dropped_terms: Set[int] = set()
+    dropped_labels = 0
+
+    fewzero = getattr(train_ds, "fewzero", None)
+
+    for pid in old_pids:
+        gids = train_ds.pid2pos.get(pid, [])
+        ws = train_ds.pos_weights_map.get(pid, [1.0] * len(gids))
+        is_gen = train_ds.pos_is_generalized.get(pid, [False] * len(gids))
+
+        if not gids:
+            dropped_prots += 1
+            continue
+
+        gids_int = [int(g) for g in gids]
+
+        kept_g: List[int] = []
+        kept_w: List[float] = []
+        kept_gen: List[bool] = []
+
+        for g, w, ig in zip(gids_int, ws, is_gen):
+            if g in valid_ids:
+                kept_g.append(g)
+                kept_w.append(float(w))
+                kept_gen.append(bool(ig))
+            else:
+                dropped_terms.add(g)
+
+        if not kept_g:
+            dropped_prots += 1
+            dropped_labels += len(gids_int)
+            continue
+
+        new_pids.append(pid)
+        new_pid2pos[pid] = kept_g
+        new_pos_weights[pid] = kept_w
+        new_pos_is_gen[pid] = kept_gen
+
+        if fewzero is not None:
+            lbl_set = set(kept_g)
+            new_is_fs.append(any((g in fewzero.few_shot_terms) for g in lbl_set))
+
+    print(
+        f"[sanitize_dataset_with_go_text] proteins: {len(old_pids)} -> {len(new_pids)}, "
+        f"dropped_proteins={dropped_prots}, dropped_labels={dropped_labels}, "
+        f"dropped_terms={len(dropped_terms)}"
+    )
+    if dropped_terms:
+        sample = sorted(dropped_terms)[:10]
+        print(f"[sanitize_dataset_with_go_text] example missing terms (no text): {sample}")
+
+    # In-place update
+    train_ds.pids = new_pids
+    train_ds.pid2pos = new_pid2pos
+    train_ds.pos_weights_map = new_pos_weights
+    train_ds.pos_is_generalized = new_pos_is_gen
+
+    if new_is_fs:
+        train_ds.is_fs = new_is_fs
+
+
 def sanity_check_go_text(train_ids, pid2pos, go_text_store):
     used_terms = set()
     for pid in train_ids:
@@ -625,7 +707,15 @@ def run_training(args, schedule: TrainSchedule):
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
+    # Training dataset cleaning
+    print("[MAIN] Sanitizing training dataset with GoTextStore...")
+    sanitize_dataset_with_go_text(datasets["train"], go_text_store)
     sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
+
+    # Val dataset cleaning
+    print("[MAIN] Sanitizing validation dataset with GoTextStore...")
+    sanitize_dataset_with_go_text(datasets["val"], go_text_store)
+    sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
 
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     train_loader, val_loader, query_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
