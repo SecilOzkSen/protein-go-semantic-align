@@ -15,7 +15,7 @@ data:
 
 general: #Ablation Purposes
   ablation_id: "A1"
-  use_queue_miner: False #CHECKED
+  use_queue_miner: True #CHECKED
   use_go_memory_bank: False #CHECKED
   use_attention_pooling: False #CHECKED
   use_lora: False #CHECKED
