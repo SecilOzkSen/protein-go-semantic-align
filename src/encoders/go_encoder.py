@@ -84,7 +84,8 @@ class BioMedBERTEncoder(nn.Module):
         self.device = torch.device(device) if isinstance(device, str) else device
         self.max_length = max_length
         # Base model and tokenizer
-        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False)
+        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False,
+                                               use_safetensors=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.enable_lora = enable_lora
         if self.enable_lora:
