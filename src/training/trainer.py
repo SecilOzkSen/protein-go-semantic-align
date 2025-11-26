@@ -849,25 +849,8 @@ class OppTrainer:
                 pos_chunk_t=int(getattr(self.cfg, "pos_chunk_t", 128)),
             )  # (B,K) GPU
 
-            # === Fallback: forward_scores her yeri 0 veriyorsa dot-product kullan ===
-            # Bu kontrol detach ile yapılıyor, grad yoluna karışmıyor.
             if scores_cand.detach().abs().max().item() == 0.0:
-                # Debug log
-                self._log_scalar_safe("debug/forward_scores_all_zero", 1, step=self._global_step, epoch=epoch_idx)
-                # 1) Prot query yi GRAD ile yeniden üret
-                vq = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh], grad açık
-                if hasattr(self.ctx.vres, "project_queries_to_index"):
-                    vq = self.ctx.vres.project_queries_to_index(vq)  # [B, Dg]
-                vq = self.normalizer(vq, dim=1)  # [B, Dg]
-
-                # 2) GO candidate vektörlerini cihaza al ve normalize et
-                K_global = self._as_device_dtype(
-                    G_vecs_global, self.device, dtype=vq.dtype
-                )  # [K, Dg]
-                K_global = self.normalizer(K_global, dim=1)
-
-                # 3) Dot product skor
-                scores_cand = vq @ K_global.t()  # [B, K]
+                raise RuntimeError("scores_cand are all zero. Fix ProteinGoAligner.forward instead of using teacher fallback.")
 
             scale = self.logit_scale.exp().clamp(max=100.0)
             scores_cand = scores_cand * scale
