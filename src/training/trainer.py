@@ -577,6 +577,7 @@ class OppTrainer:
         attn_valid, pad_mask = self._valid_and_pad_masks(batch)
         if self.to_f32 is not None:
             H = self.to_f32(H)
+        H.requires_grad_(True)
         pos_local: List[torch.Tensor] = batch["pos_go_local"]
         B = H.size(0)
 
