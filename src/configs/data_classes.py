@@ -225,6 +225,7 @@ class TrainingContext:
     return_alpha: bool = False
     fused_bank: Any = None
     pooling_strategy: str = "mean"
+    eval_id_list: List[int] = None
 
 
     def to_dict(self):
@@ -262,3 +263,10 @@ class TrainerConfig:
     pos_chunk_t: int = 128
     k_hard_queue: int = 64
     queue_K:int = 65536
+    weight_decay: float = 1e-2
+    grad_clip: float = 1.0
+    batch_size: int = 64
+    eval_batch_size: int = 128
+    fp16: bool = True
+    monitor_metric: str = "cafa_fmax"
+    monitor_mode: str = "max"

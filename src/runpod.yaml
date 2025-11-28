@@ -48,7 +48,7 @@ training:
   output_dir: /workspace/protein-go-align/outputs/run
   save_every: 2000
   keep_last_n: 3
-  resume: null
+  resume: /workspace/checkpoints/checkpoint_step56000.pt
   log_every: 500
   log_level: INFO
   monitor_metric: "cafa_fmax"   # "total" da olabilir
@@ -56,8 +56,8 @@ training:
   early_stop_patience: 3        # 0 veya negatif => kapalı
   cand_chunk_k: 8
   pos_chunk_t: 128
-  k_hard_queue: 128
-  queue_K: 8192
+  k_hard_queue: 128 #32
+  queue_K: 8192 #2048
 
 optim:
   lr: 0.0003

@@ -197,7 +197,6 @@ class OppTrainer:
 
         # --- Queue config ---
         self.use_moco_miner: bool = ctx.use_queue_miner
-        print("[Trainer] Using MoCo Queue Miner:", self.use_moco_miner)
         self.queue_K: int = int(getattr(cfg, "queue_K", getattr(ctx, "queue_K", 4096)))
         self.k_hard_queue: int = int(getattr(cfg, "k_hard_queue", getattr(ctx, "k_hard", 32)))
         self.queue_miner: Optional[MoCoQueue] = None
@@ -387,7 +386,7 @@ class OppTrainer:
     def _maybe_init_queue_miner(self, Dg: int):
         if self.queue_miner is None and self.use_moco_miner:
             self.queue_miner = MoCoQueue(dim=int(Dg), K=int(self.queue_K), device=str(self.device))
-            print(f"[Trainer] QueueMiner enabled (K={self.queue_K}, k_hard={self.k_hard_queue}, Dg={Dg}).")
+            print(f"[Trainer] MoCo QueueMiner enabled (K={self.queue_K}, k_hard={self.k_hard_queue}, Dg={Dg}).")
 
     def _build_candidates_with_queue(self,
                                      uniq_go_embs: torch.Tensor,
@@ -432,55 +431,63 @@ class OppTrainer:
     # --------- Eval space builder (for val/test) ---------
     def _build_eval_space(self, batch):
         """
-        Returns:
-          G_eval:   (B, Geval, Dg)
-          y_true:   (B, Geval)
-          eval_ids: (Geval,)
+        Eval için TEK bir global GO uzayı kullan:
+          - ctx.eval_id_list: global eval GO id listesi (sabit)
+          - G_eval:   (B, Geval, Dg)
+          - y_true:   (B, Geval) multi-hot
+          - eval_ids: (Geval,)
         """
         device = self.device
         B = batch["prot_emb_pad"].size(0)
 
-        if hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list:
-            eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long, device=device)
-            rows = torch.as_tensor([self.ctx.go_cache.id2row[int(g)] for g in eval_ids.tolist()],
-                                   dtype=torch.long, device=device)
-            bank = self.ctx.go_cache.embs.to(self.device)
-            G_eval_once = bank.index_select(0, rows)  # (Geval, Dg)
-        else:
-            eval_ids = batch["uniq_go_ids"].to(device)  # (Geval,)
-            if ("pos_go_tokens" in batch) and (hasattr(self.model, "go_encoder") and self.model.go_encoder is not None):
-                toks = batch["pos_go_tokens"]
-                G_eval_once = self.model.go_encoder(
-                    input_ids=toks["input_ids"].to(device),
-                    attention_mask=toks["attention_mask"].to(device),
-                )
-                G_eval_once = self.normalizer(G_eval_once, dim=1)
-            else:
-                G_eval_once = batch["uniq_go_embs"].to(device)
+        # 1) Global eval id listesi ZORUNLU
+        if not (hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list):
+            raise RuntimeError(
+                "[_build_eval_space] ctx.eval_id_list tanımlı değil. "
+                "Train+val dataset'ten global eval GO id listesi çıkarıp "
+                "ctx.eval_id_list olarak set etmen gerekiyor."
+            )
+
+        # eval_ids: [Geval] (global, sabit sıra)
+        eval_ids = torch.as_tensor(self.ctx.eval_id_list,
+                                   dtype=torch.long,
+                                   device=device)                         # (Geval,)
+
+        # 2) Global GO embedding bank'ten satırları çek
+        # go_cache.id2row: GO id -> row index
+        rows = torch.as_tensor(
+            [self.ctx.go_cache.id2row[int(g)] for g in eval_ids.tolist()],
+            dtype=torch.long,
+            device=self.ctx.go_cache.embs.device
+        )
+        bank = self.ctx.go_cache.embs                                  # bank device'ında
+        G_eval_once = bank.index_select(0, rows)                        # (Geval, Dg)
+        G_eval_once = G_eval_once.to(device, non_blocking=True)
 
         Geval, Dg = G_eval_once.size(0), G_eval_once.size(1)
-        G_eval = G_eval_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()
 
-        # y_true multi-hot
-        y_true = torch.zeros(B, Geval, dtype=torch.float32, device=device)
-        pos_local = batch["pos_go_local"]
+        # 3) Her batch için aynı eval uzayını genişlet
+        G_eval = G_eval_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()  # (B, Geval, Dg)
 
-        same_space = torch.equal(eval_ids, batch["uniq_go_ids"].to(device))
-        if same_space:
-            for b, loc in enumerate(pos_local):
-                if loc.numel() > 0:
-                    y_true[b, loc.to(device)] = 1.0
-        else:
-            uniq_go_ids = batch["uniq_go_ids"].to(device)
-            id2col = {int(eval_ids[i].item()): i for i in range(Geval)}
-            for b, loc in enumerate(pos_local):
-                if loc.numel() == 0:
-                    continue
-                glob = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))
-                for g in glob.tolist():
-                    j = id2col.get(int(g), None)
-                    if j is not None:
-                        y_true[b, j] = 1.0
+        # 4) y_true: batch'teki pozitifleri global eval uzayına map et
+        y_true = torch.zeros(B, Geval, dtype=torch.float32, device=device)   # (B, Geval)
+
+        pos_local: List[torch.Tensor] = batch["pos_go_local"]
+        # Bu batch'teki local uniq GO id'leri (pozitifler bu evrende indexlenmiş)
+        uniq_go_ids = batch["uniq_go_ids"].to(device)                         # (G_local,)
+
+        # eval_ids içindeki pozisyonu lookup için id -> col map
+        id2col = {int(eval_ids[i].item()): i for i in range(Geval)}
+
+        for b, loc in enumerate(pos_local):
+            if loc.numel() == 0:
+                continue
+            # local index → global GO id
+            glob = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device))    # (T_b,)
+            for g in glob.tolist():
+                j = id2col.get(int(g), None)
+                if j is not None:
+                    y_true[b, j] = 1.0
 
         return G_eval, y_true, eval_ids
 
@@ -1150,7 +1157,16 @@ class OppTrainer:
 
                 # --- Scores & InfoNCE (eval) ---
                 scores_cand = self.forward_scores(H, G_cand, pad_mask, return_alpha=False)  # (B,K)
-                l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=float(self.attr.temperature))
+                # Train ile aynı: logit_scale uygula
+                scale = self.logit_scale.exp().clamp(max=100.0)
+                scores_cand = scores_cand * scale
+
+                # Train ile aynı: tau = 1.0
+                l_con = multi_positive_infonce_from_candidates(
+                    scores_cand,
+                    pos_mask,
+                    tau=1.0
+                )
 
                 # --- Positives-only for attribution & DAG ---
                 B = H.size(0)

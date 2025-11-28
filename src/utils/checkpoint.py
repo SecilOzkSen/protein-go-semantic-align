@@ -32,8 +32,8 @@ def save_checkpoint(out_dir: str,
 
     # --- 3- Optimizer & Scheduler ---
     opt_state = {}
-    if hasattr(trainer, "optimizer"):
-        opt_state["optimizer"] = trainer.optimizer.state_dict()
+    if hasattr(trainer, "opt"):
+        opt_state["optimizer"] = trainer.opt.state_dict()
     if hasattr(trainer, "scheduler"):
         opt_state["scheduler"] = trainer.scheduler.state_dict() if hasattr(trainer.scheduler, "state_dict") else {}
 
@@ -70,7 +70,6 @@ def load_checkpoint(trainer, path: str, map_location="cuda"):
     if "go_encoder_k" in ema_state and hasattr(trainer, "go_encoder_k"):
         trainer.go_encoder_k.load_state_dict(ema_state["go_encoder_k"], strict=False)
 
-    if hasattr(trainer, "optimizer") and "optimizer" in ckpt.get("optimizer", {}):
-        trainer.optimizer.load_state_dict(ckpt["optimizer"]["optimizer"])
+    if hasattr(trainer, "opt") and "optimizer" in ckpt.get("optimizer", {}):
+        trainer.opt.load_state_dict(ckpt["optimizer"]["optimizer"])
     print(f"[checkpoint] Loaded from {path}")
-    return ckpt

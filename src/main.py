@@ -34,7 +34,7 @@ from src.go import load_go_parents, load_go_children
 from src.utils import (
     load_go_set, load_raw_json, load_raw_txt, load_go_texts_by_phase
 )
-from src.utils.checkpoint import save_checkpoint
+from src.utils.checkpoint import save_checkpoint, load_checkpoint
 from src.encoders import BioMedBERTEncoder
 from math import inf
 
@@ -133,6 +133,26 @@ def cleanup_old_checkpoints(output_dir: Path, keep_last_n: int = 3):
                 logging.getLogger("ckpt").info("Removed old checkpoint: %s", p)
             except OSError:
                 pass
+
+def collect_eval_ids_from_datasets(train_ds, val_ds=None) -> List[int]:
+    """
+    Train ve (varsa) val dataset'teki tüm GO id'lerinin birleşimini çıkarır.
+    Eval uzayı olarak bunu kullanacağız.
+    """
+    ids: Set[int] = set()
+
+    for gids in train_ds.pid2pos.values():
+        for g in gids:
+            ids.add(int(g))
+
+    if val_ds is not None:
+        for gids in val_ds.pid2pos.values():
+            for g in gids:
+                ids.add(int(g))
+
+    eval_ids = sorted(ids)
+    return eval_ids
+
 
 
 # ============== Builders ==============
@@ -662,6 +682,7 @@ def run_training(args, schedule: TrainSchedule):
     if args.wandb:
         wandb.login()
 
+
     # Phase 0 resources
     if schedule is not None:
         phase0 = 0
@@ -717,6 +738,11 @@ def run_training(args, schedule: TrainSchedule):
     sanitize_dataset_with_go_text(datasets["val"], go_text_store)
     sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
 
+    eval_id_list = collect_eval_ids_from_datasets(datasets["train"], datasets["val"])
+    logging.getLogger("main").info(
+        "[eval] using %d GO terms in eval_id_list", len(eval_id_list)
+    )
+
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     train_loader, val_loader, query_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store)
 
@@ -766,7 +792,8 @@ def run_training(args, schedule: TrainSchedule):
         attribute_loss_enabled=bool(args.use_attribution_loss),
         return_alpha = bool(args.return_alpha),
         fp16_enabled=args.fp16,
-        pooling_strategy=args.pooling_strategy
+        pooling_strategy=args.pooling_strategy,
+        eval_id_list=eval_id_list
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -853,33 +880,21 @@ def run_training(args, schedule: TrainSchedule):
         tau_distill=getattr(args, "tau_distill", 1.5),
     )
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
+
+    if getattr(args, "eval_only", False):
+        logs = trainer.eval_epoch(val_loader, epoch_idx=0)
+        print("=== Validation from checkpoint ===")
+        for k, v in logs.items():
+            print(f"{k}: {v}")
+        return
+
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
         trainer._maybe_init_queue_miner(d_g)
     # Resume
     if getattr(args, "resume", None):
         ckpt_path = str(args.resume)
-        try:
-            ckpt = torch.load(ckpt_path, map_location=device)
-            trainer.model.load_state_dict(ckpt["model"], strict=True)
-            try:
-                trainer.opt.load_state_dict(ckpt["optimizer"])
-            except Exception as e:
-                logging.getLogger("ckpt").warning("Optimizer state load failed: %r", e)
-            if "queue" in ckpt and hasattr(trainer, "queue_miner") and trainer.queue_miner is not None:
-                qstate = ckpt["queue"]
-                q = trainer.queue_miner
-                if int(q.queue.size(0)) == int(qstate.get("dim", q.queue.size(0))) and int(q.queue.size(1)) == int(qstate.get("K", q.queue.size(1))):
-                    with torch.no_grad():
-                        q.queue.copy_(qstate["queue"].to(q.queue.device))
-                        q.ptr.copy_(qstate["ptr"].to(q.ptr.device))
-                        q.filled.copy_(qstate["filled"].to(q.filled.device))
-                else:
-                    logging.getLogger("ckpt").warning("Queue shape mismatch; skipping queue restore.")
-
-                logging.getLogger("ckpt").info("Resumed from %s", ckpt_path)
-        except Exception as e:
-            logging.getLogger("ckpt").warning("Queue state load failed: %r", e)
+        load_checkpoint(trainer, ckpt_path, map_location=trainer.device)
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
@@ -1245,6 +1260,11 @@ def parse_args():
                         help="YAML config file path (örn: src/configs/colab.yaml)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="cuda device")
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Do not train, only run validation from a checkpoint."
+    )
 
     args = parser.parse_args()
     if not args.config:
