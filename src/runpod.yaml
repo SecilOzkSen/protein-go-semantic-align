@@ -48,8 +48,8 @@ training:
   output_dir: /workspace/protein-go-align/outputs/run
   save_every: 2000
   keep_last_n: 3
-  resume: /workspace/checkpoints/checkpoint_step56000.pt
-  eval_only: true
+ # resume: null #/workspace/checkpoints/checkpoint_step56000.pt
+  eval_only: false
   log_every: 500
   log_level: INFO
   monitor_metric: "cafa_fmax"   # "total" da olabilir
