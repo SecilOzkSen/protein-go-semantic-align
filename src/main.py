@@ -889,15 +889,15 @@ def run_training(args, schedule: TrainSchedule):
         load_checkpoint(trainer, ckpt_path, map_location=trainer.device)
 
         # --- EVAL ONLY MODU ---
-        if getattr(args, "eval_only", False):
-            logger.info("Eval-only mode: running validation and exiting, no training.")
-            val_logs = trainer.eval_epoch(val_loader, epoch_idx=0)
-            logger.info(
+    if getattr(args, "eval_only", False):
+        logger.info("Eval-only mode: running validation and exiting, no training.")
+        val_logs = trainer.eval_epoch(val_loader, epoch_idx=0)
+        logger.info(
                 "[eval_only] total={total:.4f} contrastive={contrastive:.4f} "
                 "dag={dag:.4f} attr={attr:.4f} entropy={entropy:.4f} "
                 "cafa_fmax={cafa_fmax:.4f} cafa_aupr={cafa_aupr:.4f}".format(**val_logs)
             )
-            return  # KRİTİK: training loop'a girmeden çık
+        return  # KRİTİK: training loop'a girmeden çık
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
