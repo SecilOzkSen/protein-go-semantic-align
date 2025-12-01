@@ -1,5 +1,4 @@
 import torch
-import os
 from pathlib import Path
 
 def save_checkpoint(out_dir: str,
@@ -59,7 +58,7 @@ def save_checkpoint(out_dir: str,
     return str(ckpt_path)
 
 def load_checkpoint(trainer, path: str, map_location="cuda"):
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model_state = ckpt.get("model", {})
     if "model" in model_state and hasattr(trainer, "model"):
         trainer.model.load_state_dict(model_state["model"], strict=False)
