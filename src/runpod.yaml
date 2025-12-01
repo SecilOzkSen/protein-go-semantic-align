@@ -49,6 +49,7 @@ training:
   save_every: 2000
   keep_last_n: 3
   resume: /workspace/checkpoints/checkpoint_step56000.pt
+  eval_only: true
   log_every: 500
   log_level: INFO
   monitor_metric: "cafa_fmax"   # "total" da olabilir

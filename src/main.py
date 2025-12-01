@@ -873,13 +873,6 @@ def run_training(args, schedule: TrainSchedule):
     )
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
 
-    if getattr(args, "eval_only", False):
-        logs = trainer.eval_epoch(val_loader, epoch_idx=0)
-        print("=== Validation from checkpoint ===")
-        for k, v in logs.items():
-            print(f"{k}: {v}")
-        return
-
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
         trainer._maybe_init_queue_miner(d_g)
@@ -1172,6 +1165,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         save_every=int(training.get("save_every", 1000)),
         keep_last_n=int(training.get("keep_last_n", 3)),
         resume=training.get("resume"),
+        eval_only=bool(training.get("eval_only", False)),
         log_every=int(training.get("log_every", 50)),
         log_level=training.get("log_level", "INFO"),
         monitor_metric=training.get("monitor_metric", "cafa_fmax"),
@@ -1263,11 +1257,6 @@ def parse_args():
                         help="YAML config file path (örn: src/configs/colab.yaml)")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="cuda device")
-    parser.add_argument(
-        "--eval_only",
-        action="store_true",
-        help="Do not train, only run validation from a checkpoint."
-    )
 
     args = parser.parse_args()
     if not args.config:
