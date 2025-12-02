@@ -160,7 +160,7 @@ class OppTrainer:
 
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
-            d_g=None,
+            d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
             d_z=cfg.d_z,          # e.g., 768
             go_encoder=go_encoder,
             normalize=True,

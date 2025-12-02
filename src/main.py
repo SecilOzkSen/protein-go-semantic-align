@@ -871,7 +871,8 @@ def run_training(args, schedule: TrainSchedule):
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
     )
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder)
+    encoder_for_trainer = go_encoder if args.ablation_id != "A1" else None
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer)
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
