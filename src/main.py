@@ -1037,15 +1037,6 @@ def run_training(args, schedule: TrainSchedule):
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
 
-            # ==== DEBUG: grad norm ====
-            if global_step % 500 == 0:
-                for name, p in trainer.model.named_parameters():
-                    if p.grad is not None:
-                        wandb.log({f"grad_norm/{name}": p.grad.detach().norm().item()}, step=global_step)
-                if trainer.logit_scale.grad is not None:
-                    wandb.log({"grad_norm/logit_scale": trainer.logit_scale.grad.detach().norm().item()},
-                              step=global_step)
-
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
                 torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), gc)

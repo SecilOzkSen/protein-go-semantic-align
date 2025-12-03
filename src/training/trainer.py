@@ -966,6 +966,14 @@ class OppTrainer:
         total = (l_con + float(getattr(self.attr, "lambda_vtrue", 0.0)) * l_con_teacher) \
                 + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
+        # ==== DEBUG: grad norm ====
+        if self._global_step % 500 == 0:
+            for name, p in self.model.named_parameters():
+                if p.grad is not None:
+                    self.wlogger.log_scalar({f"grad_norm/{name}": p.grad.detach().norm().item()}, step=self._global_step)
+            if self.logit_scale.grad is not None:
+                self.wlogger.log_scalar({"grad_norm/logit_scale": self.logit_scale.grad.detach().norm().item()}, step=self._global_step)
+
         if not torch.isfinite(total):
             raise RuntimeError(f"NaN/Inf loss at step {self._global_step}")
 
