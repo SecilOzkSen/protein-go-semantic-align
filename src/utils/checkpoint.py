@@ -26,7 +26,7 @@ def save_checkpoint(out_dir: str,
     ema_state = {}
     if hasattr(trainer, "index_projector"):
         ema_state["index_projector"] = trainer.index_projector.state_dict()
-    if hasattr(trainer, "go_encoder_k"):
+    if hasattr(trainer, "go_encoder_k" and trainer.go_encoder_k is not None):
         ema_state["go_encoder_k"] = trainer.go_encoder_k.state_dict()
 
     # --- 3- Optimizer & Scheduler ---

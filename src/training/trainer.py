@@ -257,10 +257,10 @@ class OppTrainer:
     # --------- Wandb helpers (phase bookkeeping) ---------
     def _on_phase_change(self, new_phase_id: int, new_phase_name: str, step: int):
         if self._current_phase_id is not None:
-            self._flush_phase_table(self._current_phase_id, step)
+            self._flush_phase_table(self._current_phase_id, self._global_step)
         self._current_phase_id = new_phase_id
         self._phase_acc[new_phase_id].clear()
-        wandb.log({"phase/change_to": new_phase_id, "phase/name": new_phase_name}, step=step)
+        wandb.log({"phase/change_to": new_phase_id, "phase/name": new_phase_name}, step=self._global_step)
 
     def on_epoch_finish(self):
         ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
@@ -384,7 +384,7 @@ class OppTrainer:
                 rows.append([phase_id, k, float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max()), len(arr)])
         if rows:
             table = wandb.Table(columns=["phase_id", "metric", "mean", "std", "min", "max", "n"], data=rows)
-            wandb.log({f"phase_summary/phase_{phase_id}": table}, step=step)
+            wandb.log({f"phase_summary/phase_{phase_id}": table}, step=self._global_step)
 
     def _maybe_init_queue_miner(self, Dg: int):
         if self.queue_miner is None and self.use_moco_miner:
@@ -502,7 +502,7 @@ class OppTrainer:
                 data = {key: value}
                 if epoch is not None:
                     data["epoch"] = epoch
-                wandb.log(data, step=step)
+                wandb.log(data, step=self._global_step)
         except Exception:
             pass
 
@@ -512,7 +512,7 @@ class OppTrainer:
                 data = {key: value}
                 if epoch is not None:
                     data["epoch"] = epoch
-                self.wlogger.log_scalar(data, step=step)
+                self.wlogger.log_scalar(data, step=self._global_step)
             except Exception:
                 pass
 

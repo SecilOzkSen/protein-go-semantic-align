@@ -519,25 +519,63 @@ def wandb_preview_curriculum(wandb_mod, args, total_steps: int):
         "hier_up": [interp(args.hier_up_start, args.hier_up_end, s, T, mode) for s in steps],
         "hier_dn": [interp(args.hier_dn_start, args.hier_dn_end, s, T, mode) for s in steps],
     }
-    table = wandb_mod.Table(columns=["step"] + list(curves.keys()))
+
+    # lambda_attr schedule: attr curriculum’ünü gör
+    lambda_attr_curve = []
+    lambda_attr_start_epoch = getattr(args, "lambda_attr_start", None)
+    lambda_attr_max = getattr(args, "lambda_attr_max", getattr(args, "lambda_attr", 0.0))
+    if lambda_attr_start_epoch is not None:
+        steps_per_epoch = max(1, T // max(1, args.curriculum_epochs))
+        start_step = lambda_attr_start_epoch * steps_per_epoch
+        for s in steps:
+            if s < start_step:
+                lambda_attr_curve.append(0.0)
+            else:
+                # simple ramp to max
+                frac = min(1.0, (s - start_step) / max(1, T - start_step))
+                lambda_attr_curve.append(float(lambda_attr_max) * frac)
+        curves["lambda_attr"] = lambda_attr_curve
+
+    # warmup flag
+    warmup_steps = int(args.warmup_frac * T)
+    warmup_flags = [1 if s <= warmup_steps else 0 for s in steps]
+
+    table = wandb_mod.Table(columns=["step"] + list(curves.keys()) + ["is_warmup"])
     for i, s in enumerate(steps):
-        row = [int(s)] + [curves[k][i] for k in curves.keys()]
+        row = [int(s)] + [curves[k][i] for k in curves.keys()] + [warmup_flags[i]]
         table.add_data(*row)
     wandb_mod.log({"curriculum/preview": table})
 
+    # hızlı özet, W&B summary'ye de yaz
+    try:
+        wandb_mod.summary["curriculum/total_steps"] = int(total_steps)
+        wandb_mod.summary["curriculum/warmup_steps"] = int(warmup_steps)
+        wandb_mod.summary["curriculum/hard_frac_start"] = float(args.hard_frac_start)
+        wandb_mod.summary["curriculum/hard_frac_end"] = float(args.hard_frac_end)
+        if lambda_attr_curve:
+            wandb_mod.summary["curriculum/lambda_attr_max"] = float(lambda_attr_max)
+    except Exception:
+        pass
+
+
+
+from collections import defaultdict
 
 def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
     try:
+        # 1) pozitif sayısı per protein
         pos_counts: List[int] = []
         if hasattr(train_ds, "protein_ids") and hasattr(train_ds, "pid2pos"):
             for pid in train_ds.protein_ids[:sample_n]:
                 pos = train_ds.pid2pos.get(pid, [])
                 pos_counts.append(len(pos))
         if pos_counts:
-            wandb_mod.log({"data/positives_per_protein": wandb_mod.Histogram(np.array(pos_counts))})
-            wandb_mod.summary["data/positives_per_protein_mean"] = float(np.mean(pos_counts))
-            wandb_mod.summary["data/positives_per_protein_p95"] = float(np.percentile(pos_counts, 95))
+            arr = np.array(pos_counts)
+            wandb_mod.log({"data/positives_per_protein": wandb_mod.Histogram(arr)})
+            wandb_mod.summary["data/positives_per_protein_mean"] = float(arr.mean())
+            wandb_mod.summary["data/positives_per_protein_p95"] = float(np.percentile(arr, 95))
 
+        # 2) sequence length dağılımı
         lengths: List[int] = []
         for i in range(min(sample_n, len(train_ds))):
             try:
@@ -560,11 +598,48 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
             except Exception:
                 break
         if lengths:
-            wandb_mod.log({"data/lengths": wandb_mod.Histogram(np.array(lengths))})
-            wandb_mod.summary["data/length_mean"] = float(np.mean(lengths))
-            wandb_mod.summary["data/length_p95"] = float(np.percentile(lengths, 95))
+            arr = np.array(lengths)
+            wandb_mod.log({"data/lengths": wandb_mod.Histogram(arr)})
+            wandb_mod.summary["data/length_mean"] = float(arr.mean())
+            wandb_mod.summary["data/length_p95"] = float(np.percentile(arr, 95))
+
+        # 3) GO label frekansları
+        go_counts = defaultdict(int)
+        if hasattr(train_ds, "pid2pos"):
+            for gids in train_ds.pid2pos.values():
+                for g in gids:
+                    go_counts[int(g)] += 1
+
+        if go_counts:
+            freq = np.array(list(go_counts.values()), dtype=np.int64)
+            wandb_mod.log({"data/go_label_freq": wandb_mod.Histogram(freq)})
+            wandb_mod.summary["data/go_label_freq_mean"] = float(freq.mean())
+            wandb_mod.summary["data/go_label_freq_p95"] = float(np.percentile(freq, 95))
+            wandb_mod.summary["data/n_unique_go_terms"] = int(len(go_counts))
+
+            # en sık 20 GO term tablosu
+            top_k = 20
+            top_items = sorted(go_counts.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+            table = wandb_mod.Table(columns=["go_id", "count"])
+            for gid, c in top_items:
+                table.add_data(int(gid), int(c))
+            wandb_mod.log({"data/top_go_terms": table})
+
+        # 4) few-shot, zero-shot, common oranları
+        fewzero = getattr(train_ds, "fewzero", None)
+        if fewzero is not None:
+            wandb_mod.summary["data/n_zero_shot_terms"] = int(len(fewzero.zero_shot_terms))
+            wandb_mod.summary["data/n_few_shot_terms"] = int(len(fewzero.few_shot_terms))
+            wandb_mod.summary["data/n_common_terms"] = int(len(fewzero.common_terms))
+
+        if hasattr(train_ds, "is_fs"):
+            is_fs_arr = np.asarray(train_ds.is_fs, dtype=np.float32)
+            wandb_mod.summary["data/fs_protein_frac"] = float(is_fs_arr.mean())
+            wandb_mod.log({"data/fs_protein_flags": wandb_mod.Histogram(is_fs_arr)})
+
     except Exception as e:
         logging.getLogger("wandb").warning("Dataset quickstats failed: %r", e)
+
 
 def sanitize_dataset_with_go_text(train_ds, go_text_store) -> None:
     """
@@ -895,6 +970,8 @@ def run_training(args, schedule: TrainSchedule):
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
+    wandb.define_metric("trainer_step")
+    wandb.define_metric("*", step_metric="trainer_step")
     training_context.maybe_refresh_phase_resources(current_epoch=0, force=False)
 
     best_val = -inf if args.monitor_mode == "max" else inf
