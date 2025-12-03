@@ -975,7 +975,7 @@ def run_training(args, schedule: TrainSchedule):
                         gnorm = 0.0
                     print(f"[debug] step={global_step} grad_norm={gnorm:.3e}")
                     try:
-                        trainer._log_scalar_safe({"debug/grad_norm": gnorm}, step=global_step)
+                        trainer._log_scalar_safe("debug/grad_norm", gnorm, step=global_step)
                     except Exception:
                         pass
 

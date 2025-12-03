@@ -186,8 +186,13 @@ class OppTrainer:
         if getattr(self.model, "go_encoder", None) is not None:
             self.go_encoder_k = clone_as_target(self.model.go_encoder).to(self.device)
 
+        # === Learnable logit scale (CLIP) ===
+        init_ln = math.log(1.0 / 0.07)  # ~2.659
+        self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
+
         # --- OPT ---
-        self.opt = torch.optim.AdamW(self.model.parameters(), lr=cfg.lr)
+        params = list(self.model.parameters()) + [self.logit_scale]
+        self.opt = torch.optim.AdamW(params, lr=cfg.lr)
         self._global_step = 0
 
         # projector for teacher alignment (Dh -> Dz)
@@ -201,9 +206,7 @@ class OppTrainer:
         self.k_hard_queue: int = int(getattr(cfg, "k_hard_queue", getattr(ctx, "k_hard", 32)))
         self.queue_miner: Optional[MoCoQueue] = None
 
-        # === Learnable logit scale (CLIP) ===
-        init_ln = math.log(1.0 / 0.07)  # ~2.659
-        self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
+
 
         # W&B
         self._wandb_configs(wandb_run=wandb_run, wlogger=wlogger)
