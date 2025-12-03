@@ -530,43 +530,46 @@ class OppTrainer:
 
         def _unpack(out):
             if isinstance(out, tuple):
-                if len(out) >= 2: return out[0], (out[1] or {})
-                if len(out) == 1: return out[0], {}
+                if len(out) >= 2:
+                    return out[0], (out[1] or {})
+                if len(out) == 1:
+                    return out[0], {}
                 return out, {}
             return out, {}
 
         # --- Candidate path ---
         if G.dim() == 4:  # [B,K,T,Dg]
             B, K, T, Dg = G.shape
-            if G.is_cuda:  # keep CPU!
-                G = G.to("cpu", non_blocking=True)
+
+            # G'yi CPU'ya çekmiyoruz, GPU'da tutup K boyunca chunk'luyoruz
+            # (gerekirse burada mixed precision zaten amp_ctx ile üstten geliyor)
 
             scores_all = []
-            with torch.no_grad():
-                for ks in range(0, K, cand_chunk_k):
-                    ke = min(K, ks + cand_chunk_k)
-                    G_chunk = G[:, ks:ke].contiguous()  # [B,k,T,Dg]
-                    G_chunk = G_chunk.to(device, non_blocking=True)
+            for ks in range(0, K, cand_chunk_k):
+                ke = min(K, ks + cand_chunk_k)
+                G_chunk = G[:, ks:ke].contiguous()  # [B,k,T,Dg]
+                G_chunk = G_chunk.to(device, non_blocking=True)
 
-                    out = self.model(
-                        H=H, G=G_chunk, mask=pad_mask,
-                        return_alpha=return_alpha,
-                        cand_chunk_k=None,
-                        pos_chunk_t=pos_chunk_t,
-                        **kwargs
-                    )
-                    sc, _ = _unpack(out)
-                    scores_all.append(sc.detach().cpu())
+                out = self.model(
+                    H=H,
+                    G=G_chunk,
+                    mask=pad_mask,
+                    return_alpha=return_alpha,
+                    cand_chunk_k=None,  # zaten chunk'luyoruz
+                    pos_chunk_t=pos_chunk_t,
+                    **kwargs
+                )
+                sc, _ = _unpack(out)
+                scores_all.append(sc)  # DİKKAT: detach yok, cpu yok
 
-                    del G_chunk, out, sc
-                    torch.cuda.empty_cache()
-
-            scores = torch.cat(scores_all, dim=1).to(device)
+            scores = torch.cat(scores_all, dim=1)  # (B,K), GPU, graf bağlı
             return scores
 
-        # --- Positive path ---
+        # --- Positive path (zaten doğruydu) ---
         out = self.model(
-            H=H, G=G, mask=pad_mask,
+            H=H,
+            G=G,
+            mask=pad_mask,
             return_alpha=return_alpha,
             cand_chunk_k=0,
             pos_chunk_t=pos_chunk_t,
