@@ -1039,29 +1039,12 @@ def run_training(args, schedule: TrainSchedule):
 
             # ==== DEBUG: grad norm ====
             if global_step % 500 == 0:
-                # no_grad kullanma, grad'ı okumak için gerek yok
-                grads = []
-                for name, p in trainer.model.named_parameters():
-                    if p.requires_grad and p.grad is not None:
-                        g = p.grad.detach().view(-1)
-                        grads.append(g)
-                if getattr(trainer, "logit_scale", None) is not None and trainer.logit_scale.grad is not None:
-                    grads.append(trainer.logit_scale.grad.detach().view(-1))
-
-                if grads:
-                    all_grads = torch.cat(grads)
-                    gnorm = float(all_grads.norm().item())
-                else:
-                    gnorm = 0.0
-
-                print(f"[debug] step={global_step} grad_norm={gnorm:.3e}")
-                # istersen tek tek de bak:
                 for name, p in trainer.model.named_parameters():
                     if p.grad is not None:
-                        print("  ", name, "grad_norm", float(p.grad.norm().item()))
-
+                        wandb.log({f"grad_norm/{name}": p.grad.detach().norm().item()}, step=global_step)
                 if trainer.logit_scale.grad is not None:
-                    print("  logit_scale grad_norm", float(trainer.logit_scale.grad.norm().item()))
+                    wandb.log({"grad_norm/logit_scale": trainer.logit_scale.grad.detach().norm().item()},
+                              step=global_step)
 
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
