@@ -512,7 +512,7 @@ class OppTrainer:
                 data = {key: value}
                 if epoch is not None:
                     data["epoch"] = epoch
-                self.wlogger.log_scalar(data, step=self._global_step)
+                self.wandb_run.log(data, step=self._global_step)
             except Exception:
                 pass
 
@@ -597,7 +597,8 @@ class OppTrainer:
         # ---- curriculum / attribution flags ----
         use_attr = self.ctx.attribute_loss_enabled or (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
         try:
-            self.wlogger.log_scalar({"debug/use_attr": int(use_attr), "epoch": epoch_idx}, step=self._global_step)
+            self._log_scalar_safe(key="debug/use_attr", value=int(use_attr), step=self._global_step, epoch=epoch_idx)
+            self._log_scalar_safe(key="debug/curr_epoch", value=epoch_idx, step=self._global_step)
         except Exception:
             pass
 
@@ -970,9 +971,9 @@ class OppTrainer:
         if self._global_step % 500 == 0:
             for name, p in self.model.named_parameters():
                 if p.grad is not None:
-                    self.wlogger.log_scalar({f"grad_norm/{name}": p.grad.detach().norm().item()}, step=self._global_step)
+                    self._log_scalar_safe(key=f"grad_norm/{name}", value=p.grad.detach().norm().item(), step=self._global_step)
             if self.logit_scale.grad is not None:
-                self.wlogger.log_scalar({"grad_norm/logit_scale": self.logit_scale.grad.detach().norm().item()}, step=self._global_step)
+                self._log_scalar_safe(key="grad_norm/logit_scale", value=self.logit_scale.grad.detach().norm().item(), step=self._global_step)
 
         if not torch.isfinite(total):
             raise RuntimeError(f"NaN/Inf loss at step {self._global_step}")
