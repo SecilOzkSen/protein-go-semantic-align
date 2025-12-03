@@ -949,14 +949,14 @@ class OppTrainer:
                 l_attr = windowed_attr_loss(AW, Ww, spans, delta_win)
                 l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(AW)
             else:
-                l_attr = torch.zeros((), device=device);
+                l_attr = torch.zeros((), device=device)
                 l_ent = torch.zeros((), device=device)
         else:
             try:
                 self.wlogger.log_scalar({"warn/no_alpha_info": 1}, step=self._global_step)
             except Exception:
                 pass
-            l_attr = torch.zeros((), device=device);
+            l_attr = torch.zeros((), device=device)
             l_ent = torch.zeros((), device=device)
 
         # ========== DAG consistency ==========
@@ -965,6 +965,13 @@ class OppTrainer:
 
         total = (l_con + float(getattr(self.attr, "lambda_vtrue", 0.0)) * l_con_teacher) \
                 + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
+
+        # ==== DEBUG: ilk batchte scores_cand autograd’e bağlı mı? ====
+        if self._global_step == 0:
+            print("DEBUG scores_cand.requires_grad:", scores_cand.requires_grad)
+            # proj_p ve proj_g parametrelerini basalım
+            for name, p in self.model.named_parameters():
+                print("PARAM", name, "requires_grad", p.requires_grad)
 
         if not torch.isfinite(total):
             raise RuntimeError(f"NaN/Inf loss at step {self._global_step}")
