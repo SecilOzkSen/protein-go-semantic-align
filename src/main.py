@@ -826,7 +826,7 @@ def run_training(args, schedule: TrainSchedule):
         except Exception:
             pass
 
-    if args.ablation_id == "A1":
+    if args.ablation_id == "A0":
         scheduler = None
     else:
         cur_cfg = build_scheduler_cfg(args, n_spe)
@@ -946,7 +946,7 @@ def run_training(args, schedule: TrainSchedule):
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
     )
-    encoder_for_trainer = go_encoder if args.ablation_id != "A1" else None
+    encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer)
 
     if bool(args.use_queue_miner):
@@ -992,8 +992,8 @@ def run_training(args, schedule: TrainSchedule):
                 except Exception as e:
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
 
-            # A1'de GO cache SABİT, hiçbir refresh yok
-            if getattr(args, "ablation_id", None) == "A1":
+            # A0'de GO cache SABİT, hiçbir refresh yok
+            if getattr(args, "ablation_id", None) == "A0":
                 pass
             else:
                 if len(seen_go_ids_prev) > 0:

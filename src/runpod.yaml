@@ -14,11 +14,11 @@ data:
   fs_target_ratio: 0.3
 
 general: #Ablation Purposes
-  ablation_id: "A1"
-  use_queue_miner: True #CHECKED
+  ablation_id: "A1" #A0 sanity check
+  use_queue_miner: False #CHECKED
   use_go_memory_bank: False #CHECKED
   use_attention_pooling: False #CHECKED
-  use_lora: False #CHECKED
+  use_lora: True #CHECKED
   use_attribution_loss: False #CHECKED
   return_alpha: False
   phase_based: False #CHECKED
