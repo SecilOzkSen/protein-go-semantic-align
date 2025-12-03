@@ -263,7 +263,8 @@ class OppTrainer:
         wandb.log({"phase/change_to": new_phase_id, "phase/name": new_phase_name}, step=self._global_step)
 
     def on_epoch_finish(self):
-        ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
+        if self.go_encoder_k is not None and getattr(self.model, "go_encoder", None) is not None:
+            ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
     def _to_device(self, x):
         import torch
