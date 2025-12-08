@@ -77,6 +77,7 @@ class BioMedBERTEncoder(nn.Module):
                  attn_dropout: float = 0.0,
                  special_token_weights: Optional[Dict[str, float]] = None, # Optional token weights to bias attention (e.g., {"[GOPATH]":0.45, "[PATH]":0.45, "[ISA]":0.95, "[PART]":0.85})
                  enable_lora: bool = False,
+                 use_special_tokens: bool = False,
                  lora_parameters: Optional[LoRAParameters] = None,  # LoRA options (optional)
                  gradient_checkpointing: bool = True # re-calculate each activation instead of storing it -> huge space saver.
                  ):
@@ -88,8 +89,8 @@ class BioMedBERTEncoder(nn.Module):
                                                use_safetensors=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.enable_lora = enable_lora
-        if self.enable_lora:
-            print("[INFO] Lora Enabled. Adding GO special tokens for LoRA training.")
+        if self.enable_lora and use_special_tokens:
+            print("[INFO] Lora Enabled and Adding GO special tokens for LoRA training.")
             self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
             self.model.resize_token_embeddings(len(self.tokenizer))
         if gradient_checkpointing:
