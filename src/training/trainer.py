@@ -619,8 +619,12 @@ class OppTrainer:
         # --- DIAG: GO embedding norm istatistikleri (normalize ÖNCESİ) ---
         with torch.no_grad():
             go_norms = uniq_go_raw.norm(dim=1)  # [G]
-            go_mean = go_norms.mean().item()
-            go_std = go_norms.std().item()
+            if go_norms.numel() > 1:
+                go_mean = go_norms.mean().item()
+                go_std = go_norms.std(unbiased=False).item()
+            else:
+                go_mean = go_norms.item()
+                go_std = 0.0
             self._log_scalar_safe("diag/go_norm_mean", go_mean, step=self._global_step, epoch=epoch_idx)
             self._log_scalar_safe("diag/go_norm_std", go_std, step=self._global_step, epoch=epoch_idx)
 
@@ -663,8 +667,14 @@ class OppTrainer:
 
             with torch.no_grad():
                 pq_norms = vt_for_miner_raw.norm(dim=1)  # [B]
-                pq_mean = pq_norms.mean().item()
-                pq_std = pq_norms.std().item()
+                if pq_norms.numel() > 1:
+                    pq_mean = pq_norms.mean().item()
+                    pq_std = pq_norms.std(unbiased=False).item()
+                else:
+                    # batch_size == 1 durumu
+                    pq_mean = pq_norms.item()
+                    pq_std = 0.0  # std tanımsız olduğunda sıfır
+
                 self._log_scalar_safe("diag/prot_norm_mean", pq_mean, step=self._global_step, epoch=epoch_idx)
                 self._log_scalar_safe("diag/prot_norm_std", pq_std, step=self._global_step, epoch=epoch_idx)
 
