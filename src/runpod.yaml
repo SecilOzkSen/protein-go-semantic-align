@@ -57,8 +57,9 @@ training:
   early_stop_patience: 3        # 0 veya negatif => kapalı
   cand_chunk_k: 8
   pos_chunk_t: 128
-  k_hard_queue: 32 #128
-  queue_K: 2048 #8192
+  k_hard_queue: 0 #32 #128
+  queue_K: 0 #2048 #8192
+  dag_parents: false
 
 optim:
   lr: 0.0003
@@ -76,12 +77,13 @@ model:
 
 loss:
   lambda_con: 1.0
-  lambda_dag: 0.2
+  lambda_dag: 0.0
   lambda_attr: 0.0
+  lambda_entropy_alpha: 0.0
   dag_margin: 0.05
   dag_scale: 10.0
   lambda_vtrue: 0.0
-  tau_distill: 1.5
+  tau_distill: 1.0
 
 curriculum:
   epochs: 4

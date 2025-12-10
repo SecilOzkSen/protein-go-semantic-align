@@ -302,7 +302,7 @@ def build_val_dataset(
     )
     return ds_val
 
-def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, go_cache: GoLookupCache) -> Dict[str, torch.utils.data.Dataset]:
+def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, go_cache: GoLookupCache, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
 
@@ -338,9 +338,6 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
     common = load_go_set(COMMON_IC_GO_TERMS_ID_ONLY_JSON)
     fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs, common_terms=common,
                        fs_target_ratio=args.fs_target_ratio)
-
-    dag_parents = load_go_parents()
-    #ancestor_stoplist = load_raw_txt(GO_ANCESTOR_STOPLIST)
 
     train_ds = ProteinEmbDataset(
         protein_ids=train_ids,
@@ -759,8 +756,8 @@ def run_training(args, schedule: TrainSchedule):
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
 
     go_cache = build_go_cache(str(go_cache_path))
-    dag_parents = load_go_parents()
-    dag_children = load_go_children()
+    dag_parents = load_go_parents() if args.dag_parents else None
+    dag_children = load_go_children() if args.dag_parents else None
 
     # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
@@ -946,6 +943,7 @@ def run_training(args, schedule: TrainSchedule):
         temperature=float(getattr(args, "temperature", 0.07)),
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
+        lambda_dag=getattr(args, "lambda_dag", 0.3)
     )
     run = wandb.init(
         project="protein-go-semantic-align",
@@ -1001,7 +999,7 @@ def run_training(args, schedule: TrainSchedule):
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
 
             # A0'de GO cache SABİT, hiçbir refresh yok
-            if getattr(args, "ablation_id", None) == "A0":
+            if getattr(args, "ablation_id", None) == "A1":
                 pass
             else:
                 if len(seen_go_ids_prev) > 0:
@@ -1243,6 +1241,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         k_hard_queue=int(training.get("k_hard_queue", 128)),
         queue_K=int(training.get("queue_K", 65536)),
         general_device=str(training.get("device", "cuda:0")),
+        dag_parents=bool(training.get("dag_parents", False)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
@@ -1262,6 +1261,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         lambda_con=float(loss.get("lambda_con", 1.0)),
         lambda_dag=float(loss.get("lambda_dag", 0.2)),
         lambda_attr=float(loss.get("lambda_attr", 0.1)),
+        lambda_entropy_alpha=float(loss.get("lambda_entropy_alpha", 0.0)),
         dag_margin=float(loss.get("dag_margin", 0.05)),
         dag_scale=float(loss.get("dag_scale", 10.0)),
         lambda_vtrue=float(loss.get("lambda_vtrue", 0.2)),

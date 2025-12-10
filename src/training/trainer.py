@@ -941,7 +941,7 @@ class OppTrainer:
                                          margin=0.0, scale=1.0)
 
         total = (l_con + float(getattr(self.attr, "lambda_vtrue", 0.0)) * l_con_teacher) \
-                + 0.3 * l_dag + self.attr.lambda_attr * l_attr + l_ent
+                + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
         # ==== DEBUG: grad norm ====
         if self._global_step % 500 == 0:
