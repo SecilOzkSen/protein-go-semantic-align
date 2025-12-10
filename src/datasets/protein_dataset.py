@@ -59,17 +59,22 @@ class ProteinEmbDataset(Dataset):
             # ---- 1) Zero-shot sterilizasyon ----
             pos = [int(g) for g in orig if int(g) not in fewzero.zero_shot_terms]
             # ---- 2) DAG ile genişletme ----
-            expanded, weights, is_gen_map = expand_with_ancestors(
-                pos_terms=pos,
-                parents=dag_parents,
-                zs_blocklist=fewzero.zero_shot_terms,
-                min_pos=min_pos_for_expand,
-                max_add=max_ancestor_add,
-                max_hops=max_hops,
-                stoplist=ancestor_stoplist,
-                gamma=ancestor_gamma,
-                allowed_rels=set(ALLOWED_RELS_FOR_DAG),
-            )
+            if dag_parents is None:
+                expanded = pos
+                weights = [1.0] * len(pos)
+                is_gen_map = {int(g): False for g in pos}
+            else:
+                expanded, weights, is_gen_map = expand_with_ancestors(
+                    pos_terms=pos,
+                    parents=dag_parents,
+                    zs_blocklist=fewzero.zero_shot_terms,
+                    min_pos=min_pos_for_expand,
+                    max_add=max_ancestor_add,
+                    max_hops=max_hops,
+                    stoplist=ancestor_stoplist,
+                    gamma=ancestor_gamma,
+                    allowed_rels=set(ALLOWED_RELS_FOR_DAG),
+                )
             # ---- 3) CANONICAL FILTRE: sadece GoTextStore / go_cache'in bildiği id'ler kalsın ----
             expanded_filtered: List[int] = []
             weights_filtered: List[float] = []
