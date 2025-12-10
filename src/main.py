@@ -947,8 +947,15 @@ def run_training(args, schedule: TrainSchedule):
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
     )
+    run = wandb.init(
+        project="protein-go-semantic-align",
+        name=training_context.run_name,
+        config=training_context.to_dict(),
+        settings=wandb.Settings(code_dir=".", _disable_stats=True),
+        reinit=False,
+    )
     encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer)
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer, wandb_run=run)
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
@@ -986,10 +993,10 @@ def run_training(args, schedule: TrainSchedule):
         torch.cuda.ipc_collect()
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
         try:
-            if args.wandb and (wandb.run is not None) and global_step == 1:
+            if run is not None and global_step == 1:
                 try:
-                    wandb_preview_curriculum(wandb, args, total_steps=n_spe * args.epochs)
-                    wandb_dataset_quickstats(wandb, datasets["train"], sample_n=256)
+                    wandb_preview_curriculum(run, args, total_steps=n_spe * args.epochs)
+                    wandb_dataset_quickstats(run, datasets["train"], sample_n=256)
                 except Exception as e:
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
 
@@ -1106,10 +1113,10 @@ def run_training(args, schedule: TrainSchedule):
                 )
                 logger.info(f"[ckpt] new BEST {metric_name}={best_val:.4f} @ epoch {epoch} step {global_step}")
                 # W&B özetine yazmak istersen:
-                if args.wandb and (wandb.run is not None):
-                    wandb.summary[f"best/{metric_name}"] = best_val
-                    wandb.summary["best/step"] = best_step
-                    wandb.summary["best/epoch"] = epoch
+                if run is not None:
+                    run.summary[f"best/{metric_name}"] = best_val
+                    run.summary["best/step"] = best_step
+                    run.summary["best/epoch"] = epoch
             else:
                 no_improve_epochs += 1
                 if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
@@ -1148,8 +1155,8 @@ def run_training(args, schedule: TrainSchedule):
 
     # close wandb
     try:
-        if wandb.run is not None:
-            wandb.run.finish()
+        if run is not None:
+            run.finish()
     except Exception:
         pass
 

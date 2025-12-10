@@ -32,8 +32,8 @@ caches:
 
 training:
   epochs: 5
-  batch_size: 4
-  eval_batch_size: 4
+  batch_size: 6
+  eval_batch_size: 6
 
   num_workers: 1
   val_num_workers: 1
@@ -110,7 +110,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  run_name: null
+  wandb_run_name: "protein-go-semantic-align-ablation1"
   mode: online
 
 stores:

@@ -10,14 +10,8 @@ from src.loss.attribution import attribution_loss, windowed_attr_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
 from src.miners.queue_miner import MoCoQueue
 from contextlib import nullcontext
-
-# Wandb
-import wandb
 from collections import defaultdict
-from src.utils.wandb_logger import WabLogger
-
 from src.metrics.cafa import compute_fmax, compute_term_aupr
-
 
 # ------------- Helpers -------------
 def to_f32(x: torch.Tensor) -> torch.Tensor:
@@ -145,7 +139,7 @@ def topk_maskout_full(H, G, alpha_full, k, model, pad_mask=None, return_alpha = 
 
 # ------------- Trainer -------------
 class OppTrainer:
-    def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None, wlogger=None):
+    def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None):
         self.cfg, self.attr, self.ctx = cfg, attr, ctx
         self.device = torch.device(self.cfg.device)
 
@@ -209,7 +203,7 @@ class OppTrainer:
 
 
         # W&B
-        self._wandb_configs(wandb_run=wandb_run, wlogger=wlogger)
+        self._wandb_configs(wandb_run=wandb_run)
         self._phase_acc = defaultdict(lambda: defaultdict(list))
         self._current_phase_id = None
 
@@ -232,27 +226,11 @@ class OppTrainer:
         pad_mask = ~attn_valid
         return attn_valid, pad_mask
 
-    def _wandb_configs(self, wandb_run=None, wlogger=None):
+    def _wandb_configs(self, wandb_run=None):
         if wandb_run is not None:
             self.wandb_run = wandb_run
         else:
-            self.wandb_run = wandb.init(
-                project="protein-go-semantic-align",
-                name=self.ctx.run_name,
-                config=self.ctx.to_dict(),
-                settings=wandb.Settings(code_dir=".", _disable_stats=True),
-                reinit=False
-            )
-            wandb.define_metric("*", summary="none")
-        if wlogger is not None:
-            self.wlogger = wlogger
-        else:
-            self.wlogger = WabLogger(self.wandb_run, project="protein-go-semantic-align",
-                                     config=self.ctx.to_dict())
-    #    try:
-    #        wandb.watch(self.model, log="gradients", log_freq=max(100, getattr(self.cfg, "log_every", 50)))
-    #    except Exception:
-    #        pass
+            raise RuntimeError("wandb_run must be passed explicitly")
 
     # --------- Wandb helpers (phase bookkeeping) ---------
     def _on_phase_change(self, new_phase_id: int, new_phase_name: str, step: int):
@@ -260,7 +238,7 @@ class OppTrainer:
             self._flush_phase_table(self._current_phase_id, self._global_step)
         self._current_phase_id = new_phase_id
         self._phase_acc[new_phase_id].clear()
-        wandb.log({"phase/change_to": new_phase_id, "phase/name": new_phase_name}, step=self._global_step)
+        self.wandb_run.log({"phase/change_to": new_phase_id, "phase/name": new_phase_name}, step=self._global_step)
 
     def on_epoch_finish(self):
         if self.go_encoder_k is not None and getattr(self.model, "go_encoder", None) is not None:
@@ -384,8 +362,8 @@ class OppTrainer:
                 arr = np.array(vals, dtype=float)
                 rows.append([phase_id, k, float(arr.mean()), float(arr.std()), float(arr.min()), float(arr.max()), len(arr)])
         if rows:
-            table = wandb.Table(columns=["phase_id", "metric", "mean", "std", "min", "max", "n"], data=rows)
-            wandb.log({f"phase_summary/phase_{phase_id}": table}, step=self._global_step)
+            table = self.wandb_run.Table(columns=["phase_id", "metric", "mean", "std", "min", "max", "n"], data=rows)
+            self.wandb_run.log({f"phase_summary/phase_{phase_id}": table}, step=self._global_step)
 
     def _maybe_init_queue_miner(self, Dg: int):
         if self.queue_miner is None and self.use_moco_miner:
@@ -496,26 +474,13 @@ class OppTrainer:
         return G_eval, y_true, eval_ids
 
     def _log_scalar_safe(self, key: str, value: float, step: int, epoch: int = None):
-        # W&B varsa logla
+        data = {key: value}
+        if epoch is not None:
+            data["epoch"] = epoch
         try:
-            import wandb
-            if wandb.run is not None:
-                data = {key: value}
-                if epoch is not None:
-                    data["epoch"] = epoch
-                wandb.log(data, step=self._global_step)
+            self.wandb_run.log(data, step=self._global_step)
         except Exception:
             pass
-
-        # wlogger varsa logla
-        if getattr(self, "wlogger", None) is not None:
-            try:
-                data = {key: value}
-                if epoch is not None:
-                    data["epoch"] = epoch
-                self.wandb_run.log(data, step=self._global_step)
-            except Exception:
-                pass
 
     # --------- Scoring (tensor path) ---------
     def forward_scores(self, H, G, pad_mask, return_alpha=False,
@@ -965,7 +930,7 @@ class OppTrainer:
                 l_ent = torch.zeros((), device=device)
         else:
             try:
-                self.wlogger.log_scalar({"warn/no_alpha_info": 1}, step=self._global_step)
+                self._log_scalar_safe("warn/no_alpha_info", 1, step=self._global_step)
             except Exception:
                 pass
             l_attr = torch.zeros((), device=device)
@@ -1074,7 +1039,22 @@ class OppTrainer:
             id=getattr(self, "phase_id", getattr(self.ctx, "phase_id", -1)),
             name=getattr(self, "phase_name", getattr(self.ctx, "phase_name", f"phase{getattr(self, 'phase_id', -1)}"))
         )
-        self.wlogger.log_losses(losses_log, step=self._global_step, epoch=epoch_idx, phase=phase, sched=sched)
+
+        log_payload = {
+            **{f"loss/{k}": v for k, v in losses_log.items()},
+            "epoch": epoch_idx,
+            "phase/id": phase["id"],
+            "phase/name": phase["name"],
+        }
+        if sched:
+            for k, v in sched.items():
+                if v is not None:
+                    log_payload[f"sched/{k}"] = float(v)
+
+        try:
+            self.wandb_run.log(log_payload, step=self._global_step)
+        except Exception:
+            pass
 
         pid = int(phase["id"]) if isinstance(phase.get("id", -1), (int,)) else -1
         for k, v in losses_log.items():
