@@ -756,8 +756,8 @@ def run_training(args, schedule: TrainSchedule):
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
 
     go_cache = build_go_cache(str(go_cache_path))
-    dag_parents = load_go_parents() if args.dag_parents else None
-    dag_children = load_go_children() if args.dag_parents else None
+    dag_parents = load_go_parents() if args.use_dag_in_ds else None
+    dag_children = load_go_children() if args.use_dag_in_ds else None
 
     # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
@@ -824,7 +824,7 @@ def run_training(args, schedule: TrainSchedule):
         except Exception:
             pass
 
-    if args.ablation_id == "A0":
+    if args.ablation_id == "A1" or args.ablation_id == "A0":
         scheduler = None
     else:
         cur_cfg = build_scheduler_cfg(args, n_spe)
@@ -999,7 +999,7 @@ def run_training(args, schedule: TrainSchedule):
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
 
             # A0'de GO cache SABİT, hiçbir refresh yok
-            if getattr(args, "ablation_id", None) == "A1":
+            if getattr(args, "ablation_id", None) == "A0":
                 pass
             else:
                 if len(seen_go_ids_prev) > 0:
@@ -1241,7 +1241,6 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         k_hard_queue=int(training.get("k_hard_queue", 128)),
         queue_K=int(training.get("queue_K", 65536)),
         general_device=str(training.get("device", "cuda:0")),
-        dag_parents=bool(training.get("dag_parents", False)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
@@ -1296,7 +1295,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         wandb=bool(wandb_block.get("enabled", False)),
         wandb_project=wandb_block.get("project", "protein-go-align"),
         wandb_entity=wandb_block.get("entity"),
-        wandb_run_name=wandb_block.get("run_name"),
+        wandb_run_name=wandb_block.get("wandb_run_name"),
         wandb_mode=wandb_block.get("mode", "online"),
 
         # misc
