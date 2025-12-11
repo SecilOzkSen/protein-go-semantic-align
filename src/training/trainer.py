@@ -940,6 +940,15 @@ class OppTrainer:
         l_dag = dag_consistency_loss_pos(scores_pos, pos_local, uniq_go_ids, self.ctx.dag_parents,
                                          margin=0.0, scale=1.0)
 
+        #TODO: erase
+        if self._global_step % 1000 == 0:
+            s = scores_pos.detach().view(-1)
+            print(
+                f"[debug-pos] step={self._global_step} "
+                f"mean={s.mean().item():.4f} std={s.std().item():.4f} "
+                f"min={s.min().item():.4f} max={s.max().item():.4f}"
+            )
+
         total = (l_con + float(getattr(self.attr, "lambda_vtrue", 0.0)) * l_con_teacher) \
                 + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent
 

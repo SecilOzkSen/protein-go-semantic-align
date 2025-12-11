@@ -1091,6 +1091,11 @@ def run_training(args, schedule: TrainSchedule):
                 cleanup_old_checkpoints(out_dir, keep_last_n=args.keep_last_n)
                 # (opsiyonel) wandb artifact
 
+            if global_step % 1000 == 0:
+                with torch.no_grad():
+                    scale = trainer.model.logit_scale.exp().item()
+                logger.info(f"[debug] step={global_step} logit_scale={scale:.4f}")
+
         # epoch finished - update ema
         trainer.on_epoch_finish()
 

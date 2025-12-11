@@ -155,31 +155,4 @@ class ContrastiveEmbCollator:
             go2prot_local = [torch.as_tensor(x, dtype=torch.long) for x in buckets]
             out["go2prot_local"] = go2prot_local
 
-        #TODO: debug silinecek
-
-        # ---------------- Optional: GO→Protein buckets for symmetric loss ----------------
-        if self.bidirectional:
-            G = int(uniq_go.shape[0])
-            buckets: List[List[int]] = [[] for _ in range(G)]
-            for pi, local_idxs in enumerate(pos_local):
-                for j in local_idxs.tolist():
-                    buckets[j].append(pi)
-            go2prot_local = [torch.as_tensor(x, dtype=torch.long) for x in buckets]
-            out["go2prot_local"] = go2prot_local
-
-        # DEBUG: batch içi pozitif sayıları
-        try:
-            pos_counts = [len(t) for t in pos_local]
-            print(
-                f"[collate-debug] B={len(pos_counts)}, "
-                f"min_pos={min(pos_counts)}, "
-                f"max_pos={max(pos_counts)}, "
-                f"avg_pos={sum(pos_counts)/max(1,len(pos_counts)):.2f}"
-            )
-        except Exception:
-            pass
-
-        return out
-
-
         return out
