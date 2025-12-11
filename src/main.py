@@ -417,6 +417,19 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         num_workers=0,
         pin_memory=True,
         collate_fn=fused_collator)
+    #TODO: Silinecek
+    b = next(iter(train_loader))
+    H = b["prot_emb_pad"]  # [B, T, d_h]
+
+    with torch.no_grad():
+        norms = H.norm(dim=-1)  # [B, T]
+        print(
+            "[dbg] H norms -> mean={:.3f}, min={:.3f}, max={:.3f}".format(
+                norms.mean().item(),
+                norms.min().item(),
+                norms.max().item(),
+            )
+        )
 
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
     return train_loader, val_loader, query_loader, collate
@@ -932,7 +945,7 @@ def run_training(args, schedule: TrainSchedule):
         cand_chunk_k=args.cand_chunk_k,
         pos_chunk_t=args.pos_chunk_t,
         k_hard_queue=args.k_hard_queue,
-        queue_K=args.queue_K
+        queue_K=args.queue_K,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),

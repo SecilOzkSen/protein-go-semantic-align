@@ -142,6 +142,24 @@ class ProteinGoAligner(nn.Module):
                 Zs, ainfo = self._pool(Hs, Gs, ms, return_alpha=return_alpha)
                 Zp = self.proj_p(Zs)               # [B, t, d_z]
                 Gz = self.proj_g(Gs)               # [B, t, d_z]
+                #TODO: ERASE burası debug için
+                if torch.distributed.is_initialized():
+                    is_main = (torch.distributed.get_rank() == 0)
+                else:
+                    is_main = True
+
+                if is_main and False:  # False'u 1-2 batch için True yap
+                    print("Zp mean/std:", Zp.mean().item(), Zp.std().item())
+                    print("Gz mean/std:", Gz.mean().item(), Gz.std().item())
+                    cos_sample = F.cosine_similarity(
+                        Zp.view(-1, Zp.size(-1))[:1024],
+                        Gz.view(-1, Gz.size(-1))[:1024],
+                        dim=-1
+                    )
+                    print("cosine sample mean:", cos_sample.mean().item(),
+                          "min:", cos_sample.min().item(),
+                          "max:", cos_sample.max().item())
+
                 if self.normalize:
                     Zp = self._norm(Zp, dim=-1, norm_chunk=256)
                     Gz = self._norm(Gz, dim=-1, norm_chunk=256)

@@ -270,4 +270,4 @@ class TrainerConfig:
     eval_batch_size: int = 128
     fp16: bool = True
     monitor_metric: str = "cafa_fmax"
-    monitor_mode: str = "max"
+    monitor_mode: str = "max",
