@@ -1093,7 +1093,7 @@ def run_training(args, schedule: TrainSchedule):
 
             if global_step % 1000 == 0:
                 with torch.no_grad():
-                    scale = trainer.model.logit_scale.exp().item()
+                    scale = trainer.logit_scale.log.exp().item()
                 logger.info(f"[debug] step={global_step} logit_scale={scale:.4f}")
 
         # epoch finished - update ema
