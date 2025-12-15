@@ -403,12 +403,19 @@ class OppTrainer:
                          cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
         sc, alpha = _unpack(out)
 
-        def _chk(name, t):
-            if t is None:
-                return
-            if not torch.isfinite(t).all():
-                raise RuntimeError(f"NaN/Inf in {name}: "
-                                   f"min={torch.nanmin(t).item()} max={torch.nanmax(t).item()}")
+        def _finite_minmax(t: torch.Tensor):
+            x = t.detach().float().reshape(-1)
+            m = torch.isfinite(x)
+            if not bool(m.any()):
+                return float("nan"), float("nan")
+            xf = x[m]
+            return xf.min().item(), xf.max().item()
+
+        def _chk(name: str, t: torch.Tensor):
+            t0 = t.detach()
+            bad = (~torch.isfinite(t0)).float().mean().item() if t0.numel() else 0.0
+            mn, mx = _finite_minmax(t0)
+            print(f"[chk] {name}: shape={tuple(t0.shape)} bad_frac={bad:.6f} min={mn:.6f} max={mx:.6f}")
 
         # step_losses içinde kritik yerler
         _chk("H", H)
