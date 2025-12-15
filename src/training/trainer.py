@@ -522,15 +522,26 @@ class OppTrainer:
 
         G_cand, pos_mask, cand_valid_mask = self._build_candidates(uniq_go_embs, pos_local, neg_from_queue)
 
+        amp_ctx = torch.amp.autocast(
+            device_type="cuda",
+            enabled=(torch.cuda.is_available() and self.ctx.fp16_enabled),
+        )
 
-        amp_ctx = torch.amp.autocast(device_type="cuda", enabled=(torch.cuda.is_available() and self.ctx.fp16_enabled))
         with amp_ctx:
+            # 2) scores
             scores_cand = self.forward_scores(H, G_cand, attn_valid, return_alpha=False)
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
+
+            # 3) scale
             scores_cand = scores_cand * self.logit_scale.exp().clamp(max=100.0)
-            G_cand, pos_mask, cand_valid_mask = self._build_candidates(...)
-            scores_cand = self.forward_scores(...)
-            l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=1.0, cand_valid_mask=cand_valid_mask)
+
+            # 4) loss (pad candidate'ları mask’le)
+            l_con = multi_positive_infonce_from_candidates(
+                scores_cand,
+                pos_mask,
+                tau=1.0,
+                cand_valid_mask=cand_valid_mask,
+            )
 
             if not torch.isfinite(l_con):
                 raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
