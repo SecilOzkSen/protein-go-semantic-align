@@ -35,10 +35,10 @@ training:
   batch_size: 6
   eval_batch_size: 6
 
-  num_workers: 1
+  num_workers: 0
   val_num_workers: 1
   pin_memory: true
-  persistent_workers: true
+  persistent_workers: false
   prefetch_factor: 2
 
   fp16: true

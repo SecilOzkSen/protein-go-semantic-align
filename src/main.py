@@ -197,12 +197,17 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
                 # Sadece shape öğrenmek için memmap aç (RAM'e yüklemez)
                 arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
                 n = int(arr.shape[0])
-                id2row = {str(i): i for i in range(n)}
-                row2id = {i: str(i) for i in range(n)}
+                id2row = {int(i): i for i in range(n)}
+                row2id = {i: int(i) for i in range(n)}
             except Exception:
                 # Eşlemeleri boş bırak; GoLookupCache içi tolere edebiliyorsa
                 id2row = None
                 row2id = None
+
+        if id2row is not None:
+            id2row = {int(k): int(v) for k, v in id2row.items()}
+        if row2id is not None:
+            row2id = {int(k): (int(v) if str(v).isdigit() else v) for k, v in row2id.items()}
 
         blob = {
             "memmap_path": str(memmap_path),
@@ -384,8 +389,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
-        persistent_workers=False,
+        num_workers=args.num_workers,
+        persistent_workers=(args.num_workers > 0),
 #        multiprocessing_context="forkserver",
         pin_memory=True,
     #    prefetch_factor=2,
@@ -779,7 +784,7 @@ def run_training(args, schedule: TrainSchedule):
         go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
     else:
         for ph in range(total_phases):
-            go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
+            go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
 
     res_store, fused_store = build_stores(args)
     datasets = build_datasets(args, res_store, fused_store, go_cache)
@@ -882,7 +887,7 @@ def run_training(args, schedule: TrainSchedule):
         gospec_tau=0.02,
         gospec_topk=32,
     )
-    fused_bank = materialize_fused_bank(query_loader, device=str(device))
+    fused_bank = materialize_fused_bank(query_loader, device=("cpu" if args.cpu else "cuda:0"))
     training_context.fused_bank = fused_bank
 
     assert isinstance(fused_bank, dict) and {"ids", "vecs", "id2row"} <= fused_bank.keys()
@@ -918,9 +923,10 @@ def run_training(args, schedule: TrainSchedule):
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
 
             # Dataloader’ları yeniden kur
-            nonlocal train_loader, val_loader, collate
+            nonlocal train_loader, val_loader, collate, query_loader
             train_loader, val_loader, query_loader, collate = build_dataloaders(datasets=datasets, args=args, go_cache=training_context.go_cache, go_text_store=training_context.go_text_store)
-
+            fused_bank = materialize_fused_bank(query_loader, device="cpu")
+            training_context.fused_bank = fused_bank
             training_context.current_phase = new_phase
             training_context.last_refresh_epoch = current_epoch
             training_context.last_refresh_reason = "phase_change" if not force else "force"
@@ -970,7 +976,6 @@ def run_training(args, schedule: TrainSchedule):
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
-        trainer._maybe_init_queue_miner(d_g)
     # Resume
     if getattr(args, "resume", None):
         ckpt_path = str(args.resume)
@@ -1004,7 +1009,7 @@ def run_training(args, schedule: TrainSchedule):
         torch.cuda.ipc_collect()
         # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
         try:
-            if run is not None and global_step == 1:
+            if run is not None and epoch == 0 and global_step == 0:
                 try:
                     wandb_preview_curriculum(run, args, total_steps=n_spe * args.epochs)
                     wandb_dataset_quickstats(run, datasets["train"], sample_n=256)
@@ -1048,9 +1053,8 @@ def run_training(args, schedule: TrainSchedule):
                 pass
 
             # forward + losses
-            with torch.autocast("cuda", dtype=torch.bfloat16): #TODO: autocast
-                losses = trainer.step_losses(batch, epoch)
-                loss = losses["total"]
+            losses = trainer.step_losses(batch, epoch)
+            loss = losses["total"]
 
             # backward
             trainer.opt.zero_grad(set_to_none=True)
@@ -1081,7 +1085,7 @@ def run_training(args, schedule: TrainSchedule):
             # periodic checkpoint
             if (global_step % max(1, args.save_every)) == 0:
                 ckpt_path = save_checkpoint(
-                    out_dir=out_dir.name,
+                    out_dir=str(out_dir),
                     tag=f"step{global_step}",
                     trainer=trainer,
                     args=args,
@@ -1093,11 +1097,9 @@ def run_training(args, schedule: TrainSchedule):
 
             if global_step % 1000 == 0:
                 with torch.no_grad():
-                    scale = trainer.logit_scale.log().exp().item()
+                    scale = trainer.logit_scale.exp().item()
                 logger.info(f"[debug] step={global_step} logit_scale={scale:.4f}")
 
-        # epoch finished - update ema
-        trainer.on_epoch_finish()
 
         # validation
         if val_loader is not None:
@@ -1120,7 +1122,7 @@ def run_training(args, schedule: TrainSchedule):
                 no_improve_epochs = 0
                 # en iyi modeli ayrı etiketle kaydet
                 ckpt_path = save_checkpoint(
-                    out_dir=out_dir.name,
+                    out_dir=str(out_dir),
                     tag=f"step{global_step}",
                     trainer=trainer,
                     args=args,
