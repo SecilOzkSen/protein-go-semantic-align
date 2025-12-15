@@ -739,6 +739,12 @@ def sanitize_dataset_with_go_text(train_ds, go_text_store) -> None:
     train_ds.pos_weights_map = new_pos_weights
     train_ds.pos_is_generalized = new_pos_is_gen
 
+    if hasattr(train_ds, "protein_ids"):
+        train_ds.protein_ids = new_pids
+        print("[sanitize_dataset_with_go_text] Updated train_ds.protein_ids")
+    if hasattr(train_ds, "ids"):
+        train_ds.ids = new_pids
+
     if new_is_fs:
         train_ds.is_fs = new_is_fs
 
