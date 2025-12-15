@@ -402,7 +402,6 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         collate_fn=collate,
     )
     b = next(iter(train_loader))
-
     #TODO: Erase
     lens = [int(x.numel()) for x in b["pos_go_local"]]
     print("[DBG] pos lens first20:", lens[:20], "any_pos:", any(l > 0 for l in lens))

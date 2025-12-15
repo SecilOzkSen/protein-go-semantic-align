@@ -15,7 +15,7 @@ data:
 
 general: #Ablation Purposes
   ablation_id: "A1" #A0 sanity check
-  use_queue_miner: False #CHECKED
+  use_queue_miner: True #CHECKED
   use_go_memory_bank: False #CHECKED
   use_attention_pooling: False #CHECKED
   use_lora: True #CHECKED
@@ -32,8 +32,8 @@ caches:
 
 training:
   epochs: 5
-  batch_size: 6
-  eval_batch_size: 6
+  batch_size: 1
+  eval_batch_size: 1
 
   num_workers: 0
   val_num_workers: 1
