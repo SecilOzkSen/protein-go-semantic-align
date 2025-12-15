@@ -197,17 +197,12 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
                 # Sadece shape öğrenmek için memmap aç (RAM'e yüklemez)
                 arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
                 n = int(arr.shape[0])
-                id2row = {int(i): i for i in range(n)}
+                id2row = {str(i): i for i in range(n)}
                 row2id = {i: int(i) for i in range(n)}
             except Exception:
                 # Eşlemeleri boş bırak; GoLookupCache içi tolere edebiliyorsa
                 id2row = None
                 row2id = None
-
-        if id2row is not None:
-            id2row = {int(k): int(v) for k, v in id2row.items()}
-        if row2id is not None:
-            row2id = {int(k): (int(v) if str(v).isdigit() else v) for k, v in row2id.items()}
 
         blob = {
             "memmap_path": str(memmap_path),
@@ -771,6 +766,7 @@ def run_training(args, schedule: TrainSchedule):
         go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
         phase0 = -1 # ablation 1 - no phase
+        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
 
     go_cache = build_go_cache(str(go_cache_path))
