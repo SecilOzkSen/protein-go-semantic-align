@@ -60,6 +60,9 @@ def multi_positive_infonce_from_candidates(
     pos_logits = logits.masked_fill(~pos_mask, float("-inf"))  # (B, K)
     pos_any = pos_mask.any(dim=1)  # (B,)
 
+    if not pos_any.any():
+        raise RuntimeError("No positives in batch: pos_mask is all False. Dataset/collate is producing empty labels.")
+
     if (~pos_any).any():
         pos_logits = pos_logits.clone()
         pos_logits[~pos_any] = -1e9
