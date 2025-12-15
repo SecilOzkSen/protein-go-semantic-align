@@ -402,6 +402,21 @@ class OppTrainer:
         out = self.model(H=H, G=G, mask=mask, return_alpha=return_alpha,
                          cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
         sc, alpha = _unpack(out)
+
+        def _chk(name, t):
+            if t is None:
+                return
+            if not torch.isfinite(t).all():
+                raise RuntimeError(f"NaN/Inf in {name}: "
+                                   f"min={t.nanmin().item()} max={t.nanmax().item()}")
+
+        # step_losses içinde kritik yerler
+        _chk("H", H)
+        _chk("G", G)  # GO emb
+        _chk("scores_pre_scale", sc)
+        _chk("logit_scale", self.logit_scale)
+        _chk("scores_post_scale", sc)
+
         return (sc, alpha) if return_alpha else sc
 
     # ----------------- eval space cache -----------------
@@ -478,6 +493,9 @@ class OppTrainer:
             scores_cand = scores_cand * self.logit_scale.exp().clamp(max=100.0)
             l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=1.0)
 
+            if not torch.isfinite(l_con):
+                raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
+
             # positives-only
             B = H.size(0)
             T_max = max((int(x.numel()) for x in pos_local), default=1)
@@ -488,7 +506,7 @@ class OppTrainer:
                     G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
 
             # attr train: keep as you had, but use return_alpha correctly
-            use_attr = self.ctx.attribute_loss_enabled or (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
+            use_attr = self.ctx.attribute_loss_enabled and (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
             if use_attr:
                 scores_pos, alpha_info = self.forward_scores(H, G_pos, attn_valid, return_alpha=True)
             else:
@@ -565,7 +583,9 @@ class OppTrainer:
             # build global eval space from cache
             G_eval, y_true = self._build_eval_space(batch)
             scores = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-            scores = scores * self.logit_scale.exp().clamp(max=100.0)
+            logit_scale = self.logit_scale.clamp(min=-10.0, max=10.0)
+            scale = logit_scale.exp()
+            scores = scores * scale
             probs = torch.sigmoid(scores)
 
             preds.append(probs.cpu())
