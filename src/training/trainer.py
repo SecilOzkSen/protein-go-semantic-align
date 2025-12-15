@@ -408,7 +408,7 @@ class OppTrainer:
                 return
             if not torch.isfinite(t).all():
                 raise RuntimeError(f"NaN/Inf in {name}: "
-                                   f"min={t.nanmin().item()} max={t.nanmax().item()}")
+                                   f"min={torch.nanmin(t).item()} max={torch.nanmax(t).item()}")
 
         # step_losses içinde kritik yerler
         _chk("H", H)
