@@ -440,19 +440,6 @@ class OppTrainer:
             xf = x[m]
             return xf.min().item(), xf.max().item()
 
-        def _chk(name: str, t: torch.Tensor):
-            t0 = t.detach()
-            bad = (~torch.isfinite(t0)).float().mean().item() if t0.numel() else 0.0
-            mn, mx = _finite_minmax(t0)
-            print(f"[chk] {name}: shape={tuple(t0.shape)} bad_frac={bad:.6f} min={mn:.6f} max={mx:.6f}")
-
-        # step_losses içinde kritik yerler
-        _chk("H", H)
-        _chk("G", G)  # GO emb
-        _chk("scores_pre_scale", sc)
-        _chk("logit_scale", self.logit_scale)
-        _chk("scores_post_scale", sc)
-
         return (sc, alpha) if return_alpha else sc
 
     # ----------------- eval space cache -----------------
