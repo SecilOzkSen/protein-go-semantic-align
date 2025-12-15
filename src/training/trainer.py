@@ -432,14 +432,6 @@ class OppTrainer:
                          cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
         sc, alpha = _unpack(out)
 
-        def _finite_minmax(t: torch.Tensor):
-            x = t.detach().float().reshape(-1)
-            m = torch.isfinite(x)
-            if not bool(m.any()):
-                return float("nan"), float("nan")
-            xf = x[m]
-            return xf.min().item(), xf.max().item()
-
         return (sc, alpha) if return_alpha else sc
 
     # ----------------- eval space cache -----------------

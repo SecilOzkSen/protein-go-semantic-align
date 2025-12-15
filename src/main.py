@@ -971,12 +971,15 @@ def run_training(args, schedule: TrainSchedule):
         lambda_dag=getattr(args, "lambda_dag", 0.3)
     )
     run = wandb.init(
-        project="protein-go-semantic-align",
+        project=args.wandb_project or "protein-go-semantic-align",
+        entity=args.wandb_entity,
         name=training_context.run_name,
         config=training_context.to_dict(),
+        mode=args.wandb_mode or "online",
         settings=wandb.Settings(code_dir=".", _disable_stats=True),
         reinit=False,
     )
+
     encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer, wandb_run=run)
 
@@ -1087,6 +1090,17 @@ def run_training(args, schedule: TrainSchedule):
                 logger.info(f"[train] epoch {epoch} step {global_step} :: " +
                             " | ".join([f"{k}:{v:.4f}" for k, v in avg.items()]) +
                             (f" | lr:{lr0:.2e}" if lr0 is not None else ""))
+                if args.wandb and run is not None:
+                    payload = {f"train/{k}": float(v) for k, v in avg.items()}
+                    payload["trainer_step"] = int(global_step)
+                    if lr0 is not None:
+                        payload["train/lr"] = float(lr0)
+                    # logit_scale faydalı
+                    try:
+                        payload["train/logit_scale"] = float(trainer.logit_scale.detach().exp().clamp(max=100).item())
+                    except Exception:
+                        pass
+                    wandb.log(payload, step=int(global_step))
 
             # periodic checkpoint
             if (global_step % max(1, args.save_every)) == 0:
