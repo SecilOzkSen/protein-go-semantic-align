@@ -204,6 +204,16 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
                 id2row = None
                 row2id = None
 
+        arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)  # [N,D]
+        print("memmap path:", memmap_path)
+        norms = np.linalg.norm(arr.astype(np.float32), axis=1)
+        n_zero = int((norms < 1e-8).sum())
+        if n_zero > 0:
+            raise RuntimeError(
+                f"GO cache has {n_zero} zero-embedding rows in {memmap_path}. "
+                "This will produce NaNs in contrastive loss. Rebuild GO embeddings."
+            )
+
         blob = {
             "memmap_path": str(memmap_path),
             "id2row": id2row,

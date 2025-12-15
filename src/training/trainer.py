@@ -10,8 +10,6 @@ from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss, windowed_attr_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
 from src.miners.queue_miner import MoCoQueue
-from contextlib import nullcontext
-from collections import defaultdict
 from src.metrics.cafa import compute_fmax, compute_term_aupr
 
 # ------------- Helpers -------------
@@ -490,14 +488,6 @@ class OppTrainer:
         with torch.no_grad():
             prot_query = self._get_prot_query(H, attn_valid, Dg_batch)
             neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dg_batch)
-
-        cand_ids = batch.get("cand_go_ids") or batch.get("uniq_go_ids")
-        cand_ids = [int(x) for x in cand_ids] if cand_ids is not None else []
-
-        miss = [g for g in cand_ids if
-                (self.ctx.go_cache.id2row is not None and int(g) not in self.ctx.go_cache.id2row)]
-        print("[DBG] cand_ids range:", (min(cand_ids), max(cand_ids)) if cand_ids else None)
-        print("[DBG] missing in go_cache:", len(miss), "example:", miss[:10])
 
         G_cand, pos_mask = self._build_candidates(uniq_go_embs, pos_local, neg_from_queue)
 
