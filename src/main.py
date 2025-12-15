@@ -404,14 +404,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
     b = next(iter(train_loader))
 
     #TODO: Erase
-    pos_local = b["pos_go_local"]
-    lens = [int(x.numel()) for x in pos_local]
-    print("[DBG] pos_go_local lens:", lens[:20], "any_pos:", any(l > 0 for l in lens))
-
-    print("[DBG] uniq_go_ids shape:", getattr(b.get("uniq_go_ids", None), "shape", None))
-    if b.get("uniq_go_ids", None) is not None:
-        u = b["uniq_go_ids"]
-        print("[DBG] uniq_go_ids min/max:", int(u.min().item()), int(u.max().item()))
+    lens = [int(x.numel()) for x in b["pos_go_local"]]
+    print("[DBG] pos lens first20:", lens[:20], "any_pos:", any(l > 0 for l in lens))
     # -----
     assert "protein_ids" in b and isinstance(b["protein_ids"], list) and len(b["protein_ids"]) == b["prot_emb_pad"].shape[0]
     val_loader = None
