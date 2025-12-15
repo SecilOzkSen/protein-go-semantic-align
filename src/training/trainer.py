@@ -17,7 +17,9 @@ def to_f32(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.float32 else x.float()
 
 def norm_f32(x: torch.Tensor, p: int = 2, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
-    return F.normalize(to_f32(x), p=p, dim=dim, eps=eps)
+    norm = F.normalize(to_f32(x), p=p, dim=dim, eps=eps)
+    norm = torch.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
+    return norm
 
 def clone_as_target(module: torch.nn.Module) -> torch.nn.Module:
     k = copy.deepcopy(module).eval()
@@ -35,21 +37,38 @@ def entropy_regularizer(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     ent = -(a * a.log()).sum(dim=-1)
     return ent.mean()
 
-def multi_positive_infonce_from_candidates(scores: torch.Tensor, pos_mask: torch.Tensor, tau: float) -> torch.Tensor:
+def multi_positive_infonce_from_candidates(
+    scores: torch.Tensor,
+    pos_mask: torch.Tensor,
+    tau: float,
+    cand_valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
     scores: (B, K)
     pos_mask: (B, K) boolean; True at positives
+    cand_valid_mask: (B, K) boolean; True only where a real candidate exists (not padding)
     """
-    logits = scores / max(1e-8, tau)                          # (B, K)
-    denom = torch.logsumexp(logits, dim=-1)                   # (B,)
-    pos_logits = logits.masked_fill(~pos_mask, float('-inf')) # (B, K)
-    pos_any = pos_mask.any(dim=1)                             # (B,)
+    logits = scores / max(1e-8, tau)  # (B, K)
+
+    if cand_valid_mask is not None:
+        cand_valid_mask = cand_valid_mask.to(dtype=torch.bool, device=logits.device)
+        logits = logits.masked_fill(~cand_valid_mask, float("-inf"))
+        pos_mask = pos_mask & cand_valid_mask
+
+    denom = torch.logsumexp(logits, dim=-1)  # (B,)
+
+    pos_logits = logits.masked_fill(~pos_mask, float("-inf"))  # (B, K)
+    pos_any = pos_mask.any(dim=1)  # (B,)
+
     if (~pos_any).any():
         pos_logits = pos_logits.clone()
         pos_logits[~pos_any] = -1e9
-    num = torch.logsumexp(pos_logits, dim=-1)                 # (B,)
-    loss = -(num - denom)                                     # (B,)
+
+    num = torch.logsumexp(pos_logits, dim=-1)  # (B,)
+    loss = -(num - denom)  # (B,)
+
     return loss[pos_any].mean() if pos_any.any() else denom.mean() * 0.0
+
 
 def surrogate_delta_y_from_mask_grad(H, G, model, mask=None, return_alpha=False):
     """
@@ -360,19 +379,31 @@ class OppTrainer:
         kq = 0 if neg_from_queue is None else neg_from_queue.size(1)
 
         pos_lens = [int(loc.numel()) for loc in pos_local]
+        # K: batch içindeki max (p + kq)
         K = max((p + kq) for p in pos_lens) if B > 0 else max(1, kq)
 
         G_cand = torch.zeros(B, K, Dg, device=self.device, dtype=uniq_go_embs.dtype)
         pos_mask = torch.zeros(B, K, dtype=torch.bool, device=self.device)
 
+        # NEW: candidate validity mask
+        cand_valid_mask = torch.zeros(B, K, dtype=torch.bool, device=self.device)
+
         for b, loc in enumerate(pos_local):
             p = int(loc.numel())
+
+            # positives
             if p > 0:
                 G_cand[b, :p] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
                 pos_mask[b, :p] = True
+                cand_valid_mask[b, :p] = True
+
+            # negatives from queue
             if kq > 0:
-                G_cand[b, p:p+kq] = neg_from_queue[b]
-        return G_cand, pos_mask
+                # neg_from_queue[b] shape: [kq, Dg]
+                G_cand[b, p:p + kq] = neg_from_queue[b]
+                cand_valid_mask[b, p:p + kq] = True
+
+        return G_cand, pos_mask, cand_valid_mask
 
     # ----------------- forward scoring -----------------
     def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
@@ -489,14 +520,17 @@ class OppTrainer:
             prot_query = self._get_prot_query(H, attn_valid, Dg_batch)
             neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dg_batch)
 
-        G_cand, pos_mask = self._build_candidates(uniq_go_embs, pos_local, neg_from_queue)
+        G_cand, pos_mask, cand_valid_mask = self._build_candidates(uniq_go_embs, pos_local, neg_from_queue)
+
 
         amp_ctx = torch.amp.autocast(device_type="cuda", enabled=(torch.cuda.is_available() and self.ctx.fp16_enabled))
         with amp_ctx:
             scores_cand = self.forward_scores(H, G_cand, attn_valid, return_alpha=False)
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
             scores_cand = scores_cand * self.logit_scale.exp().clamp(max=100.0)
-            l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=1.0)
+            G_cand, pos_mask, cand_valid_mask = self._build_candidates(...)
+            scores_cand = self.forward_scores(...)
+            l_con = multi_positive_infonce_from_candidates(scores_cand, pos_mask, tau=1.0, cand_valid_mask=cand_valid_mask)
 
             if not torch.isfinite(l_con):
                 raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
