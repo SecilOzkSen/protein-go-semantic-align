@@ -575,7 +575,14 @@ class OppTrainer:
         if preds:
             y_pred = torch.cat(preds, dim=0).numpy()
             y_true = torch.cat(trues, dim=0).numpy()
-            fmax, _ = compute_fmax(y_true, y_pred)
+
+            # CAFA-style protein-centric Fmax
+            fmax, _ = compute_fmax(
+                y_true=y_true,
+                y_pred=y_pred,
+                num_thresholds=101
+            )
+
             aupr = compute_term_aupr(y_true, y_pred)
         else:
             fmax, aupr = 0.0, 0.0
