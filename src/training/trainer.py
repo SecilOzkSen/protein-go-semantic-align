@@ -37,40 +37,33 @@ def entropy_regularizer(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     ent = -(a * a.log()).sum(dim=-1)
     return ent.mean()
 
-def multi_positive_infonce_from_candidates(
-    scores: torch.Tensor,
-    pos_mask: torch.Tensor,
-    tau: float,
-    cand_valid_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
+def multi_positive_infonce_from_candidates(scores: torch.Tensor,
+                                           pos_mask: torch.Tensor,
+                                           tau: float,
+                                           cand_valid_mask: torch.Tensor | None = None) -> torch.Tensor:
     """
     scores: (B, K)
-    pos_mask: (B, K) boolean; True at positives
-    cand_valid_mask: (B, K) boolean; True only where a real candidate exists (not padding)
+    pos_mask: (B, K) boolean
+    cand_valid_mask: (B, K) boolean, True=valid candidate
     """
-    logits = scores / max(1e-8, tau)  # (B, K)
+    logits = scores / max(1e-8, tau)
 
     if cand_valid_mask is not None:
-        cand_valid_mask = cand_valid_mask.to(dtype=torch.bool, device=logits.device)
         logits = logits.masked_fill(~cand_valid_mask, float("-inf"))
         pos_mask = pos_mask & cand_valid_mask
 
     denom = torch.logsumexp(logits, dim=-1)  # (B,)
 
-    pos_logits = logits.masked_fill(~pos_mask, float("-inf"))  # (B, K)
-    pos_any = pos_mask.any(dim=1)  # (B,)
-
-    if not pos_any.any():
-        raise RuntimeError("No positives in batch: pos_mask is all False. Dataset/collate is producing empty labels.")
-
+    pos_logits = logits.masked_fill(~pos_mask, float("-inf"))
+    pos_any = pos_mask.any(dim=1)
     if (~pos_any).any():
         pos_logits = pos_logits.clone()
         pos_logits[~pos_any] = -1e9
 
     num = torch.logsumexp(pos_logits, dim=-1)  # (B,)
-    loss = -(num - denom)  # (B,)
-
+    loss = -(num - denom)
     return loss[pos_any].mean() if pos_any.any() else denom.mean() * 0.0
+
 
 
 def surrogate_delta_y_from_mask_grad(H, G, model, mask=None, return_alpha=False):
@@ -376,35 +369,74 @@ class OppTrainer:
         neg = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
         return neg  # [B,k,Dg]
 
-    def _build_candidates(self, uniq_go_embs, pos_local, neg_from_queue):
+    def _build_candidates(self, uniq_go_embs, pos_local, neg_from_queue=None, *, max_inbatch: int | None = None):
+        """
+        Returns:
+          G_cand: [B, K, Dg]
+          pos_mask: [B, K]  (True sadece pozitifler için)
+          cand_valid_mask: [B, K] (True valid slot)
+        """
+        device = self.device
         B = len(pos_local)
-        Dg = uniq_go_embs.size(1)
-        kq = 0 if neg_from_queue is None else neg_from_queue.size(1)
+        U = int(uniq_go_embs.size(0))  # in-batch uniq candidate count
+        Dg = int(uniq_go_embs.size(1))
 
-        pos_lens = [int(loc.numel()) for loc in pos_local]
-        # K: batch içindeki max (p + kq)
-        K = max((p + kq) for p in pos_lens) if B > 0 else max(1, kq)
+        # (opsiyonel) in-batch candidate sayısını kıs
+        if max_inbatch is not None and U > max_inbatch:
+            # Pozitifleri koru, geri kalanı random kıs
+            keep = set()
+            for loc in pos_local:
+                keep.update([int(x) for x in loc.tolist()])
+            keep = sorted(keep)
 
-        G_cand = torch.zeros(B, K, Dg, device=self.device, dtype=uniq_go_embs.dtype)
-        pos_mask = torch.zeros(B, K, dtype=torch.bool, device=self.device)
+            # kalanlardan sample
+            all_idx = torch.arange(U, device=device)
+            keep_t = torch.tensor(keep, device=device, dtype=torch.long) if keep else torch.empty(0, device=device,
+                                                                                                  dtype=torch.long)
+            mask = torch.ones(U, device=device, dtype=torch.bool)
+            if keep_t.numel() > 0:
+                mask[keep_t] = False
+            rest = all_idx[mask]
+            need = max(0, max_inbatch - int(keep_t.numel()))
+            if need > 0 and rest.numel() > 0:
+                perm = torch.randperm(rest.numel(), device=device)[:need]
+                extra = rest[perm]
+                cand_idx = torch.cat([keep_t, extra], dim=0) if keep_t.numel() > 0 else extra
+            else:
+                cand_idx = keep_t
+            cand_idx = cand_idx.unique(sorted=False)
+            uniq_sub = uniq_go_embs.index_select(0, cand_idx.to(uniq_go_embs.device))
+            # pos_local’ları yeni index’e map et
+            old2new = {int(old): i for i, old in enumerate(cand_idx.tolist())}
+            new_pos_local = []
+            for loc in pos_local:
+                new_loc = [old2new[int(x)] for x in loc.tolist() if int(x) in old2new]
+                new_pos_local.append(torch.tensor(new_loc, device=device, dtype=torch.long))
+            uniq_go_embs = uniq_sub
+            pos_local = new_pos_local
+            U = int(uniq_go_embs.size(0))
 
-        # NEW: candidate validity mask
-        cand_valid_mask = torch.zeros(B, K, dtype=torch.bool, device=self.device)
+        kq = 0 if neg_from_queue is None else int(neg_from_queue.size(1))
+        K = U + kq
 
+        G_cand = torch.zeros(B, K, Dg, device=device, dtype=uniq_go_embs.dtype)
+        pos_mask = torch.zeros(B, K, device=device, dtype=torch.bool)
+        cand_valid_mask = torch.zeros(B, K, device=device, dtype=torch.bool)
+
+        # 1) in-batch candidates: hepsi valid
+        G_cand[:, :U] = uniq_go_embs.unsqueeze(0).expand(B, U, Dg).to(device)
+        cand_valid_mask[:, :U] = True
+
+        # 2) pozitif mask: pos_local indexleri in-batch segmentine işaret ediyor
         for b, loc in enumerate(pos_local):
-            p = int(loc.numel())
+            if loc.numel() > 0:
+                pos_mask[b, loc.to(device)] = True
 
-            # positives
-            if p > 0:
-                G_cand[b, :p] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
-                pos_mask[b, :p] = True
-                cand_valid_mask[b, :p] = True
-
-            # negatives from queue
-            if kq > 0:
-                # neg_from_queue[b] shape: [kq, Dg]
-                G_cand[b, p:p + kq] = neg_from_queue[b]
-                cand_valid_mask[b, p:p + kq] = True
+        # 3) queue negleri append
+        if kq > 0:
+            G_cand[:, U:U + kq] = neg_from_queue.to(device)
+            cand_valid_mask[:, U:U + kq] = True
+            # pos_mask queue kısmında False kalmalı
 
         return G_cand, pos_mask, cand_valid_mask
 
@@ -498,15 +530,28 @@ class OppTrainer:
         Dg_batch = int(uniq_go_embs.size(1))
         self._maybe_init_queue(Dg_batch)
 
-        with torch.no_grad():
-            prot_query = self._get_prot_query(H, attn_valid, Dg_batch)
-            neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dg_batch)
-
-        G_cand, pos_mask, cand_valid_mask = self._build_candidates(uniq_go_embs, pos_local, neg_from_queue)
-
         amp_ctx = torch.amp.autocast(
             device_type="cuda",
             enabled=(torch.cuda.is_available() and self.ctx.fp16_enabled),
+        )
+
+        # queue miner varsa hard neg çıkar, yoksa None
+        with torch.no_grad():
+            prot_query = self._get_prot_query(H, attn_valid, Dg_batch)
+            neg_from_queue = None
+            if self.queue_miner is not None:
+                neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dg_batch)
+
+        # candidates: in-batch + optional queue
+        max_inbatch = None
+        if getattr(self.ctx, "scheduler", None) is not None:
+            try:
+                max_inbatch = int(self.ctx.scheduler.shortlist_M)
+            except Exception:
+                max_inbatch = None
+
+        G_cand, pos_mask, cand_valid_mask = self._build_candidates(
+            uniq_go_embs, pos_local, neg_from_queue, max_inbatch=max_inbatch
         )
 
         with amp_ctx:
@@ -593,6 +638,22 @@ class OppTrainer:
                         pos_vecs = uniq_go_embs.index_select(0, local_cat).detach()
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
                     self.queue_miner.enqueue(pos_vecs, pos_ids)
+
+        try:
+            self.wandb_run.log(
+                {
+                    "trainer_step": self._global_step,
+                    "train/total": float(total.detach().item()),
+                    "train/contrastive": float(l_con.detach().item()),
+                    "train/dag": float(l_dag.detach().item()),
+                    "train/attr": float(l_attr.detach().item()),
+                    "train/entropy": float(l_ent.detach().item()),
+                    "train/logit_scale": float(self.logit_scale.detach().exp().item()),
+                },
+                step=int(self._global_step),
+            )
+        except Exception:
+            pass
 
         return {"total": total, "contrastive": l_con, "dag": l_dag, "attr": l_attr, "entropy": l_ent}
 
