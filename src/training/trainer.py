@@ -224,7 +224,7 @@ def build_dag_ancestors(dag_parents: dict[int, list[int]]) -> dict[int, list[int
             return memo[x]
         out = {x}
         for p in dag_parents.get(x, []):
-            out.update(dfs(int(p)))
+            out.update(dfs(int(p[0])))
         memo[x] = list(out)
         return memo[x]
 
