@@ -13,7 +13,7 @@ class GoMemoryBank:
         self,
         init_embs: Union[torch.Tensor, np.memmap],
         row2id: Sequence[int],
-        device: str = "cuda:0",
+        device: str = "cuda",
         to_device: bool = True,
         already_normalized: bool = False,
         device_dtype: torch.dtype = torch.float16,   #  GPU'da fp16 varsayılan
@@ -43,7 +43,7 @@ class GoMemoryBank:
             t = t.to(self.device, non_blocking=True)
             if device_dtype is not None:
                 # sadece GPU'da half'a çevir (CPU memmap'le karışmasın)
-                if t.device.type == "cuda:0":
+                if t.device.type == "cuda":
                     t = t.to(device_dtype)
         self._embs = t.contiguous()
 
@@ -77,10 +77,10 @@ class GoMemoryBank:
         return m
 
     def __call__(self, go_ids: Sequence[int]) -> torch.Tensor:
-        idxs = self.to_local(go_ids, drop_missing=True)
-        if idxs.numel() == 0:
-            d = int(self._embs.size(1))
-            return torch.empty(0, d, dtype=self._embs.dtype, device=self._embs.device)
+        idxs = self.to_local(go_ids, drop_missing=False)
+        if (idxs < 0).any():
+            bad = [int(go_ids[i]) for i in (idxs < 0).nonzero(as_tuple=False).view(-1).tolist()[:5]]
+            raise KeyError(f"GoMemoryBank missing ids, example: {bad}")
         return self.index_select(idxs)
 
     @torch.no_grad()
@@ -95,7 +95,7 @@ class GoMemoryBank:
 
         # normalize + cihaz
         new_embs = F.normalize(new_embs.float(), p=2, dim=1).to(self._embs.device, non_blocking=True)
-        if self._device_dtype is not None and self._embs.device.type == "cuda:0":
+        if self._device_dtype is not None and self._embs.device.type == "cuda":
             new_embs = new_embs.to(self._device_dtype)
 
         rows = self.to_local(ids, drop_missing=False)

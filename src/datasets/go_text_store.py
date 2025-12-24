@@ -60,14 +60,17 @@ class GoTextStore:
     # ---- pickle safety (avoid mmap/shm explosions with num_workers>0) ----
     def __getstate__(self):
         s = self.__dict__.copy()
-        # Drop big tensor cache before forking; workers rebuild lazily if needed
-        s['id2tok'] = {}
+        s["id2tok"] = {}
+        s["lazy"] = True  # ZORUNLU
         return s
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        if 'id2tok' not in self.__dict__ or self.id2tok is None:
+        if "id2tok" not in self.__dict__ or self.id2tok is None:
             self.id2tok = {}
+        # worker tarafında cache boşsa lazy olmalı
+        if len(self.id2tok) == 0:
+            self.lazy = True  # ZORUNLU
 
     # ---- internals ----
     def _encode(self, text: Optional[str]) -> Dict[str, torch.Tensor]:

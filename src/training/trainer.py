@@ -32,10 +32,18 @@ def ema_update(q: torch.nn.Module, k: torch.nn.Module, m: float):
     for p_q, p_k in zip(q.parameters(), k.parameters()):
         p_k.data.mul_(m).add_(p_q.data, alpha=1.0 - m)
 
-def entropy_regularizer(alpha: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def entropy_regularizer(alpha: torch.Tensor, mask: torch.Tensor | None = None, eps: float = 1e-8) -> torch.Tensor:
     a = alpha.clamp_min(eps)
-    ent = -(a * a.log()).sum(dim=-1)
+    ent = -(a * a.log()).sum(dim=-1)  # [...]
+    if mask is not None:
+        # mask: [B,L] -> expand to alpha dims and compute log(L_valid)
+        m = mask.to(a.dtype)
+        while m.dim() < a.dim():
+            m = m.unsqueeze(1)
+        L_valid = m.sum(dim=-1).clamp_min(1.0)
+        ent = ent / (L_valid.log() + eps)
     return ent.mean()
+
 
 def multi_positive_infonce_from_candidates(scores: torch.Tensor,
                                            pos_mask: torch.Tensor,
@@ -63,6 +71,111 @@ def multi_positive_infonce_from_candidates(scores: torch.Tensor,
     num = torch.logsumexp(pos_logits, dim=-1)  # (B,)
     loss = -(num - denom)
     return loss[pos_any].mean() if pos_any.any() else denom.mean() * 0.0
+
+@torch.no_grad()
+def delta_y_from_occlusion_windows(
+    H: torch.Tensor,                  # [B, L, Dh]
+    G_pos: torch.Tensor,              # [B, P, Dg]
+    model,                            # ProteinGoAligner
+    valid_mask: torch.Tensor | None = None,  # [B, L] bool
+    window: int = 32,
+    stride: int = 16,
+    mask_value: float = 0.0,
+    chunk_windows: int = 32,          # memory control
+) -> torch.Tensor:
+    """
+    Returns:
+      delta: [B, P, L]  (label-specific importance proxy)
+    Meaning:
+      delta[b,p,l] is proportional to drop in score for label p when masking windows covering residue l.
+    """
+
+    device = H.device
+    B, L, Dh = H.shape
+    _, P, _ = G_pos.shape
+
+    if valid_mask is not None and valid_mask.dtype != torch.bool:
+        valid_mask = valid_mask != 0
+
+    # 1) base scores: [B, P]
+    with torch.autocast(device_type="cuda", enabled=False):
+        base_scores = model(H=H, G=G_pos, mask=valid_mask, return_alpha=False)  # [B, P]
+        base_scores = base_scores.float()
+
+    # 2) define window starts
+    if L <= window:
+        starts = torch.tensor([0], device=device, dtype=torch.long)
+    else:
+        starts = torch.arange(0, L - window + 1, stride, device=device, dtype=torch.long)
+        if starts.numel() == 0:
+            starts = torch.tensor([0], device=device, dtype=torch.long)
+
+    # 3) accumulate deltas into [B, P, L]
+    delta = torch.zeros((B, P, L), device=device, dtype=torch.float32)
+    counts = torch.zeros((L,), device=device, dtype=torch.float32)  # how many windows cover each residue
+
+    # precompute coverage counts once (for normalization)
+    for s in starts.tolist():
+        e = min(L, s + window)
+        counts[s:e] += 1.0
+    counts = counts.clamp_min(1.0)  # avoid divide-by-zero
+
+    # 4) iterate windows in chunks
+    for ws in range(0, starts.numel(), chunk_windows):
+        we = min(starts.numel(), ws + chunk_windows)
+        cur_starts = starts[ws:we]  # [W]
+
+        W = int(cur_starts.numel())
+
+        # Build masked H batch: [B, W, L, Dh]
+        # We keep it explicit for clarity, then reshape to [B*W, L, Dh]
+        H_rep = H.unsqueeze(1).expand(B, W, L, Dh).contiguous()
+        if valid_mask is not None:
+            mask_rep = valid_mask.unsqueeze(1).expand(B, W, L).contiguous()
+        else:
+            mask_rep = None
+
+        # Apply masking windows
+        for i, s in enumerate(cur_starts.tolist()):
+            e = min(L, s + window)
+            H_rep[:, i, s:e, :] = mask_value
+            if mask_rep is not None:
+                # masked residues are effectively invalid for pooling
+                mask_rep[:, i, s:e] = False
+
+        H_flat = H_rep.view(B * W, L, Dh)
+        if mask_rep is not None:
+            mask_flat = mask_rep.view(B * W, L)
+        else:
+            mask_flat = None
+
+        # Repeat G_pos for each window: [B*W, P, Dg]
+        G_flat = G_pos.unsqueeze(1).expand(B, W, P, G_pos.size(-1)).contiguous().view(B * W, P, G_pos.size(-1))
+
+        # 5) masked scores
+        with torch.autocast(device_type="cuda", enabled=False):
+            masked_scores = model(H=H_flat, G=G_flat, mask=mask_flat, return_alpha=False)  # [B*W, P]
+            masked_scores = masked_scores.view(B, W, P).float()  # [B, W, P]
+
+        # 6) score drop: relu(base - masked) to keep only evidence of importance
+        drop = (base_scores.unsqueeze(1) - masked_scores).clamp_min(0.0)  # [B, W, P]
+        drop = drop.permute(0, 2, 1).contiguous()  # [B, P, W]
+
+        # 7) distribute each window’s drop over residues it covers
+        for i, s in enumerate(cur_starts.tolist()):
+            e = min(L, s + window)
+            # add contribution to all residues in window
+            delta[:, :, s:e] += drop[:, :, i].unsqueeze(-1)
+
+    # 8) normalize by coverage count and per-label max
+    delta = delta / counts.view(1, 1, L)
+    delta = delta / (delta.amax(dim=-1, keepdim=True) + 1e-8)
+
+    # Optionally zero out padding residues
+    if valid_mask is not None:
+        delta = delta * valid_mask.to(delta.dtype).unsqueeze(1)
+
+    return delta  # [B, P, L]
 
 
 
@@ -101,6 +214,27 @@ def surrogate_delta_y_from_mask_grad(H, G, model, mask=None, return_alpha=False)
         proxy = proxy / (proxy.amax(dim=-1, keepdim=True) + 1e-8)
 
     return proxy, alpha_info
+
+def build_dag_ancestors(dag_parents: dict[int, list[int]]) -> dict[int, list[int]]:
+    # child -> all ancestors (including itself)
+    memo: dict[int, list[int]] = {}
+
+    def dfs(x: int) -> list[int]:
+        if x in memo:
+            return memo[x]
+        out = {x}
+        for p in dag_parents.get(x, []):
+            out.update(dfs(int(p)))
+        memo[x] = list(out)
+        return memo[x]
+
+    # materialize for all keys (and parents that might not be keys)
+    nodes = set(dag_parents.keys())
+    for ps in dag_parents.values():
+        nodes.update(int(p) for p in ps)
+    for n in nodes:
+        dfs(int(n))
+    return memo
 
 
 def dag_consistency_loss_pos_ids(
@@ -219,7 +353,7 @@ class OppTrainer:
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
-
+        self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents)
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
@@ -282,15 +416,19 @@ class OppTrainer:
 
     # ----------------- basic helpers -----------------
     def _build_pos_go_ids(self, pos_local: List[torch.Tensor], uniq_go_ids: torch.Tensor) -> torch.Tensor:
+        device = self.device
         B = len(pos_local)
-        Pmax = max((int(x.numel()) for x in pos_local), default=1)
-        out = torch.full((B, Pmax), -1, dtype=torch.long, device=self.device)
+        Pmax = max((int(x.numel()) for x in pos_local), default=0)
+        out = torch.full((B, Pmax), -1, dtype=torch.long, device=device)
+        if Pmax == 0:
+            return out
+        uniq_go_ids = uniq_go_ids.to(device, non_blocking=True)
         for b, loc in enumerate(pos_local):
             t = int(loc.numel())
             if t <= 0:
                 continue
-            gids = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device)).to(self.device)
-            out[b, :t] = gids
+            loc = loc.to(device, non_blocking=True)
+            out[b, :t] = uniq_go_ids.index_select(0, loc)
         return out
 
     def _valid_and_pad_masks(self, batch):
@@ -312,15 +450,42 @@ class OppTrainer:
         device = self.device
         if ("pos_go_tokens" in batch) and (getattr(self.model, "go_encoder", None) is not None):
             toks = batch["pos_go_tokens"]
-            embs = self.model.go_encoder(
-                    input_ids=toks["input_ids"].to(device, non_blocking=True),
-                    attention_mask=toks["attention_mask"].to(device, non_blocking=True),
-                )
+            assert "input_ids" in toks and "attention_mask" in toks
+            assert toks["input_ids"].size(0) == batch["uniq_go_ids"].size(0), \
+                "pos_go_tokens must align 1:1 with uniq_go_ids order"
+
+            out = self.model.go_encoder(
+                input_ids=toks["input_ids"].to(device, non_blocking=True),
+                attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+            )
+            # unwrap
+            if isinstance(out, tuple):
+                embs = out[0]
+            elif isinstance(out, dict):
+                embs = out.get("pooler_output", None)
+                if embs is None:
+                    embs = out["last_hidden_state"][:, 0]  # CLS fallback
+            else:
+                embs = out
+
+            # enforce [G, Dg]
+            if embs.dim() == 3:
+                embs = embs[:, 0]  # CLS by default, or mean pool if you prefer
+            if embs.dim() != 2:
+                raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
+
         else:
             embs = batch["uniq_go_embs"].to(device, non_blocking=True)
+            if embs.dim() != 2:
+                raise RuntimeError(f"uniq_go_embs must be [G,D], got {tuple(embs.shape)}")
+
         embs = self.normalizer(embs, dim=1)
-        ids = batch["uniq_go_ids"].to(device, non_blocking=True)
-        return embs, ids  # [G,Dg], [G]
+        ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
+
+        if torch.unique(ids).numel() != ids.numel():
+             raise RuntimeError("uniq_go_ids contains duplicates")
+
+        return embs, ids
 
     @torch.no_grad()
     def _get_prot_query(self, H, attn_valid, Dg_batch: int):
@@ -345,29 +510,79 @@ class OppTrainer:
         if all_neg_vecs.size(1) != Dg_batch:
             raise RuntimeError(f"Queue D mismatch: {all_neg_vecs.size(1)} vs {Dg_batch}")
 
-        Kmat = self.normalizer(all_neg_vecs.to(self.device), dim=1)  # [K,Dg]
-        sims = prot_query @ Kmat.T  # [B,K]
-
-        # false-negative mask
+        device = self.device
+        # [K, Dg]
+        Kmat = self.normalizer(all_neg_vecs.to(device, non_blocking=True), dim=1)
+        # [B, K]
+        sims = prot_query @ Kmat.T
+        # ---- DAG-aware false-negative mask ----
         if all_neg_ids is not None:
-            ids_list = all_neg_ids.tolist()
-            mask = torch.zeros_like(sims, dtype=torch.bool)
-            for b, loc in enumerate(pos_local):
-                if loc.numel() == 0:
-                    continue
-                gids = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device)).tolist()
-                s = set(map(int, gids))
-                for j, gid in enumerate(ids_list):
-                    if gid in s:
-                        mask[b, j] = True
-            sims = sims.masked_fill(mask, float("-inf"))
+            if not torch.is_tensor(all_neg_ids):
+                all_neg_ids = torch.as_tensor(all_neg_ids, dtype=torch.long)
+            all_neg_ids = all_neg_ids.to(device, non_blocking=True).long()  # [K]
 
-        k = min(int(self.k_hard_queue), Kmat.size(0))
+            B = len(pos_local)
+            if B > 0:
+                Pmax = max((int(loc.numel()) for loc in pos_local), default=0)
+            else:
+                Pmax = 0
+
+            if Pmax > 0:
+                # Build base pos ids: [B, Pmax] (pad=-1)
+                pos_go_ids = torch.full((B, Pmax), -1, device=device, dtype=torch.long)
+                uniq_go_ids_dev = uniq_go_ids.to(device, non_blocking=True).long()
+
+                for b, loc in enumerate(pos_local):
+                    if loc.numel() == 0:
+                        continue
+                    loc = loc.to(device, non_blocking=True)
+                    gids = uniq_go_ids_dev.index_select(0, loc)
+                    t = int(gids.numel())
+                    if t > 0:
+                        pos_go_ids[b, :t] = gids
+
+                # Optionally expand with ancestors (guard even if you do propagation)
+                dag_anc = self.dag_ancestors  # dict[int, list[int]] or None
+                if dag_anc is not None:
+                    # Build expanded exclude ids per sample (small loop over B, OK)
+                    expanded: list[torch.Tensor] = []
+                    Emax = 0
+                    for b in range(B):
+                        ids = pos_go_ids[b]
+                        ids = ids[ids >= 0].tolist()
+                        if not ids:
+                            expanded.append(torch.empty(0, device=device, dtype=torch.long))
+                            continue
+                        s = set()
+                        for gid in ids:
+                            s.update(dag_anc.get(int(gid), [int(gid)]))
+                        ex = torch.as_tensor(list(s), device=device, dtype=torch.long)
+                        expanded.append(ex)
+                        Emax = max(Emax, int(ex.numel()))
+
+                    if Emax > 0:
+                        excl = torch.full((B, Emax), -1, device=device, dtype=torch.long)
+                        for b, ex in enumerate(expanded):
+                            if ex.numel() > 0:
+                                excl[b, : ex.numel()] = ex
+                        # vectorized compare: [B, Emax, 1] == [1, 1, K] -> [B, Emax, K] -> any -> [B, K]
+                        fn_mask = (excl.unsqueeze(-1) == all_neg_ids.view(1, 1, -1)).any(dim=1)
+                    else:
+                        fn_mask = None
+                else:
+                    # propagation-only mode: exclude just the pos ids
+                    fn_mask = (pos_go_ids.unsqueeze(-1) == all_neg_ids.view(1, 1, -1)).any(dim=1)
+
+                if fn_mask is not None:
+                    sims = sims.masked_fill(fn_mask, float("-inf"))
+
+        k = min(int(self.k_hard_queue), int(Kmat.size(0)))
         if k <= 0:
             return None
-        idx = sims.topk(k, dim=1).indices  # [B,k]
+
+        idx = sims.topk(k, dim=1).indices  # [B, k]
         neg = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
-        return neg  # [B,k,Dg]
+        return neg  # [B, k, Dg]
 
     def _build_candidates(self, uniq_go_embs, pos_local, neg_from_queue=None, *, max_inbatch: int | None = None):
         """
@@ -466,6 +681,8 @@ class OppTrainer:
         out = self.model(H=H, G=G, mask=mask, return_alpha=return_alpha,
                          cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
         sc, alpha = _unpack(out)
+        if G.dim() == 3:
+            assert sc.dim() == 2 and sc.size(0) == H.size(0), "forward_scores: bad score shape"
 
         return (sc, alpha) if return_alpha else sc
 
@@ -514,9 +731,18 @@ class OppTrainer:
         return G_eval, y_true
 
     # ----------------- training step -----------------
-    def step_losses(self, batch, epoch_idx: int):
+    def step_losses(self, batch, epoch_idx: int, debug: bool = False):
         self.model.train()
         device = self.device
+
+        # === SANITY CHECK ===
+        if debug:
+            if ("pos_go_tokens" in batch) and ("uniq_go_ids" in batch):
+                assert batch["pos_go_tokens"]["input_ids"].size(0) == batch["uniq_go_ids"].numel(), \
+                    "pos_go_tokens and uniq_go_ids size mismatch"
+            if "uniq_go_embs" in batch:
+                assert batch["uniq_go_embs"].size(0) == batch["uniq_go_ids"].numel(), \
+                    "uniq_go_embs and uniq_go_ids size mismatch"
 
         H = batch["prot_emb_pad"].to(device, non_blocking=True)
         attn_valid, pad_mask = self._valid_and_pad_masks(batch)
@@ -593,7 +819,16 @@ class OppTrainer:
         # attr + entropy
         if use_attr and alpha_info and ("alpha_full" in alpha_info):
             alpha = alpha_info["alpha_full"]
-            delta, _ = surrogate_delta_y_from_mask_grad(H, G_pos, self.model, mask=attn_valid, return_alpha=False)
+            delta = delta_y_from_occlusion_windows(
+                H=H.detach(),
+                G_pos=G_pos.detach(),
+                model=self.model,
+                valid_mask=attn_valid,
+                window=32,
+                stride=16,
+                mask_value=0.0,
+                chunk_windows=32,
+            )
             l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
             l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
         else:

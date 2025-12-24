@@ -143,23 +143,18 @@ class BioMedBERTEncoder(nn.Module):
         self.to(device)
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-            Returns pooled embeddings for a tokenized batch.
-        """
-        if input_ids.device != self.device:
-            input_ids = input_ids.to(self.device, non_blocking=False)
-        if attention_mask.device != self.device:
-            attention_mask = attention_mask.to(self.device, non_blocking=False)
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        H = out.last_hidden_state  # (B, L, H)
+        H = out.last_hidden_state  # [B, L, H]
+
         if self.use_attention_pool and self.attn_head is not None:
-            return self.attn_head(H=H,
-                                  input_ids=input_ids,
-                                  attention_mask=attention_mask,
+            return self.attn_head(H=H, input_ids=input_ids, attention_mask=attention_mask,
                                   token_weight_map=self._id_weight_map)
-        # fallback: masked mean
-        m = attention_mask.unsqueeze(-1).float()
-        return (H * m).sum(1) / m.sum(1).clamp(min=1e-6)
+
+        # masked mean pooling (stable)
+        mf = attention_mask.unsqueeze(-1).float()
+        Hf = H.float()
+        pooled = (Hf * mf).sum(1) / mf.sum(1).clamp_min(1.0)
+        return pooled
 
     # Inference
     @torch.no_grad()

@@ -39,8 +39,9 @@ class GoTokenAlignPooler(nn.Module):
         if valid_mask is not None:
             if valid_mask.dtype != torch.bool:
                 valid_mask = valid_mask != 0
-            logits = logits.masked_fill(~valid_mask.unsqueeze(1), -1e9)
+            logits = logits.masked_fill(~valid_mask.unsqueeze(1), float("-inf"))
 
+        logits = logits * (Hk.size(-1) ** -0.5)
         alpha = F.softmax(logits, dim=-1)              # [B,K,T]
         Z = torch.einsum("bkt,btd->bkd", alpha, H)     # [B,K,Dh]
 

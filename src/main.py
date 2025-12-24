@@ -402,10 +402,6 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         collate_fn=collate,
     )
     b = next(iter(train_loader))
-    #TODO: Erase
-    lens = [int(x.numel()) for x in b["pos_go_local"]]
-    print("[DBG] pos lens first20:", lens[:20], "any_pos:", any(l > 0 for l in lens))
-    # -----
     assert "protein_ids" in b and isinstance(b["protein_ids"], list) and len(b["protein_ids"]) == b["prot_emb_pad"].shape[0]
     val_loader = None
     if datasets.get("val") is not None:
@@ -992,6 +988,14 @@ def run_training(args, schedule: TrainSchedule):
 
     encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer, wandb_run=run)
+
+    b = next(iter(train_loader))
+    for i in range(20):
+        losses = trainer.step_losses(b, epoch_idx=0, debug=True)
+        print(i, {k: float(v) for k, v in losses.items()})
+        trainer.opt.zero_grad(set_to_none=True)
+        losses["total"].backward()
+        trainer.opt.step()
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")

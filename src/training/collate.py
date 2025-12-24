@@ -76,6 +76,8 @@ class ContrastiveEmbCollator:
         if len(pos_lists) > 0:
             uniq_go = torch.unique(torch.cat(pos_lists))
             uniq_go_embs = self.go_lookup(uniq_go.tolist())  # [G, Dg]
+            assert uniq_go_embs.size(0) == uniq_go.numel()
+
         else:
             uniq_go = torch.empty(0, dtype=torch.long)
             uniq_go_embs = torch.empty(0)
@@ -116,6 +118,10 @@ class ContrastiveEmbCollator:
         # over 'uniq_go_ids' is more deterministic and compute-friendly (G items).
         if self.go_text_store is not None and uniq_go.numel() > 0:
             pos_go_tokens = self.go_text_store.batch(uniq_go.tolist())  # dict of [G, L]
+
+        if pos_go_tokens is not None:
+            assert pos_go_tokens["input_ids"].size(0) == uniq_go.numel()
+            assert pos_go_tokens["attention_mask"].size(0) == uniq_go.numel()
 
         # ---------------- NEW: negative mining (IDs only) ----------------
         neg_go_ids: Optional[List[List[int]]] = None
