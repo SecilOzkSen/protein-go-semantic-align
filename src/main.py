@@ -862,7 +862,7 @@ def run_training(args, schedule: TrainSchedule):
 
 
     # Vector resources — FAISS YOK: sadece bank embs ile
-    vres = VectorResources(faiss_index=None, go_embs=go_cache.embs, device=device)
+    vres = VectorResources(go_embs=go_cache.embs, device=device)
 
     out_dir = Path(args.output_dir)
 

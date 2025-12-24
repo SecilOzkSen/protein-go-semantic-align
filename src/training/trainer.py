@@ -231,7 +231,7 @@ def build_dag_ancestors(dag_parents: dict[int, list[int]]) -> dict[int, list[int
     # materialize for all keys (and parents that might not be keys)
     nodes = set(dag_parents.keys())
     for ps in dag_parents.values():
-        nodes.update(int(p) for p in ps)
+        nodes.update(int(p[0]) for p in ps)
     for n in nodes:
         dfs(int(n))
     return memo
