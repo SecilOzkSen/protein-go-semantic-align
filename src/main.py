@@ -1142,19 +1142,34 @@ def run_training(args, schedule: TrainSchedule):
         # validation
         if val_loader is not None:
             logger.info("[eval-cache] materializing full GO cache for evaluation")
-            logger.info(f"[eval-debug] eval_id_list size: {len(training_context.eval_id_list)}")
+            eval_ids = list(map(int, training_context.eval_id_list))
+            logger.info(f"[eval-debug] eval_id_list size: {len(eval_ids)}")
+            try:
+                training_context.go_encoder.model.gradient_checkpointing_disable()
+            except Exception:
+                pass
 
-            eval_ids = training_context.eval_id_list
-            toks = go_text_store.batch(eval_ids)
+            trainer.model.go_encoder.eval()
+
+            bs = int(getattr(args, "eval_go_bs", 128))  # 256 veya 128 güvenli
+            out_cpu = []
 
             with torch.no_grad():
-                embs = go_encoder(
-                    input_ids=toks["input_ids"].to(device),
-                    attention_mask=toks["attention_mask"].to(device),
-                )
-            embs = F.normalize(embs, p=2, dim=1).cpu()
+                for s in range(0, len(eval_ids), bs):
+                    chunk_ids = eval_ids[s:s + bs]
+                    toks = go_text_store.batch(chunk_ids)
 
-            training_context.go_cache.update(eval_ids, embs)
+                    embs = trainer.model.go_encoder(
+                        input_ids=toks["input_ids"].to(device, non_blocking=True),
+                        attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+                    )
+
+                    embs = F.normalize(embs.float(), p=2, dim=1).cpu()
+                    out_cpu.append(embs)
+
+            new_embs = torch.cat(out_cpu, dim=0)  # [Geval, Dg] CPU
+            training_context.go_cache.update(eval_ids, new_embs)
+
             trainer._eval_cache_ready = False
             #VAL
             val_logs = trainer.eval_epoch(val_loader, epoch)
@@ -1316,6 +1331,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         queue_K=int(training.get("queue_K", 65536)),
         general_device=str(training.get("device", "cuda:0")),
         max_refresh_go=int(training.get("max_refresh_go", 5000)),
+        eval_go_bs=int(training.get("eval_go_bs", 256)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
