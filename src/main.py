@@ -990,13 +990,13 @@ def run_training(args, schedule: TrainSchedule):
     encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
     trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer, wandb_run=run)
 
-    b = next(iter(train_loader))
-    for i in range(20):
-        losses = trainer.step_losses(b, epoch_idx=0, debug=True)
-        print(i, {k: float(v) for k, v in losses.items()})
-        trainer.opt.zero_grad(set_to_none=True)
-        losses["total"].backward()
-        trainer.opt.step()
+ #   b = next(iter(train_loader))
+ #   for i in range(20):
+ #       losses = trainer.step_losses(b, epoch_idx=0, debug=True)
+ #       print(i, {k: float(v) for k, v in losses.items()})
+ #       trainer.opt.zero_grad(set_to_none=True)
+ #       losses["total"].backward()
+ #       trainer.opt.step()
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
@@ -1040,24 +1040,27 @@ def run_training(args, schedule: TrainSchedule):
                 except Exception as e:
                     logging.getLogger("wandb").warning("deferred previews failed: %r", e)
 
-            # A0'de GO cache SABİT, hiçbir refresh yok
-            if getattr(args, "ablation_id", None) == "A0":
-                pass
-            else:
+            if "seen_go_ids_prev" not in locals() or seen_go_ids_prev is None:
+                seen_go_ids_prev = set()
+
+            if getattr(args, "ablation_id", None) != "A0":
                 if len(seen_go_ids_prev) > 0:
-                    ids_to_update = sorted(set(int(i) for i in seen_go_ids_prev))
+                    ids_to_update = sorted({int(i) for i in seen_go_ids_prev})
+                    ids_to_update = ids_to_update[:args.max_refresh_go]  # örn 5000
+
                     toks = go_text_store.batch(ids_to_update)
+                    input_ids = toks["input_ids"].to(device, non_blocking=True)
+                    attn = toks["attention_mask"].to(device, non_blocking=True)
+
                     with torch.no_grad():
-                        new_embs = go_encoder(
-                            input_ids=toks['input_ids'].to(device),
-                            attention_mask=toks['attention_mask'].to(device)
-                        ).detach().cpu()
-                    new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
-                    training_context.go_cache.update(ids_to_update, new_embs)
+                        new_embs = go_encoder(input_ids=input_ids, attention_mask=attn)  # [N, Dg]
+                        new_embs = F.normalize(new_embs.float(), p=2, dim=1)  # stabilize
+
+                    training_context.go_cache.update(ids_to_update, new_embs.to("cpu", non_blocking=False))
+                    seen_go_ids_prev.clear()
 
         except Exception as _e:
-            logging.getLogger('bank').warning('Partial refresh failed: %r', _e)
-
+            logging.getLogger("bank").warning("Partial refresh failed: %r", _e)
 
         seen_go_ids = set()
         training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
@@ -1296,6 +1299,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         k_hard_queue=int(training.get("k_hard_queue", 128)),
         queue_K=int(training.get("queue_K", 65536)),
         general_device=str(training.get("device", "cuda:0")),
+        max_refresh_go=int(training.get("max_refresh_go", 5000)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
