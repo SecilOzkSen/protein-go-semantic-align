@@ -487,14 +487,44 @@ class OppTrainer:
 
         return embs, ids
 
+    def _get_Dz(self) -> int:
+        pp = self.model.proj_p
+        if hasattr(pp, "fc1"):
+            return int(pp.fc1.out_features)
+        if hasattr(pp, "weight"):
+            return int(pp.weight.size(0))
+        raise RuntimeError("Cannot infer Dz from proj_p")
+
     @torch.no_grad()
-    def _get_prot_query(self, H, attn_valid, Dg_batch: int):
-        v = self.ctx.vres.true_prot_vecs(H, attn_valid)  # [B, Dh]
-        if hasattr(self.ctx.vres, "project_queries_to_index"):
-            v = self.ctx.vres.project_queries_to_index(v)  # [B, Dg]
-        if v.size(1) != Dg_batch:
-            raise RuntimeError(f"prot_query dim mismatch: {v.size(1)} vs {Dg_batch}")
-        return self.normalizer(v, dim=1)
+    def _get_prot_query(self, H: torch.Tensor, attn_valid: torch.Tensor, Dz: int) -> torch.Tensor:
+        """
+        H: [B, T, Dh]
+        attn_valid: [B, T] bool
+        Return: prot_query [B, Dz] in the SAME space as queued vectors (Dz).
+        """
+        device = H.device
+        B, T, Dh = H.shape
+
+        # 1) masked mean pool -> [B, Dh]
+        if attn_valid is not None:
+            w = attn_valid.to(H.dtype).unsqueeze(-1)  # [B,T,1]
+            denom = w.sum(dim=1).clamp_min(1.0)  # [B,1]
+            h_pool = (H * w).sum(dim=1) / denom  # [B,Dh]
+        else:
+            h_pool = H.mean(dim=1)
+
+        # 2) project to Dz using the SAME projection head used in scoring
+        # model.proj_p: Dh -> Dz
+        q = self.model.proj_p(h_pool)  # [B,Dz]
+
+        # 3) normalize (cosine space)
+        q = self.normalizer(q, dim=1)  # [B,Dz]
+
+        # 4) hard safety
+        if q.size(1) != int(Dz):
+            raise RuntimeError(f"prot_query dim mismatch: got {q.size(1)} expected {Dz}")
+
+        return q
 
     @torch.no_grad()
     def _mine_queue_hard_negs(self, prot_query, pos_local, uniq_go_ids, Dg_batch: int):
@@ -512,7 +542,7 @@ class OppTrainer:
 
         device = self.device
         # [K, Dg]
-        Kmat = self.normalizer(all_neg_vecs.to(device, non_blocking=True), dim=1)
+        Kmat = all_neg_vecs
         # [B, K]
         sims = prot_query @ Kmat.T
         # ---- DAG-aware false-negative mask ----
@@ -754,7 +784,8 @@ class OppTrainer:
         if getattr(self.model, "go_encoder", None) is not None:
             assert "pos_go_tokens" in batch, "GO encoder present but pos_go_tokens missing, LoRA won't train"
         Dg_batch = int(uniq_go_embs.size(1))
-        self._maybe_init_queue(Dg_batch)
+        Dz = self._get_Dz()
+        self._maybe_init_queue(Dz)
 
         amp_ctx = torch.amp.autocast(
             device_type="cuda",
@@ -763,10 +794,10 @@ class OppTrainer:
 
         # queue miner varsa hard neg çıkar, yoksa None
         with torch.no_grad():
-            prot_query = self._get_prot_query(H, attn_valid, Dg_batch)
+            prot_query = self._get_prot_query(H, attn_valid, Dz)
             neg_from_queue = None
             if self.queue_miner is not None:
-                neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dg_batch)
+                neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dz)
 
         # candidates: in-batch + optional queue
         max_inbatch = None
@@ -871,6 +902,9 @@ class OppTrainer:
                         pos_vecs = embs_k.index_select(0, local_cat).detach()
                     else:
                         pos_vecs = uniq_go_embs.index_select(0, local_cat).detach()
+                    # enqueue after projection.
+                    pos_vecs = self.model.proj_g(pos_vecs)
+                    pos_vecs = self.normalizer(pos_vecs, dim=1)
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
                     self.queue_miner.enqueue(pos_vecs, pos_ids)
 

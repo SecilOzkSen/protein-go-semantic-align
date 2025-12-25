@@ -21,10 +21,10 @@ import argparse
 
 import wandb
 from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT, GO_INDEX
-from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore, VectorResources
+from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore
 from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
 from src.training.collate import ContrastiveEmbCollator, fused_collator
-from src.training.trainer import OppTrainer, ema_update
+from src.training.trainer import OppTrainer
 from src.configs.data_classes import (
     FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
@@ -862,7 +862,8 @@ def run_training(args, schedule: TrainSchedule):
 
 
     # Vector resources — FAISS YOK: sadece bank embs ile
-    vres = VectorResources(go_embs=go_cache.embs, device=device)
+  #  vres = VectorResources(go_embs=go_cache.embs, device=device)
+    vres = None
 
     out_dir = Path(args.output_dir)
 
@@ -913,10 +914,10 @@ def run_training(args, schedule: TrainSchedule):
 
         if prev_phase is None:
             training_context.current_phase = new_phase
-            try:
-                training_context.vres.set_backends(None, training_context.go_cache.embs)
-            except Exception:
-                pass
+        #    try:
+        #        training_context.vres.set_backends(None, training_context.go_cache.embs)
+        #    except Exception:
+        #        pass
             training_context.last_refresh_epoch = current_epoch
             training_context.last_refresh_reason = "init"
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
@@ -929,7 +930,7 @@ def run_training(args, schedule: TrainSchedule):
             new_go_cache = build_go_cache(new_go_path)
             training_context.go_cache = new_go_cache
             training_context.memory_bank = new_go_cache if args.use_go_memory_bank else None
-            training_context.vres.set_backends(None, training_context.go_cache.embs)
+        #    training_context.vres.set_backends(None, training_context.go_cache.embs)
 
             # GoTextStore fazı
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
