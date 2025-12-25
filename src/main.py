@@ -1142,6 +1142,7 @@ def run_training(args, schedule: TrainSchedule):
         # validation
         if val_loader is not None:
             logger.info("[eval-cache] materializing full GO cache for evaluation")
+            logger.info(f"[eval-debug] eval_id_list size: {len(training_context.eval_id_list)}")
 
             eval_ids = training_context.eval_id_list
             toks = go_text_store.batch(eval_ids)
@@ -1155,6 +1156,7 @@ def run_training(args, schedule: TrainSchedule):
 
             training_context.go_cache.update(eval_ids, embs)
             trainer._eval_cache_ready = False
+            #VAL
             val_logs = trainer.eval_epoch(val_loader, epoch)
             msg = " | ".join([f"{k}: {val_logs[k]:.4f}" for k in val_logs])
             logger.info(f"[val]   epoch {epoch} :: {msg}")

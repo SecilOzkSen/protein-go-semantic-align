@@ -717,23 +717,31 @@ class OppTrainer:
         return (sc, alpha) if return_alpha else sc
 
     # ----------------- eval space cache -----------------
+    @torch.no_grad()
     def _ensure_eval_cache(self):
-        missing = [int(g) for g in self.ctx.eval_id_list if int(g) not in self.ctx.go_cache.id2row]
-        print(f"[eval-cache] missing GO ids in go_cache: {len(missing)} / {len(self.ctx.eval_id_list)}")
-
         if self._eval_cache_ready:
             return
         if not (hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list):
             raise RuntimeError("ctx.eval_id_list missing")
+        eval_ids = [int(x) for x in self.ctx.eval_id_list]
+        device = self.device
 
-        eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long)  # CPU
-        rows = torch.as_tensor([self.ctx.go_cache.id2row[int(g)] for g in eval_ids.tolist()],
-                               dtype=torch.long, device=self.ctx.go_cache.embs.device)
-        G_once = self.ctx.go_cache.embs.index_select(0, rows).contiguous()  # bank device
-        # cache as attributes (avoid rebuilding every batch)
-        self.ctx._eval_ids_cpu = eval_ids
-        self.ctx._eval_G_once_bank = G_once
-        self.ctx._eval_id2col = {int(eval_ids[i].item()): i for i in range(eval_ids.numel())}
+        # 1) id2col
+        self._eval_ids_cpu = torch.as_tensor(eval_ids, dtype=torch.long)
+        self._eval_id2col = {gid: i for i, gid in enumerate(eval_ids)}
+
+        # 2) Build G_once WITHOUT go_cache (cap=5000 safe)
+        if ("go_text_store" not in vars(self.ctx)) or (self.ctx.go_text_store is None):
+            raise RuntimeError("ctx.go_text_store missing for eval GO encoding")
+
+        toks = self.ctx.go_text_store.batch(eval_ids)
+        G_once = self.model.go_encoder(
+            input_ids=toks["input_ids"].to(device, non_blocking=True),
+            attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+        )
+        G_once = self.normalizer(G_once, dim=1).contiguous()  # [Geval, Dg]
+
+        self._eval_G_once_bank = G_once
         self._eval_cache_ready = True
 
     def _build_eval_space(self, batch):
@@ -741,10 +749,10 @@ class OppTrainer:
         device = self.device
         B = batch["prot_emb_pad"].size(0)
 
-        eval_ids_cpu = self.ctx._eval_ids_cpu
-        id2col = self.ctx._eval_id2col
+        eval_ids_cpu = self._eval_ids_cpu
+        id2col = self._eval_id2col
 
-        G_once = self.ctx._eval_G_once_bank.to(device, non_blocking=True)  # [Geval,Dg]
+        G_once = self._eval_G_once_bank.to(device, non_blocking=True)  # [Geval,Dg]
         Geval, Dg = G_once.size()
         G_eval = G_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()
 
@@ -760,7 +768,7 @@ class OppTrainer:
                 j = id2col.get(int(g), None)
                 if j is not None:
                     y_true[b, j] = 1.0
-
+        print(f"[eval-debug] avg_pos_per_prot={float(y_true.sum(dim=1).mean().item()):.3f}")
         return G_eval, y_true
 
     # ----------------- training step -----------------
