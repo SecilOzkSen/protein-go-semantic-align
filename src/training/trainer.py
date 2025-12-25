@@ -718,6 +718,9 @@ class OppTrainer:
 
     # ----------------- eval space cache -----------------
     def _ensure_eval_cache(self):
+        missing = [int(g) for g in self.ctx.eval_id_list if int(g) not in self.ctx.go_cache.id2row]
+        print(f"[eval-cache] missing GO ids in go_cache: {len(missing)} / {len(self.ctx.eval_id_list)}")
+
         if self._eval_cache_ready:
             return
         if not (hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list):

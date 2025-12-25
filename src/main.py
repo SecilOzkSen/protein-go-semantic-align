@@ -1141,6 +1141,20 @@ def run_training(args, schedule: TrainSchedule):
 
         # validation
         if val_loader is not None:
+            logger.info("[eval-cache] materializing full GO cache for evaluation")
+
+            eval_ids = training_context.eval_id_list
+            toks = go_text_store.batch(eval_ids)
+
+            with torch.no_grad():
+                embs = go_encoder(
+                    input_ids=toks["input_ids"].to(device),
+                    attention_mask=toks["attention_mask"].to(device),
+                )
+            embs = F.normalize(embs, p=2, dim=1).cpu()
+
+            training_context.go_cache.update(eval_ids, embs)
+            trainer._eval_cache_ready = False
             val_logs = trainer.eval_epoch(val_loader, epoch)
             msg = " | ".join([f"{k}: {val_logs[k]:.4f}" for k in val_logs])
             logger.info(f"[val]   epoch {epoch} :: {msg}")
