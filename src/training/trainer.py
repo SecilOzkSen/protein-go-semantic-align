@@ -411,8 +411,11 @@ class OppTrainer:
         if wandb_run is None:
             raise RuntimeError("wandb_run must be passed explicitly")
         self.wandb_run = wandb_run
-
+        self.eval_id_list = ctx.eval_id_list
         self._eval_cache_ready = False
+        self._eval_ids_cpu = None
+        self._eval_G_once_cpu = None
+        self._eval_id2col = None
 
     # ----------------- basic helpers -----------------
     def _build_pos_go_ids(self, pos_local: List[torch.Tensor], uniq_go_ids: torch.Tensor) -> torch.Tensor:
@@ -719,44 +722,55 @@ class OppTrainer:
     # ----------------- eval space cache -----------------
     @torch.no_grad()
     def _ensure_eval_cache(self):
-        if self._eval_cache_ready:
+        if getattr(self, "_eval_cache_ready", False):
+            print("Eval cache not ready!")
             return
-        if not (hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list):
-            raise RuntimeError("ctx.eval_id_list missing")
+        if not hasattr(self, "eval_id_list") or not self.eval_id_list:
+            raise RuntimeError("trainer.eval_id_list missing. Set trainer.eval_id_list = eval_ids in main.")
+        if self.ctx is None or not hasattr(self.ctx, "go_cache"):
+            raise RuntimeError("trainer.ctx.go_cache missing")
 
-        self.eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long)  # CPU
+        eval_ids = [int(x) for x in self.eval_id_list]
 
-        missing = [int(g) for g in self.eval_ids.tolist() if int(g) not in self.ctx.go_cache.id2row]
+        # 1) go_cache'de var mı kontrol
+        missing = [g for g in eval_ids if int(g) not in self.ctx.go_cache.id2row]
         if missing:
-            raise RuntimeError(f"Eval ids not in go_cache. Missing {len(missing)}. Example {missing[:10]}")
+            raise RuntimeError(f"Eval ids not in go_cache. Missing {len(missing)}. Example: {missing[:10]}")
 
+        # 2) bank'ten rows çek, ama GPU'ya taşıma: CPU cache oluştur
         rows = torch.as_tensor(
-            [self.ctx.go_cache.id2row[int(g)] for g in self.eval_ids.tolist()],
+            [self.ctx.go_cache.id2row[int(g)] for g in eval_ids],
             dtype=torch.long,
-            device=self.ctx.go_cache.embs.device,
+            device=self.ctx.go_cache.embs.device
         )
-        G_once = self.ctx.go_cache.embs.index_select(0, rows).contiguous()  # bank device
+        G_bank = self.ctx.go_cache.embs.index_select(0, rows).contiguous()  # bank device
+        G_once_cpu = G_bank.detach().to("cpu", non_blocking=False).contiguous()  # CPU cache
 
-        self.ctx._eval_ids_cpu = self.eval_ids
-        self.ctx._eval_G_once_bank = G_once
-        self.ctx._eval_id2col = {int(self.eval_ids[i].item()): i for i in range(self.eval_ids.numel())}
+        # 3) mapping
+        eval_ids_cpu = torch.as_tensor(eval_ids, dtype=torch.long)  # CPU
+        id2col = {int(eval_ids_cpu[i].item()): i for i in range(eval_ids_cpu.numel())}
+
+        # 4) store on trainer
+        self._eval_ids_cpu = eval_ids_cpu
+        self._eval_G_once_cpu = G_once_cpu
+        self._eval_id2col = id2col
         self._eval_cache_ready = True
 
     def _build_eval_space(self, batch):
         self._ensure_eval_cache()
+
         device = self.device
         B = batch["prot_emb_pad"].size(0)
 
-        eval_ids_cpu = self._eval_ids_cpu
-        id2col = self._eval_id2col
-
-        G_once = self._eval_G_once_bank.to(device, non_blocking=True)  # [Geval,Dg]
+        # CPU cache -> GPU batch
+        G_once = self._eval_G_once_cpu.to(device, non_blocking=True)  # [Geval,Dg] on GPU
         Geval, Dg = G_once.size()
         G_eval = G_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()
 
         y_true = torch.zeros(B, Geval, dtype=torch.float32, device=device)
         uniq_go_ids = batch["uniq_go_ids"].to(device, non_blocking=True)
         pos_local = batch["pos_go_local"]
+        id2col = self._eval_id2col
 
         for b, loc in enumerate(pos_local):
             if loc.numel() == 0:
@@ -766,7 +780,7 @@ class OppTrainer:
                 j = id2col.get(int(g), None)
                 if j is not None:
                     y_true[b, j] = 1.0
-        print(f"[eval-debug] avg_pos_per_prot={float(y_true.sum(dim=1).mean().item()):.3f}")
+
         return G_eval, y_true
 
     # ----------------- training step -----------------
