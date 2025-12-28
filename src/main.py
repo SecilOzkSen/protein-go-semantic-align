@@ -902,6 +902,11 @@ def run_training(args, schedule: TrainSchedule):
     )
     fused_bank = materialize_fused_bank(query_loader, device=("cpu" if args.cpu else "cuda:0"))
     training_context.fused_bank = fused_bank
+    missing = [int(g) for g in training_context.eval_id_list if int(g) not in training_context.go_cache.id2row]
+    if missing:
+        raise RuntimeError(f"go_cache missing {len(missing)} eval GO ids, e.g. {missing[:10]}")
+
+     # Sanity check
 
     assert isinstance(fused_bank, dict) and {"ids", "vecs", "id2row"} <= fused_bank.keys()
     assert len(fused_bank["ids"]) == fused_bank["vecs"].shape[0] > 0, "fused bank boş/eksik"
@@ -1031,7 +1036,7 @@ def run_training(args, schedule: TrainSchedule):
     for epoch in range(args.epochs):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
-        # ---- Partial MemoryBank refresh using GO ids seen in the previous epoch ----
+        # ---- Partial MemoryBank refresh  ----
         try:
             if run is not None and epoch == 0 and global_step == 0:
                 try:
@@ -1043,21 +1048,28 @@ def run_training(args, schedule: TrainSchedule):
             if "seen_go_ids_prev" not in locals() or seen_go_ids_prev is None:
                 seen_go_ids_prev = set()
 
+            # ---- Partial MemoryBank refresh ----
             if getattr(args, "ablation_id", None) != "A0":
-                if len(seen_go_ids_prev) > 0:
-                    ids_to_update = sorted({int(i) for i in seen_go_ids_prev})
-                    ids_to_update = ids_to_update[:args.max_refresh_go]  # örn 5000
+                ids_eval = list(map(int, training_context.eval_id_list))
+                ids_seen = sorted(set(int(i) for i in seen_go_ids_prev)) if len(seen_go_ids_prev) > 0 else []
 
+                # eval ids are mandatory
+                ids_to_update = ids_eval + [i for i in ids_seen if i not in set(ids_eval)]
+
+                # enforce budget
+                max_r = int(getattr(args, "max_refresh_go", 5000))
+                if max_r > 0 and len(ids_to_update) > max_r:
+                    ids_to_update = ids_to_update[:max_r]
+
+                if len(ids_to_update) > 0:
                     toks = go_text_store.batch(ids_to_update)
-                    input_ids = toks["input_ids"].to(device, non_blocking=True)
-                    attn = toks["attention_mask"].to(device, non_blocking=True)
-
                     with torch.no_grad():
-                        new_embs = go_encoder(input_ids=input_ids, attention_mask=attn)  # [N, Dg]
-                        new_embs = F.normalize(new_embs.float(), p=2, dim=1)  # stabilize
-
-                    training_context.go_cache.update(ids_to_update, new_embs.to("cpu", non_blocking=False))
-                    seen_go_ids_prev.clear()
+                        new_embs = go_encoder(
+                            input_ids=toks["input_ids"].to(device, non_blocking=True),
+                            attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+                        ).detach().cpu()
+                    new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
+                    training_context.go_cache.update(ids_to_update, new_embs)
 
         except Exception as _e:
             logging.getLogger("bank").warning("Partial refresh failed: %r", _e)
@@ -1145,7 +1157,7 @@ def run_training(args, schedule: TrainSchedule):
             eval_ids = list(map(int, training_context.eval_id_list))
             logger.info(f"[eval-debug] eval_id_list size: {len(eval_ids)}")
             try:
-                training_context.go_encoder.model.gradient_checkpointing_disable()
+                trainer.model.go_encoder.gradient_checkpointing_disable()
             except Exception:
                 pass
 

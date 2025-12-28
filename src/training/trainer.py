@@ -723,25 +723,23 @@ class OppTrainer:
             return
         if not (hasattr(self.ctx, "eval_id_list") and self.ctx.eval_id_list):
             raise RuntimeError("ctx.eval_id_list missing")
-        eval_ids = [int(x) for x in self.ctx.eval_id_list]
-        device = self.device
 
-        # 1) id2col
-        self._eval_ids_cpu = torch.as_tensor(eval_ids, dtype=torch.long)
-        self._eval_id2col = {gid: i for i, gid in enumerate(eval_ids)}
+        self.eval_ids = torch.as_tensor(self.ctx.eval_id_list, dtype=torch.long)  # CPU
 
-        # 2) Build G_once WITHOUT go_cache (cap=5000 safe)
-        if ("go_text_store" not in vars(self.ctx)) or (self.ctx.go_text_store is None):
-            raise RuntimeError("ctx.go_text_store missing for eval GO encoding")
+        missing = [int(g) for g in self.eval_ids.tolist() if int(g) not in self.ctx.go_cache.id2row]
+        if missing:
+            raise RuntimeError(f"Eval ids not in go_cache. Missing {len(missing)}. Example {missing[:10]}")
 
-        toks = self.ctx.go_text_store.batch(eval_ids)
-        G_once = self.model.go_encoder(
-            input_ids=toks["input_ids"].to(device, non_blocking=True),
-            attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+        rows = torch.as_tensor(
+            [self.ctx.go_cache.id2row[int(g)] for g in self.eval_ids.tolist()],
+            dtype=torch.long,
+            device=self.ctx.go_cache.embs.device,
         )
-        G_once = self.normalizer(G_once, dim=1).contiguous()  # [Geval, Dg]
+        G_once = self.ctx.go_cache.embs.index_select(0, rows).contiguous()  # bank device
 
-        self._eval_G_once_bank = G_once
+        self.ctx._eval_ids_cpu = self.eval_ids
+        self.ctx._eval_G_once_bank = G_once
+        self.ctx._eval_id2col = {int(self.eval_ids[i].item()): i for i in range(self.eval_ids.numel())}
         self._eval_cache_ready = True
 
     def _build_eval_space(self, batch):
