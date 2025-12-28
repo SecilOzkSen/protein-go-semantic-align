@@ -517,6 +517,31 @@ def materialize_fused_bank(query_loader, *, device: str = "cpu"):
     logger.info("Fused bank built: N=%d, D=%d", vecs_cpu.size(0), vecs_cpu.size(1))
     return {"ids": ids_all, "vecs": vecs_cpu, "id2row": id2row}
 
+def refresh_go_cache_chunked(ids_to_update, go_text_store, go_encoder, go_cache, device, chunk_size=256):
+    ids_to_update = list(ids_to_update)
+    go_encoder.eval()
+    out_chunks = []
+
+    with torch.no_grad():
+        for s in range(0, len(ids_to_update), chunk_size):
+            chunk_ids = ids_to_update[s:s + chunk_size]
+            toks = go_text_store.batch(chunk_ids)
+
+            input_ids = toks["input_ids"].to(device, non_blocking=True)
+            attn = toks["attention_mask"].to(device, non_blocking=True)
+
+            embs = go_encoder(input_ids=input_ids, attention_mask=attn)  # [C, D]
+            embs = F.normalize(embs.float(), p=2, dim=1).to("cpu", non_blocking=False)
+
+            out_chunks.append(embs)
+
+            # kritik: peak mem düşür
+            del toks, input_ids, attn, embs
+            torch.cuda.empty_cache()
+
+    new_embs_cpu = torch.cat(out_chunks, dim=0)  # [N, D] on CPU
+    go_cache.update(ids_to_update, new_embs_cpu)
+
 
 def wandb_preview_curriculum(wandb_mod, args, total_steps: int):
     mode = args.curriculum_mode
@@ -1062,14 +1087,14 @@ def run_training(args, schedule: TrainSchedule):
                     ids_to_update = ids_to_update[:max_r]
 
                 if len(ids_to_update) > 0:
-                    toks = go_text_store.batch(ids_to_update)
-                    with torch.no_grad():
-                        new_embs = go_encoder(
-                            input_ids=toks["input_ids"].to(device, non_blocking=True),
-                            attention_mask=toks["attention_mask"].to(device, non_blocking=True),
-                        ).detach().cpu()
-                    new_embs = F.normalize(new_embs, p=2, dim=1).cpu()
-                    training_context.go_cache.update(ids_to_update, new_embs)
+                    refresh_go_cache_chunked(
+                        ids_to_update=ids_to_update,
+                        go_text_store=go_text_store,
+                        go_encoder=go_encoder,
+                        go_cache=training_context.go_cache,
+                        device=device,
+                        chunk_size=128
+                    )
 
         except Exception as _e:
             logging.getLogger("bank").warning("Partial refresh failed: %r", _e)
