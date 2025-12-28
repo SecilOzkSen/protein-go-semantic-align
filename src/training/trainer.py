@@ -723,8 +723,8 @@ class OppTrainer:
     @torch.no_grad()
     def _ensure_eval_cache(self):
         if getattr(self, "_eval_cache_ready", False):
-            print("Eval cache not ready!")
             return
+        print("Eval cache preparation...")
         if not hasattr(self, "eval_id_list") or not self.eval_id_list:
             raise RuntimeError("trainer.eval_id_list missing. Set trainer.eval_id_list = eval_ids in main.")
         if self.ctx is None or not hasattr(self.ctx, "go_cache"):
