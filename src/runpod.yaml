@@ -118,7 +118,7 @@ wandb:
 
 stores:
   train_ids_path: /workspace/data/training_ready/proteins/protein_train_ids.txt
-  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives_canonical.json
+  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives.json #pid_to_positives_canonical
   val_ids_path: /workspace/data/training_ready/proteins/protein_val_ids.txt
 
   embed_dir: /workspace/esm_output #ESM3b
