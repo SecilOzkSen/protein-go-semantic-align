@@ -696,7 +696,12 @@ def sanitize_dataset_with_go_text(train_ds, go_text_store) -> None:
     - train_ds.pids ve train_ds.is_fs'i yeniden yazar
     """
 
-    valid_ids: Set[int] = set(int(g) for g in go_text_store.id2tok.keys())
+    valid_ids: Set[int] = set(int(g) for g in go_text_store.id2text.keys())
+
+    if len(valid_ids) == 0:
+        raise RuntimeError(
+            "GoTextStore has empty id2text domain. Phase/text loading is broken."
+        )
 
     old_pids = list(train_ds.pids)
     new_pids: List[str] = []
