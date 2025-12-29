@@ -885,11 +885,6 @@ def run_training(args, schedule: TrainSchedule):
         cur_cfg = build_scheduler_cfg(args, n_spe)
         scheduler = CurriculumScheduler(cur_cfg)
 
-
-    # Vector resources — FAISS YOK: sadece bank embs ile
-  #  vres = VectorResources(go_embs=go_cache.embs, device=device)
-    vres = None
-
     out_dir = Path(args.output_dir)
 
     # Lightweight runtime context
@@ -898,7 +893,7 @@ def run_training(args, schedule: TrainSchedule):
         schedule=schedule,
         go_cache=go_cache,
         faiss_index=None,
-        vres=vres, #For similarity searches etc.
+        vres=None, #For similarity searches etc.
         memory_bank=memory_bank,
         current_phase=None,
         last_refresh_epoch=None,
@@ -944,10 +939,6 @@ def run_training(args, schedule: TrainSchedule):
 
         if prev_phase is None:
             training_context.current_phase = new_phase
-        #    try:
-        #        training_context.vres.set_backends(None, training_context.go_cache.embs)
-        #    except Exception:
-        #        pass
             training_context.last_refresh_epoch = current_epoch
             training_context.last_refresh_reason = "init"
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
@@ -960,8 +951,6 @@ def run_training(args, schedule: TrainSchedule):
             new_go_cache = build_go_cache(new_go_path)
             training_context.go_cache = new_go_cache
             training_context.memory_bank = new_go_cache if args.use_go_memory_bank else None
-        #    training_context.vres.set_backends(None, training_context.go_cache.embs)
-
             # GoTextStore fazı
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
 
