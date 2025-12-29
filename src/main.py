@@ -786,7 +786,7 @@ def sanity_check_go_text(train_ids, pid2pos, go_text_store):
         for g in gids:
             used_terms.add(int(g))
 
-    missing = [g for g in used_terms if g not in go_text_store.id2tok]
+    missing = [g for g in used_terms if g not in go_text_store.id2text]
     if missing:
         raise RuntimeError(
             f"GoTextStore is missing {len(missing)} GO ids, e.g. {missing[:10]}"
