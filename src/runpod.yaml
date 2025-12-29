@@ -132,4 +132,4 @@ stores:
   output_dir: /workspace/protein-go-align-outputs
   logs: /workspace/protein-go-align-logs
 
-  go_text_folder: /workspace/data/processed/go_terms/canonical #ablation 1
+  go_text_folder: /workspace/data/processed/go_terms/go_phases   #canonical #ablation 1
