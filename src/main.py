@@ -849,7 +849,7 @@ def run_training(args, schedule: TrainSchedule):
 
     # GoTextStore + dataloaders
     lazy = True if phase0 >=0 else False
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=lazy)
+    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=False, max_len=args.go_text_store_max_len)
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
@@ -1363,6 +1363,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         general_device=str(training.get("device", "cuda:0")),
         max_refresh_go=int(training.get("max_refresh_go", 5000)),
         eval_go_bs=int(training.get("eval_go_bs", 256)),
+        go_text_store_max_len=int(training.get("go_text_store_max_len", 512)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
