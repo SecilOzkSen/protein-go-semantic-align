@@ -1004,7 +1004,8 @@ class OppTrainer:
         self.model.eval()
         device = self.device
 
-        logs = {"cafa_fmax": 0.0, "cafa_aupr": 0.0}
+        logs = {"cafa_fmax": 0.0, "cafa_aupr": 0.0, "align_R@1": 0.0, "align_R@5": 0.0,
+                "align_R@10": 0.0, "align_MRR": 0.0, "align_nDCG@10": 0.0}
         n = 0
 
         preds, trues = [], []
