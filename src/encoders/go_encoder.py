@@ -106,7 +106,7 @@ class BioMedBERTEncoder(nn.Module):
                 p.requires_grad_(True)
 
         # Optional: add special tokens and keep id->weight map for attention bias
-        self._id_weight_map: Dict[int, float] = {}
+        self._id_weight_map: Dict[int, float] = {} #TODO: fill with special tokens if any
         if special_token_weights:
             # Ensure tokens exist in the vocab
             self.tokenizer.add_special_tokens({"additional_special_tokens": list(special_token_weights.keys())})
