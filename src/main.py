@@ -32,7 +32,7 @@ from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache
 from src.go import load_go_parents, load_go_children
 from src.utils import (
-    load_go_set, load_raw_json, load_raw_txt, load_go_texts_by_phase
+    load_go_set, load_raw_json, load_raw_txt, load_go_texts_by_phase, load_raw_pickle
 )
 from src.utils.checkpoint import save_checkpoint, load_checkpoint
 from src.encoders import BioMedBERTEncoder
@@ -323,6 +323,12 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
     pid2pos = load_raw_json(args.pid2pos)
     train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
     val_ids = load_raw_txt(PROTEIN_VAL_IDS)
+
+    # TODO: Debug! erase later.
+    test_pids = load_raw_pickle("/workspace/data/processed/test_ids.pkl")
+    assert len(set(train_ids) & set(val_ids)) == 0, "Train and Val sets overlap!"
+    assert len(set(train_ids) & set(test_pids)) == 0, "Train and Test sets overlap!"
+    assert len(set(val_ids) & set(test_pids)) == 0, "Val and Test sets overlap!"
 
     fused_dir = str(Path(args.embed_dir_fused))  # senin kullandığın yol
     have_fused = _collect_fused_ids(fused_dir)
