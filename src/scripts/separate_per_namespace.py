@@ -12,7 +12,7 @@ def namespace_converter(ns: str) -> str:
     }
     return ns_map.get(ns, "")
 
-def separate_terms_per_namespace(go_terms_pkl: Path = GO_TERMS_PKL) -> dict[str, Any]:
+def separate_terms_per_namespace(go_terms_pkl: Path = GO_TERMS_PKL):
     """
     Load GO terms from a pickle file and separate them by namespace.
 
