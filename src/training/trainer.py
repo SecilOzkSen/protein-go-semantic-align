@@ -11,6 +11,7 @@ from src.loss.attribution import attribution_loss, windowed_attr_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
 from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import compute_fmax, compute_term_aupr
+from src.metrics.retrieval import retrieval_metrics_from_scores
 
 # ------------- Helpers -------------
 def to_f32(x: torch.Tensor) -> torch.Tensor:
@@ -43,6 +44,54 @@ def entropy_regularizer(alpha: torch.Tensor, mask: torch.Tensor | None = None, e
         L_valid = m.sum(dim=-1).clamp_min(1.0)
         ent = ent / (L_valid.log() + eps)
     return ent.mean()
+
+import math
+import torch
+
+def multi_positive_infonce_from_candidates_v2(
+    scores: torch.Tensor,
+    pos_mask: torch.Tensor,
+    tau: float,
+    cand_valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    scores: (B, K)
+    pos_mask: (B, K) bool
+    cand_valid_mask: (B, K) bool, True=valid candidate
+    """
+    # safer math
+    tau = float(tau)
+    tau = tau if tau > 1e-8 else 1e-8
+
+    logits = (scores / tau).float()  # logsumexp stability
+
+    if cand_valid_mask is not None:
+        cand_valid_mask = cand_valid_mask.bool()
+        pos_mask = pos_mask.bool() & cand_valid_mask
+        logits = logits.masked_fill(~cand_valid_mask, -1e9)
+        valid_any = cand_valid_mask.any(dim=1)
+    else:
+        pos_mask = pos_mask.bool()
+        valid_any = torch.ones(logits.size(0), dtype=torch.bool, device=logits.device)
+
+    # denom
+    denom = torch.logsumexp(logits, dim=-1)  # (B,)
+
+    # numerator: log-mean-exp over positives
+    pos_any = pos_mask.any(dim=1) & valid_any
+    pos_count = pos_mask.sum(dim=1).clamp_min(1)  # avoid log(0)
+
+    pos_logits = logits.masked_fill(~pos_mask, -1e9)
+    num = torch.logsumexp(pos_logits, dim=-1) - pos_count.float().log()  # (B,)
+
+    # loss only where we have positives and at least one valid candidate
+    keep = pos_any
+    if keep.any():
+        loss = -(num - denom)
+        return loss[keep].mean()
+
+    # return 0 with correct dtype/device
+    return denom.mean() * 0.0
 
 
 def multi_positive_infonce_from_candidates(scores: torch.Tensor,
@@ -840,10 +889,11 @@ class OppTrainer:
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
 
             # 3) scale
-            scores_cand = scores_cand * self.logit_scale.exp().clamp(max=100.0)
+            logit_scale = self.logit_scale.clamp(min=-10.0, max=3.9)
+            scores_cand = scores_cand * logit_scale.exp()
 
             # 4) loss (pad candidate'ları mask’le)
-            l_con = multi_positive_infonce_from_candidates(
+            l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
                 pos_mask,
                 tau=1.0,
@@ -958,6 +1008,9 @@ class OppTrainer:
         n = 0
 
         preds, trues = [], []
+        sum_num = 0
+        sum_R1 = sum_R5 = sum_R10 = 0.0
+        sum_MRR = sum_nDCG = 0.0
 
         for batch in loader:
             H = batch["prot_emb_pad"].to(device, non_blocking=True)
@@ -968,14 +1021,24 @@ class OppTrainer:
             # build global eval space from cache
             G_eval, y_true = self._build_eval_space(batch)
             scores = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-            logit_scale = self.logit_scale.clamp(min=-10.0, max=10.0)
+            logit_scale = self.logit_scale.clamp(min=-10.0, max=3.9)
             scale = logit_scale.exp()
             scores = scores * scale
+            #Alignment metrics on raw scores
+            m = retrieval_metrics_from_scores(scores, y_true, ks=(1, 5, 10))
+            if m["num"] > 0:
+                sum_num += m["num"]
+                sum_R1 += m["R@1"] * m["num"]
+                sum_R5 += m["R@5"] * m["num"]
+                sum_R10 += m["R@10"] * m["num"]
+                sum_MRR += m["MRR"] * m["num"]
+                sum_nDCG += m["nDCG@10"] * m["num"]
+
             probs = torch.sigmoid(scores)
 
             preds.append(probs.cpu())
             trues.append(y_true.cpu())
-            n += 1
+            n += H.size(0)
 
         if preds:
             y_pred = torch.cat(preds, dim=0).numpy()
@@ -991,6 +1054,16 @@ class OppTrainer:
             aupr = compute_term_aupr(y_true, y_pred)
         else:
             fmax, aupr = 0.0, 0.0
+
+        if sum_num > 0:
+            logs["align_R@1"] = sum_R1 / sum_num
+            logs["align_R@5"] = sum_R5 / sum_num
+            logs["align_R@10"] = sum_R10 / sum_num
+            logs["align_MRR"] = sum_MRR / sum_num
+            logs["align_nDCG@10"] = sum_nDCG / sum_num
+        else:
+            logs["align_R@1"] = logs["align_R@5"] = logs["align_R@10"] = 0.0
+            logs["align_MRR"] = logs["align_nDCG@10"] = 0.0
 
         logs["cafa_fmax"] = float(fmax)
         logs["cafa_aupr"] = float(aupr)
