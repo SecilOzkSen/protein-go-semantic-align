@@ -330,6 +330,10 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
     assert len(set(train_ids) & set(test_pids)) == 0, "Train and Test sets overlap!"
     assert len(set(val_ids) & set(test_pids)) == 0, "Val and Test sets overlap!"
 
+    assert len(set(train_ids) ) == len(train_ids), "Train IDs contain duplicates!"
+    assert len(set(val_ids) ) == len(val_ids), "Val IDs contain duplicates!"
+    assert len(set(test_pids)) == len(test_pids), "Test IDs contain duplicates!"
+
     fused_dir = str(Path(args.embed_dir_fused))  # senin kullandığın yol
     have_fused = _collect_fused_ids(fused_dir)
 
