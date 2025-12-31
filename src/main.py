@@ -882,8 +882,10 @@ def run_training(args, schedule: TrainSchedule):
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     go_token_dropout = None
     if args.go_token_dropout:
+        special_tokens_to_protect = set(tid for tid in [go_encoder.tokenizer.pad_token_id, go_encoder.tokenizer.cls_token_id, go_encoder.tokenizer.sep_token_id] if tid is not None)
+        special_tokens_to_protect.update(go_encoder.tokenizer.additional_special_tokens_ids)
         go_dropout_config = GoDropoutConfig(enabled=True, p=0.08, pad_id=go_encoder.tokenizer.pad_token_id,
-                    protect_ids=go_encoder.tokenizer.special_tokens_map)
+                    protect_ids=tuple(special_tokens_to_protect))
         go_token_dropout = GoTokenDropout(go_dropout_config)
     train_loader, val_loader, query_loader = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
 
