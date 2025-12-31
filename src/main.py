@@ -384,13 +384,21 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
     except RuntimeError:
         pass
 
-    collate = ContrastiveEmbCollator(
+    train_collate = ContrastiveEmbCollator(
         go_lookup=go_cache,
         go_text_store=go_text_store, #tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
         neg_k=args.neg_k,
         go_dropout=go_dropout
+    )
+    val_collate = ContrastiveEmbCollator(
+        go_lookup=go_cache,
+        go_text_store=go_text_store,  # tokenizer
+        zs_mask_vec=zs_mask_vec,
+        bidirectional=True,
+        neg_k=args.neg_k,
+        go_dropout=None # dropout off
     )
 
     train_loader = DataLoader(
@@ -402,7 +410,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
 #        multiprocessing_context="forkserver",
         pin_memory=True,
     #    prefetch_factor=2,
-        collate_fn=collate,
+        collate_fn=train_collate,
     )
     b = next(iter(train_loader))
     assert "protein_ids" in b and isinstance(b["protein_ids"], list) and len(b["protein_ids"]) == b["prot_emb_pad"].shape[0]
@@ -415,7 +423,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             num_workers=0,
             persistent_workers=False,
             pin_memory=False,
-            collate_fn=collate,
+            collate_fn=val_collate,
 #            multiprocessing_context="forkserver",
             drop_last=False
         )
@@ -445,7 +453,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         )
 
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
-    return train_loader, val_loader, query_loader, collate
+    return train_loader, val_loader, query_loader
 
 
 def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
@@ -877,7 +885,7 @@ def run_training(args, schedule: TrainSchedule):
         go_dropout_config = GoDropoutConfig(enabled=True, p=0.08, pad_id=go_encoder.tokenizer.pad_token_id,
                     protect_ids=go_encoder.tokenizer.special_tokens_map)
         go_token_dropout = GoTokenDropout(go_dropout_config)
-    train_loader, val_loader, query_loader, collate = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
+    train_loader, val_loader, query_loader = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
 
     # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
     memory_bank = go_cache if args.use_go_memory_bank else None
@@ -968,8 +976,8 @@ def run_training(args, schedule: TrainSchedule):
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
 
             # Dataloader’ları yeniden kur
-            nonlocal train_loader, val_loader, collate, query_loader
-            train_loader, val_loader, query_loader, collate = build_dataloaders(datasets=datasets,
+            nonlocal train_loader, val_loader, query_loader
+            train_loader, val_loader, query_loader = build_dataloaders(datasets=datasets,
                                                                                 args=args,
                                                                                 go_cache=training_context.go_cache,
                                                                                 go_text_store=training_context.go_text_store,
