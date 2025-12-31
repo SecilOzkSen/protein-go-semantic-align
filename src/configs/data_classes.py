@@ -271,3 +271,4 @@ class TrainerConfig:
     fp16: bool = True
     monitor_metric: str = "cafa_fmax"
     monitor_mode: str = "max",
+    is_logit_scale_constant: bool = False

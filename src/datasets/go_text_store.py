@@ -48,13 +48,6 @@ class GoTextStore:
         self.phase = int(phase)
         self.id2text = self.full_id2text[self.phase]
 
-        #TODO - you should erase it!
-        keys = list(self.id2text.keys())
-        values = list(self.id2text.values())
-        import random
-        random.shuffle(values)
-        self.id2text = dict(zip(keys, values))
-
         # Token cache: {go_id: {"input_ids": T[L], "attention_mask": T[L]}}
         self.id2tok: Dict[int, Dict[str, torch.Tensor]] = {}
 
@@ -219,13 +212,6 @@ class GoTextStore:
             return
         self.phase = int(new_phase)
         self.id2text = self.full_id2text[self.phase]
-        #TODO - you should erase it!
-        keys = list(self.id2text.keys())
-        values = list(self.id2text.values())
-        import random
-        random.shuffle(values)
-        self.id2text = dict(zip(keys, values))
-        #TODO - you should erase it!
         # Clear previous phase cache to save RAM
         self.id2tok.clear()
         if not self.lazy:

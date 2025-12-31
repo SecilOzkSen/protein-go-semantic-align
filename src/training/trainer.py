@@ -1,8 +1,7 @@
-from typing import Dict, Any, List, Tuple, Optional
+from typing import List, Tuple, Optional
 import copy
 import torch
 import torch.nn.functional as F
-import time
 import math
 import re
 
@@ -44,9 +43,6 @@ def entropy_regularizer(alpha: torch.Tensor, mask: torch.Tensor | None = None, e
         L_valid = m.sum(dim=-1).clamp_min(1.0)
         ent = ent / (L_valid.log() + eps)
     return ent.mean()
-
-import math
-import torch
 
 def multi_positive_infonce_from_candidates_v2(
     scores: torch.Tensor,
@@ -420,6 +416,13 @@ class OppTrainer:
 
         init_ln = math.log(1.0 / 0.07)
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
+        if getattr(cfg, "is_logit_scale_constant", None) is not None and cfg.is_logit_scale_constant is True:
+            with torch.no_grad():
+                self.logit_scale.fill_(init_ln)
+            self.logit_scale.requires_grad_(False)
+            assert not self.logit_scale.requires_grad
+        else:
+            self.logit_scale.requires_grad_(True)
 
        # self.opt = torch.optim.AdamW(list(self.model.parameters()) + [self.logit_scale], lr=cfg.lr)
         # -------- Optimizer: split GO encoder LoRA params --------
@@ -829,6 +832,12 @@ class OppTrainer:
 
         return G_eval, y_true
 
+    def logit_scale_value(self) -> float:
+        if not self.cfg.logit_scale_constant:
+            return float(self.logit_scale.clamp(min=-10.0, max=3.9).exp())
+        else:
+            return float(self.logit_scale.exp())
+
     # ----------------- training step -----------------
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
         self.model.train()
@@ -886,8 +895,8 @@ class OppTrainer:
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
 
             # 3) scale
-            logit_scale = self.logit_scale.clamp(min=-10.0, max=3.9)
-            scores_cand = scores_cand * logit_scale.exp()
+            scale = self.logit_scale_value()
+            scores_cand = scores_cand * scale
 
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
@@ -1019,8 +1028,7 @@ class OppTrainer:
             # build global eval space from cache
             G_eval, y_true = self._build_eval_space(batch)
             scores = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-            logit_scale = self.logit_scale.clamp(min=-10.0, max=3.9)
-            scale = logit_scale.exp()
+            scale = self.logit_scale_value()
             scores = scores * scale
             #Alignment metrics on raw scores
             m = retrieval_metrics_from_scores(scores, y_true, ks=(1, 5, 10))
