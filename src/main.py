@@ -1156,7 +1156,11 @@ def run_training(args, schedule: TrainSchedule):
                         payload["train/lr"] = float(lr0)
                     # logit_scale faydalı
                     try:
-                        payload["train/logit_scale"] = float(trainer.logit_scale.detach().exp().clamp(max=100).item())
+                        raw = trainer.logit_scale.detach()
+                        clamped = raw.clamp(min=-10.0, max=3.9)
+                        payload["train/logit_scale_raw"] = float(raw.item())
+                        payload["train/logit_scale_clamped"] = float(clamped.item())
+                        payload["train/scale_used"] = float(clamped.exp().item())  # bu forward'da kullanılan
                     except Exception:
                         pass
                     wandb.log(payload, step=int(global_step))

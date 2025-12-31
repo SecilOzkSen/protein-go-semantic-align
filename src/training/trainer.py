@@ -807,25 +807,22 @@ class OppTrainer:
 
     def _build_eval_space(self, batch):
         self._ensure_eval_cache()
-
         device = self.device
         B = batch["prot_emb_pad"].size(0)
 
-        # CPU cache -> GPU batch
-        G_once = self._eval_G_once_cpu.to(device, non_blocking=True)  # [Geval,Dg] on GPU
+        # global eval GO matrix (Geval, Dg)
+        G_once = self._eval_G_once_cpu.to(device, non_blocking=True)
         Geval, Dg = G_once.size()
         G_eval = G_once.unsqueeze(0).expand(B, Geval, Dg).contiguous()
 
         y_true = torch.zeros(B, Geval, dtype=torch.float32, device=device)
-        uniq_go_ids = batch["uniq_go_ids"].to(device, non_blocking=True)
-        pos_local = batch["pos_go_local"]
         id2col = self._eval_id2col
 
-        for b, loc in enumerate(pos_local):
-            if loc.numel() == 0:
+        # use global ids directly (safe)
+        for b, gids in enumerate(batch["pos_go_global"]):
+            if gids.numel() == 0:
                 continue
-            gids = uniq_go_ids.index_select(0, loc.to(uniq_go_ids.device)).tolist()
-            for g in gids:
+            for g in gids.tolist():
                 j = id2col.get(int(g), None)
                 if j is not None:
                     y_true[b, j] = 1.0
