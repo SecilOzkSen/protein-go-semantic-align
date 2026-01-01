@@ -272,3 +272,4 @@ class TrainerConfig:
     monitor_metric: str = "cafa_fmax"
     monitor_mode: str = "max",
     is_logit_scale_constant: bool = False
+    go_pooling: str = "masked_mean"  # cls, mean, masked_mean

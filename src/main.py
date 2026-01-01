@@ -1012,6 +1012,7 @@ def run_training(args, schedule: TrainSchedule):
         k_hard_queue=args.k_hard_queue,
         queue_K=args.queue_K,
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
+        go_pooling=args.go_pooling
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1393,6 +1394,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         go_text_store_max_len=int(training.get("go_text_store_max_len", 512)),
         is_logit_scale_constant=bool(training.get("is_logit_scale_constant", False)),
         go_token_dropout=bool(training.get("go_token_dropout", False)),
+        go_pooling=str(training.get("go_pooling", "mean")),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

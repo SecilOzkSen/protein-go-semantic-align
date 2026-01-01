@@ -503,31 +503,63 @@ class OppTrainer:
 
     def _get_uniq_go_embs(self, batch):
         device = self.device
-        if ("pos_go_tokens" in batch) and (getattr(self.model, "go_encoder", None) is not None):
+        go_enc = getattr(self.model, "go_encoder", None)
+
+        if ("pos_go_tokens" in batch) and (go_enc is not None):
             toks = batch["pos_go_tokens"]
             assert "input_ids" in toks and "attention_mask" in toks
             assert toks["input_ids"].size(0) == batch["uniq_go_ids"].size(0), \
                 "pos_go_tokens must align 1:1 with uniq_go_ids order"
 
-            out = self.model.go_encoder(
-                input_ids=toks["input_ids"].to(device, non_blocking=True),
-                attention_mask=toks["attention_mask"].to(device, non_blocking=True),
-            )
+            input_ids = toks["input_ids"].to(device, non_blocking=True)
+            attn = toks["attention_mask"].to(device, non_blocking=True)
+
+            out = go_enc(input_ids=input_ids, attention_mask=attn)
+
             # unwrap
             if isinstance(out, tuple):
-                embs = out[0]
+                hidden = out[0]
             elif isinstance(out, dict):
-                embs = out.get("pooler_output", None)
-                if embs is None:
-                    embs = out["last_hidden_state"][:, 0]  # CLS fallback
+                hidden = out.get("last_hidden_state", None)
+                if hidden is None:
+                    # some models expose pooler_output
+                    pooled = out.get("pooler_output", None)
+                    if pooled is None:
+                        raise RuntimeError("go_encoder output missing last_hidden_state/pooler_output")
+                    hidden = pooled  # [G,D]
             else:
-                embs = out
+                hidden = out
 
-            # enforce [G, Dg]
-            if embs.dim() == 3:
-                embs = embs[:, 0]  # CLS by default, or mean pool if you prefer
-            if embs.dim() != 2:
-                raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
+            # ---- POOLING ----
+            pooling = getattr(self.cfg, "go_pooling", "cls")  # "cls" | "mean" | "masked_mean"
+
+            if hidden.dim() == 2:
+                embs = hidden  # already pooled [G,D]
+            elif hidden.dim() == 3:
+                # hidden: [G, L, D]
+                if pooling == "cls":
+                    embs = hidden[:, 0]  # CLS summary (since add_special_tokens default True)
+                else:
+                    # mean pooling with attention mask
+                    m = attn.to(hidden.dtype).unsqueeze(-1)  # [G,L,1]
+
+                    if pooling == "masked_mean":
+                        # remove special tokens from pooling
+                        special_ids = set(self.tokenizer.all_special_ids) if hasattr(self, "tokenizer") else set()
+                        # If you don't store tokenizer on trainer, use go_text_store.tokenizer:
+                        tok = getattr(self.ctx, "go_text_store", None)
+                        if tok is not None and hasattr(tok, "tokenizer"):
+                            special_ids = set(tok.tokenizer.all_special_ids)
+
+                        if len(special_ids) > 0:
+                            sid = torch.tensor(list(special_ids), device=device, dtype=input_ids.dtype)
+                            is_special = (input_ids.unsqueeze(-1) == sid.view(1, 1, -1)).any(dim=-1)  # [G,L]
+                            m = m * (~is_special).to(m.dtype).unsqueeze(-1)
+
+                    denom = m.sum(dim=1).clamp_min(1.0)  # [G,1]
+                    embs = (hidden * m).sum(dim=1) / denom  # [G,D]
+            else:
+                raise RuntimeError(f"go_encoder must return [G,D] or [G,L,D], got {tuple(hidden.shape)}")
 
         else:
             embs = batch["uniq_go_embs"].to(device, non_blocking=True)
@@ -538,7 +570,7 @@ class OppTrainer:
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
 
         if torch.unique(ids).numel() != ids.numel():
-             raise RuntimeError("uniq_go_ids contains duplicates")
+            raise RuntimeError("uniq_go_ids contains duplicates")
 
         return embs, ids
 
@@ -773,6 +805,95 @@ class OppTrainer:
 
     # ----------------- eval space cache -----------------
     @torch.no_grad()
+    def _ensure_eval_cache_v2(self, chunk=1024):
+        if getattr(self, "_eval_cache_ready", False):
+            return
+        print("Eval cache preparation...")
+        if not hasattr(self, "eval_id_list") or not self.eval_id_list:
+            raise RuntimeError("trainer.eval_id_list missing. Set trainer.eval_id_list = eval_ids in main.")
+        if self.ctx is None or not hasattr(self.ctx, "go_cache"):
+            raise RuntimeError("trainer.ctx.go_cache missing")
+
+        eval_ids = [int(x) for x in self.eval_id_list]
+
+        # 1) go_cache'de var mı kontrol (id list consistency)
+        missing = [g for g in eval_ids if int(g) not in self.ctx.go_cache.id2row]
+        if missing:
+            raise RuntimeError(f"Eval ids not in go_cache. Missing {len(missing)}. Example: {missing[:10]}")
+
+        # 2) mapping (CPU)
+        eval_ids_cpu = torch.as_tensor(eval_ids, dtype=torch.long)  # CPU
+        id2col = {int(eval_ids_cpu[i].item()): i for i in range(eval_ids_cpu.numel())}
+
+        # 3) Build eval GO embedding matrix ONCE
+        device = self.device
+
+        if self.model.go_encoder is not None:
+            # We want deterministic eval embeddings
+            was_training = self.model.go_encoder.training
+            self.model.go_encoder.eval()
+
+            # Need go_text_store for tokenization
+            if not hasattr(self.ctx, "go_text_store") or self.ctx.go_text_store is None:
+                raise RuntimeError("ctx.go_text_store is required to build eval cache with go_encoder")
+
+            toks = self.ctx.go_text_store.batch(eval_ids)  # dict: input_ids [Geval,L], attention_mask [Geval,L]
+
+            input_ids = toks["input_ids"]
+            attention_mask = toks["attention_mask"]
+
+            # Optional safety: ensure no dropout in eval tokens at collator level.
+            # Here we assume toks are clean.
+
+            # Encode in chunks to avoid OOM
+            embs_list = []
+            for s in range(0, input_ids.size(0), chunk):
+                e = min(input_ids.size(0), s + chunk)
+                out = self.model.go_encoder(
+                    input_ids=input_ids[s:e].to(device, non_blocking=True),
+                    attention_mask=attention_mask[s:e].to(device, non_blocking=True),
+                )
+
+                # unwrap outputs
+                if isinstance(out, tuple):
+                    embs = out[0]
+                elif isinstance(out, dict):
+                    embs = out.get("pooler_output", None)
+                    if embs is None:
+                        embs = out["last_hidden_state"][:, 0]
+                else:
+                    embs = out
+
+                if embs.dim() == 3:
+                    embs = embs[:, 0]
+                if embs.dim() != 2:
+                    raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
+
+                embs = self.normalizer(embs, dim=1)  # cosine space
+                embs_list.append(embs.detach().to("cpu", non_blocking=False).contiguous())
+
+            G_once_cpu = torch.cat(embs_list, dim=0).contiguous()
+
+            # restore
+            if was_training:
+                self.model.go_encoder.train()
+
+        else:
+            # Fallback: use precomputed cache embeddings (old behavior)
+            rows = torch.as_tensor(
+                [self.ctx.go_cache.id2row[int(g)] for g in eval_ids],
+                dtype=torch.long,
+                device=self.ctx.go_cache.embs.device
+            )
+            G_bank = self.ctx.go_cache.embs.index_select(0, rows).contiguous()
+            G_once_cpu = G_bank.detach().to("cpu", non_blocking=False).contiguous()
+
+        # 4) store on trainer
+        self._eval_ids_cpu = eval_ids_cpu
+        self._eval_G_once_cpu = G_once_cpu
+        self._eval_id2col = id2col
+        self._eval_cache_ready = True
+    @torch.no_grad()
     def _ensure_eval_cache(self):
         if getattr(self, "_eval_cache_ready", False):
             return
@@ -809,7 +930,8 @@ class OppTrainer:
         self._eval_cache_ready = True
 
     def _build_eval_space(self, batch):
-        self._ensure_eval_cache()
+        self._ensure_eval_cache_v2(chunk=256)
+        print("Eval G_once std:", float(self._eval_G_once_cpu.float().std().item()))
         device = self.device
         B = batch["prot_emb_pad"].size(0)
 

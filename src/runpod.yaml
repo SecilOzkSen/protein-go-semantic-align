@@ -64,6 +64,7 @@ training:
   go_text_store_max_len: 512 # batch size for storing go text embeddings
   is_logit_scale_constant: true #false = trainable logit scale
   go_token_dropout: true
+  go_pooling: "masked_mean" # cls, mean, masked_mean
 
 optim:
   lr: 0.0003
