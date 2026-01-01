@@ -350,42 +350,6 @@ def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = Fals
                 delta[b, t] = delta[b, t] / m
     return delta
 
-# ------------- Optim helpers -------------
-def _split_lora_params(module: torch.nn.Module) -> Tuple[List[torch.nn.Parameter], List[torch.nn.Parameter]]:
-    """
-    Returns: (lora_params, other_trainable_params) for the given module.
-    Heuristic based on parameter names to be framework-agnostic.
-    """
-    lora_params: List[torch.nn.Parameter] = []
-    other: List[torch.nn.Parameter] = []
-    if module is None:
-        return lora_params, other
-
-    for name, p in module.named_parameters():
-        if not p.requires_grad:
-            continue
-        n = name.lower()
-        if ("lora" in n) or ("adapter" in n) or re.search(r"\blora\b", n) is not None:
-            print(f"[Optimizer] LoRA param: {name}, shape={p.shape}")
-            lora_params.append(p)
-        else:
-            other.append(p)
-    return lora_params, other
-
-def _freeze_all_but_lora(module: torch.nn.Module):
-    """
-    Make sure we train LoRA only: freeze everything then unfreeze LoRA-like params.
-    Safe even if module already configured.
-    """
-    if module is None:
-        return
-    for _, p in module.named_parameters():
-        p.requires_grad_(False)
-    for name, p in module.named_parameters():
-        n = name.lower()
-        if ("lora" in n) or ("adapter" in n):
-            p.requires_grad_(True)
-
 # ------------- Trainer -------------
 class OppTrainer:
     def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None):
@@ -411,7 +375,6 @@ class OppTrainer:
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))
         self.go_encoder_k = None
         if getattr(self.model, "go_encoder", None) is not None:
-            _freeze_all_but_lora(self.model.go_encoder)
             self.go_encoder_k = clone_as_target(self.model.go_encoder).to(self.device)
 
         init_ln = math.log(1.0 / 0.07)
@@ -425,32 +388,41 @@ class OppTrainer:
             self.logit_scale.requires_grad_(True)
 
        # self.opt = torch.optim.AdamW(list(self.model.parameters()) + [self.logit_scale], lr=cfg.lr)
-        # -------- Optimizer: split GO encoder LoRA params --------
+        # -------- Optimizer: main + GO encoder param groups --------
         wd = float(getattr(cfg, "weight_decay", 0.01))
         lr_main = float(cfg.lr)
-        lr_lora = float(getattr(cfg, "lr_lora", lr_main * 0.1))
-        # Main params: everything trainable except GO encoder (we will add LoRA separately)
+
+        # Main params: everything trainable except go_encoder.*
         main_params: List[torch.nn.Parameter] = []
-        go_encoder = getattr(self.model, "go_encoder", None)
+
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            # if it belongs to go_encoder, skip here (LoRA group will handle)
-            if (go_encoder is not None) and name.startswith("go_encoder."):
+            # IMPORTANT: skip GO encoder here, it will be added via ge.param_groups_for_optimizer()
+            if (self.model.go_encoder is not None) and name.startswith("go_encoder."):
                 continue
             main_params.append(p)
 
-        lora_params, go_other_trainable = _split_lora_params(go_encoder) if go_encoder is not None else ([], [])
-        if len(go_other_trainable) > 0:
-            # This means base encoder params are still trainable, which we do NOT want in LoRA-only mode.
-            # Make it explicit to catch silent misconfig.
-            raise RuntimeError(f"GO encoder has non-LoRA trainable params ({len(go_other_trainable)}). "
-             "Freeze base encoder, only LoRA should be trainable.")
+        param_groups = [
+            {"params": main_params, "lr": lr_main, "weight_decay": wd},
+            {"params": [self.logit_scale], "lr": lr_main, "weight_decay": 0.0},
+        ]
 
-        param_groups = [{"params": main_params, "lr": lr_main, "weight_decay": wd},
-                        {"params": [self.logit_scale], "lr": lr_main, "weight_decay": 0.0}]
-        if len(lora_params) > 0:
-            param_groups.append({"params": lora_params, "lr": lr_lora, "weight_decay": 0.0})
+        # Add GO encoder groups (LoRA + embeddings + attn head), if present
+        if self.model.go_encoder is not None:
+            lr_lora = float(getattr(cfg, "lr_lora", lr_main * 0.1))
+            lr_emb = float(getattr(cfg, "lr_go_emb", lr_main * 0.5))
+            lr_attn = float(getattr(cfg, "lr_go_attn", lr_main * 0.1))
+
+            # BioMedBERTEncoder implements this
+            ge_groups = self.model.go_encoder.param_groups_for_optimizer(
+                lr_emb=lr_emb,
+                lr_lora=lr_lora,
+                wd_lora=0.01,
+                lr_attn=lr_attn,
+                wd_attn=0.0,
+            )
+            param_groups.extend(ge_groups)
 
         self.opt = torch.optim.AdamW(param_groups)
         self._global_step = 0
@@ -468,6 +440,12 @@ class OppTrainer:
         self._eval_ids_cpu = None
         self._eval_G_once_cpu = None
         self._eval_id2col = None
+        #TODO: Debug - erase later.
+        if self.model.go_encoder is not None:
+            trainables = [(n, p.shape) for n, p in self.model.named_parameters() if p.requires_grad]
+            print("TRAINABLE COUNT:", len(trainables))
+            for n, s in trainables[:50]:
+                print("  ", n, s)
 
     # ----------------- basic helpers -----------------
     def _build_pos_go_ids(self, pos_local: List[torch.Tensor], uniq_go_ids: torch.Tensor) -> torch.Tensor:
@@ -503,75 +481,32 @@ class OppTrainer:
 
     def _get_uniq_go_embs(self, batch):
         device = self.device
-        go_enc = getattr(self.model, "go_encoder", None)
 
-        if ("pos_go_tokens" in batch) and (go_enc is not None):
-            toks = batch["pos_go_tokens"]
-            assert "input_ids" in toks and "attention_mask" in toks
-            assert toks["input_ids"].size(0) == batch["uniq_go_ids"].size(0), \
-                "pos_go_tokens must align 1:1 with uniq_go_ids order"
-
-            input_ids = toks["input_ids"].to(device, non_blocking=True)
-            attn = toks["attention_mask"].to(device, non_blocking=True)
-
-            out = go_enc(input_ids=input_ids, attention_mask=attn)
-
-            # unwrap
-            if isinstance(out, tuple):
-                hidden = out[0]
-            elif isinstance(out, dict):
-                hidden = out.get("last_hidden_state", None)
-                if hidden is None:
-                    # some models expose pooler_output
-                    pooled = out.get("pooler_output", None)
-                    if pooled is None:
-                        raise RuntimeError("go_encoder output missing last_hidden_state/pooler_output")
-                    hidden = pooled  # [G,D]
-            else:
-                hidden = out
-
-            # ---- POOLING ----
-            pooling = getattr(self.cfg, "go_pooling", "cls")  # "cls" | "mean" | "masked_mean"
-
-            if hidden.dim() == 2:
-                embs = hidden  # already pooled [G,D]
-            elif hidden.dim() == 3:
-                # hidden: [G, L, D]
-                if pooling == "cls":
-                    embs = hidden[:, 0]  # CLS summary (since add_special_tokens default True)
-                else:
-                    # mean pooling with attention mask
-                    m = attn.to(hidden.dtype).unsqueeze(-1)  # [G,L,1]
-
-                    if pooling == "masked_mean":
-                        # remove special tokens from pooling
-                        special_ids = set(self.tokenizer.all_special_ids) if hasattr(self, "tokenizer") else set()
-                        # If you don't store tokenizer on trainer, use go_text_store.tokenizer:
-                        tok = getattr(self.ctx, "go_text_store", None)
-                        if tok is not None and hasattr(tok, "tokenizer"):
-                            special_ids = set(tok.tokenizer.all_special_ids)
-
-                        if len(special_ids) > 0:
-                            sid = torch.tensor(list(special_ids), device=device, dtype=input_ids.dtype)
-                            is_special = (input_ids.unsqueeze(-1) == sid.view(1, 1, -1)).any(dim=-1)  # [G,L]
-                            m = m * (~is_special).to(m.dtype).unsqueeze(-1)
-
-                    denom = m.sum(dim=1).clamp_min(1.0)  # [G,1]
-                    embs = (hidden * m).sum(dim=1) / denom  # [G,D]
-            else:
-                raise RuntimeError(f"go_encoder must return [G,D] or [G,L,D], got {tuple(hidden.shape)}")
-
-        else:
+        if self.model.go_encoder is None or ("pos_go_tokens" not in batch):
             embs = batch["uniq_go_embs"].to(device, non_blocking=True)
-            if embs.dim() != 2:
-                raise RuntimeError(f"uniq_go_embs must be [G,D], got {tuple(embs.shape)}")
+            ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
+            return self.normalizer(embs, dim=1), ids
+
+        toks = batch["pos_go_tokens"]
+        input_ids = toks["input_ids"].to(device, non_blocking=True)
+        attn = toks["attention_mask"].to(device, non_blocking=True)
+
+        out = self.model.go_encoder(input_ids=input_ids, attention_mask=attn)
+
+        # HF AutoModelOutput
+        hidden = out.last_hidden_state  # [G, L, D]
+
+        pooling = getattr(self.cfg, "go_pooling", "masked_mean")  # "cls" | "masked_mean"
+        if pooling == "cls":
+            embs = hidden[:, 0]
+        elif pooling == "masked_mean":
+            m = attn.to(hidden.dtype).unsqueeze(-1)  # [G,L,1]
+            embs = (hidden * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+        else:
+            raise ValueError(f"Unknown go_pooling={pooling}")
 
         embs = self.normalizer(embs, dim=1)
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
-
-        if torch.unique(ids).numel() != ids.numel():
-            raise RuntimeError("uniq_go_ids contains duplicates")
-
         return embs, ids
 
     def _get_Dz(self) -> int:

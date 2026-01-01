@@ -89,10 +89,11 @@ class BioMedBERTEncoder(nn.Module):
                                                use_safetensors=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.enable_lora = enable_lora
+        special_tokens_added = False
         if self.enable_lora and use_special_tokens:
             print("[INFO] Lora Enabled and Adding GO special tokens for LoRA training.")
             self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
-            self.model.resize_token_embeddings(len(self.tokenizer))
+            special_tokens_added = True
         if gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
@@ -110,12 +111,14 @@ class BioMedBERTEncoder(nn.Module):
         if special_token_weights:
             # Ensure tokens exist in the vocab
             self.tokenizer.add_special_tokens({"additional_special_tokens": list(special_token_weights.keys())})
-            self.model.resize_token_embeddings(len(self.tokenizer))
+            special_tokens_added = True
             # Build id->weight map
             for tok, w in special_token_weights.items():
                 tid = self.tokenizer.convert_tokens_to_ids(tok)
                 if tid != self.tokenizer.unk_token_id:  # keep even if newly added
                     self._id_weight_map[tid] = float(w)
+        if special_tokens_added:
+            self.model.resize_token_embeddings(len(self.tokenizer))
 
         # LoRA
         print("[INFO] LoRA enabled:", self.enable_lora)
@@ -133,14 +136,25 @@ class BioMedBERTEncoder(nn.Module):
                        )
             self.model = get_peft_model(self.model, self.lora_cfg, adapter_name=lora_parameters.adapter_name)
             for name, param in self.model.named_parameters():
-                if "lora_" not in name:
+                if "lora_" in name:
+                    param.requires_grad = True
+                else:
                     param.requires_grad = False
+
+            if use_special_tokens:
+                for name, param in self.model.named_parameters():
+                    if "embeddings.word_embeddings.weight" in name:
+                        param.requires_grad = True
             try:
                 self.model.print_trainable_parameters()
             except Exception:
                 pass
             assert isinstance(self.model, PeftModel), "[LoRA] get_peft_model failed; adapter not attached."
         self.to(device)
+        if use_special_tokens:
+            for tok in GO_SPECIAL_TOKENS:
+                tid = self.tokenizer.convert_tokens_to_ids(tok)
+                assert tid != self.tokenizer.unk_token_id, f"{tok} is UNK"
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
