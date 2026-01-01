@@ -833,7 +833,7 @@ class OppTrainer:
         return G_eval, y_true
 
     def logit_scale_value(self) -> float:
-        if not self.cfg.logit_scale_constant:
+        if not self.cfg.is_logit_scale_constant:
             return float(self.logit_scale.clamp(min=-10.0, max=3.9).exp())
         else:
             return float(self.logit_scale.exp())
