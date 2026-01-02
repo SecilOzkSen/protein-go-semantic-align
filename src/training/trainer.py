@@ -530,6 +530,11 @@ class OppTrainer:
 
         out = self.model.go_encoder(input_ids=input_ids, attention_mask=attn)
 
+        if self._global_step % 500 == 0:
+            self.ctx.logger.info(f"[debug] go_out_type={type(out)}")
+            self.ctx.logger.info(f"[debug] out_requires_grad={getattr(out, 'requires_grad', None)}")
+            self.ctx.logger.info(f"[debug] out_grad_fn={getattr(out, 'grad_fn', None)}")
+
         # BioMedBERTEncoder returns [G,D] already
         if isinstance(out, torch.Tensor):
             if out.dim() != 2:
@@ -560,7 +565,10 @@ class OppTrainer:
         else:
             raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
-    #    embs = self.normalizer(embs, dim=1)
+        embs = self.normalizer(embs, dim=1)
+        if self._global_step % 500 == 0:
+            self.ctx.logger.info(f"[debug] embs_requires_grad={embs.requires_grad}")
+            self.ctx.logger.info(f"[debug] embs_grad_fn={embs.grad_fn}")
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
         return embs, ids
 
