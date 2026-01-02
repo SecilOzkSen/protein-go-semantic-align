@@ -32,10 +32,6 @@ class GoMemoryBank:
             t = torch.as_tensor(init_embs)               # CPU/GPU olabilir
             self._cpu_mmap = None
 
-        t = t.float()                                    # normalize için güvenli
-        if not already_normalized:
-            t = F.normalize(t, p=2, dim=1)
-
         # SHARP: isteğe bağlı pin + half
         if to_device:
             if pin_memory and t.device.type == "cpu":
@@ -94,7 +90,7 @@ class GoMemoryBank:
             f"new_embs shape {tuple(new_embs.shape)} d={d} ile uyuşmuyor"
 
         # normalize + cihaz
-        new_embs = F.normalize(new_embs.float(), p=2, dim=1).to(self._embs.device, non_blocking=True)
+        new_embs = torch.as_tensor(new_embs).float().to(self._embs.device, non_blocking=True)
         if self._device_dtype is not None and self._embs.device.type == "cuda":
             new_embs = new_embs.to(self._device_dtype)
 
@@ -124,7 +120,7 @@ class GoLookupCache:
                  id2row: Optional[dict] = None,
                  row2id: Optional[Sequence[int]] = None,
                  device: str = "cpu",
-                 already_normalized: bool = False):
+                 already_normalized: bool = True):
 
         # Güvenli başlangıç
         _id2row = id2row

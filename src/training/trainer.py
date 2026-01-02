@@ -422,7 +422,7 @@ class OppTrainer:
 
         param_groups = [
             {"params": main_params, "lr": lr_main, "weight_decay": wd},
-            {"params": [self.logit_scale], "lr": lr_main, "weight_decay": 0.0},
+            {"params": [self.logit_scale], "lr": lr_main*0.05, "weight_decay": 0.0},
         ]
 
         # Add GO encoder groups (LoRA + embeddings + attn head), if present
@@ -522,7 +522,7 @@ class OppTrainer:
         if self.model.go_encoder is None or ("pos_go_tokens" not in batch):
             embs = batch["uniq_go_embs"].to(device, non_blocking=True)
             ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
-            return self.normalizer(embs, dim=1), ids
+            return embs, ids
 
         toks = batch["pos_go_tokens"]
         input_ids = toks["input_ids"].to(device, non_blocking=True)
@@ -565,10 +565,8 @@ class OppTrainer:
         else:
             raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
-        embs = self.normalizer(embs, dim=1)
-        if self._global_step % 500 == 0:
-            self.ctx.logger.info(f"[debug] embs_requires_grad={embs.requires_grad}")
-            self.ctx.logger.info(f"[debug] embs_grad_fn={embs.grad_fn}")
+        #embs = self.normalizer(embs, dim=1)
+        embs = torch.nan_to_num(embs)
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
         return embs, ids
 
@@ -879,7 +877,7 @@ class OppTrainer:
                 if embs.dim() != 2:
                     raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
 
-                embs = self.normalizer(embs, dim=1)  # cosine space
+             #   embs = self.normalizer(embs, dim=1)  # cosine space
                 embs_list.append(embs.detach().to("cpu", non_blocking=False).contiguous())
 
             G_once_cpu = torch.cat(embs_list, dim=0).contiguous()
@@ -966,7 +964,7 @@ class OppTrainer:
 
     def logit_scale_value(self) -> float:
         if not self.cfg.is_logit_scale_constant:
-            return float(self.logit_scale.clamp(min=-10.0, max=3.9).exp())
+            return float(self.logit_scale.clamp(min=-10.0, max=4.6).exp())
         else:
             return float(self.logit_scale.exp())
 
@@ -1110,23 +1108,26 @@ class OppTrainer:
                 local_idx_list = [loc.to(device) for loc in pos_local if loc.numel() > 0]
                 if local_idx_list:
                     local_cat = torch.unique(torch.cat(local_idx_list, dim=0))
-                 #   pos_vecs = uniq_go_embs.index_select(0, local_cat).detach()
-                    pos_vecs = None
-                    if("pos_go_tokens" in batch) and (self.go_encoder_k is not None):
+
+                    if ("pos_go_tokens" in batch) and (self.go_encoder_k is not None):
                         toks = batch["pos_go_tokens"]
-                        assert toks["input_ids"].size(0) == uniq_go_ids.size(
-                            0), "pos_go_tokens must align with uniq_go_ids order"
-                        embs_k = self.go_encoder_k(input_ids = toks["input_ids"].to(device, non_blocking=True),
-                            attention_mask = toks["attention_mask"].to(device, non_blocking=True))
-                        embs_k = self.normalizer(embs_k, dim=1)
-                        pos_vecs = embs_k.index_select(0, local_cat).detach()
+                        assert toks["input_ids"].size(0) == uniq_go_ids.size(0)
+
+                        pos_vecs = self.go_encoder_k(
+                            input_ids=toks["input_ids"].to(device, non_blocking=True),
+                            attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+                        )
+                        pos_vecs = pos_vecs.index_select(0, local_cat)  # raw encoder space
                     else:
-                        pos_vecs = uniq_go_embs.index_select(0, local_cat).detach()
-                    # enqueue after projection.
+                        pos_vecs = uniq_go_embs.index_select(0,
+                                                             local_cat)  # raw encoder space (trainer'da normalize yok artık)
+
+                    # enqueue in projected+normalized space
                     pos_vecs = self.model.proj_g(pos_vecs)
                     pos_vecs = self.normalizer(pos_vecs, dim=1)
+
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
-                    self.queue_miner.enqueue(pos_vecs, pos_ids)
+                    self.queue_miner.enqueue(pos_vecs.detach(), pos_ids)
 
         try:
             self.wandb_run.log(

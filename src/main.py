@@ -222,8 +222,6 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
         return GoLookupCache(blob)
 
     blob = torch.load(str(p), map_location="cpu", weights_only=False)
-    if isinstance(blob, dict) and "embs" in blob and isinstance(blob["embs"], torch.Tensor):
-        blob["embs"] = F.normalize(blob["embs"].float(), p=2, dim=1)
     return GoLookupCache(blob)
 
 
@@ -542,7 +540,7 @@ def refresh_go_cache_chunked(ids_to_update, go_text_store, go_encoder, go_cache,
             attn = toks["attention_mask"].to(device, non_blocking=True)
 
             embs = go_encoder(input_ids=input_ids, attention_mask=attn)  # [C, D]
-            embs = F.normalize(embs.float(), p=2, dim=1).to("cpu", non_blocking=False)
+        #    embs = F.normalize(embs.float(), p=2, dim=1).to("cpu", non_blocking=False)
 
             out_chunks.append(embs)
 
@@ -1142,23 +1140,6 @@ def run_training(args, schedule: TrainSchedule):
             # backward
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
-            #TODO Erase Later
-            from src.training.trainer import _sum_param_norm
-            from src.training.trainer import _sum_grad_norm
-            if global_step % 500 == 0:
-                go = getattr(trainer.model, "go_encoder", None)
-                if go is not None:
-                    gsum, gcnt = _sum_grad_norm(go, "lora_")
-                    psum, pcnt = _sum_param_norm(go, "lora_")
-                    logger.info(
-                        f"[debug] step={global_step} go_lora_grad_norm_sum={gsum:.4e} over {gcnt} "
-                        f"| go_lora_param_norm_sum={psum:.4e} over {pcnt}"
-                    )
-                    logger.info(
-                    f"[debug] step={global_step} logit_scale_exp={float(trainer.logit_scale.detach().exp().item()):.4f} "
-                    f"requires_grad={trainer.logit_scale.requires_grad}"
-                )
-            #TODO: Erase Later!
 
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
@@ -1241,7 +1222,7 @@ def run_training(args, schedule: TrainSchedule):
                         attention_mask=toks["attention_mask"].to(device, non_blocking=True),
                     )
 
-                    embs = F.normalize(embs.float(), p=2, dim=1).cpu()
+                #    embs = F.normalize(embs.float(), p=2, dim=1).cpu()
                     out_cpu.append(embs)
 
             new_embs = torch.cat(out_cpu, dim=0)  # [Geval, Dg] CPU
