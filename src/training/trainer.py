@@ -493,15 +493,12 @@ class OppTrainer:
 
         out = self.model.go_encoder(input_ids=input_ids, attention_mask=attn)
 
-        # HF AutoModelOutput
-        hidden = out.last_hidden_state  # [G, L, D]
-
         pooling = getattr(self.cfg, "go_pooling", "masked_mean")  # "cls" | "masked_mean"
         if pooling == "cls":
-            embs = hidden[:, 0]
+            embs = out[:, 0]
         elif pooling == "masked_mean":
-            m = attn.to(hidden.dtype).unsqueeze(-1)  # [G,L,1]
-            embs = (hidden * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+            m = attn.to(out.dtype).unsqueeze(-1)  # [G,L,1]
+            embs = (out * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
         else:
             raise ValueError(f"Unknown go_pooling={pooling}")
 

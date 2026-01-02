@@ -1,4 +1,3 @@
-# go_text_store.py
 
 from typing import Dict, List, Mapping, Optional, Iterable
 import os
@@ -26,75 +25,83 @@ class GoTextStore:
     """
 
     def __init__(
-        self,
-        full_id2text: Mapping[int, Mapping[int, str]],
-        tokenizer,
-        phase: int = 0,
-        max_len: int = 256,
-        lazy: bool = False,
-        chunk_log: int = 0,
+            self,
+            full_id2text: Mapping[int, Mapping[int, str]],
+            tokenizer,
+            phase: int = 0,
+            max_len: int = 256,
+            lazy: bool = True,  # keep default True so workers don't explode
+            chunk_log: int = 0,
     ):
         self.tokenizer = tokenizer
         self.max_len = int(max_len)
         self.lazy = bool(lazy)
         self.chunk_log = int(chunk_log)
 
-        # Keep keys as int to avoid mismatches; allow None->"[UNK]"
         self.full_id2text: Dict[int, Dict[int, str]] = {
             int(p): {int(k): (v or "") for k, v in d.items()} for p, d in full_id2text.items()
         }
 
-        # Current phase/text view
         self.phase = int(phase)
+        if self.phase not in self.full_id2text:
+            raise KeyError(f"phase={self.phase} not found in full_id2text keys={list(self.full_id2text.keys())[:5]}...")
+
         self.id2text = self.full_id2text[self.phase]
 
-        # Token cache: {go_id: {"input_ids": T[L], "attention_mask": T[L]}}
+        # {go_id: {"input_ids": [L], "attention_mask": [L]}}
         self.id2tok: Dict[int, Dict[str, torch.Tensor]] = {}
 
-        # Eager or lazy
+        # IMPORTANT: do not eager tokenize here, that is what caused double work.
+        # Main process should call materialize_tokens_once() explicitly.
         if not self.lazy:
+            # still support old behavior if someone sets lazy=False intentionally
             self._tokenize_all()
         else:
-            print("[GoTextStore] lazy mode: will tokenize on demand.")
+            print("[GoTextStore] lazy mode: will tokenize on demand (workers). Call materialize_tokens_once() on main.")
 
-    # ---- pickle safety (avoid mmap/shm explosions with num_workers>0) ----
+        # ---- pickle safety (avoid mmap/shm explosions with num_workers>0) ----
+
     def __getstate__(self):
         s = self.__dict__.copy()
+        # never ship full cache to workers
         s["id2tok"] = {}
-        s["lazy"] = True  # ZORUNLU
+        s["lazy"] = True  # force lazy in workers
         return s
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         if "id2tok" not in self.__dict__ or self.id2tok is None:
             self.id2tok = {}
-        # worker tarafında cache boşsa lazy olmalı
+        # if cache is empty, worker must be lazy
         if len(self.id2tok) == 0:
-            self.lazy = True  # ZORUNLU
+            self.lazy = True
 
-    # ---- internals ----
+        # ---- internals ----
+
     def _encode(self, text: Optional[str]) -> Dict[str, torch.Tensor]:
         txt = text if (text is not None and len(text) > 0) else "[UNK]"
         enc = self.tokenizer(
             txt,
             truncation=True,
             max_length=self.max_len,
-            padding="max_length",       # batch() kendi stack eder; boylar eşit
+            padding="max_length",
             return_tensors="pt",
+            return_attention_mask=True,
         )
         return {
-            "input_ids": enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
+            "input_ids": enc["input_ids"].squeeze(0).to(dtype=torch.long),
+            "attention_mask": enc["attention_mask"].squeeze(0).to(dtype=torch.long),
         }
 
     def _tokenize_all(self):
-        """Eager, single-thread (safe) encode of current phase."""
+        """Eager, single-thread encode of current phase (kept for backward compat)."""
         self.id2tok.clear()
         total = len(self.id2text)
         for i, (gid, text) in enumerate(self.id2text.items(), 1):
             self.id2tok[int(gid)] = self._encode(text)
             if self.chunk_log and (i % self.chunk_log == 0):
                 print(f"[GoTextStore] tokenized {i}/{total}")
+        self.lazy = False
         print("[GoTextStore] Tokenize ended (eager).")
 
     def _ensure_cached(self, gid: int) -> None:
@@ -104,34 +111,41 @@ class GoTextStore:
                 raise KeyError(f"GO id {gid} not found in phase {self.phase}.")
             self.id2tok[gid] = self._encode(self.id2text[gid])
 
-    # ---- fast batch pre-tokenization (recommended on Colab) ----
+        # ---- fast batch pre-tokenization (main process) ----
+
     @torch.no_grad()
     def batch_tokenize_phase(
-        self,
-        phase: Optional[int] = None,
-        batch_size: int = 512,
-        show_progress: bool = True,
-    ):
+            self,
+            phase: Optional[int] = None,
+            batch_size: int = 512,
+            show_progress: bool = True,
+            make_live_if_current: bool = True,
+    ) -> Dict[int, Dict[str, torch.Tensor]]:
         """
-        Batch-pretokenize a given phase (or current phase) on the main process.
-        Safer than lazy tokenization with multiple DataLoader workers.
+        Batch pretokenize a phase on MAIN process.
 
-        Stores into self.id2tok if phase == self.phase.
-        For other phases, returns a dict you can stash or ignore.
+        If make_live_if_current and ph == self.phase:
+          - self.id2tok is replaced
+          - self.lazy = False
+
+        Returns cache dict for requested phase.
         """
-        # Guard rails to avoid worker crashes in Colab
+        # Guard rails
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         os.environ["OMP_NUM_THREADS"] = "1"
         os.environ["MKL_NUM_THREADS"] = "1"
         torch.set_num_threads(1)
 
         ph = self.phase if phase is None else int(phase)
+        if ph not in self.full_id2text:
+            raise KeyError(f"phase={ph} not found in full_id2text")
+
         id2text = self.full_id2text[ph]
         total = len(id2text)
         if total == 0:
             return {} if ph != self.phase else self.id2tok
 
-        items = list(id2text.items())  # [(gid, text), ...]
+        items = list(id2text.items())
         steps = math.ceil(total / batch_size)
         rng: Iterable[int] = range(steps)
 
@@ -154,70 +168,78 @@ class GoTextStore:
                 texts,
                 truncation=True,
                 max_length=self.max_len,
-                padding="max_length",  # fixed length → easy stack
+                padding="max_length",
                 return_tensors="pt",
                 return_attention_mask=True,
             )
-            ids = enc["input_ids"]           # [B, L]
-            am  = enc["attention_mask"]      # [B, L]
+
+            ids = enc["input_ids"].to(dtype=torch.long)  # [B,L]
+            am = enc["attention_mask"].to(dtype=torch.long)  # [B,L]
 
             for i, g in enumerate(gids):
-                out_cache[g] = {
-                    "input_ids": ids[i].clone().to(dtype=torch.long),
-                    "attention_mask": am[i].clone().to(dtype=torch.long),
-                }
+                out_cache[g] = {"input_ids": ids[i].clone(), "attention_mask": am[i].clone()}
 
             if self.chunk_log and (((step + 1) * batch_size) % self.chunk_log == 0):
                 done = min((step + 1) * batch_size, total)
                 print(f"[GoTextStore] tokenized {done}/{total} (phase {ph})")
 
-        if ph == self.phase:
-            # make the cache live for current phase
+        if make_live_if_current and ph == self.phase:
             self.id2tok = out_cache
             self.lazy = False
+
         return out_cache
 
     @torch.no_grad()
     def materialize_tokens_once(
-        self,
-        phases: Optional[List[int]] = None,
-        batch_size: int = 512,
-        show_progress: bool = True,
+            self,
+            batch_size: int = 512,
+            show_progress: bool = True,
     ):
         """
-        One-shot pre-tokenization entry point.
-        - If phases=None: pretokenize ONLY current phase into self.id2tok (fast path).
-        - If phases=[...]: pretokenize listed phases; current phase goes to self.id2tok.
+        MAIN PROCESS ONLY: materialize current phase into self.id2tok exactly once.
+        This is the path you should use in your training startup.
         """
-        if phases is None:
-            self.batch_tokenize_phase(self.phase, batch_size=batch_size, show_progress=show_progress)
-            print("[GoTextStore] materialized current phase; lazy=False")
+        self.batch_tokenize_phase(self.phase, batch_size=batch_size, show_progress=show_progress,
+                                  make_live_if_current=True)
+        print(f"[GoTextStore] materialized phase {self.phase}; lazy=False")
+
+    # ---- public API ----
+    def update_phase(self, new_phase: int, materialize: bool = True, batch_size: int = 512, show_progress: bool = True):
+        """
+        Phase change:
+          - clears cache
+          - switches id2text view
+          - optionally materializes new phase on main
+        """
+        new_phase = int(new_phase)
+        if new_phase == self.phase:
             return
 
-        # explicit list of phases
-        for ph in phases:
-            cache = self.batch_tokenize_phase(ph, batch_size=batch_size, show_progress=show_progress)
-            if int(ph) == self.phase:
-                self.id2tok = cache
-        self.lazy = False
-        print(f"[GoTextStore] materialized phases {phases}; active phase={self.phase}")
+        if new_phase not in self.full_id2text:
+            raise KeyError(f"new_phase={new_phase} not found in full_id2text")
 
-    # ---- public API (kept compatible) ----
+        self.phase = new_phase
+        self.id2text = self.full_id2text[self.phase]
+        self.id2tok.clear()
+
+        # default: deterministic behavior, materialize now on main
+        if materialize:
+            self.batch_tokenize_phase(self.phase, batch_size=batch_size, show_progress=show_progress,
+                                      make_live_if_current=True)
+            print(f"[GoTextStore] switched to phase {self.phase} and materialized; lazy=False")
+        else:
+            # stay lazy
+            self.lazy = True
+            print(f"[GoTextStore] switched to phase {self.phase} (lazy=True)")
+
+    # Backward-compat names
     def tokenize(self):
-        """Backwards-compat alias: eager tokenize current phase."""
         self._tokenize_all()
 
     def update_phase_and_tokenize(self, new_phase: int):
-        if int(new_phase) == self.phase:
-            return
-        self.phase = int(new_phase)
-        self.id2text = self.full_id2text[self.phase]
-        # Clear previous phase cache to save RAM
-        self.id2tok.clear()
-        if not self.lazy:
-            self._tokenize_all()
-        else:
-            print(f"[GoTextStore] switched to phase {self.phase} (lazy mode).")
+        # old behavior was ambiguous based on lazy flag
+        # new behavior: switch and materialize deterministically (safe default)
+        self.update_phase(new_phase, materialize=True)
 
     def has(self, gid: int) -> bool:
         gid = int(gid)
@@ -238,10 +260,18 @@ class GoTextStore:
         attn_mask = torch.stack([self.id2tok[g]["attention_mask"] for g in gids], dim=0)
         return {"input_ids": input_ids, "attention_mask": attn_mask}
 
-    # ---- utilities ----
-    def set_max_len(self, max_len: int):
-        """Change max_len safely (clears cache; respects lazy/eager mode)."""
+    def set_max_len(self, max_len: int, materialize: bool = False, batch_size: int = 512, show_progress: bool = True):
+        """
+        Change max_len safely:
+          - clears cache
+          - optionally materialize current phase immediately
+        """
         self.max_len = int(max_len)
         self.id2tok.clear()
-        if not self.lazy:
-            self._tokenize_all()
+        if materialize:
+            self.materialize_tokens_once(batch_size=batch_size, show_progress=show_progress)
+        else:
+            # keep whatever mode you had, but cache is empty now
+            if not self.lazy:
+                # if previously eager, you probably want deterministic behavior
+                self.materialize_tokens_once(batch_size=batch_size, show_progress=show_progress)
