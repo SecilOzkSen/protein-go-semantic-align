@@ -1023,7 +1023,7 @@ class OppTrainer:
         max_inbatch = None
         if getattr(self.ctx, "scheduler", None) is not None:
             try:
-                max_inbatch = int(self.ctx.scheduler.shortlist_M)
+                max_inbatch = int(self.ctx.scheduler(self._global_step)["shortlist_M"])
             except Exception:
                 max_inbatch = None
 
