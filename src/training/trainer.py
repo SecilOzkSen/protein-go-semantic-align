@@ -349,24 +349,24 @@ def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = Fals
             if m > 0:
                 delta[b, t] = delta[b, t] / m
     return delta
+def _tstats(x: torch.Tensor, name: str):
+    if x is None:
+        print(f"[DBG] {name}=None")
+        return
+    xf = x.detach()
+    if xf.numel() == 0:
+        print(f"[DBG] {name}: empty shape={tuple(x.shape)} dtype={x.dtype} device={x.device}")
+        return
+    xf32 = xf.float()
+    nan = torch.isnan(xf32).any().item()
+    inf = torch.isinf(xf32).any().item()
+    mn = float(xf32.min().item())
+    mx = float(xf32.max().item())
+    mean = float(xf32.mean().item())
+    std = float(xf32.std(unbiased=False).item())
+    nrm = float(torch.linalg.vector_norm(xf32, dim=-1).mean().item()) if xf32.dim() >= 2 else float(torch.linalg.vector_norm(xf32).item())
+    print(f"[DBG] {name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} nan={nan} inf={inf} min={mn:.4g} max={mx:.4g} mean={mean:.4g} std={std:.4g} mean_norm={nrm:.4g}")
 
-def _sum_grad_norm(module, name_contains: str):
-    s = 0.0
-    c = 0
-    for n, p in module.named_parameters():
-        if (name_contains in n) and (p.grad is not None):
-            s += float(p.grad.detach().float().norm().item())
-            c += 1
-    return s, c
-
-def _sum_param_norm(module, name_contains: str):
-    s = 0.0
-    c = 0
-    for n, p in module.named_parameters():
-        if (name_contains in n):
-            s += float(p.detach().float().norm().item())
-            c += 1
-    return s, c
 # ------------- Trainer -------------
 class OppTrainer:
     def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None):
@@ -477,12 +477,16 @@ class OppTrainer:
         self._eval_ids_cpu = None
         self._eval_G_once_cpu = None
         self._eval_id2col = None
-        #TODO: Debug - erase later.
-        if self.model.go_encoder is not None:
-            trainables = [(n, p.shape) for n, p in self.model.named_parameters() if p.requires_grad]
-            print("TRAINABLE COUNT:", len(trainables))
-            for n, s in trainables[:50]:
-                print("  ", n, s)
+        # init sonrası bir kere
+        opt_params = set()
+        for g in self.opt.param_groups:
+            for p in g["params"]:
+                opt_params.add(id(p))
+
+        for name, p in self.model.named_parameters():
+            if ("pooler" in name or "proj_p" in name) and p.requires_grad:
+                in_opt = (id(p) in opt_params)
+                print("[OPTCHK]", name, "in_opt=", in_opt, "shape=", tuple(p.shape))
 
     # ----------------- basic helpers -----------------
     def _build_pos_go_ids(self, pos_local: List[torch.Tensor], uniq_go_ids: torch.Tensor) -> torch.Tensor:
@@ -529,11 +533,6 @@ class OppTrainer:
         attn = toks["attention_mask"].to(device, non_blocking=True)
 
         out = self.model.go_encoder(input_ids=input_ids, attention_mask=attn)
-
-        if self._global_step % 500 == 0:
-            self.ctx.logger.info(f"[debug] go_out_type={type(out)}")
-            self.ctx.logger.info(f"[debug] out_requires_grad={getattr(out, 'requires_grad', None)}")
-            self.ctx.logger.info(f"[debug] out_grad_fn={getattr(out, 'grad_fn', None)}")
 
         # BioMedBERTEncoder returns [G,D] already
         if isinstance(out, torch.Tensor):
@@ -628,6 +627,11 @@ class OppTrainer:
         Kmat = all_neg_vecs
         # [B, K]
         sims = prot_query @ Kmat.T
+        if getattr(self, "_global_step", 0) % 200 == 0:
+            frac_neginf = float(torch.isneginf(sims).float().mean().item())
+            frac_finite = float(torch.isfinite(sims).float().mean().item())
+            print(
+                f"[DBG] queue sims: frac_neginf={frac_neginf:.3f} frac_finite={frac_finite:.3f} K={int(sims.size(1))}")
         # ---- DAG-aware false-negative mask ----
         if all_neg_ids is not None:
             if not torch.is_tensor(all_neg_ids):
@@ -988,16 +992,10 @@ class OppTrainer:
             H = self.to_f32(H)
 
         pos_local = batch["pos_go_local"]
-        #TODO: Erase Later!
-        if self._global_step % 500 == 0:
-            has_tokens = ("pos_go_tokens" in batch) and (getattr(self.model, "go_encoder", None) is not None)
-            self.ctx.logger.info(
-                f"[debug] step={self._global_step} has_pos_go_tokens={has_tokens} "
-                f"uniq_go_ids={tuple(batch['uniq_go_ids'].shape)} "
-                f"{'pos_go_tokens_bs=' + str(tuple(batch['pos_go_tokens']['input_ids'].shape)) if 'pos_go_tokens' in batch else ''}"
-            )
-        #TODO: Erase Later!
         uniq_go_embs, uniq_go_ids = self._get_uniq_go_embs(batch)
+        if self._global_step % 200 == 0:
+            _tstats(uniq_go_embs, "uniq_go_embs(raw)")
+            print("[DBG] uniq_go_ids:", tuple(uniq_go_ids.shape), "uniq=", int(torch.unique(uniq_go_ids).numel()))
         if getattr(self.model, "go_encoder", None) is not None:
             assert "pos_go_tokens" in batch, "GO encoder present but pos_go_tokens missing, LoRA won't train"
         Dg_batch = int(uniq_go_embs.size(1))
@@ -1015,6 +1013,11 @@ class OppTrainer:
             neg_from_queue = None
             if self.queue_miner is not None:
                 neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dz)
+                if self._global_step % 200 == 0:
+                    if neg_from_queue is None:
+                        print("[DBG] neg_from_queue=None (queue empty or disabled)")
+                    else:
+                        _tstats(neg_from_queue, "neg_from_queue(Dz)")
 
         # candidates: in-batch + optional queue
         max_inbatch = None
@@ -1031,11 +1034,22 @@ class OppTrainer:
         with amp_ctx:
             # 2) scores
             scores_cand = self.forward_scores(H, G_cand, attn_valid, return_alpha=False)
+            if self._global_step % 200 == 0:
+                _tstats(scores_cand, "scores_cand(pre_scale)")
+                scale = self.logit_scale_value()
+                print(
+                    f"[DBG] logit_scale_exp={scale:.4g} requires_grad={bool(getattr(self.logit_scale, 'requires_grad', False))}")
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
 
             # 3) scale
             scale = self.logit_scale_value()
             scores_cand = scores_cand * scale
+            if self._global_step % 200 == 0:
+                _tstats(scores_cand, "scores_cand(post_scale)")
+                # pos var mı
+                pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
+                print(
+                    f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
 
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
@@ -1044,6 +1058,8 @@ class OppTrainer:
                 tau=1.0,
                 cand_valid_mask=cand_valid_mask,
             )
+            if self._global_step % 200 == 0:
+                print(f"[DBG] l_con={float(l_con.detach().item()):.4f}")
 
             if not torch.isfinite(l_con):
                 raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
@@ -1128,6 +1144,12 @@ class OppTrainer:
 
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
                     self.queue_miner.enqueue(pos_vecs.detach(), pos_ids)
+                    if self._global_step % 200 == 0:
+                        try:
+                            qn = int(self.queue_miner.ptr) if hasattr(self.queue_miner, "ptr") else -1
+                            print(f"[DBG] enqueue done. queue_ptr={qn}")
+                        except Exception as e:
+                            print("[DBG] enqueue done (ptr read failed):", repr(e))
 
         try:
             self.wandb_run.log(

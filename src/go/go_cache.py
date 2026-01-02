@@ -83,27 +83,31 @@ class GoMemoryBank:
     def update(self, ids: Sequence[int], new_embs: torch.Tensor) -> None:
         if not ids:
             return
-        # boyut/d eşleşmesi
+
         d = int(self._embs.size(1))
         new_embs = torch.as_tensor(new_embs)
         assert new_embs.dim() == 2 and new_embs.size(1) == d, \
             f"new_embs shape {tuple(new_embs.shape)} d={d} ile uyuşmuyor"
 
-        # normalize + cihaz
-        new_embs = torch.as_tensor(new_embs).float().to(self._embs.device, non_blocking=True)
-        if self._device_dtype is not None and self._embs.device.type == "cuda":
-            new_embs = new_embs.to(self._device_dtype)
+        # normalize in fp32 for safety
+        new_embs = F.normalize(new_embs.float(), p=2, dim=1)
+        new_embs = torch.nan_to_num(new_embs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # move to same device
+        new_embs = new_embs.to(self._embs.device, non_blocking=True)
+
+        # HARD RULE: match dtype of bank
+        if new_embs.dtype != self._embs.dtype:
+            new_embs = new_embs.to(self._embs.dtype)
 
         rows = self.to_local(ids, drop_missing=False)
         ok = rows >= 0
         if ok.any():
             self._embs.index_copy_(0, rows[ok], new_embs[ok])
 
-            # SHARP: memmap'e kalıcı yaz (isteğe bağlı)
             if self._persist_back and (self._cpu_mmap is not None):
-                # sadece güncellenen satırları CPU'ya çekip yaz
+                # write-back should be fp32 on CPU
                 cpu_block = new_embs[ok].to(dtype=torch.float32, device="cpu").contiguous()
-                # float16 memmap varsa, cast etmeyi unutma:
                 np_block = cpu_block.numpy()
                 for off, r in enumerate(rows[ok].tolist()):
                     self._cpu_mmap[r] = np_block[off]

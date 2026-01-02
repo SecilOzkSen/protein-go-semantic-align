@@ -1141,6 +1141,27 @@ def run_training(args, schedule: TrainSchedule):
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
 
+            if global_step % 200 == 0:
+                # proj_g grad
+                pg = trainer.model.proj_g
+                gnorm = 0.0
+                cnt = 0
+                for n, p in pg.named_parameters():
+                    if p.grad is not None:
+                        gnorm += float(p.grad.detach().float().norm().item());
+                        cnt += 1
+                print(f"[DBG] proj_g grad_norm_sum={gnorm:.4g} over {cnt}")
+
+                # go_encoder LoRA grad
+                if getattr(trainer.model, "go_encoder", None) is not None:
+                    s = 0.0;
+                    c = 0
+                    for n, p in trainer.model.go_encoder.named_parameters():
+                        if p.requires_grad and p.grad is not None and "lora_" in n:
+                            s += float(p.grad.detach().float().norm().item());
+                            c += 1
+                    print(f"[DBG] go_lora grad_norm_sum={s:.4g} over {c}")
+
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
                 torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), gc)

@@ -31,6 +31,7 @@ class ProteinGoAligner(nn.Module):
         self.mean_pool = bool(mean_pool)
         self.proj_p = ProjectionHead(d_in=d_h, d_out=d_z)
         self.proj_g = ProjectionHead(d_in=d_g, d_out=d_z)
+        self.protein_ln = nn.LayerNorm(d_h)
 
         self.pooler = None if self.mean_pool else GoTokenAlignPooler(d_h=d_h, d_g=d_g, d_att=att_d)
 
@@ -55,6 +56,8 @@ class ProteinGoAligner(nn.Module):
 
         B, T, Dh = H.shape
         _, K, Dg = G.shape
+
+        H = self.protein_ln(H)
 
         if self.mean_pool:
             # protein global mean pool, then score against all G
