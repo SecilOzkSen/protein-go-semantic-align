@@ -493,14 +493,35 @@ class OppTrainer:
 
         out = self.model.go_encoder(input_ids=input_ids, attention_mask=attn)
 
-        pooling = getattr(self.cfg, "go_pooling", "masked_mean")  # "cls" | "masked_mean"
-        if pooling == "cls":
-            embs = out[:, 0]
-        elif pooling == "masked_mean":
-            m = attn.to(out.dtype).unsqueeze(-1)  # [G,L,1]
-            embs = (out * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+        # BioMedBERTEncoder returns [G,D] already
+        if isinstance(out, torch.Tensor):
+            if out.dim() != 2:
+                raise RuntimeError(f"go_enc returned tensor with shape {tuple(out.shape)}, expected [G,D]")
+            embs = out
+        elif isinstance(out, tuple):
+            # if you ever return (pooled, attn) etc
+            embs = out[0]
+            if embs.dim() != 2:
+                raise RuntimeError(f"go_enc returned tuple[0] shape {tuple(embs.shape)}, expected [G,D]")
+        elif isinstance(out, dict):
+            # only if you ever swap in raw HF model
+            hidden = out.get("last_hidden_state", None)
+            pooled = out.get("pooler_output", None)
+            if pooled is not None:
+                embs = pooled
+            elif hidden is not None:
+                # if raw HF: choose pooling strategy here
+                pooling = getattr(self.cfg, "go_pooling", "cls")
+                if pooling == "cls":
+                    embs = hidden[:, 0]
+                else:
+                    m = attn.to(hidden.dtype).unsqueeze(-1)
+                    embs = (hidden * m).sum(1) / m.sum(1).clamp_min(1.0)
+            else:
+                raise RuntimeError("go_encoder dict output missing last_hidden_state/pooler_output")
+
         else:
-            raise ValueError(f"Unknown go_pooling={pooling}")
+            raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
         embs = self.normalizer(embs, dim=1)
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
