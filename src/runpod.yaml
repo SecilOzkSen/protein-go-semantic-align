@@ -57,8 +57,8 @@ training:
   early_stop_patience: 10        # 0 veya negatif => kapalı
   cand_chunk_k: 8
   pos_chunk_t: 128
-  k_hard_queue: 0 #32 #128
-  queue_K: 0 #2048 #8192
+  k_hard_queue: 32 #32 #128
+  queue_K: 16384 #2048 #8192
   max_refresh_go: 7500 # max go queue refresh per epoch - bc we do lora training!
   eval_go_bs: 128 # eval go batch size for go embedding extraction
   go_text_store_max_len: 512 # batch size for storing go text embeddings
