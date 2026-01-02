@@ -350,6 +350,23 @@ def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = Fals
                 delta[b, t] = delta[b, t] / m
     return delta
 
+def _sum_grad_norm(module, name_contains: str):
+    s = 0.0
+    c = 0
+    for n, p in module.named_parameters():
+        if (name_contains in n) and (p.grad is not None):
+            s += float(p.grad.detach().float().norm().item())
+            c += 1
+    return s, c
+
+def _sum_param_norm(module, name_contains: str):
+    s = 0.0
+    c = 0
+    for n, p in module.named_parameters():
+        if (name_contains in n):
+            s += float(p.detach().float().norm().item())
+            c += 1
+    return s, c
 # ------------- Trainer -------------
 class OppTrainer:
     def __init__(self, cfg: TrainerConfig, attr: AttrConfig, ctx, go_encoder, wandb_run=None):
@@ -425,6 +442,26 @@ class OppTrainer:
             param_groups.extend(ge_groups)
 
         self.opt = torch.optim.AdamW(param_groups)
+        # TODO - Erase later
+        go = getattr(self.model, "go_encoder", None)
+        if go is not None:
+            # kaç trainable param var
+            trainable = [(n, p) for n, p in go.named_parameters() if p.requires_grad]
+            self.ctx.logger.info(f"[debug] go_trainable_params={len(trainable)}")
+
+            # trainable isimlerinden ilk 10 tanesini yaz
+            for n, _ in trainable[:10]:
+                self.ctx.logger.info(f"[debug] go_trainable: {n}")
+
+            # optimizer param group’larında LoRA var mı?
+            nopt = 0
+            for gi, g in enumerate(self.opt.param_groups):
+                for p in g["params"]:
+                    if any(p is tp for _, tp in trainable):
+                        nopt += 1
+                        break
+            self.ctx.logger.info(f"[debug] opt_groups_touching_go_trainable={nopt} (should be >=1)")
+        # TODO: Erase Later
         self._global_step = 0
 
         self.use_moco_miner = bool(ctx.use_queue_miner)
@@ -523,7 +560,7 @@ class OppTrainer:
         else:
             raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
-        embs = self.normalizer(embs, dim=1)
+    #    embs = self.normalizer(embs, dim=1)
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
         return embs, ids
 
@@ -753,6 +790,18 @@ class OppTrainer:
         sc, alpha = _unpack(out)
         if G.dim() == 3:
             assert sc.dim() == 2 and sc.size(0) == H.size(0), "forward_scores: bad score shape"
+        #TODO: Erase later
+        if self._global_step % 500 == 0 and getattr(self.model, "go_encoder", None) is not None:
+            ge = self.model.go_encoder
+            g = None
+            for n, p in ge.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    g = p.grad.detach().float().abs().mean().item()
+                    print("[DEBUG] grad example:", n, g)
+                    break
+            if g is None:
+                print("[DEBUG] NO GRAD flowing into go_encoder trainables")
+        #TODO: Erase later
 
         return (sc, alpha) if return_alpha else sc
 
@@ -933,6 +982,15 @@ class OppTrainer:
             H = self.to_f32(H)
 
         pos_local = batch["pos_go_local"]
+        #TODO: Erase Later!
+        if self._global_step % 500 == 0:
+            has_tokens = ("pos_go_tokens" in batch) and (getattr(self.model, "go_encoder", None) is not None)
+            self.ctx.logger.info(
+                f"[debug] step={self._global_step} has_pos_go_tokens={has_tokens} "
+                f"uniq_go_ids={tuple(batch['uniq_go_ids'].shape)} "
+                f"{'pos_go_tokens_bs=' + str(tuple(batch['pos_go_tokens']['input_ids'].shape)) if 'pos_go_tokens' in batch else ''}"
+            )
+        #TODO: Erase Later!
         uniq_go_embs, uniq_go_ids = self._get_uniq_go_embs(batch)
         if getattr(self.model, "go_encoder", None) is not None:
             assert "pos_go_tokens" in batch, "GO encoder present but pos_go_tokens missing, LoRA won't train"

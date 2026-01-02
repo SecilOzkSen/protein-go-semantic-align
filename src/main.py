@@ -1142,6 +1142,22 @@ def run_training(args, schedule: TrainSchedule):
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
 
+            #TODO Erase Later
+            if global_step % 500 == 0:
+                go = getattr(trainer.model, "go_encoder", None)
+                if go is not None:
+                    gsum, gcnt = trainer._sum_grad_norm(go, "lora_")
+                    psum, pcnt = trainer._sum_param_norm(go, "lora_")
+                    logger.info(
+                        f"[debug] step={global_step} go_lora_grad_norm_sum={gsum:.4e} over {gcnt} "
+                        f"| go_lora_param_norm_sum={psum:.4e} over {pcnt}"
+                    )
+                    logger.info(
+                    f"[debug] step={global_step} logit_scale_exp={float(trainer.logit_scale.detach().exp().item()):.4f} "
+                    f"requires_grad={trainer.logit_scale.requires_grad}"
+                )
+            #TODO: Erase Later!
+
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
                 torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), gc)
