@@ -394,7 +394,7 @@ class OppTrainer:
         if getattr(self.model, "go_encoder", None) is not None:
             self.go_encoder_k = clone_as_target(self.model.go_encoder).to(self.device)
 
-        init_ln = math.log(1.0 / 0.07)
+        init_ln = math.log(10) #1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
         if getattr(cfg, "is_logit_scale_constant", None) is not None and cfg.is_logit_scale_constant is True:
             with torch.no_grad():
@@ -800,18 +800,6 @@ class OppTrainer:
         sc, alpha = _unpack(out)
         if G.dim() == 3:
             assert sc.dim() == 2 and sc.size(0) == H.size(0), "forward_scores: bad score shape"
-        #TODO: Erase later
-        if self._global_step % 500 == 0 and getattr(self.model, "go_encoder", None) is not None:
-            ge = self.model.go_encoder
-            g = None
-            for n, p in ge.named_parameters():
-                if p.requires_grad and p.grad is not None:
-                    g = p.grad.detach().float().abs().mean().item()
-                    print("[DEBUG] grad example:", n, g)
-                    break
-            if g is None:
-                print("[DEBUG] NO GRAD flowing into go_encoder trainables")
-        #TODO: Erase later
 
         return (sc, alpha) if return_alpha else sc
 
@@ -971,6 +959,26 @@ class OppTrainer:
             return float(self.logit_scale.clamp(min=-10.0, max=4.6).exp())
         else:
             return float(self.logit_scale.exp())
+
+    def debug_queue(self):
+        q = self.queue_miner
+        if q is None:
+            print("[QDBG] queue_miner=None")
+            return
+
+        print("[QDBG] queue shape:", tuple(q.queue.shape))  # (K, D)
+        print("[QDBG] queue dtype:", q.queue.dtype)
+        print("[QDBG] queue device:", q.queue.device)
+
+        if hasattr(q, "ptr"):
+            p = q.ptr.item() if torch.is_tensor(q.ptr) else int(q.ptr)
+            print("[QDBG] ptr:", p)
+
+        # queue içi gerçekten dolu mu?
+        with torch.no_grad():
+            norms = q.queue.float().norm(dim=1)
+            nonzero = (norms > 1e-6).sum().item()
+            print(f"[QDBG] nonzero rows: {nonzero}/{q.queue.size(0)}")
 
     # ----------------- training step -----------------
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
@@ -1145,11 +1153,7 @@ class OppTrainer:
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
                     self.queue_miner.enqueue(pos_vecs.detach(), pos_ids)
                     if self._global_step % 200 == 0:
-                        try:
-                            qn = int(self.queue_miner.ptr) if hasattr(self.queue_miner, "ptr") else -1
-                            print(f"[DBG] enqueue done. queue_ptr={qn}")
-                        except Exception as e:
-                            print("[DBG] enqueue done (ptr read failed):", repr(e))
+                        self.debug_queue()
 
         try:
             self.wandb_run.log(
