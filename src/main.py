@@ -932,7 +932,8 @@ def run_training(args, schedule: TrainSchedule):
         return_alpha = bool(args.return_alpha),
         fp16_enabled=args.fp16,
         pooling_strategy=args.pooling_strategy,
-        eval_id_list=eval_id_list
+        eval_id_list=eval_id_list,
+        logger=logger
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(

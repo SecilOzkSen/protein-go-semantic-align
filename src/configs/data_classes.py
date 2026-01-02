@@ -226,6 +226,7 @@ class TrainingContext:
     fused_bank: Any = None
     pooling_strategy: str = "mean"
     eval_id_list: List[int] = None
+    logger: Any = None
 
 
     def to_dict(self):
