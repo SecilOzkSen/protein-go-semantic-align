@@ -13,7 +13,7 @@ from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
 
 # DEBUG
-def dbg_batch_labels_once(batch, go_text_store, cand_idx, step: int, k: int = 2, show_text: int = 2):
+def dbg_batch_labels_once(batch, go_text_store, cand_go_global, step: int, k: int = 2, show_text: int = 0):
     if step != 0:
         return
 
@@ -22,56 +22,35 @@ def dbg_batch_labels_once(batch, go_text_store, cand_idx, step: int, k: int = 2,
         print("[DBG-LABEL] batch keys:", list(batch.keys()))
         return
 
+    if cand_go_global is None:
+        print("[DBG-LABEL] cand_go_global=None")
+        return
+
+    # cand_go_global -> 1D global gid list/tensor
+    if torch.is_tensor(cand_go_global):
+        cand_ids_t = cand_go_global.detach().cpu().long().flatten()
+    else:
+        cand_ids_t = torch.as_tensor(list(cand_go_global), dtype=torch.long)
+
+    cand_list = cand_ids_t.tolist()
+    cand_set = set(cand_list)
+
     pids = batch["protein_ids"]
     pos_local = batch["pos_go_local"]
-    uniq_go_ids = batch["uniq_go_ids"]
-
-    if cand_idx is None:
-        print("[DBG-LABEL] cand_idx=None")
-        return
-
-    # cand_idx -> 1D long CPU
-    if torch.is_tensor(cand_idx):
-        cand_idx_t = cand_idx.detach().cpu().long().flatten()
-    else:
-        cand_idx_t = torch.as_tensor(list(cand_idx), dtype=torch.long)
-
-    uniq_cpu = uniq_go_ids.detach().cpu().long()
-    G = int(uniq_cpu.numel())
-    if G == 0:
-        print("[DBG-LABEL] uniq_go_ids empty")
-        return
-
-    # ✅ clamp yok, yerine hard assert
-    if cand_idx_t.numel() > 0:
-        mn = int(cand_idx_t.min().item())
-        mx = int(cand_idx_t.max().item())
-        assert 0 <= mn and mx < G, f"[DBG-LABEL] cand_idx out of range: min={mn} max={mx} but G={G}"
-
-    cand_go_global = uniq_cpu.index_select(0, cand_idx_t)
-    cand_list = cand_go_global.tolist()
-    cand_set = set(cand_list)
+    uniq_go_ids = batch["uniq_go_ids"].detach().cpu().long()
 
     B = min(len(pids), len(pos_local), int(k))
     for i in range(B):
         pid = str(pids[i])
 
         loc = pos_local[i]
-        if torch.is_tensor(loc):
-            loc_cpu = loc.detach().cpu().long().flatten()
-        else:
-            loc_cpu = torch.as_tensor(list(loc), dtype=torch.long)
+        loc_cpu = loc.detach().cpu().long().flatten() if torch.is_tensor(loc) else torch.as_tensor(list(loc), dtype=torch.long)
 
-        # ✅ clamp yok, hard assert
-        if loc_cpu.numel() > 0:
-            mn = int(loc_cpu.min().item())
-            mx = int(loc_cpu.max().item())
-            assert 0 <= mn and mx < G, f"[DBG-LABEL] pos_local[{i}] out of range: min={mn} max={mx} but G={G}"
-
-        pos_go_global = uniq_cpu.index_select(0, loc_cpu).tolist() if loc_cpu.numel() > 0 else []
+        # local -> global (NO clamp)
+        pos_go_global = uniq_go_ids.index_select(0, loc_cpu).tolist() if loc_cpu.numel() > 0 else []
 
         pos_in = [g for g in pos_go_global if g in cand_set]
-        idxs = [cand_list.index(g) for g in pos_in]
+        idxs = [cand_list.index(g) for g in pos_in]  # candidate içindeki yerleri
 
         print(f"\n[DBG-LABEL] pid={pid}")
         print(f"pos_go_global[:10]={pos_go_global[:10]} (len={len(pos_go_global)})")
