@@ -13,12 +13,11 @@ from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
 
 # DEBUG
-def dbg_batch_labels_once(batch, go_text_store, step: int, k: int = 2):
+def dbg_batch_labels_once(batch, go_text_store, cand, step: int, k: int = 2):
     if step != 0:
         return
-    pids = batch.get("pid")
-    pos = batch.get("pos_go_ids")
-    cand = batch.get("cand_go_ids")
+    pids = batch.get("protein_ids")
+    pos = batch.get("uniq_go_ids")
     if pids is None or pos is None or cand is None:
         print("[DBG-LABEL] missing keys. need: pid, pos_go_ids, cand_go_ids")
         print("[DBG-LABEL] batch keys:", list(batch.keys()))
@@ -849,7 +848,7 @@ class OppTrainer:
             cand_valid_mask[:, U:U + kq] = True
             # pos_mask queue kısmında False kalmalı
 
-        return G_cand, pos_mask, cand_valid_mask
+        return G_cand, pos_mask, cand_valid_mask, cand_idx
 
     # ----------------- forward scoring -----------------
     def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
@@ -1138,7 +1137,7 @@ class OppTrainer:
             except Exception:
                 max_inbatch = None
 
-        G_cand, pos_mask, cand_valid_mask = self._build_candidates(
+        G_cand, pos_mask, cand_valid_mask, cand_idx = self._build_candidates(
             uniq_go_embs, pos_local, neg_from_queue, max_inbatch=max_inbatch
         )
 
@@ -1161,7 +1160,7 @@ class OppTrainer:
                 pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
                 print(
                     f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
-            dbg_batch_labels_once(batch, self.ctx.go_text_store, step=self._global_step, k=2)
+            dbg_batch_labels_once(batch, self.ctx.go_text_store, cand=cand_idx,step=self._global_step, k=2)
             dbg_topk_pos_once(scores_cand, batch, step=self._global_step, topk=10, i=0)
             dbg_cand_alignment_once(G_cand, batch, self.ctx.go_text_store, step=self._global_step, i=0, j=0)
 
