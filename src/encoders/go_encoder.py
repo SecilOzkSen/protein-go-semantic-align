@@ -9,7 +9,6 @@ from peft import LoraConfig, get_peft_model, PeftModel
 from src.configs.data_classes import LoRAParameters
 from src.configs.parameters import GO_SPECIAL_TOKENS
 
-
 class AttnPool(nn.Module):
     """
         Attention pooling that learns per-token importance and returns a single embedding.
@@ -88,6 +87,7 @@ class BioMedBERTEncoder(nn.Module):
         self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False,
                                                use_safetensors=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        old_vocab_size = len(self.tokenizer)
         self.enable_lora = enable_lora
         special_tokens_added = False
         if self.enable_lora and use_special_tokens:
@@ -140,11 +140,10 @@ class BioMedBERTEncoder(nn.Module):
                     param.requires_grad = True
                 else:
                     param.requires_grad = False
+            if use_special_tokens & special_tokens_added:
+                # Enable grad only for new tokens in embeddings
+                self._enable_new_token_grad_only(old_vocab_size)
 
-            if use_special_tokens:
-                for name, param in self.model.named_parameters():
-                    if "embeddings.word_embeddings.weight" in name:
-                        param.requires_grad = True
             try:
                 self.model.print_trainable_parameters()
             except Exception:
@@ -155,6 +154,29 @@ class BioMedBERTEncoder(nn.Module):
             for tok in GO_SPECIAL_TOKENS:
                 tid = self.tokenizer.convert_tokens_to_ids(tok)
                 assert tid != self.tokenizer.unk_token_id, f"{tok} is UNK"
+
+    def _enable_new_token_grad_only(self, old_vocab_size: int):
+        # PEFT kullanıyorsun, path doğru: base_model.model...
+        emb = self.model.base_model.model.embeddings.word_embeddings
+        W = emb.weight  # [V, H]
+
+        new_vocab = W.shape[0]
+        if new_vocab <= old_vocab_size:
+            print(f"[DBG] no new tokens to train: old={old_vocab_size} new={new_vocab}")
+            return
+
+        # eski satırlar donacak, yeni satırlar update alacak
+        W.requires_grad_(True)
+
+        # mask: [V, 1] ile broadcast
+        mask = torch.zeros((new_vocab, 1), device=W.device, dtype=W.dtype)
+        mask[old_vocab_size:new_vocab] = 1.0
+
+        # hook: backward sırasında grad’i maskele
+        W.register_hook(lambda g: g * mask)
+
+        print(
+            f"[DBG] embedding grad mask enabled. old={old_vocab_size}, new={new_vocab}, train_rows={new_vocab - old_vocab_size}")
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)

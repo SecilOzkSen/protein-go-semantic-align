@@ -12,6 +12,85 @@ from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
 
+# DEBUG
+def dbg_batch_labels_once(batch, go_text_store, step: int, k: int = 2):
+    if step != 0:
+        return
+    pids = batch.get("pid")
+    pos = batch.get("pos_go_ids")
+    cand = batch.get("cand_go_ids")
+    if pids is None or pos is None or cand is None:
+        print("[DBG-LABEL] missing keys. need: pid, pos_go_ids, cand_go_ids")
+        print("[DBG-LABEL] batch keys:", list(batch.keys()))
+        return
+
+    B = min(len(pids), k)
+    for i in range(B):
+        pid = int(pids[i])
+        pos_i = [int(x) for x in pos[i]]
+        cand_i = [int(x) for x in cand[i]]
+        pos_in = [g for g in pos_i if g in cand_i]
+        idxs = [cand_i.index(g) for g in pos_in]
+
+        print(f"\n[DBG-LABEL] pid={pid}")
+        print(f"pos_i[:10]={pos_i[:10]} (len={len(pos_i)})")
+        print(f"cand_i[:10]={cand_i[:10]} (len={len(cand_i)})")
+        print(f"pos_in[:10]={pos_in[:10]} idxs[:10]={idxs[:10]}")
+        for g in pos_in[:2]:
+            try:
+                txt = go_text_store.get_text_by_id(g)
+                print(f"GO {g} text: {txt[:120]}")
+            except Exception as e:
+                print(f"GO {g} text fetch failed: {e}")
+
+@torch.no_grad()
+def dbg_topk_pos_once(scores_cand, batch, step: int, topk: int = 10, i: int = 0):
+    if step != 0:
+        return
+    cand = batch.get("cand_go_ids")
+    pos = batch.get("pos_go_ids")
+    if cand is None or pos is None:
+        print("[DBG-TOPK] missing cand_go_ids / pos_go_ids")
+        return
+
+    s = scores_cand[i].float().detach().cpu()
+    cand_i = [int(x) for x in cand[i]]
+    pos_i = set(int(x) for x in pos[i])
+    pos_in = [g for g in cand_i if g in pos_i]
+
+    print(f"\n[DBG-TOPK] sample={i} pos_in_candidates={len(pos_in)}")
+    k = min(topk, s.numel())
+    vals, idxs = torch.topk(s, k=k)
+    for r in range(k):
+        j = int(idxs[r])
+        gid = cand_i[j]
+        tag = "POS" if gid in pos_i else ""
+        print(f"{r:02d} logit={float(vals[r]):+.4f} gid={gid} {tag}")
+
+@torch.no_grad()
+def dbg_cand_alignment_once(cand_go_embs, batch, go_text_store, step: int, j: int = 0, i: int = 0):
+    if step != 0:
+        return
+    cand = batch.get("cand_go_ids")
+    if cand is None:
+        print("[DBG-ALIGN] missing cand_go_ids")
+        return
+
+    cand_i = [int(x) for x in cand[i]]
+    gid = cand_i[j]
+
+    e1 = cand_go_embs[j].float()  # [D]
+    try:
+        e2 = go_text_store.get_emb_by_id(gid).to(e1.device).float()  # [D]
+    except Exception as e:
+        print(f"[DBG-ALIGN] store emb fetch failed gid={gid}: {e}")
+        return
+
+    e1 = F.normalize(e1, dim=-1)
+    e2 = F.normalize(e2, dim=-1)
+    cos = float((e1 * e2).sum().item())
+    print(f"\n[DBG-ALIGN] sample={i} cand_index={j} gid={gid} cos(e1,e2)={cos:.4f}")
+
 # ------------- Helpers -------------
 def to_f32(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.float32 else x.float()
@@ -1082,6 +1161,9 @@ class OppTrainer:
                 pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
                 print(
                     f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
+            dbg_batch_labels_once(batch, self.ctx.go_text_store, step=self._global_step, k=2)
+            dbg_topk_pos_once(scores_cand, batch, step=self._global_step, topk=10, i=0)
+            dbg_cand_alignment_once(G_cand, batch, self.ctx.go_text_store, step=self._global_step, i=0, j=0)
 
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
