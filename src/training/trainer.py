@@ -996,6 +996,28 @@ class OppTrainer:
 
         H = batch["prot_emb_pad"].to(device, non_blocking=True)
         attn_valid, pad_mask = self._valid_and_pad_masks(batch)
+
+        # TODO: Erase later
+        with torch.no_grad():
+            B, T, D = H.shape
+            mv = attn_valid.sum(dim=1)
+            print(f"[DBG] H: {tuple(H.shape)} {H.dtype} {H.device}")
+            print(f"[DBG] attn_valid.sum: min={int(mv.min())} mean={float(mv.float().mean()):.2f} max={int(mv.max())}")
+
+            hn = torch.linalg.vector_norm(H.float(), dim=-1)  # [B,T]
+            z = hn < 1e-12
+            print(
+                f"[DBG] H.norm tokenwise: min={float(hn.min()):.6f} mean={float(hn.mean()):.4f} max={float(hn.max()):.4f}")
+            print(f"[DBG] zero-token frac(all)={float(z.float().mean()):.6f} any={bool(z.any())}")
+
+            z_valid = z & attn_valid
+            print(f"[DBG] zero-token frac(valid)={float(z_valid.float().mean()):.6f} any_valid={bool(z_valid.any())}")
+
+            # pad tarafında sıfır normal olabilir, valid tarafında olmamalı
+            z_pad = z & (~attn_valid)
+            print(f"[DBG] zero-token frac(pad)={float(z_pad.float().mean()):.6f} any_pad={bool(z_pad.any())}")
+        # TODO end
+
         if self.to_f32 is not None:
             H = self.to_f32(H)
 
