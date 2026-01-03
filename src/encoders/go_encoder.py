@@ -173,7 +173,7 @@ class BioMedBERTEncoder(nn.Module):
         mask[old_vocab_size:new_vocab] = 1.0
 
         # hook: backward sırasında grad’i maskele
-        W.register_hook(lambda g: g * mask)
+        W.register_hook(lambda g: g * mask.to(device=g.device, dtype=g.dtype))
 
         print(
             f"[DBG] embedding grad mask enabled. old={old_vocab_size}, new={new_vocab}, train_rows={new_vocab - old_vocab_size}")
