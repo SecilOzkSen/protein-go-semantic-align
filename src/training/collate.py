@@ -127,15 +127,6 @@ class ContrastiveEmbCollator:
             assert pos_go_tokens["input_ids"].size(0) == uniq_go.numel()
             assert pos_go_tokens["attention_mask"].size(0) == uniq_go.numel()
 
-        # ---------------- NEW: negative mining (IDs only) ----------------
-        neg_go_ids: Optional[List[List[int]]] = None
-        if self.faiss_miner is not None and self.neg_k > 0:
-            seed_pos_ids: List[int] = []
-            for b in batch:
-                pids = b["pos_go_ids"].tolist()
-                seed_pos_ids.append(int(pids[0]) if len(pids) > 0 else -1)  # -1 → miner filtreleyebilir
-            neg_go_ids = self.faiss_miner(seed_pos_ids, self.neg_k, self.zs_mask_vec)  # List[List[int]]
-
         # ---------------- Output dict ----------------
         out: Dict[str, Any] = dict(
             protein_ids=[b["protein_id"] for b in batch],
@@ -152,8 +143,6 @@ class ContrastiveEmbCollator:
         # NEW fields (optional)
         if pos_go_tokens is not None:
             out["pos_go_tokens"] = pos_go_tokens      # dict: {"input_ids":[G,L], "attention_mask":[G,L]}
-        if neg_go_ids is not None:
-            out["neg_go_ids"] = neg_go_ids            # List[List[int]]  (B x K)
 
         # ---------------- Optional: GO→Protein buckets for symmetric loss ----------------
         if self.bidirectional:

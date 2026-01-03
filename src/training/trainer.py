@@ -43,17 +43,16 @@ def dbg_batch_labels_once(batch, go_text_store, cand, step: int, k: int = 2):
                 print(f"GO {g} text fetch failed: {e}")
 
 @torch.no_grad()
-def dbg_topk_pos_once(scores_cand, batch, step: int, topk: int = 10, i: int = 0):
+def dbg_topk_pos_once(scores_cand, batch, cand_ids, step: int, topk: int = 10, i: int = 0):
     if step != 0:
         return
-    cand = batch.get("cand_go_ids")
-    pos = batch.get("pos_go_ids")
-    if cand is None or pos is None:
+    pos = batch.get("uniq_go_ids")
+    if cand_ids is None or pos is None:
         print("[DBG-TOPK] missing cand_go_ids / pos_go_ids")
         return
 
     s = scores_cand[i].float().detach().cpu()
-    cand_i = [int(x) for x in cand[i]]
+    cand_i = [int(x) for x in cand_ids[i]]
     pos_i = set(int(x) for x in pos[i])
     pos_in = [g for g in cand_i if g in pos_i]
 
@@ -67,15 +66,14 @@ def dbg_topk_pos_once(scores_cand, batch, step: int, topk: int = 10, i: int = 0)
         print(f"{r:02d} logit={float(vals[r]):+.4f} gid={gid} {tag}")
 
 @torch.no_grad()
-def dbg_cand_alignment_once(cand_go_embs, batch, go_text_store, step: int, j: int = 0, i: int = 0):
+def dbg_cand_alignment_once(cand_go_embs, cand_idx, go_text_store, step: int, j: int = 0, i: int = 0):
     if step != 0:
         return
-    cand = batch.get("cand_go_ids")
-    if cand is None:
+    if cand_idx is None:
         print("[DBG-ALIGN] missing cand_go_ids")
         return
 
-    cand_i = [int(x) for x in cand[i]]
+    cand_i = [int(x) for x in cand_idx[i]]
     gid = cand_i[j]
 
     e1 = cand_go_embs[j].float()  # [D]
@@ -848,7 +846,7 @@ class OppTrainer:
             cand_valid_mask[:, U:U + kq] = True
             # pos_mask queue kısmında False kalmalı
 
-        return G_cand, pos_mask, cand_valid_mask, cand_idx
+        return G_cand, pos_mask, cand_valid_mask
 
     # ----------------- forward scoring -----------------
     def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
@@ -1160,9 +1158,14 @@ class OppTrainer:
                 pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
                 print(
                     f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
-            dbg_batch_labels_once(batch, self.ctx.go_text_store, cand=cand_idx,step=self._global_step, k=2)
-            dbg_topk_pos_once(scores_cand, batch, step=self._global_step, topk=10, i=0)
-            dbg_cand_alignment_once(G_cand, batch, self.ctx.go_text_store, step=self._global_step, i=0, j=0)
+            #TODO: Debugging
+            B = H.size(0)
+            U = uniq_go_ids.numel()
+            cand_ids = uniq_go_ids.to(device).view(1, U).expand(B, U).contiguous()
+            dbg_batch_labels_once(batch, self.ctx.go_text_store, cand=cand_ids,step=self._global_step, k=2)
+            dbg_topk_pos_once(scores_cand, batch, cand_ids, step=self._global_step, topk=10, i=0)
+            dbg_cand_alignment_once(G_cand, cand_ids, self.ctx.go_text_store, step=self._global_step, i=0, j=0)
+            #TODO: end
 
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
