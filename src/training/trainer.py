@@ -13,7 +13,7 @@ from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
 
 # DEBUG
-def dbg_batch_labels_once(batch, go_text_store, cand_idx, step: int, k: int = 2, show_text: int = 3):
+def dbg_batch_labels_once(batch, go_text_store, cand_idx, step: int, k: int = 2, show_text: int = 2):
     if step != 0:
         return
 
@@ -26,21 +26,29 @@ def dbg_batch_labels_once(batch, go_text_store, cand_idx, step: int, k: int = 2,
     pos_local = batch["pos_go_local"]
     uniq_go_ids = batch["uniq_go_ids"]
 
-    # cand_idx normalize
     if cand_idx is None:
         print("[DBG-LABEL] cand_idx=None")
         return
+
+    # cand_idx -> 1D long CPU
     if torch.is_tensor(cand_idx):
         cand_idx_t = cand_idx.detach().cpu().long().flatten()
     else:
         cand_idx_t = torch.as_tensor(list(cand_idx), dtype=torch.long)
 
-    if uniq_go_ids.numel() == 0:
+    uniq_cpu = uniq_go_ids.detach().cpu().long()
+    G = int(uniq_cpu.numel())
+    if G == 0:
         print("[DBG-LABEL] uniq_go_ids empty")
         return
 
-    uniq_cpu = uniq_go_ids.detach().cpu().long()
-    cand_go_global = uniq_cpu.index_select(0, cand_idx_t.clamp(0, uniq_cpu.numel() - 1))
+    # ✅ clamp yok, yerine hard assert
+    if cand_idx_t.numel() > 0:
+        mn = int(cand_idx_t.min().item())
+        mx = int(cand_idx_t.max().item())
+        assert 0 <= mn and mx < G, f"[DBG-LABEL] cand_idx out of range: min={mn} max={mx} but G={G}"
+
+    cand_go_global = uniq_cpu.index_select(0, cand_idx_t)
     cand_list = cand_go_global.tolist()
     cand_set = set(cand_list)
 
@@ -54,13 +62,16 @@ def dbg_batch_labels_once(batch, go_text_store, cand_idx, step: int, k: int = 2,
         else:
             loc_cpu = torch.as_tensor(list(loc), dtype=torch.long)
 
+        # ✅ clamp yok, hard assert
         if loc_cpu.numel() > 0:
-            pos_go_global = uniq_cpu.index_select(0, loc_cpu.clamp(0, uniq_cpu.numel() - 1)).tolist()
-        else:
-            pos_go_global = []
+            mn = int(loc_cpu.min().item())
+            mx = int(loc_cpu.max().item())
+            assert 0 <= mn and mx < G, f"[DBG-LABEL] pos_local[{i}] out of range: min={mn} max={mx} but G={G}"
+
+        pos_go_global = uniq_cpu.index_select(0, loc_cpu).tolist() if loc_cpu.numel() > 0 else []
 
         pos_in = [g for g in pos_go_global if g in cand_set]
-        idxs = [cand_list.index(g) for g in pos_in]  # candidate içindeki yerleri
+        idxs = [cand_list.index(g) for g in pos_in]
 
         print(f"\n[DBG-LABEL] pid={pid}")
         print(f"pos_go_global[:10]={pos_go_global[:10]} (len={len(pos_go_global)})")
@@ -126,49 +137,47 @@ def dbg_topk_pos_once(scores_cand, batch, cand_idx, step: int, topk: int = 10, i
         print(f"{r:02d} logit={float(vals[r]):+.4f} gid={gid} {tag}")
 
 @torch.no_grad()
-def dbg_cand_alignment_once(G_cand, batch, cand_idx, go_text_store, step: int, j: int = 0, i: int = 0):
+def dbg_cand_alignment_once(cand_go_embs, batch, cand_ids, go_text_store, step: int, j: int = 0, i: int = 0):
     if step != 0:
         return
-
-    if cand_idx is None:
-        print("[DBG-ALIGN] cand_idx=None")
+    if cand_ids is None:
+        print("[DBG-ALIGN] cand_ids=None (need global GO ids for candidates)")
         return
-    if ("uniq_go_ids" not in batch) or ("protein_ids" not in batch):
-        print("[DBG-ALIGN] missing uniq_go_ids / protein_ids")
+    if go_text_store is None:
+        print("[DBG-ALIGN] go_text_store=None")
         return
 
-    B, K, D = G_cand.shape
-    i = 0 if i >= B else i
-    j = 0 if j >= K else j
-
-    # map candidate slot -> global go id
-    if torch.is_tensor(cand_idx):
-        cand_idx_t = cand_idx.detach().cpu().long().flatten()
+    # cand_ids -> 1D global gid list/tensor
+    if torch.is_tensor(cand_ids):
+        cand_ids_t = cand_ids.detach().cpu().long().flatten()
     else:
-        cand_idx_t = torch.as_tensor(list(cand_idx), dtype=torch.long)
+        cand_ids_t = torch.as_tensor(list(cand_ids), dtype=torch.long)
 
-    uniq_cpu = batch["uniq_go_ids"].detach().cpu().long()
-    gid = int(uniq_cpu[int(cand_idx_t[j])].item())
-    pid = str(batch["protein_ids"][i])
-
-    e1 = G_cand[i, j].detach().float()
-    e1 = torch.nn.functional.normalize(e1, dim=-1)
-
-    if go_text_store is None or (not hasattr(go_text_store, "get_emb_by_id")):
-        print(f"\n[DBG-ALIGN] pid={pid} j={j} gid={gid} (no store emb to compare)")
+    K = int(cand_ids_t.numel())
+    if K == 0:
+        print("[DBG-ALIGN] cand_ids empty")
         return
+    assert 0 <= j < K, f"[DBG-ALIGN] j out of range: j={j} K={K}"
+
+    gid = int(cand_ids_t[j].item())  # ✅ GLOBAL GO ID
+
+    # cand_go_embs: [B, K, D] or [K, D]
+    if cand_go_embs.dim() == 3:
+        e1 = cand_go_embs[i, j].float()
+    else:
+        e1 = cand_go_embs[j].float()
 
     try:
-        e2 = go_text_store.get_emb_by_id(gid)
-        if e2 is None:
-            print(f"\n[DBG-ALIGN] pid={pid} gid={gid} store emb=None")
-            return
-        e2 = torch.as_tensor(e2).to(e1.device).float()
-        e2 = torch.nn.functional.normalize(e2, dim=-1)
-        cos = float((e1 * e2).sum().item())
-        print(f"\n[DBG-ALIGN] pid={pid} cand_j={j} gid={gid} cos(cand,store)={cos:.4f}")
+        e2 = go_text_store.get_emb_by_id(gid).to(e1.device).float()
     except Exception as e:
-        print(f"\n[DBG-ALIGN] pid={pid} gid={gid} store emb fetch failed: {e}")
+        print(f"[DBG-ALIGN] store emb fetch failed gid={gid}: {e}")
+        return
+
+    e1 = F.normalize(e1, dim=-1)
+    e2 = F.normalize(e2, dim=-1)
+    cos = float((e1 * e2).sum().item())
+    pid = str(batch["protein_ids"][i]) if "protein_ids" in batch else "?"
+    print(f"\n[DBG-ALIGN] pid={pid} sample={i} cand_j={j} gid={gid} cos(cand_emb,store_emb)={cos:.4f}")
 
 # ------------- Helpers -------------
 def to_f32(x: torch.Tensor) -> torch.Tensor:
