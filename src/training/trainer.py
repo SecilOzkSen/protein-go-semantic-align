@@ -1135,7 +1135,7 @@ class OppTrainer:
             except Exception:
                 max_inbatch = None
 
-        G_cand, pos_mask, cand_valid_mask, cand_idx = self._build_candidates(
+        G_cand, pos_mask, cand_valid_mask = self._build_candidates(
             uniq_go_embs, pos_local, neg_from_queue, max_inbatch=max_inbatch
         )
 
