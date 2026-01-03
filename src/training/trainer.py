@@ -1232,7 +1232,7 @@ class OppTrainer:
             B = H.size(0)
             U = uniq_go_ids.numel()
             cand_ids = uniq_go_ids.to(device).view(1, U).expand(B, U).contiguous()
-            dbg_batch_labels_once(batch, self.ctx.go_text_store, cand_idx=cand_ids,step=self._global_step, k=2)
+            dbg_batch_labels_once(batch, self.ctx.go_text_store, cand_go_global=cand_ids,step=self._global_step, k=2)
             dbg_topk_pos_once(scores_cand, batch, cand_ids, step=self._global_step, topk=10, i=0)
             dbg_cand_alignment_once(G_cand, batch, cand_ids, self.ctx.go_text_store, step=self._global_step, i=0, j=0)
             #TODO: end
