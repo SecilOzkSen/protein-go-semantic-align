@@ -1228,14 +1228,15 @@ class OppTrainer:
                 pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
                 print(
                     f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
-            #TODO: Debugging
-            B = H.size(0)
-            U = uniq_go_ids.numel()
-            cand_ids = uniq_go_ids.to(device).view(1, U).expand(B, U).contiguous()
-            dbg_batch_labels_once(batch, self.ctx.go_text_store, cand_go_global=cand_ids,step=self._global_step, k=2)
-            dbg_topk_pos_once(scores_cand, batch, cand_ids, step=self._global_step, topk=10, i=0)
-            dbg_cand_alignment_once(G_cand, batch, cand_ids, self.ctx.go_text_store, step=self._global_step, i=0, j=0)
-            #TODO: end
+            # TODO: Debug
+            if self._global_step % 50 == 0:
+                # 1) her sample’da pozitif var mı
+                print("[DBG] pos_any_per_sample:", pos_mask.any(dim=1).detach().cpu().tolist())
+
+                # 2) sample 0 için pos indexleri (candidate index)
+                i = 0
+                print("[DBG] pos_mask idx sample0:", torch.where(pos_mask[i])[0].detach().cpu().tolist()[:50])
+            # TODO end
 
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
