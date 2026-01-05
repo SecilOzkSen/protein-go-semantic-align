@@ -62,7 +62,7 @@ training:
   max_refresh_go: 7500 # max go queue refresh per epoch - bc we do lora training!
   eval_go_bs: 128 # eval go batch size for go embedding extraction
   go_text_store_max_len: 512 # batch size for storing go text embeddings
-  is_logit_scale_constant: true #false = trainable logit scale
+  is_logit_scale_constant: false #false = trainable logit scale
   go_token_dropout: false
   go_pooling: "masked_mean" # cls, mean, masked_mean
 

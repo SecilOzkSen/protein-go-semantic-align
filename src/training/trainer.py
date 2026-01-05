@@ -1219,12 +1219,6 @@ class OppTrainer:
             # 3) scale
             scale = self.logit_scale_value()
             scores_cand = scores_cand * scale
-            if self._global_step % 200 == 0:
-                _tstats(scores_cand, "scores_cand(post_scale)")
-                # pos var mı
-                pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
-                print(
-                    f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
@@ -1232,8 +1226,6 @@ class OppTrainer:
                 tau=1.0,
                 cand_valid_mask=cand_valid_mask,
             )
-            if self._global_step % 200 == 0:
-                print(f"[DBG] l_con={float(l_con.detach().item()):.4f}")
 
             if not torch.isfinite(l_con):
                 raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
@@ -1312,7 +1304,7 @@ class OppTrainer:
                         pos_vecs = uniq_go_embs.index_select(0,
                                                              local_cat)  # raw encoder space (trainer'da normalize yok artık)
 
-                    if self._global_step % 200 == 0:
+                    if self._global_step % 1000 == 0:
                         self._dbg_norms(pos_vecs=pos_vecs, tag="[enq-raw]")
 
                     # enqueue in projected+normalized space
