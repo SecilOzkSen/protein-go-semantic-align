@@ -22,7 +22,7 @@ general: #Ablation Purposes
   use_attribution_loss: False #CHECKED
   return_alpha: False
   phase_based: True #CHECKED
-  pooling_strategy: "mean"
+  pooling_strategy: "go_token_align_pooler" #  "mean", "go_token_align_pooler" #CHECKED
 
 caches:
   go_cache: null

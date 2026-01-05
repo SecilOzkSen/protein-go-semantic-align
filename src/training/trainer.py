@@ -656,7 +656,7 @@ class OppTrainer:
             q = self.queue_miner.queue
             qmn = _mean_norm(q)
             qnz = float((q.float().norm(dim=-1) > 1e-6).float().mean().item())
-            ptr = int(self.queue_miner.ptr.item()) if hasattr(self.queue_miner, "ptr") else -1
+            ptr = int(self.queue_miner._ptr.item()) if hasattr(self.queue_miner, "_ptr") else -1
             print(
                 f"[DBG-NORM]{tag} queue_mean_norm={qmn} queue_nz_frac={qnz:.3f} ptr={ptr} K={q.size(0)} D={q.size(1)}")
 
@@ -1101,7 +1101,6 @@ class OppTrainer:
 
     def _build_eval_space(self, batch):
         self._ensure_eval_cache_v2(chunk=256)
-        print("Eval G_once std:", float(self._eval_G_once_cpu.float().std().item()))
         device = self.device
         B = batch["prot_emb_pad"].size(0)
 
@@ -1140,8 +1139,8 @@ class OppTrainer:
         print("[QDBG] queue dtype:", q.queue.dtype)
         print("[QDBG] queue device:", q.queue.device)
 
-        if hasattr(q, "ptr"):
-            p = q.ptr.item() if torch.is_tensor(q.ptr) else int(q.ptr)
+        if hasattr(q, "_ptr"):
+            p = q._ptr.item() if torch.is_tensor(q._ptr) else int(q._ptr)
             print("[QDBG] ptr:", p)
 
         # queue içi gerçekten dolu mu?
@@ -1322,13 +1321,11 @@ class OppTrainer:
                     pos_vecs = self.model.proj_g(pos_vecs)
                     pos_vecs = self.normalizer(pos_vecs, dim=1)
 
-                    if self._global_step % 200 == 0:
-                        self._dbg_norms(pos_vecs=pos_vecs, tag="[enq-proj]")
-
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
                     self.queue_miner.enqueue(pos_vecs.detach(), pos_ids)
-                    if self._global_step % 200 == 0:
+                    if self._global_step % 1000 == 0:
                         self.debug_queue()
+                        self._dbg_norms(pos_vecs=pos_vecs, tag="[enq-proj]")
 
         try:
             self.wandb_run.log(
