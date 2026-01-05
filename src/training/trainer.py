@@ -656,7 +656,7 @@ class OppTrainer:
             q = self.queue_miner.queue
             qmn = _mean_norm(q)
             qnz = float((q.float().norm(dim=-1) > 1e-6).float().mean().item())
-            ptr = int(self.queue_miner._ptr.item()) if hasattr(self.queue_miner, "_ptr") else -1
+            ptr = int(self.queue_miner._ptr) if hasattr(self.queue_miner, "_ptr") else -1
             print(
                 f"[DBG-NORM]{tag} queue_mean_norm={qmn} queue_nz_frac={qnz:.3f} ptr={ptr} K={q.size(0)} D={q.size(1)}")
 
@@ -1140,8 +1140,7 @@ class OppTrainer:
         print("[QDBG] queue device:", q.queue.device)
 
         if hasattr(q, "_ptr"):
-            p = q._ptr.item() if torch.is_tensor(q._ptr) else int(q._ptr)
-            print("[QDBG] ptr:", p)
+            print("[QDBG] ptr:", q._ptr)
 
         # queue içi gerçekten dolu mu?
         with torch.no_grad():
