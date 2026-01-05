@@ -633,6 +633,32 @@ class OppTrainer:
             if ("pooler" in name or "proj_p" in name) and p.requires_grad:
                 in_opt = (id(p) in opt_params)
                 print("[OPTCHK]", name, "in_opt=", in_opt, "shape=", tuple(p.shape))
+    # ----------------- debug -----------------
+    @torch.no_grad()
+    def _dbg_norms(self, *, prot_query=None, pos_vecs=None, uniq_go_embs=None, tag=""):
+        def _mean_norm(x):
+            if x is None or x.numel() == 0:
+                return None
+            x = x.detach()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.size(-1))
+            return float(x.float().norm(dim=-1).mean().item())
+
+        pq = _mean_norm(prot_query)
+        pv = _mean_norm(pos_vecs)
+        ug = _mean_norm(uniq_go_embs)
+
+        msg = f"[DBG-NORM]{tag} prot_query={pq} pos_vecs={pv} uniq_go_embs={ug}"
+        print(msg)
+
+        # queue stats
+        if self.queue_miner is not None:
+            q = self.queue_miner.queue
+            qmn = _mean_norm(q)
+            qnz = float((q.float().norm(dim=-1) > 1e-6).float().mean().item())
+            ptr = int(self.queue_miner.ptr.item()) if hasattr(self.queue_miner, "ptr") else -1
+            print(
+                f"[DBG-NORM]{tag} queue_mean_norm={qmn} queue_nz_frac={qnz:.3f} ptr={ptr} K={q.size(0)} D={q.size(1)}")
 
     # ----------------- basic helpers -----------------
     def _build_pos_go_ids(self, pos_local: List[torch.Tensor], uniq_go_ids: torch.Tensor) -> torch.Tensor:
@@ -732,14 +758,15 @@ class OppTrainer:
         """
         device = H.device
         B, T, Dh = H.shape
+        Hn = self.model.protein_ln(H)
 
         # 1) masked mean pool -> [B, Dh]
         if attn_valid is not None:
-            w = attn_valid.to(H.dtype).unsqueeze(-1)  # [B,T,1]
+            w = attn_valid.to(Hn.dtype).unsqueeze(-1)  # [B,T,1]
             denom = w.sum(dim=1).clamp_min(1.0)  # [B,1]
-            h_pool = (H * w).sum(dim=1) / denom  # [B,Dh]
+            h_pool = (Hn * w).sum(dim=1) / denom  # [B,Dh]
         else:
-            h_pool = H.mean(dim=1)
+            h_pool = Hn.mean(dim=1)
 
         # 2) project to Dz using the SAME projection head used in scoring
         # model.proj_p: Dh -> Dz
@@ -751,6 +778,9 @@ class OppTrainer:
         # 4) hard safety
         if q.size(1) != int(Dz):
             raise RuntimeError(f"prot_query dim mismatch: got {q.size(1)} expected {Dz}")
+
+        if getattr(self, "_global_step", 0) % 200 == 0:
+            print(f"[DBG-NORM][prot_query] mean_norm={float(q.float().norm(dim=-1).mean().item()):.4f} Dz={q.size(1)}")
 
         return q
 
@@ -951,6 +981,52 @@ class OppTrainer:
 
     # ----------------- eval space cache -----------------
     @torch.no_grad()
+    def _refresh_eval_go_cache(self, chunk: int = 256):
+        if self.model.go_encoder is None:
+            return  # cache already has embeddings, nothing to refresh via encoder
+
+        if not hasattr(self.ctx, "go_text_store") or self.ctx.go_text_store is None:
+            raise RuntimeError("ctx.go_text_store is required for GO refresh")
+
+        eval_ids = [int(x) for x in self.eval_id_list]
+        device = self.device
+
+        # pick which encoder to use for cache refresh
+        enc = self.go_encoder_k if self.go_encoder_k is not None else self.model.go_encoder
+        was_training = enc.training
+        enc.eval()
+
+        toks = self.ctx.go_text_store.batch(eval_ids)
+        input_ids = toks["input_ids"]
+        attention_mask = toks["attention_mask"]
+
+        out_cpu = []
+        for s in range(0, input_ids.size(0), chunk):
+            e = min(input_ids.size(0), s + chunk)
+            embs = enc(
+                input_ids=input_ids[s:e].to(device, non_blocking=True),
+                attention_mask=attention_mask[s:e].to(device, non_blocking=True),
+            )
+
+            # unwrap just in case
+            if isinstance(embs, tuple):
+                embs = embs[0]
+            if embs.dim() == 3:
+                embs = embs[:, 0]
+            if embs.dim() != 2:
+                raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
+
+            # IMPORTANT: go_cache should store RAW encoder space, not projected
+            # normalize here only if you decided go_cache is normalized-space
+            embs = torch.nan_to_num(embs).float().cpu().contiguous()
+            out_cpu.append(embs)
+
+        new_embs_cpu = torch.cat(out_cpu, dim=0).contiguous()
+        self.ctx.go_cache.update(eval_ids, new_embs_cpu)
+
+        if was_training:
+            enc.train()
+    @torch.no_grad()
     def _ensure_eval_cache_v2(self, chunk=1024):
         if getattr(self, "_eval_cache_ready", False):
             return
@@ -974,65 +1050,13 @@ class OppTrainer:
         # 3) Build eval GO embedding matrix ONCE
         device = self.device
 
-        if self.model.go_encoder is not None:
-            # We want deterministic eval embeddings
-            was_training = self.model.go_encoder.training
-            self.model.go_encoder.eval()
-
-            # Need go_text_store for tokenization
-            if not hasattr(self.ctx, "go_text_store") or self.ctx.go_text_store is None:
-                raise RuntimeError("ctx.go_text_store is required to build eval cache with go_encoder")
-
-            toks = self.ctx.go_text_store.batch(eval_ids)  # dict: input_ids [Geval,L], attention_mask [Geval,L]
-
-            input_ids = toks["input_ids"]
-            attention_mask = toks["attention_mask"]
-
-            # Optional safety: ensure no dropout in eval tokens at collator level.
-            # Here we assume toks are clean.
-
-            # Encode in chunks to avoid OOM
-            embs_list = []
-            for s in range(0, input_ids.size(0), chunk):
-                e = min(input_ids.size(0), s + chunk)
-                out = self.model.go_encoder(
-                    input_ids=input_ids[s:e].to(device, non_blocking=True),
-                    attention_mask=attention_mask[s:e].to(device, non_blocking=True),
-                )
-
-                # unwrap outputs
-                if isinstance(out, tuple):
-                    embs = out[0]
-                elif isinstance(out, dict):
-                    embs = out.get("pooler_output", None)
-                    if embs is None:
-                        embs = out["last_hidden_state"][:, 0]
-                else:
-                    embs = out
-
-                if embs.dim() == 3:
-                    embs = embs[:, 0]
-                if embs.dim() != 2:
-                    raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
-
-             #   embs = self.normalizer(embs, dim=1)  # cosine space
-                embs_list.append(embs.detach().to("cpu", non_blocking=False).contiguous())
-
-            G_once_cpu = torch.cat(embs_list, dim=0).contiguous()
-
-            # restore
-            if was_training:
-                self.model.go_encoder.train()
-
-        else:
-            # Fallback: use precomputed cache embeddings (old behavior)
-            rows = torch.as_tensor(
-                [self.ctx.go_cache.id2row[int(g)] for g in eval_ids],
-                dtype=torch.long,
-                device=self.ctx.go_cache.embs.device
-            )
-            G_bank = self.ctx.go_cache.embs.index_select(0, rows).contiguous()
-            G_once_cpu = G_bank.detach().to("cpu", non_blocking=False).contiguous()
+        rows = torch.as_tensor(
+            [self.ctx.go_cache.id2row[int(g)] for g in eval_ids],
+            dtype=torch.long,
+            device=self.ctx.go_cache.embs.device
+        )
+        G_bank = self.ctx.go_cache.embs.index_select(0, rows).contiguous()
+        G_once_cpu = G_bank.detach().float().cpu().contiguous()
 
         # 4) store on trainer
         self._eval_ids_cpu = eval_ids_cpu
@@ -1143,29 +1167,6 @@ class OppTrainer:
         H = batch["prot_emb_pad"].to(device, non_blocking=True)
         attn_valid, pad_mask = self._valid_and_pad_masks(batch)
 
-        if self._global_step % 200 == 0:
-            with torch.no_grad():
-                B, T, D = H.shape
-                mv = attn_valid.sum(dim=1)
-                print(f"[DBG] H: {tuple(H.shape)} {H.dtype} {H.device}")
-                print(
-                    f"[DBG] attn_valid.sum: min={int(mv.min())} mean={float(mv.float().mean()):.2f} max={int(mv.max())}")
-
-                hn = torch.linalg.vector_norm(H.float(), dim=-1)  # [B,T]
-                z = hn < 1e-12
-                print(
-                    f"[DBG] H.norm tokenwise: min={float(hn.min()):.6f} mean={float(hn.mean()):.4f} max={float(hn.max()):.4f}")
-                print(f"[DBG] zero-token frac(all)={float(z.float().mean()):.6f} any={bool(z.any())}")
-
-                z_valid = z & attn_valid
-                print(
-                    f"[DBG] zero-token frac(valid)={float(z_valid.float().mean()):.6f} any_valid={bool(z_valid.any())}")
-
-                # pad tarafında sıfır normal olabilir, valid tarafında olmamalı
-                z_pad = z & (~attn_valid)
-                print(f"[DBG] zero-token frac(pad)={float(z_pad.float().mean()):.6f} any_pad={bool(z_pad.any())}")
-        # TODO end
-
         if self.to_f32 is not None:
             H = self.to_f32(H)
 
@@ -1191,11 +1192,9 @@ class OppTrainer:
             neg_from_queue = None
             if self.queue_miner is not None:
                 neg_from_queue = self._mine_queue_hard_negs(prot_query, pos_local, uniq_go_ids, Dz)
-                if self._global_step % 200 == 0:
-                    if neg_from_queue is None:
-                        print("[DBG] neg_from_queue=None (queue empty or disabled)")
-                    else:
-                        _tstats(neg_from_queue, "neg_from_queue(Dz)")
+
+            if self._global_step % 200 == 0:
+                self._dbg_norms(prot_query=prot_query, uniq_go_embs=uniq_go_embs, tag="[pre-enq]")
 
         # candidates: in-batch + optional queue
         max_inbatch = None
@@ -1228,16 +1227,6 @@ class OppTrainer:
                 pos_any = bool(pos_mask.any(dim=1).all().item()) if pos_mask.numel() else False
                 print(
                     f"[DBG] pos_mask any-per-sample? {pos_mask.any(dim=1).detach().cpu().tolist()} overall_all_have_pos={pos_any}")
-            # TODO: Debug
-            if self._global_step % 50 == 0:
-                # 1) her sample’da pozitif var mı
-                print("[DBG] pos_any_per_sample:", pos_mask.any(dim=1).detach().cpu().tolist())
-
-                # 2) sample 0 için pos indexleri (candidate index)
-                i = 0
-                print("[DBG] pos_mask idx sample0:", torch.where(pos_mask[i])[0].detach().cpu().tolist()[:50])
-            # TODO end
-
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
@@ -1325,9 +1314,16 @@ class OppTrainer:
                         pos_vecs = uniq_go_embs.index_select(0,
                                                              local_cat)  # raw encoder space (trainer'da normalize yok artık)
 
+                    if self._global_step % 200 == 0:
+                        self._dbg_norms(pos_vecs=pos_vecs, tag="[enq-raw]")
+
                     # enqueue in projected+normalized space
+                    pos_vecs = self.model.go_ln(pos_vecs)
                     pos_vecs = self.model.proj_g(pos_vecs)
                     pos_vecs = self.normalizer(pos_vecs, dim=1)
+
+                    if self._global_step % 200 == 0:
+                        self._dbg_norms(pos_vecs=pos_vecs, tag="[enq-proj]")
 
                     pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
                     self.queue_miner.enqueue(pos_vecs.detach(), pos_ids)
@@ -1356,6 +1352,10 @@ class OppTrainer:
     def eval_epoch(self, loader, epoch_idx: int):
         self.model.eval()
         device = self.device
+
+        self._refresh_eval_go_cache(chunk=256)
+        self._eval_cache_ready = False  # force rebuild next time
+        self._ensure_eval_cache_v2(chunk=256)
 
         logs = {"cafa_fmax": 0.0, "cafa_aupr": 0.0, "align_R@1": 0.0, "align_R@5": 0.0,
                 "align_R@10": 0.0, "align_MRR": 0.0, "align_nDCG@10": 0.0}

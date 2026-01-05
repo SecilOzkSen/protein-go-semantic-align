@@ -80,19 +80,6 @@ class ProteinGoAligner(nn.Module):
         if self.normalize:
             Zp = self._norm(Zp, dim=-1)
             Gz = self._norm(Gz, dim=-1)
-        #TODO: Erase later
-        with torch.no_grad():
-            def _stat(name, x):
-                n = torch.linalg.vector_norm(x.float(), dim=-1)
-                print(f"[DBG] {name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} "
-                      f"val_min={float(x.min()):.4f} val_max={float(x.max()):.4f} "
-                      f"norm_mean={float(n.mean()):.4f} norm_min={float(n.min()):.4f} norm_max={float(n.max()):.4f}")
-
-            _stat("Z(pre_proj)", Z)  # [B,K,Dh]
-            _stat("Zp", Zp)  # [B,K,Dz]
-            _stat("Gz", Gz)  # [B,K,Dz]
-            cos = (Zp * Gz).sum(dim=-1)  # [B,K]
-            print(f"[DBG] cos: min={float(cos.min()):.4f} mean={float(cos.mean()):.4f} max={float(cos.max()):.4f}")
 
         scores = (Zp * Gz).sum(dim=-1)  # [B,K]
 

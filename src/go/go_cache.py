@@ -15,8 +15,7 @@ class GoMemoryBank:
         row2id: Sequence[int],
         device: str = "cuda",
         to_device: bool = True,
-        already_normalized: bool = False,
-        device_dtype: torch.dtype = torch.float16,   #  GPU'da fp16 varsayılan
+        device_dtype: torch.dtype = torch.float32,   #  GPU'da fp16 varsayılan
         pin_memory: bool = False,                    # dataloader uyumu
         persist_back: bool = True                   # update() memmap'e yazsın mı?
     ):
@@ -90,7 +89,7 @@ class GoMemoryBank:
             f"new_embs shape {tuple(new_embs.shape)} d={d} ile uyuşmuyor"
 
         # normalize in fp32 for safety
-        new_embs = F.normalize(new_embs.float(), p=2, dim=1)
+     #   new_embs = F.normalize(new_embs.float(), p=2, dim=1)
         new_embs = torch.nan_to_num(new_embs, nan=0.0, posinf=0.0, neginf=0.0)
 
         # move to same device
@@ -123,8 +122,7 @@ class GoLookupCache:
                  embs_or_blob: Union[torch.Tensor, Mapping, np.memmap],
                  id2row: Optional[dict] = None,
                  row2id: Optional[Sequence[int]] = None,
-                 device: str = "cpu",
-                 already_normalized: bool = True):
+                 device: str = "cpu"):
 
         # Güvenli başlangıç
         _id2row = id2row
@@ -169,8 +167,7 @@ class GoLookupCache:
             _embs_in,
             row2id=_row2id,
             device=device,
-            to_device=True,
-            already_normalized=already_normalized,
+            to_device=True
         )
 
         # Dış API alanları

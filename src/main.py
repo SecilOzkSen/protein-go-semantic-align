@@ -436,19 +436,6 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         num_workers=0,
         pin_memory=True,
         collate_fn=fused_collator)
-    #TODO: Silinecek
-    b = next(iter(train_loader))
-    H = b["prot_emb_pad"]  # [B, T, d_h]
-
-    with torch.no_grad():
-        norms = H.norm(dim=-1)  # [B, T]
-        print(
-            "[dbg] H norms -> mean={:.3f}, min={:.3f}, max={:.3f}".format(
-                norms.mean().item(),
-                norms.min().item(),
-                norms.max().item(),
-            )
-        )
 
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
     return train_loader, val_loader, query_loader
@@ -1233,23 +1220,6 @@ def run_training(args, schedule: TrainSchedule):
             bs = int(getattr(args, "eval_go_bs", 128))  # 256 veya 128 güvenli
             out_cpu = []
 
-            with torch.no_grad():
-                for s in range(0, len(eval_ids), bs):
-                    chunk_ids = eval_ids[s:s + bs]
-                    toks = go_text_store.batch(chunk_ids)
-
-                    embs = trainer.model.go_encoder(
-                        input_ids=toks["input_ids"].to(device, non_blocking=True),
-                        attention_mask=toks["attention_mask"].to(device, non_blocking=True),
-                    )
-
-                #    embs = F.normalize(embs.float(), p=2, dim=1).cpu()
-                    out_cpu.append(embs)
-
-            new_embs = torch.cat(out_cpu, dim=0)  # [Geval, Dg] CPU
-            training_context.go_cache.update(eval_ids, new_embs)
-
-            trainer._eval_cache_ready = False
             #VAL
             val_logs = trainer.eval_epoch(val_loader, epoch)
             msg = " | ".join([f"{k}: {val_logs[k]:.4f}" for k in val_logs])
