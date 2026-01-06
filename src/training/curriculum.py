@@ -94,9 +94,4 @@ class CurriculumScheduler:
             mix_sibling_queue=mix,
             allow_siblings=allow_siblings,
         )
-        print("--------------------------------------------------------------------------------")
-        print("CurriculumScheduler params:")
-        for key, value in return_dict.items():
-            print(f"[CurriculumScheduler] step={step} {key}={value}")
-        print("--------------------------------------------------------------------------------")
         return return_dict
