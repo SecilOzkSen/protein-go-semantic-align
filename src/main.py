@@ -527,16 +527,17 @@ def refresh_go_cache_chunked(ids_to_update, go_text_store, go_encoder, go_cache,
             attn = toks["attention_mask"].to(device, non_blocking=True)
 
             embs = go_encoder(input_ids=input_ids, attention_mask=attn)  # [C, D]
-        #    embs = F.normalize(embs.float(), p=2, dim=1).to("cpu", non_blocking=False)
 
+            # IMPORTANT: cache update için CPU float32 sabitle
+            embs = embs.detach().float().cpu().contiguous()
             out_chunks.append(embs)
 
-            # kritik: peak mem düşür
             del toks, input_ids, attn, embs
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    new_embs_cpu = torch.cat(out_chunks, dim=0)  # [N, D] on CPU
-    go_cache.update(ids_to_update, new_embs_cpu)
+    new_embs = torch.cat(out_chunks, dim=0).contiguous()  # CPU [N, D]
+    go_cache.update(ids_to_update, new_embs)
 
 
 def wandb_preview_curriculum(wandb_mod, args, total_steps: int):
@@ -956,10 +957,22 @@ def run_training(args, schedule: TrainSchedule):
         if force or (new_phase != prev_phase):
             logger.info(f"[PHASE SWITCH] epoch={current_epoch} :: {prev_phase + 1} -> {new_phase + 1}")
 
-            new_go_path = training_context.schedule.resolve_go_cache_path(new_phase)
-            new_go_cache = build_go_cache(new_go_path)
-            training_context.go_cache = new_go_cache
-            training_context.memory_bank = new_go_cache if args.use_go_memory_bank else None
+            # Phase değiştir
+            training_context.go_text_store.update_phase_and_tokenize(new_phase)
+
+            phase_ids = sorted(int(g) for g in training_context.go_text_store.id2text.keys())
+
+            refresh_go_cache_chunked(
+                ids_to_update=phase_ids,
+                go_text_store=training_context.go_text_store,
+                go_encoder=go_encoder,
+                go_cache=training_context.go_cache,  # aynı cache
+                device=device,
+                chunk_size=128
+            )
+
+            training_context.memory_bank = training_context.go_cache if args.use_go_memory_bank else None
+
             # GoTextStore fazı
             training_context.go_text_store.update_phase_and_tokenize(new_phase)
 
@@ -970,6 +983,11 @@ def run_training(args, schedule: TrainSchedule):
                                                                                 go_cache=training_context.go_cache,
                                                                                 go_text_store=training_context.go_text_store,
                                                                                 go_dropout=go_token_dropout)
+            try:
+                trainer.queue_miner.reset()
+                logger.info("[queue] soft reset after phase change")
+            except Exception:
+                pass
             fused_bank = materialize_fused_bank(query_loader, device="cpu")
             training_context.fused_bank = fused_bank
             training_context.current_phase = new_phase

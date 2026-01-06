@@ -15,6 +15,12 @@ class MoCoQueue(torch.nn.Module):
         return self.queue.device
 
     @torch.no_grad()
+    def reset(self):
+        self.valid.zero_()  # all False
+        self.ids.fill_(-1)
+        self._ptr = 0
+
+    @torch.no_grad()
     def on_change_dim(self, new_dim: int):
         new_dim = int(new_dim)
         cur_dim = int(self.queue.size(1))
