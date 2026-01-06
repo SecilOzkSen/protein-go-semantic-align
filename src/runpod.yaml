@@ -52,19 +52,19 @@ training:
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "align_nDCG@10"   # "total" da olabilir
+  monitor_metric: "align_MRR"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 10        # 0 veya negatif => kapalı
-  cand_chunk_k: 8
+  early_stop_patience: 8        # 0 veya negatif => kapalı
+  cand_chunk_k: 4 #8
   pos_chunk_t: 128
-  k_hard_queue: 32 #32 #128
-  queue_K: 16384 #2048 #8192
-  max_refresh_go: 7500 # max go queue refresh per epoch - bc we do lora training!
-  eval_go_bs: 128 # eval go batch size for go embedding extraction
+  k_hard_queue: 16  #32 #128
+  queue_K: 8192  #16384 #2048 #8192
+  max_refresh_go: 2000 #7500 # max go queue refresh per epoch - bc we do lora training!
+  eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 512 # batch size for storing go text embeddings
   is_logit_scale_constant: false #false = trainable logit scale
   go_token_dropout: false
-  go_pooling: "masked_mean" # cls, mean, masked_mean
+  go_pooling: "none" # cls, mean, masked_mean -> NO NEED
 
 optim:
   lr: 0.0003
@@ -94,7 +94,7 @@ curriculum:
   epochs: 4
   warmup_frac: 0.1
   mode: cosine
-  hard_frac: [0.2, 0.7]
+  hard_frac: [0.2, 0.5]
   shortlist_M: [128, 64]
   k_hard: [4, 1]
   hier_up: [1, 0]
@@ -105,7 +105,7 @@ curriculum:
   curriculum_mode: cosine
 
 schedule:
-  phase_breaks: [5, 12, 25]
+  phase_breaks: [5, 9, 12]
   stageA_mix: [1.0, 0.0, 0.0]
   stageB_mix: [0.7, 0.3, 0.0]
   stageC_mix: [0.4, 0.4, 0.2]
@@ -117,7 +117,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation1"
+  wandb_run_name: "protein-go-semantic-align-ablation1-b"
   mode: online
 
 stores:

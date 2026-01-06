@@ -992,7 +992,7 @@ class OppTrainer:
         device = self.device
 
         # pick which encoder to use for cache refresh
-        enc = self.go_encoder_k if self.go_encoder_k is not None else self.model.go_encoder
+        enc = self.model.go_encoder
         was_training = enc.training
         enc.eval()
 
@@ -1341,9 +1341,9 @@ class OppTrainer:
         self.model.eval()
         device = self.device
 
-        self._refresh_eval_go_cache(chunk=256)
+        self._refresh_eval_go_cache(chunk=self.cfg.eval_go_bs)
         self._eval_cache_ready = False  # force rebuild next time
-        self._ensure_eval_cache_v2(chunk=256)
+        self._ensure_eval_cache_v2(chunk=self.cfg.eval_go_bs)
 
         logs = {"cafa_fmax": 0.0, "cafa_aupr": 0.0, "align_R@1": 0.0, "align_R@5": 0.0,
                 "align_R@10": 0.0, "align_MRR": 0.0, "align_nDCG@10": 0.0}

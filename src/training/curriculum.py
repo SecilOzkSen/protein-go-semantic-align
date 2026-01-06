@@ -83,7 +83,7 @@ class CurriculumScheduler:
         # Güvenlik: shortlist M, k_hard'dan küçük olmasın
         shortlist_M = max(shortlist_M, k_hard)
 
-        return dict(
+        return_dict = dict(
             hard_frac=hard_frac,
             shortlist_M=shortlist_M,
             k_hard=k_hard,
@@ -94,3 +94,9 @@ class CurriculumScheduler:
             mix_sibling_queue=mix,
             allow_siblings=allow_siblings,
         )
+        print("--------------------------------------------------------------------------------")
+        print("CurriculumScheduler params:")
+        for key, value in return_dict.items():
+            print(f"[CurriculumScheduler] step={step} {key}={value}")
+        print("--------------------------------------------------------------------------------")
+        return return_dict

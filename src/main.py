@@ -998,7 +998,8 @@ def run_training(args, schedule: TrainSchedule):
         k_hard_queue=args.k_hard_queue,
         queue_K=args.queue_K,
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
-        go_pooling=args.go_pooling
+        go_pooling=args.go_pooling,
+        eval_go_bs=args.eval_go_bs
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1216,9 +1217,6 @@ def run_training(args, schedule: TrainSchedule):
                 pass
 
             trainer.model.go_encoder.eval()
-
-            bs = int(getattr(args, "eval_go_bs", 128))  # 256 veya 128 güvenli
-            out_cpu = []
 
             #VAL
             val_logs = trainer.eval_epoch(val_loader, epoch)
