@@ -25,68 +25,81 @@ def _find_first_key(batch: Dict[str, Any], candidates: List[str]) -> Optional[st
 
 import numpy as np
 
-def cafa_metrics(y_true, y_pred, name="val"):
-    # y_true, y_pred: [N, M]
+import numpy as np
+
+def cafa_metrics_sanity(y_true, y_pred, name="val", sample=2048, seed=0):
+    """
+    Fast sanity checks for CAFA-style multi-label eval.
+    y_true, y_pred: array-like [N, M]
+    Prints diagnostics and raises AssertionError on hard inconsistencies.
+    """
+
     yt = np.asarray(y_true)
     yp = np.asarray(y_pred)
 
-    true_pos = yt.sum()
-    pos_per_prot = true_pos / yt.shape[0]
+    # 0) shape + finiteness
+    assert yt.ndim == 2 and yp.ndim == 2, "y_true/y_pred must be 2D [N,M]"
+    assert yt.shape == yp.shape, f"shape mismatch: y_true={yt.shape} y_pred={yp.shape}"
+    assert np.isfinite(yp).all(), "NaN/Inf found in y_pred"
 
-    print(f"[DBG][CAFA] true_pos={true_pos:.0f}  pos_per_prot={pos_per_prot:.4f}")
+    N, M = yt.shape
 
+    # 1) label density sanity
+    true_pos = float(yt.sum())
+    pos_per_prot = true_pos / max(1, N)
+    pos_per_label = true_pos / max(1, M)
+    assert true_pos > 0, "y_true is all-zero (label mapping broken)"
+
+    # 2) prediction distribution
     mn = float(yp.min())
     mx = float(yp.max())
     mean = float(yp.mean())
     std = float(yp.std())
+    assert std > 0.0, "y_pred has zero std (constant predictions)"
 
-    print(f"[DBG][CAFA] y_pred min={mn:.6f} max={mx:.6f} mean={mean:.6f} std={std:.6f}")
-
-    # pozitif ve negatif indeksleri bul
+    # 3) quick separation proxy: positives should score higher than negatives
     pos_idx = np.argwhere(yt > 0)
     neg_idx = np.argwhere(yt == 0)
+    assert len(pos_idx) > 0 and len(neg_idx) > 0, "cannot sample pos/neg indices"
 
-    if len(pos_idx) > 0 and len(neg_idx) > 0:
-        rng = np.random.default_rng(0)
+    rng = np.random.default_rng(seed)
+    ps = pos_idx[rng.integers(0, len(pos_idx), size=min(sample, len(pos_idx)))]
+    ns = neg_idx[rng.integers(0, len(neg_idx), size=min(sample, len(neg_idx)))]
+    pos_mean = float(np.mean(yp[ps[:, 0], ps[:, 1]]))
+    neg_mean = float(np.mean(yp[ns[:, 0], ns[:, 1]]))
+    assert pos_mean > neg_mean, f"alignment broken: pos_mean={pos_mean:.6f} <= neg_mean={neg_mean:.6f}"
 
-        ps = pos_idx[rng.integers(0, len(pos_idx), size=min(1024, len(pos_idx)))]
-        ns = neg_idx[rng.integers(0, len(neg_idx), size=min(1024, len(neg_idx)))]
-
-        pos_mean = float(np.mean(yp[ps[:, 0], ps[:, 1]]))
-        neg_mean = float(np.mean(yp[ns[:, 0], ns[:, 1]]))
-
-        print(f"[DBG][CAFA] score_mean pos={pos_mean:.6f} neg={neg_mean:.6f} (want pos > neg)")
-
-    print(f"[DBG][{name}] y_true shape={yt.shape} y_pred shape={yp.shape}")
-    assert yt.shape == yp.shape, "shape mismatch"
-
-    # 1) label density sanity
-    true_pos = yt.sum()
-    print(f"[DBG][{name}] true_pos={true_pos:.0f}  pos_per_prot={true_pos/yt.shape[0]:.3f}")
-    assert true_pos > 0, "y_true all-zero (label mapping broken)"
-
-    # 2) prediction range sanity
-    mn, mx, mean, std = float(yp.min()), float(yp.max()), float(yp.mean()), float(yp.std())
-    print(f"[DBG][{name}] y_pred min/max/mean/std = {mn:.4f} {mx:.4f} {mean:.4f} {std:.4f}")
-    assert np.isfinite([mn, mx, mean, std]).all(), "NaN/Inf in y_pred"
-
-    # 3) per-protein signal sanity: top score vs median
+    # 4) per-protein signal sanity: top1 should exceed median by some margin
     top1 = np.sort(yp, axis=1)[:, -1]
     med = np.median(yp, axis=1)
     gap = float(np.mean(top1 - med))
-    print(f"[DBG][{name}] avg(top1 - median) = {gap:.4f}")
+    assert gap > 0.0, f"no per-protein score contrast: avg(top1-median)={gap:.6f}"
 
-    # 4) quick overlap proxy (NO threshold): do positives get higher scores?
-    # sample 512 positives, 512 negatives
-    pos_idx = np.argwhere(yt > 0)
-    neg_idx = np.argwhere(yt == 0)
-    if len(pos_idx) > 0 and len(neg_idx) > 0:
-        rng = np.random.default_rng(0)
-        ps = pos_idx[rng.integers(0, len(pos_idx), size=min(512, len(pos_idx)))]
-        ns = neg_idx[rng.integers(0, len(neg_idx), size=min(512, len(neg_idx)))]
-        pos_mean = float(np.mean(yp[ps[:,0], ps[:,1]]))
-        neg_mean = float(np.mean(yp[ns[:,0], ns[:,1]]))
-        print(f"[DBG][{name}] score_mean pos={pos_mean:.4f} neg={neg_mean:.4f} (want pos>neg)")
+    # 5) threshold sweep sanity: does predicted positive count change with threshold?
+    # Use a few percentiles of y_pred as thresholds (fast, scale-agnostic)
+    thr_list = np.quantile(yp, [0.99, 0.95, 0.9, 0.75, 0.5])
+    pred_counts = [int((yp >= thr).sum()) for thr in thr_list]
+    assert len(set(pred_counts)) > 1, f"thresholding ineffective, pred_counts={pred_counts}"
+
+    print(
+        f"[DBG][{name}] N={N} M={M} "
+        f"true_pos={int(true_pos)} pos/prot={pos_per_prot:.3f} pos/label={pos_per_label:.3f} | "
+        f"y_pred min/max/mean/std={mn:.4f}/{mx:.4f}/{mean:.4f}/{std:.4f} | "
+        f"pos_mean={pos_mean:.4f} neg_mean={neg_mean:.4f} gap(top1-med)={gap:.4f} | "
+        f"thr_counts={pred_counts}"
+    )
+
+    # Return a small dict in case you want to log it
+    return {
+        "N": N, "M": M,
+        "true_pos": true_pos,
+        "pos_per_prot": pos_per_prot,
+        "pos_per_label": pos_per_label,
+        "y_pred_min": mn, "y_pred_max": mx, "y_pred_mean": mean, "y_pred_std": std,
+        "pos_mean": pos_mean, "neg_mean": neg_mean,
+        "top1_minus_median": gap,
+        "thr_counts": pred_counts,
+    }
 
 
 # ----------------------------------------
@@ -193,7 +206,7 @@ def compute_fmax(
     recall is averaged only over proteins with at least 1 true label
     """
 
-    cafa_metrics(y_true, y_pred, name="val")
+    _ = cafa_metrics_sanity(y_true, y_pred, name="val")
 
     y_true = (y_true > 0).astype(np.int32)
 
