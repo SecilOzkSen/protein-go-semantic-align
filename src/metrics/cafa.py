@@ -198,11 +198,60 @@ def collect_probs_and_labels_from_dict_batch(
     y_true = (y_true > 0.0).astype(np.int32)
     return y_pred, y_true
 
+import numpy as np
+from typing import Tuple
+
+def compute_fmax(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    num_thresholds: int = 101,
+    eps: float = 1e-8
+) -> Tuple[float, float]:
+    """
+    Proper CAFA-style protein-centric Fmax:
+      - compute F1 per protein
+      - average over proteins with at least 1 true label
+      - maximize over thresholds
+    """
+    y_true = (y_true > 0).astype(np.bool_)
+    y_pred = y_pred.astype(np.float32)
+
+    thresholds = np.linspace(0.0, 1.0, num_thresholds, dtype=np.float32)
+
+    # only proteins with at least 1 true label
+    true_cnt = y_true.sum(axis=1)
+    has_true = true_cnt > 0
+    if not np.any(has_true):
+        return 0.0, 0.0
+
+    yt = y_true[has_true]
+    yp = y_pred[has_true]
+
+    best_f, best_t = 0.0, 0.0
+
+    for t in thresholds:
+        pred = (yp >= t)
+
+        tp = (pred & yt).sum(axis=1).astype(np.float32)
+        fp = (pred & ~yt).sum(axis=1).astype(np.float32)
+        fn = (~pred & yt).sum(axis=1).astype(np.float32)
+
+        prec_i = tp / np.clip(tp + fp, 1.0, None)
+        rec_i  = tp / np.clip(tp + fn, 1.0, None)
+
+        f1_i = (2.0 * prec_i * rec_i) / np.clip(prec_i + rec_i, eps, None)
+
+        f = float(np.mean(f1_i))
+        if f > best_f:
+            best_f, best_t = f, float(t)
+
+    return best_f, best_t
+
 
 # -----------------------------
 # CAFA-style protein-centric Fmax
 # -----------------------------
-def compute_fmax(
+def compute_fmax_old(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     num_thresholds: int = 101,

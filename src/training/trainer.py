@@ -1364,7 +1364,7 @@ class OppTrainer:
             scale = self.logit_scale_value()
             scores = scores * scale
             #Alignment metrics on raw scores
-            m = retrieval_metrics_from_scores(scores, y_true, ks=(1, 5, 10))
+            m = retrieval_metrics_from_scores(scores, y_true, ks=(5, 10, 50, 100, 200))
             if m["num"] > 0:
                 sum_num += m["num"]
                 sum_R1 += m["R@1"] * m["num"]
