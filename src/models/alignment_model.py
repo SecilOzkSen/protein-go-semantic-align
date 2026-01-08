@@ -42,12 +42,12 @@ class ProteinGoAligner(nn.Module):
         return x / n.to(x.dtype)
 
     def forward(
-        self,
-        H: torch.Tensor,                 # [B,T,Dh]
-        G: torch.Tensor,                 # [B,K,Dg]
-        mask: Optional[torch.Tensor],    # [B,T] bool, True=valid
-        return_alpha: bool = False,
-        **kwargs
+            self,
+            H: torch.Tensor,  # [B,T,Dh]
+            G: torch.Tensor,  # [B,K,Dg]
+            mask: Optional[torch.Tensor],  # [B,T] bool True=valid
+            return_alpha: bool = False,
+            **kwargs
     ):
         if mask is not None and mask.dtype != torch.bool:
             mask = mask != 0
@@ -58,24 +58,27 @@ class ProteinGoAligner(nn.Module):
         B, T, Dh = H.shape
         _, K, Dg = G.shape
 
-        H = self.protein_ln(H)
-        G = self.go_ln(G)
+        alpha_info = {}
 
         if self.mean_pool:
-            # protein global mean pool, then score against all G
+            # masked mean pool: [B,Dh]
             if mask is not None:
                 w = mask.to(H.dtype).unsqueeze(-1)  # [B,T,1]
-                denom = w.sum(dim=1, keepdim=False).clamp_min(1.0)  # [B,1]
-                Z = (H * w).sum(dim=1) / denom                      # [B,Dh]
+                denom = w.sum(dim=1).clamp_min(1.0)  # [B,1]
+                h_pool = (H * w).sum(dim=1) / denom  # [B,Dh]
             else:
-                Z = H.mean(dim=1)                                   # [B,Dh]
-            Z = Z.unsqueeze(1).expand(B, K, Dh)                      # [B,K,Dh]
-            alpha_info = {}
-        else:
-            Z, alpha_info = self.pooler(H, G, mask, return_alpha=return_alpha)  # Z:[B,K,Dh]
+                h_pool = H.mean(dim=1)  # [B,Dh]
 
-        Zp = self.proj_p(Z)     # [B,K,Dz]
-        Gz = self.proj_g(G)     # [B,K,Dz]
+            h_pool = self.protein_ln(h_pool)  # LN AFTER pool
+            Z = h_pool.unsqueeze(1).expand(B, K, Dh)  # [B,K,Dh]
+        else:
+            Z, alpha_info = self.pooler(H, G, mask, return_alpha=return_alpha)  # [B,K,Dh]
+            Z = self.protein_ln(Z)  # LN on [B,K,Dh]
+
+        G = self.go_ln(G)  # [B,K,Dg]
+
+        Zp = self.proj_p(Z)  # [B,K,Dz]
+        Gz = self.proj_g(G)  # [B,K,Dz]
 
         if self.normalize:
             Zp = self._norm(Zp, dim=-1)

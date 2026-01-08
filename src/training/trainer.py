@@ -752,35 +752,33 @@ class OppTrainer:
     @torch.no_grad()
     def _get_prot_query(self, H: torch.Tensor, attn_valid: torch.Tensor, Dz: int) -> torch.Tensor:
         """
-        H: [B, T, Dh]
-        attn_valid: [B, T] bool
-        Return: prot_query [B, Dz] in the SAME space as queued vectors (Dz).
+        H: [B,T,Dh]
+        attn_valid: [B,T] bool True=valid
+        Return: q [B,Dz] (same space as GO vectors)
         """
-        device = H.device
-        B, T, Dh = H.shape
-        Hn = self.model.protein_ln(H)
+        if attn_valid is not None and attn_valid.dtype != torch.bool:
+            attn_valid = attn_valid != 0
 
-        # 1) masked mean pool -> [B, Dh]
+        # 1) pool first
         if attn_valid is not None:
-            w = attn_valid.to(Hn.dtype).unsqueeze(-1)  # [B,T,1]
+            w = attn_valid.to(H.dtype).unsqueeze(-1)  # [B,T,1]
             denom = w.sum(dim=1).clamp_min(1.0)  # [B,1]
-            h_pool = (Hn * w).sum(dim=1) / denom  # [B,Dh]
+            h_pool = (H * w).sum(dim=1) / denom  # [B,Dh]
         else:
-            h_pool = Hn.mean(dim=1)
+            h_pool = H.mean(dim=1)  # [B,Dh]
 
-        # 2) project to Dz using the SAME projection head used in scoring
-        # model.proj_p: Dh -> Dz
+        # 2) LN after pool (match forward mean_pool path)
+        h_pool = self.model.protein_ln(h_pool)  # [B,Dh]
+
+        # 3) same projection head
         q = self.model.proj_p(h_pool)  # [B,Dz]
 
-        # 3) normalize (cosine space)
-        q = self.normalizer(q, dim=1)  # [B,Dz]
+        # 4) same normalization rule as scoring
+        if getattr(self.model, "normalize", False):
+            q = self.model._norm(q, dim=-1)
 
-        # 4) hard safety
         if q.size(1) != int(Dz):
             raise RuntimeError(f"prot_query dim mismatch: got {q.size(1)} expected {Dz}")
-
-        if getattr(self, "_global_step", 0) % 200 == 0:
-            print(f"[DBG-NORM][prot_query] mean_norm={float(q.float().norm(dim=-1).mean().item()):.4f} Dz={q.size(1)}")
 
         return q
 
@@ -950,6 +948,19 @@ class OppTrainer:
 
     # ----------------- forward scoring -----------------
     def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
+        if mask is not None and (getattr(self, "_global_step", 0) % 200 == 0):
+            m = mask
+            if m.dtype != torch.bool:
+                m = m != 0
+            with torch.no_grad():
+                print(
+                    "[DBG][mask]",
+                    "dtype", m.dtype,
+                    "shape", tuple(m.shape),
+                    "sum_min", int(m.sum(1).min().item()),
+                    "sum_max", int(m.sum(1).max().item()),
+                    "T", int(m.size(1)))
+
         cand_chunk_k = int(getattr(self.cfg, "cand_chunk_k", cand_chunk_k))
         pos_chunk_t = int(getattr(self.cfg, "pos_chunk_t", pos_chunk_t))
 
