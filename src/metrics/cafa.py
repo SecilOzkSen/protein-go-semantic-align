@@ -30,6 +30,33 @@ def cafa_metrics(y_true, y_pred, name="val"):
     yt = np.asarray(y_true)
     yp = np.asarray(y_pred)
 
+    true_pos = yt.sum()
+    pos_per_prot = true_pos / yt.shape[0]
+
+    print(f"[DBG][CAFA] true_pos={true_pos:.0f}  pos_per_prot={pos_per_prot:.4f}")
+
+    mn = float(yp.min())
+    mx = float(yp.max())
+    mean = float(yp.mean())
+    std = float(yp.std())
+
+    print(f"[DBG][CAFA] y_pred min={mn:.6f} max={mx:.6f} mean={mean:.6f} std={std:.6f}")
+
+    # pozitif ve negatif indeksleri bul
+    pos_idx = np.argwhere(yt > 0)
+    neg_idx = np.argwhere(yt == 0)
+
+    if len(pos_idx) > 0 and len(neg_idx) > 0:
+        rng = np.random.default_rng(0)
+
+        ps = pos_idx[rng.integers(0, len(pos_idx), size=min(1024, len(pos_idx)))]
+        ns = neg_idx[rng.integers(0, len(neg_idx), size=min(1024, len(neg_idx)))]
+
+        pos_mean = float(np.mean(yp[ps[:, 0], ps[:, 1]]))
+        neg_mean = float(np.mean(yp[ns[:, 0], ns[:, 1]]))
+
+        print(f"[DBG][CAFA] score_mean pos={pos_mean:.6f} neg={neg_mean:.6f} (want pos > neg)")
+
     print(f"[DBG][{name}] y_true shape={yt.shape} y_pred shape={yp.shape}")
     assert yt.shape == yp.shape, "shape mismatch"
 
