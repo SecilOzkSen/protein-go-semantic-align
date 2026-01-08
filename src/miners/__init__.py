@@ -1,1 +1,0 @@
-from .index_utils import load_faiss_index_for_phase

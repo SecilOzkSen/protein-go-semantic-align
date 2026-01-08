@@ -37,6 +37,15 @@ def cafa_metrics_sanity(y_true, y_pred, name="val", sample=2048, seed=0):
     yt = np.asarray(y_true)
     yp = np.asarray(y_pred)
 
+    # 1) Bir protein seç
+    i = 0
+    pos_cols = np.where(yt[i] > 0)[0]
+    top_cols = np.argsort(-yp[i])[:50]
+
+    print("[DBG][CAFA-check] pos_cols[:10] =", pos_cols[:10].tolist())
+    print("[DBG][CAFA-check] top_cols[:10] =", top_cols[:10].tolist())
+    print("[DBG][CAFA-check] overlap@50 =", int(np.intersect1d(pos_cols, top_cols).size))
+
     # 0) shape + finiteness
     assert yt.ndim == 2 and yp.ndim == 2, "y_true/y_pred must be 2D [N,M]"
     assert yt.shape == yp.shape, f"shape mismatch: y_true={yt.shape} y_pred={yp.shape}"
