@@ -1373,7 +1373,7 @@ class OppTrainer:
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
-            probs = torch.sigmoid(scores)
+            probs = (0.5 * (scores + 1.0)).clamp(0,1)           # CAFA
 
             preds.append(probs.cpu())
             trues.append(y_true.cpu())
