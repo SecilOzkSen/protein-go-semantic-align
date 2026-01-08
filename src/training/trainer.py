@@ -948,44 +948,6 @@ class OppTrainer:
 
     # ----------------- forward scoring -----------------
     def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
-        # src/.../model.py (forward_scores'un EN BAŞI)
-        if mask is not None and (getattr(self, "_global_step", 0) % 200 == 0):
-            m = mask if mask.dtype == torch.bool else (mask != 0)
-
-            with torch.no_grad():
-                lens = m.sum(dim=1)  # [B]
-                T = m.size(1)
-
-                # 1) mask sanity
-                full_ratio = (lens == T).float().mean().item()
-                short_ratio = (lens <= 32).float().mean().item()
-
-                # 2) pooled vec norms (mask'li ve masksiz kıyas)
-                w = m.to(H.dtype).unsqueeze(-1)  # [B,T,1]
-                denom = w.sum(dim=1).clamp_min(1.0)  # [B,1]
-                h_pool_masked = (H * w).sum(dim=1) / denom  # [B,D]
-                h_pool_unmasked = H.mean(dim=1)  # [B,D]
-
-                nm = h_pool_masked.float().norm(dim=-1)  # [B]
-                nu = h_pool_unmasked.float().norm(dim=-1)  # [B]
-
-                # 3) collapse sinyali: batch içi varyans
-                var_masked = h_pool_masked.float().std(dim=0).mean().item()
-                var_unmasked = h_pool_unmasked.float().std(dim=0).mean().item()
-
-                print(
-                    "[DBG][pool]",
-                    f"B={H.size(0)} T={T}",
-                    "len_min", int(lens.min().item()),
-                    "len_max", int(lens.max().item()),
-                    "full_ratio", f"{full_ratio:.2f}",
-                    "short_ratio<=32", f"{short_ratio:.2f}",
-                    "norm_masked_mean", f"{nm.mean().item():.3f}",
-                    "norm_unmasked_mean", f"{nu.mean().item():.3f}",
-                    "var_masked", f"{var_masked:.6f}",
-                    "var_unmasked", f"{var_unmasked:.6f}",
-                )
-
         cand_chunk_k = int(getattr(self.cfg, "cand_chunk_k", cand_chunk_k))
         pos_chunk_t = int(getattr(self.cfg, "pos_chunk_t", pos_chunk_t))
 

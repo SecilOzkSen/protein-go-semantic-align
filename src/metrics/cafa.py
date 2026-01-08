@@ -23,6 +23,44 @@ def _find_first_key(batch: Dict[str, Any], candidates: List[str]) -> Optional[st
             return k
     return None
 
+import numpy as np
+
+def cafa_metrics(y_true, y_pred, name="val"):
+    # y_true, y_pred: [N, M]
+    yt = np.asarray(y_true)
+    yp = np.asarray(y_pred)
+
+    print(f"[DBG][{name}] y_true shape={yt.shape} y_pred shape={yp.shape}")
+    assert yt.shape == yp.shape, "shape mismatch"
+
+    # 1) label density sanity
+    true_pos = yt.sum()
+    print(f"[DBG][{name}] true_pos={true_pos:.0f}  pos_per_prot={true_pos/yt.shape[0]:.3f}")
+    assert true_pos > 0, "y_true all-zero (label mapping broken)"
+
+    # 2) prediction range sanity
+    mn, mx, mean, std = float(yp.min()), float(yp.max()), float(yp.mean()), float(yp.std())
+    print(f"[DBG][{name}] y_pred min/max/mean/std = {mn:.4f} {mx:.4f} {mean:.4f} {std:.4f}")
+    assert np.isfinite([mn, mx, mean, std]).all(), "NaN/Inf in y_pred"
+
+    # 3) per-protein signal sanity: top score vs median
+    top1 = np.sort(yp, axis=1)[:, -1]
+    med = np.median(yp, axis=1)
+    gap = float(np.mean(top1 - med))
+    print(f"[DBG][{name}] avg(top1 - median) = {gap:.4f}")
+
+    # 4) quick overlap proxy (NO threshold): do positives get higher scores?
+    # sample 512 positives, 512 negatives
+    pos_idx = np.argwhere(yt > 0)
+    neg_idx = np.argwhere(yt == 0)
+    if len(pos_idx) > 0 and len(neg_idx) > 0:
+        rng = np.random.default_rng(0)
+        ps = pos_idx[rng.integers(0, len(pos_idx), size=min(512, len(pos_idx)))]
+        ns = neg_idx[rng.integers(0, len(neg_idx), size=min(512, len(neg_idx)))]
+        pos_mean = float(np.mean(yp[ps[:,0], ps[:,1]]))
+        neg_mean = float(np.mean(yp[ns[:,0], ns[:,1]]))
+        print(f"[DBG][{name}] score_mean pos={pos_mean:.4f} neg={neg_mean:.4f} (want pos>neg)")
+
 
 # ----------------------------------------
 # Collect logits/probs + labels from dict batch
@@ -127,6 +165,9 @@ def compute_fmax(
     precision is averaged only over proteins where we predicted at least 1 term
     recall is averaged only over proteins with at least 1 true label
     """
+
+    cafa_metrics(y_true, y_pred, name="val")
+
     y_true = (y_true > 0).astype(np.int32)
 
     fmax, best_t = 0.0, 0.0
