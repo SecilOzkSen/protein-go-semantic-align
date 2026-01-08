@@ -1349,7 +1349,7 @@ class OppTrainer:
 
         preds, trues = [], []
         sum_num = 0
-        sum_R1 = sum_R5 = sum_R10 = 0.0
+        sum_R1 = sum_R5 = sum_R10 = sum_R100 = sum_R200 = 0.0
         sum_MRR = sum_nDCG = 0.0
 
         for batch in loader:
@@ -1367,9 +1367,11 @@ class OppTrainer:
             m = retrieval_metrics_from_scores(scores, y_true, ks=(5, 10, 50, 100, 200))
             if m["num"] > 0:
                 sum_num += m["num"]
-                sum_R1 += m["R@1"] * m["num"]
-                sum_R5 += m["R@5"] * m["num"]
-                sum_R10 += m["R@10"] * m["num"]
+                sum_R1 += m["R@5"] * m["num"]
+                sum_R5 += m["R@10"] * m["num"]
+                sum_R10 += m["R@50"] * m["num"]
+                sum_R100 += m["R@100"] * m["num"]
+                sum_R200 += m["R@200"] * m["num"]
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
@@ -1395,9 +1397,11 @@ class OppTrainer:
             fmax, aupr = 0.0, 0.0
 
         if sum_num > 0:
-            logs["align_R@1"] = sum_R1 / sum_num
-            logs["align_R@5"] = sum_R5 / sum_num
-            logs["align_R@10"] = sum_R10 / sum_num
+            logs["align_R@5"] = sum_R1 / sum_num
+            logs["align_R@10"] = sum_R5 / sum_num
+            logs["align_R@50"] = sum_R10 / sum_num
+            logs["align_R@100"] = sum_R100 / sum_num
+            logs["align_R@200"] = sum_R200 / sum_num
             logs["align_MRR"] = sum_MRR / sum_num
             logs["align_nDCG@10"] = sum_nDCG / sum_num
         else:
