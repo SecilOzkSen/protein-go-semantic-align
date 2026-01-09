@@ -808,7 +808,7 @@ def run_training(args, schedule: TrainSchedule):
         phase0 = 0
         go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
-        phase0 = 4 # ablation 1 - no phase: -1, full ablation phase 4
+        phase0 = 3 # ablation 1 - no phase: -1, full ablation phase 4
        # print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
         print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
@@ -820,7 +820,7 @@ def run_training(args, schedule: TrainSchedule):
     # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
-    if phase0 == -1 or phase0==4: # phase = 4 -> full token activation
+    if phase0 == -1 or phase0==3: # phase = 4 -> full token activation
         go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
     else:
         for ph in range(total_phases):
@@ -846,7 +846,7 @@ def run_training(args, schedule: TrainSchedule):
     )
 
     # GoTextStore + dataloaders
-    lazy = True if phase0 >=0 and phase0!=4 else False
+    lazy = True if phase0 >=0 and phase0!=3 else False
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=False, max_len=args.go_text_store_max_len)
 
     print("GoTextStore size:", len(go_text_store.id2tok))
