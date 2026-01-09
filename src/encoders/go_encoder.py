@@ -169,7 +169,7 @@ class BioMedBERTEncoder(nn.Module):
         mapping = {
             "[IS_A]": "is",
             "[PART]": "part",
-            "[GOPATH]": "relations",
+            "[GOPATH]": "relation",
             "[PATH]": "path",
         }
         for new_tok, ref_tok in mapping.items():
