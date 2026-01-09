@@ -22,7 +22,8 @@ general: #Ablation Purposes
   use_attribution_loss: False #CHECKED
   return_alpha: False
   phase_based: True #CHECKED
-  pooling_strategy: "mean" #  "mean", "go_token_align_pooler" #CHECKED
+  pooling_strategy: "go_token_align_pooler" #  "mean", "go_token_align_pooler" #CHECKED
+  is_phasing: false # go token based phases are closed
 
 caches:
   go_cache: null
@@ -45,7 +46,7 @@ training:
   cpu: false
   seed: 42
 
-  output_dir: /workspace/protein-go-align/outputs/run-1-2-b
+  output_dir: /workspace/protein-go-align/outputs/run-2
   save_every: 10000
   keep_last_n: 3
  # resume: null #/workspace/checkpoints/checkpoint_step56000.pt
@@ -57,14 +58,15 @@ training:
   early_stop_patience: 8        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
-  k_hard_queue: 16  #32 #128
-  queue_K: 8192  #16384 #2048 #8192
+  k_hard_queue: 128  #32 #128 #16
+  queue_K: 16384  #8192 #2048 #8192
   max_refresh_go: 2000 #7500 # max go queue refresh per epoch - bc we do lora training!
   eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 512 # batch size for storing go text embeddings
   is_logit_scale_constant: false #false = trainable logit scale
   go_token_dropout: false
   go_pooling: "none" # cls, mean, masked_mean -> NO NEED
+
 
 optim:
   lr: 0.0003
@@ -133,7 +135,7 @@ stores:
   seq_len_lookup_dir: /workspace/data/training_ready/proteins/seq_len_lookup.pkl
   protein_manifest_file: /workspace/data/training_ready/manifest_cache/esm_manifest.pkl
 
-  output_dir: /workspace/protein-go-align-outputs-1-2-b
-  logs: /workspace/protein-go-align-logs-1-2-b
+  output_dir: /workspace/protein-go-align-outputs-2
+  logs: /workspace/protein-go-align-logs-2
 
   go_text_folder: /workspace/data/processed/go_terms/go_phases   #canonical #ablation 1

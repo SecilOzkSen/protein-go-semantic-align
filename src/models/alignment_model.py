@@ -34,7 +34,7 @@ class ProteinGoAligner(nn.Module):
         self.protein_ln = nn.LayerNorm(d_h)
         self.go_ln = nn.LayerNorm(d_g)
 
-        self.pooler = None if self.mean_pool else GoTokenAlignPooler(d_h=d_h, d_g=d_g, d_att=att_d)
+        self.pooler = None if self.mean_pool else GoTokenAlignPooler(d_h=d_h, d_g=d_g, d_att=att_d, dropout=0.05)
 
     @staticmethod
     def _norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:

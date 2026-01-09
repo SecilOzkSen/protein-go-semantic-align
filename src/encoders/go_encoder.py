@@ -119,6 +119,8 @@ class BioMedBERTEncoder(nn.Module):
                     self._id_weight_map[tid] = float(w)
         if special_tokens_added:
             self.model.resize_token_embeddings(len(self.tokenizer))
+            self.init_relation_token_embeds()
+            print("[tok] relation token embeddings initialized")
 
         # LoRA
         print("[INFO] LoRA enabled:", self.enable_lora)
@@ -154,6 +156,28 @@ class BioMedBERTEncoder(nn.Module):
             for tok in GO_SPECIAL_TOKENS:
                 tid = self.tokenizer.convert_tokens_to_ids(tok)
                 assert tid != self.tokenizer.unk_token_id, f"{tok} is UNK"
+
+    def copy_token_embed(self, new_tok: str, ref_tok: str):
+        emb = self.model.get_input_embeddings().weight.data  # [V,D]
+        new_id = self.tokenizer.convert_tokens_to_ids(new_tok)
+        ref_id = self.tokenizer.convert_tokens_to_ids(ref_tok)
+        if new_id is None or ref_id is None or new_id < 0 or ref_id < 0:
+            raise RuntimeError(f"bad token ids: {new_tok}={new_id}, {ref_tok}={ref_id}")
+        emb[new_id].copy_(emb[ref_id])
+
+    def init_relation_token_embeds(self):
+        mapping = {
+            "[IS_A]": "is",
+            "[PART]": "part",
+            "[GOPATH]": "relations",
+            "[PATH]": "path",
+        }
+        for new_tok, ref_tok in mapping.items():
+            try:
+                self.copy_token_embed(new_tok, ref_tok)
+            except Exception:
+                # fallback: copy from "the" if ref token not in vocab
+                self.copy_token_embed(new_tok, "the")
 
     def _enable_new_token_grad_only(self, old_vocab_size: int):
         # PEFT kullanıyorsun, path doğru: base_model.model...

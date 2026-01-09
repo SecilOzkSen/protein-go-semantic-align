@@ -588,26 +588,6 @@ class OppTrainer:
             param_groups.extend(ge_groups)
 
         self.opt = torch.optim.AdamW(param_groups)
-        # TODO - Erase later
-        go = getattr(self.model, "go_encoder", None)
-        if go is not None:
-            # kaç trainable param var
-            trainable = [(n, p) for n, p in go.named_parameters() if p.requires_grad]
-            self.ctx.logger.info(f"[debug] go_trainable_params={len(trainable)}")
-
-            # trainable isimlerinden ilk 10 tanesini yaz
-            for n, _ in trainable[:10]:
-                self.ctx.logger.info(f"[debug] go_trainable: {n}")
-
-            # optimizer param group’larında LoRA var mı?
-            nopt = 0
-            for gi, g in enumerate(self.opt.param_groups):
-                for p in g["params"]:
-                    if any(p is tp for _, tp in trainable):
-                        nopt += 1
-                        break
-            self.ctx.logger.info(f"[debug] opt_groups_touching_go_trainable={nopt} (should be >=1)")
-        # TODO: Erase Later
         self._global_step = 0
 
         self.use_moco_miner = bool(ctx.use_queue_miner)

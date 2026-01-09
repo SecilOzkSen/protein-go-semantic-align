@@ -808,8 +808,9 @@ def run_training(args, schedule: TrainSchedule):
         phase0 = 0
         go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
-        phase0 = -1 # ablation 1 - no phase
-        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
+        phase0 = 4 # ablation 1 - no phase: -1, full ablation phase 4
+       # print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
+        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
 
     go_cache = build_go_cache(str(go_cache_path))
@@ -819,7 +820,7 @@ def run_training(args, schedule: TrainSchedule):
     # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
-    if phase0 == -1:
+    if phase0 == -1 or phase0==4: # phase = 4 -> full token activation
         go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
     else:
         for ph in range(total_phases):
@@ -845,7 +846,7 @@ def run_training(args, schedule: TrainSchedule):
     )
 
     # GoTextStore + dataloaders
-    lazy = True if phase0 >=0 else False
+    lazy = True if phase0 >=0 and phase0!=4 else False
     go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=False, max_len=args.go_text_store_max_len)
 
     print("GoTextStore size:", len(go_text_store.id2tok))
@@ -911,7 +912,7 @@ def run_training(args, schedule: TrainSchedule):
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
-        scheduler=scheduler,
+        scheduler=None, #scheduler,
         go_text_store=go_text_store,
         use_queue_miner=bool(args.use_queue_miner),
         attribute_loss_enabled=bool(args.use_attribution_loss),
@@ -995,7 +996,7 @@ def run_training(args, schedule: TrainSchedule):
             training_context.last_refresh_reason = "phase_change" if not force else "force"
 
     # expose refresher
-    training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources
+    training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources if args.is_phasing else None
 
     # infer dims
     with torch.no_grad():
@@ -1073,7 +1074,8 @@ def run_training(args, schedule: TrainSchedule):
     logger.info("Start training for %d epochs", args.epochs)
     wandb.define_metric("trainer_step")
     wandb.define_metric("*", step_metric="trainer_step")
-    training_context.maybe_refresh_phase_resources(current_epoch=0, force=False)
+    if training_context.maybe_refresh_phase_resources is not None:
+        training_context.maybe_refresh_phase_resources(current_epoch=0, force=False)
 
     best_val = -inf if args.monitor_mode == "max" else inf
     best_step = 0
@@ -1123,7 +1125,8 @@ def run_training(args, schedule: TrainSchedule):
             logging.getLogger("bank").warning("Partial refresh failed: %r", _e)
 
         seen_go_ids = set()
-        training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
+        if training_context.maybe_refresh_phase_resources is not None:
+            training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
 
         trainer.model.train()
         running = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
@@ -1343,6 +1346,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         phase_based = bool(general.get("phase_based", False)),
         pooling_strategy = general.get("pooling_strategy", "mean"),
         ablation_id = general.get("ablation_id", None),
+        is_phasing = bool(general.get("is_phasing", False)),
         # paths / store
         train_ids=Path(stores.get("train_ids_path", PROTEIN_TRAIN_IDS)),
         pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),
@@ -1464,15 +1468,16 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
 
     if args.phase_based is False:
         return args, None
-    schedule = TrainSchedule(
-        phase_breaks=tuple(sched.get("phase_breaks", (5, 12, 25))),
-        stageA_mix=tuple(sched.get("stageA_mix", (1.0, 0.0, 0.0))),
-        stageB_mix=tuple(sched.get("stageB_mix", (0.7, 0.3, 0.0))),
-        stageC_mix=tuple(sched.get("stageC_mix", (0.4, 0.4, 0.2))),
-        stageD_mix=tuple(sched.get("stageD_mix", (0.4, 0.4, 0.2))),
-        lambda_attr_start=int(sched.get("lambda_attr_start", 6)),
-        lambda_attr_max=float(sched.get("lambda_attr_max", 0.2)),
-    )
+    schedule = None
+  #  schedule = TrainSchedule(
+  #      phase_breaks=tuple(sched.get("phase_breaks", (5, 12, 25))),
+  #      stageA_mix=tuple(sched.get("stageA_mix", (1.0, 0.0, 0.0))),
+  #      stageB_mix=tuple(sched.get("stageB_mix", (0.7, 0.3, 0.0))),
+  #      stageC_mix=tuple(sched.get("stageC_mix", (0.4, 0.4, 0.2))),
+  #     stageD_mix=tuple(sched.get("stageD_mix", (0.4, 0.4, 0.2))),
+  #      lambda_attr_start=int(sched.get("lambda_attr_start", 6)),
+  #      lambda_attr_max=float(sched.get("lambda_attr_max", 0.2)),
+  #  )
     return args, schedule
 
 def parse_args():
