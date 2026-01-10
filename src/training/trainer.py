@@ -1320,73 +1320,75 @@ class OppTrainer:
         device = self.device
 
         self._refresh_eval_go_cache(chunk=self.cfg.eval_go_bs)
-        self._eval_cache_ready = False  # force rebuild next time
+        self._eval_cache_ready = False
         self._ensure_eval_cache_v2(chunk=self.cfg.eval_go_bs)
 
-        logs = {"cafa_fmax": 0.0, "cafa_aupr": 0.0, "align_R@1": 0.0, "align_R@5": 0.0,
-                "align_R@10": 0.0, "align_MRR": 0.0, "align_nDCG@10": 0.0}
-        n = 0
+        logs = {
+            "cafa_fmax": 0.0, "cafa_aupr": 0.0,
+            "align_R@1": 0.0, "align_R@5": 0.0, "align_R@10": 0.0,
+            "align_R@50": 0.0, "align_R@100": 0.0, "align_R@200": 0.0,
+            "align_MRR": 0.0, "align_nDCG@10": 0.0
+        }
 
         preds, trues = [], []
+
         sum_num = 0
-        sum_R1 = sum_R5 = sum_R10 = sum_R100 = sum_R200 = 0.0
+        sum_R1 = sum_R5 = sum_R10 = sum_R50 = sum_R100 = sum_R200 = 0.0
         sum_MRR = sum_nDCG = 0.0
+
+        scale = self.logit_scale_value()
 
         for batch in loader:
             H = batch["prot_emb_pad"].to(device, non_blocking=True)
             if self.to_f32 is not None:
                 H = self.to_f32(H)
-            attn_valid, pad_mask = self._valid_and_pad_masks(batch)
+            attn_valid, _ = self._valid_and_pad_masks(batch)
 
-            # build global eval space from cache
             G_eval, y_true = self._build_eval_space(batch)
-            scores = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-            scale = self.logit_scale_value()
-            scores = scores * scale
-            #Alignment metrics on raw scores
-            m = retrieval_metrics_from_scores(scores, y_true, ks=(5, 10, 50, 100, 200))
+
+            # raw (ideally cosine-ish) scores
+            scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)  # [B,Geval]
+
+            # retrieval metrics should use the SAME scores as training ranking signal
+            scores_rank = scores_raw * scale
+
+            m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200))
             if m["num"] > 0:
                 sum_num += m["num"]
-                sum_R1 += m["R@5"] * m["num"]
-                sum_R5 += m["R@10"] * m["num"]
-                sum_R10 += m["R@50"] * m["num"]
+                sum_R1 += m["R@1"] * m["num"]
+                sum_R5 += m["R@5"] * m["num"]
+                sum_R10 += m["R@10"] * m["num"]
+                sum_R50 += m["R@50"] * m["num"]
                 sum_R100 += m["R@100"] * m["num"]
                 sum_R200 += m["R@200"] * m["num"]
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
-            probs = (0.5 * (scores + 1.0)).clamp(0,1)           # CAFA
+            # CAFA probability mapping: DO NOT use scaled scores
+            # If your scores_raw are cosine in [-1,1], this is the clean CAFA-style mapping:
+            probs = (0.5 * (scores_raw + 1.0)).clamp(0, 1)
 
             preds.append(probs.cpu())
             trues.append(y_true.cpu())
-            n += H.size(0)
 
         if preds:
             y_pred = torch.cat(preds, dim=0).numpy()
-            y_true = torch.cat(trues, dim=0).numpy()
+            y_true_np = torch.cat(trues, dim=0).numpy()
 
-            # CAFA-style protein-centric Fmax
-            fmax, _ = compute_fmax(
-                y_true=y_true,
-                y_pred=y_pred,
-                num_thresholds=101
-            )
-
-            aupr = compute_term_aupr(y_true, y_pred)
+            fmax, _ = compute_fmax(y_true=y_true_np, y_pred=y_pred, num_thresholds=101)
+            aupr = compute_term_aupr(y_true_np, y_pred)
         else:
             fmax, aupr = 0.0, 0.0
 
         if sum_num > 0:
-            logs["align_R@5"] = sum_R1 / sum_num
-            logs["align_R@10"] = sum_R5 / sum_num
-            logs["align_R@50"] = sum_R10 / sum_num
+            logs["align_R@1"] = sum_R1 / sum_num
+            logs["align_R@5"] = sum_R5 / sum_num
+            logs["align_R@10"] = sum_R10 / sum_num
+            logs["align_R@50"] = sum_R50 / sum_num
             logs["align_R@100"] = sum_R100 / sum_num
             logs["align_R@200"] = sum_R200 / sum_num
             logs["align_MRR"] = sum_MRR / sum_num
             logs["align_nDCG@10"] = sum_nDCG / sum_num
-        else:
-            logs["align_R@1"] = logs["align_R@5"] = logs["align_R@10"] = 0.0
-            logs["align_MRR"] = logs["align_nDCG@10"] = 0.0
 
         logs["cafa_fmax"] = float(fmax)
         logs["cafa_aupr"] = float(aupr)
