@@ -244,7 +244,7 @@ def main(
 
 if __name__ == "__main__":
     main(
-        go_path="/workspace/protein-go-semantic-align/src/data/processed/go_terms/canonical/go_texts_canonical_2.jsonl",
+        go_path="/workspace/protein-go-semantic-align/src/data/processed/go_terms/canonical2/go_texts_canonical_2.jsonl",
         output_prefix="/workspace/protein-go-semantic-align/src/data/training_ready/go_indexes/go_text_embeddings_canonical_2",
         phase="-2",
         model_name="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
