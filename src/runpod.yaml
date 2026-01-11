@@ -46,7 +46,7 @@ training:
   cpu: false
   seed: 42
 
-  output_dir: /workspace/protein-go-align/outputs/run-2
+  output_dir: /workspace/protein-go-align/outputs/run-3
   save_every: 10000
   keep_last_n: 3
  # resume: null #/workspace/checkpoints/checkpoint_step56000.pt
@@ -119,7 +119,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation1-c"
+  wandb_run_name: "protein-go-semantic-align-ablation3"
   mode: online
 
 stores:
@@ -135,7 +135,7 @@ stores:
   seq_len_lookup_dir: /workspace/data/training_ready/proteins/seq_len_lookup.pkl
   protein_manifest_file: /workspace/data/training_ready/manifest_cache/esm_manifest.pkl
 
-  output_dir: /workspace/protein-go-align-outputs-2
-  logs: /workspace/protein-go-align-logs-2
+  output_dir: /workspace/protein-go-align-outputs-3
+  logs: /workspace/protein-go-align-logs-3
 
   go_text_folder: /workspace/data/processed/go_terms/go_phases   #canonical #ablation 1

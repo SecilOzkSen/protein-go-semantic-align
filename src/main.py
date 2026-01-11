@@ -808,11 +808,11 @@ def run_training(args, schedule: TrainSchedule):
         phase0 = 0
         go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
-        phase0 = 3 # ablation 1 - no phase: -1, full ablation phase 4
-       # print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
-        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
-        #go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
-        go_cache_path = GO_INDEX[phase0+1]["TEXT_EMB"]
+        phase0 = -1 # ablation 1 - no phase: -1, full ablation phase 4
+        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
+      #  print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
+        go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
+        #go_cache_path = GO_INDEX[phase0+1]["TEXT_EMB"]
 
     go_cache = build_go_cache(str(go_cache_path))
     dag_parents = load_go_parents() if args.use_dag_in_ds else None
