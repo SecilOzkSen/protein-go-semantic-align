@@ -88,8 +88,13 @@ COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic
 
 # ---- GO indexes by phase -----------------------------
 GO_INDEX_NON_PHASE = TRAINING_READY / "go_indexes" / "canonical"
+GO_INDEX_NON_PHASE_2 = TRAINING_READY / "go_indexes" / "canonical2"
 _GO_IDX = lambda p: TRAINING_READY / "go_indexes" / "memmap" / f"phase{p}"
 GO_INDEX = {
+    -2: {
+        "TEXT_EMB": GO_INDEX_NON_PHASE_2 / "go_text_embeddings_canonical_2.npy",
+        "META":      GO_INDEX_NON_PHASE_2 / "go_text_embeddings_canonical_2.npy.meta.pt",
+        },
     -1: {
         "TEXT_EMB": GO_INDEX_NON_PHASE / "go_text_embeddings_canonical.npy",
         "META":      GO_INDEX_NON_PHASE / "go_text_embeddings_canonical.npy.meta.pt",

@@ -808,7 +808,7 @@ def run_training(args, schedule: TrainSchedule):
         phase0 = 0
         go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
-        phase0 = -1 # ablation 1 - no phase: -1, full ablation phase 4
+        phase0 = -2 # ablation 1 - no phase: -1, full ablation phase 4
         print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
       #  print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]

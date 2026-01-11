@@ -764,96 +764,160 @@ class OppTrainer:
 
     @torch.no_grad()
     def _mine_queue_hard_negs(self, prot_query, pos_local, uniq_go_ids, Dg_batch: int):
+        """
+        Returns:
+          neg: [B, k, Dg]  (projected+normalized GO space)
+        Notes:
+          - prot_query: [B, Dg] projected+normalized protein query
+          - queue stores: [Kq, Dg] projected+normalized GO vectors, plus ids
+          - DAG-aware filtering excludes positives (and optionally ancestors)
+          - Mix hard and random for stability
+          - Fallback if all candidates masked out for a sample
+        """
         if self.queue_miner is None:
             return None
 
         res = self.queue_miner.get_all_neg()
         if res is None:
             return None
+
         all_neg_vecs, all_neg_ids = res
         if all_neg_vecs is None or all_neg_vecs.numel() == 0:
             return None
-        if all_neg_vecs.size(1) != Dg_batch:
-            raise RuntimeError(f"Queue D mismatch: {all_neg_vecs.size(1)} vs {Dg_batch}")
+
+        # Expect [Kq, Dg]
+        if all_neg_vecs.dim() != 2:
+            raise RuntimeError(f"Queue vecs must be [Kq,D], got {tuple(all_neg_vecs.shape)}")
+        if int(all_neg_vecs.size(1)) != int(Dg_batch):
+            raise RuntimeError(f"Queue D mismatch: {int(all_neg_vecs.size(1))} vs {int(Dg_batch)}")
 
         device = self.device
-        # [K, Dg]
-        Kmat = all_neg_vecs
-        # [B, K]
-        sims = prot_query @ Kmat.T
-        if getattr(self, "_global_step", 0) % 200 == 0:
-            frac_neginf = float(torch.isneginf(sims).float().mean().item())
-            frac_finite = float(torch.isfinite(sims).float().mean().item())
-            print(
-                f"[DBG] queue sims: frac_neginf={frac_neginf:.3f} frac_finite={frac_finite:.3f} K={int(sims.size(1))}")
-        # ---- DAG-aware false-negative mask ----
+        B = int(prot_query.size(0))
+
+        # Move to device, align dtype
+        Kmat = all_neg_vecs.to(device, non_blocking=True).to(prot_query.dtype)  # [Kq, Dg]
+        Kq = int(Kmat.size(0))
+
+        # ids to device
         if all_neg_ids is not None:
             if not torch.is_tensor(all_neg_ids):
                 all_neg_ids = torch.as_tensor(all_neg_ids, dtype=torch.long)
-            all_neg_ids = all_neg_ids.to(device, non_blocking=True).long()  # [K]
+            all_neg_ids = all_neg_ids.to(device, non_blocking=True).long()  # [Kq]
+        else:
+            all_neg_ids = None
 
-            B = len(pos_local)
-            if B > 0:
-                Pmax = max((int(loc.numel()) for loc in pos_local), default=0)
-            else:
-                Pmax = 0
+        # Similarities [B, Kq]
+        sims = prot_query @ Kmat.T
 
-            if Pmax > 0:
-                # Build base pos ids: [B, Pmax] (pad=-1)
-                pos_go_ids = torch.full((B, Pmax), -1, device=device, dtype=torch.long)
-                uniq_go_ids_dev = uniq_go_ids.to(device, non_blocking=True).long()
+        # Debug norms, optional
+        if getattr(self, "_global_step", 0) % 200 == 0:
+            qn = float(prot_query.norm(dim=1).mean().item())
+            kn = float(Kmat.norm(dim=1).mean().item())
+            frac_finite = float(torch.isfinite(sims).float().mean().item())
+            print(f"[DBG] queue sims: finite={frac_finite:.3f} Kq={Kq} norms q={qn:.3f} k={kn:.3f}")
 
-                for b, loc in enumerate(pos_local):
-                    if loc.numel() == 0:
-                        continue
-                    loc = loc.to(device, non_blocking=True)
-                    gids = uniq_go_ids_dev.index_select(0, loc)
-                    t = int(gids.numel())
-                    if t > 0:
-                        pos_go_ids[b, :t] = gids
+        # --------- DAG-aware false-negative filtering (memory-safe) ----------
+        # Build exclude ids per sample, then mask with torch.isin per row.
+        if all_neg_ids is not None and pos_local is not None and len(pos_local) > 0:
+            uniq_go_ids_dev = uniq_go_ids.to(device, non_blocking=True).long()
 
-                # Optionally expand with ancestors (guard even if you do propagation)
-                dag_anc = self.dag_ancestors  # dict[int, list[int]] or None
+            dag_anc = getattr(self, "dag_ancestors", None)
+
+            for b in range(B):
+                loc = pos_local[b]
+                if loc is None or int(loc.numel()) == 0:
+                    continue
+                loc = loc.to(device, non_blocking=True).long()
+                pos_ids = uniq_go_ids_dev.index_select(0, loc)  # [P]
+
+                # expand exclude set with ancestors if provided
                 if dag_anc is not None:
-                    # Build expanded exclude ids per sample (small loop over B, OK)
-                    expanded: list[torch.Tensor] = []
-                    Emax = 0
-                    for b in range(B):
-                        ids = pos_go_ids[b]
-                        ids = ids[ids >= 0].tolist()
-                        if not ids:
-                            expanded.append(torch.empty(0, device=device, dtype=torch.long))
-                            continue
-                        s = set()
-                        for gid in ids:
-                            s.update(dag_anc.get(int(gid), [int(gid)]))
-                        ex = torch.as_tensor(list(s), device=device, dtype=torch.long)
-                        expanded.append(ex)
-                        Emax = max(Emax, int(ex.numel()))
-
-                    if Emax > 0:
-                        excl = torch.full((B, Emax), -1, device=device, dtype=torch.long)
-                        for b, ex in enumerate(expanded):
-                            if ex.numel() > 0:
-                                excl[b, : ex.numel()] = ex
-                        # vectorized compare: [B, Emax, 1] == [1, 1, K] -> [B, Emax, K] -> any -> [B, K]
-                        fn_mask = (excl.unsqueeze(-1) == all_neg_ids.view(1, 1, -1)).any(dim=1)
-                    else:
-                        fn_mask = None
+                    ids_list = [int(x) for x in pos_ids.detach().cpu().tolist()]
+                    s = set()
+                    for gid in ids_list:
+                        # dag_anc should contain gid itself too, but guard anyway
+                        anc = dag_anc.get(int(gid), None)
+                        if anc is None:
+                            s.add(int(gid))
+                        else:
+                            for a in anc:
+                                s.add(int(a))
+                    excl = torch.as_tensor(list(s), device=device, dtype=torch.long)
                 else:
-                    # propagation-only mode: exclude just the pos ids
-                    fn_mask = (pos_go_ids.unsqueeze(-1) == all_neg_ids.view(1, 1, -1)).any(dim=1)
+                    excl = pos_ids.unique()
 
-                if fn_mask is not None:
-                    sims = sims.masked_fill(fn_mask, float("-inf"))
+                if excl.numel() > 0:
+                    mask = torch.isin(all_neg_ids, excl)  # [Kq] bool
+                    sims[b].masked_fill_(mask, float("-inf"))
 
-        k = min(int(self.k_hard_queue), int(Kmat.size(0)))
-        if k <= 0:
+        # --------- choose k, and mix hard+random ----------
+        k_total = int(getattr(self, "k_hard_queue", 0))
+        if k_total <= 0:
             return None
+        k_total = min(k_total, Kq)
 
-        idx = sims.topk(k, dim=1).indices  # [B, k]
-        neg = Kmat.index_select(0, idx.reshape(-1)).reshape(idx.size(0), k, -1).contiguous()
-        return neg  # [B, k, Dg]
+        # mix ratios (feel free to tune)
+        hard_frac = float(getattr(self, "hard_frac_queue", 0.7))  # default 70% hard
+        k_hard = int(round(k_total * hard_frac))
+        k_hard = max(0, min(k_hard, k_total))
+        k_rand = k_total - k_hard
+
+        # We'll select per sample to handle per-row masking properly.
+        neg_idx = torch.empty((B, k_total), device=device, dtype=torch.long)
+
+        for b in range(B):
+            row = sims[b]  # [Kq]
+            finite_mask = torch.isfinite(row)
+
+            # If nothing finite, fallback: random from all
+            if int(finite_mask.sum().item()) == 0:
+                perm = torch.randperm(Kq, device=device)[:k_total]
+                neg_idx[b] = perm
+                continue
+
+            # Hard part
+            if k_hard > 0:
+                # topk on finite values only, easiest by setting -inf already done
+                hard = torch.topk(row, k=min(k_hard, Kq), dim=0).indices  # [k_hard]
+            else:
+                hard = torch.empty((0,), device=device, dtype=torch.long)
+
+            # Random part from remaining finite (and not in hard)
+            if k_rand > 0:
+                # candidate pool = finite and not hard
+                pool = torch.nonzero(finite_mask, as_tuple=False).squeeze(1)  # [M]
+                if hard.numel() > 0:
+                    # remove hard indices
+                    hard_set_mask = torch.isin(pool, hard)
+                    pool = pool[~hard_set_mask]
+
+                if pool.numel() == 0:
+                    # fallback: sample from hard (or from all finite)
+                    pool = hard if hard.numel() > 0 else torch.nonzero(finite_mask, as_tuple=False).squeeze(1)
+
+                if pool.numel() <= k_rand:
+                    rand = pool
+                    # pad if still short
+                    if rand.numel() < k_rand:
+                        extra = pool[torch.randperm(pool.numel(), device=device)[: (k_rand - rand.numel())]]
+                        rand = torch.cat([rand, extra], dim=0)
+                else:
+                    rand = pool[torch.randperm(pool.numel(), device=device)[:k_rand]]
+            else:
+                rand = torch.empty((0,), device=device, dtype=torch.long)
+
+            sel = torch.cat([hard, rand], dim=0)
+            # If sel is shorter due to corner cases, pad randomly from all
+            if int(sel.numel()) < k_total:
+                need = k_total - int(sel.numel())
+                extra = torch.randperm(Kq, device=device)[:need]
+                sel = torch.cat([sel, extra], dim=0)
+
+            neg_idx[b] = sel[:k_total]
+
+        # gather neg vectors: [B, k, Dg]
+        neg = Kmat.index_select(0, neg_idx.reshape(-1)).view(B, k_total, -1).contiguous()
+        return neg
 
     def _build_candidates(self, uniq_go_embs, pos_local, neg_from_queue=None, *, max_inbatch: int | None = None):
         """
