@@ -1,0 +1,29 @@
+model:
+  text_model_name: microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext
+  protein_dim: 1280
+
+training:
+  retriever_ckpt: null
+  device: cuda
+  fp16: true
+  topk: 200
+  batch_size: 16
+  epochs: 10
+  lr: 2e-4
+  weight_decay: 0.01
+  log_every: 500
+  eval_every: 2000
+  save_metric: "fmax"
+
+stores:
+  out_dir: /workspace/protein-go-align/outputs/reranker/run-1
+  train_ids_path: /workspace/data/training_ready/proteins/protein_train_ids.txt
+  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives.json #pid_to_positives_canonical
+  val_ids_path: /workspace/data/training_ready/proteins/protein_val_ids.txt
+
+  embed_dir_res: /workspace/protein/residues
+  embed_dir_fused: /workspace/protein/fused
+
+  seq_len_lookup_dir: /workspace/data/training_ready/proteins/seq_len_lookup.pkl
+  protein_manifest_file: /workspace/data/training_ready/manifest_cache/esm_manifest.pkl
+  go_text_folder: /workspace/data/processed/go_terms/go_phases

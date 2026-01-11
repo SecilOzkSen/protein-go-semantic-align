@@ -1,90 +1,71 @@
-# src/training/reranker_model.py
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
+from typing import Optional, Dict, Tuple, Union
 from transformers import AutoModel
-from src.models.go_token_align_pooler import GoTokenAlignPooler
 
-# -----------------------------
-# (B) Fast baseline: protein_vec + GO_CLS -> MLP
-# -----------------------------
-class RerankerConcatMLP(nn.Module):
-    """
-    protein_vec: [B, Dp]
-    go_text: tokenized -> BiomedBERT CLS [B, Dt]
-    score = MLP([protein_vec, go_cls])
-    """
-    def __init__(
-        self,
-        text_model_name: str,
-        protein_dim: int,
-        hidden_dim: int = 512,
-        freeze_text_encoder: bool = True,
-        dropout: float = 0.0,
-    ):
+
+class MaskedMeanPool(nn.Module):
+    def __init__(self, eps: float = 1e-8):
         super().__init__()
-        self.text_encoder = AutoModel.from_pretrained(text_model_name)
-        dt = self.text_encoder.config.hidden_size
+        self.eps = float(eps)
 
-        if freeze_text_encoder:
-            for p in self.text_encoder.parameters():
-                p.requires_grad = False
+    def forward(self, H: torch.Tensor, valid_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        H: [B,T,D]
+        valid_mask: [B,T] bool (True=valid)
+        returns: [B,D]
+        """
+        if valid_mask is None:
+            return H.mean(dim=1)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(protein_dim + dt, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity(),
-            nn.Linear(hidden_dim, 1)
-        )
+        if valid_mask.dtype != torch.bool:
+            valid_mask = valid_mask != 0
 
-    def forward(self, protein_vec, input_ids, attention_mask):
-        out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        go_cls = out.last_hidden_state[:, 0]                  # [B,Dt]
-        x = torch.cat([protein_vec, go_cls], dim=-1)
-        return self.mlp(x).squeeze(-1)                        # [B]
+        w = valid_mask.to(H.dtype).unsqueeze(-1)     # [B,T,1]
+        denom = w.sum(dim=1).clamp_min(1.0)          # [B,1]
+        return (H * w).sum(dim=1) / denom            # [B,D]
 
 
-# -----------------------------
-# (A+) AlignPooler reranker: H tokens + GO_CLS -> GO-conditioned pooling -> MLP
-# -----------------------------
-class RerankerGoAlignPooler(nn.Module):
+class RerankerMeanPoolConcatMLP(nn.Module):
     """
+    Minimal working reranker.
+
     Input:
-      H: [B,T,Dh]              protein token/residue reps (from your protein encoder pipeline)
-      valid_mask: [B,T] bool   True=valid
-      go_text: tokenized for K candidates per protein, shaped as [B*K, L]
-    Steps:
-      1) Encode GO text with BiomedBERT -> go_cls [B*K, Dt]
-      2) Reshape go_cls -> G [B,K,Dt]
-      3) Pool protein tokens conditioned on each GO: Z = pooler(H, G) -> [B,K,Dh]
-      4) Score each pair with MLP on [Z || G]
+      H: [B,T,Dh] protein token reps (frozen encoder output or stored embeddings)
+      valid_mask: [B,T] bool
+      go_input_ids: [B*K,L]
+      go_attention_mask: [B*K,L]
+      K: int
+
     Output:
       logits: [B,K]
+
+    Notes:
+      - Text encoder can be frozen or LoRA-wrapped outside.
     """
     def __init__(
         self,
         text_model_name: str,
-        d_h: int,
-        d_att: int = 256,
+        d_h: int, #protein residue(token) embedding dim
         hidden_dim: int = 512,
         freeze_text_encoder: bool = True,
-        dropout: float = 0.0,
-        return_alpha: bool = False,
+        dropout: float = 0.1,
+        use_protein_ln: bool = True,
+        use_go_ln: bool = True,
     ):
         super().__init__()
         self.text_encoder = AutoModel.from_pretrained(text_model_name)
-        d_g = self.text_encoder.config.hidden_size
+        d_g = int(self.text_encoder.config.hidden_size)
 
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad = False
 
-        self.pooler = GoTokenAlignPooler(d_h=d_h, d_g=d_g, d_att=d_att, dropout=dropout)
-
-        # LN after pooling is safer
-        self.protein_ln = nn.LayerNorm(d_h)
-        self.go_ln = nn.LayerNorm(d_g)
+        self.pool = MaskedMeanPool()
+        self.protein_ln = nn.LayerNorm(d_h) if use_protein_ln else nn.Identity()
+        self.go_ln = nn.LayerNorm(d_g) if use_go_ln else nn.Identity()
 
         self.scorer = nn.Sequential(
             nn.Linear(d_h + d_g, hidden_dim),
@@ -93,8 +74,6 @@ class RerankerGoAlignPooler(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        self._return_alpha_default = return_alpha
-
     def forward(
         self,
         H: torch.Tensor,                       # [B,T,Dh]
@@ -102,33 +81,29 @@ class RerankerGoAlignPooler(nn.Module):
         go_input_ids: torch.Tensor,            # [B*K,L]
         go_attention_mask: torch.Tensor,       # [B*K,L]
         K: int,
-        return_alpha: Optional[bool] = None,
-    ):
-        if return_alpha is None:
-            return_alpha = self._return_alpha_default
-
+        return_alpha: bool = False,            # kept for trainer compat, always ignored
+        **kwargs,
+    ) -> torch.Tensor:
         B, T, Dh = H.shape
         BK, L = go_input_ids.shape
-        assert BK == B * K, f"go batch must be B*K. got {BK} expected {B*K}"
+        if BK != B * K:
+            raise RuntimeError(f"go batch must be B*K. got {BK} expected {B*K}")
 
-        # 1) GO text encoder
+        # 1) protein -> [B,Dh]
+        prot_vec = self.pool(H, valid_mask)         # [B,Dh]
+        prot_vec = self.protein_ln(prot_vec)
+
+        # 2) go text -> [B*K,Dg]
         out = self.text_encoder(input_ids=go_input_ids, attention_mask=go_attention_mask)
-        go_cls = out.last_hidden_state[:, 0]                 # [B*K, Dg]
-        Dg = go_cls.size(-1)
+        go_cls = out.last_hidden_state[:, 0]        # [B*K,Dg]
+        go_cls = self.go_ln(go_cls)
 
-        # 2) reshape to [B,K,Dg]
-        G = go_cls.view(B, K, Dg)
+        # 3) repeat prot for each candidate
+        prot_rep = prot_vec.unsqueeze(1).expand(B, K, Dh).contiguous().view(B * K, Dh)
 
-        # 3) GO-conditioned pooling: Z [B,K,Dh]
-        Z, alpha_info = self.pooler(H, G, valid_mask, return_alpha=return_alpha)
+        # 4) score
+        x = torch.cat([prot_rep, go_cls], dim=-1)   # [B*K, Dh+Dg]
+        s = self.scorer(x).squeeze(-1)              # [B*K]
+        logits = s.view(B, K)
 
-        Z = self.protein_ln(Z)
-        G = self.go_ln(G)
-
-        # 4) pairwise scoring
-        x = torch.cat([Z, G], dim=-1)                        # [B,K,Dh+Dg]
-        logits = self.scorer(x).squeeze(-1)                  # [B,K]
-
-        if return_alpha:
-            return logits, alpha_info
         return logits

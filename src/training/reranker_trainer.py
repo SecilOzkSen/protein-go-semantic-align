@@ -44,8 +44,7 @@ class RerankerTrainer:
     def train_step(self, batch: Dict[str, torch.Tensor]) -> RerankerTrainStats:
         batch = self._to_device(batch)
         self.model.train()
-
-        H = batch["H"]                              # [B,T,Dh]
+        H = batch["H"]  # [B,T,Dh]
         valid_mask = batch["valid_mask"]            # [B,T]
         go_input_ids = batch["go_input_ids"]        # [B*K,L]
         go_attention_mask = batch["go_attention_mask"]
