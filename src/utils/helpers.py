@@ -37,7 +37,7 @@ def load_go_texts(path: str) -> Dict[int, str]:
         out[go_int] = el["text"]
     return out
 
-def load_go_texts_canonical(go_text_path: str) -> Dict[int, str]:
+def load_go_texts_canonical(go_text_path: str, phase=-2) -> Dict[int, str]:
     """
     Canonical GO text loader for format:
     {
@@ -89,8 +89,9 @@ def load_go_texts_canonical(go_text_path: str) -> Dict[int, str]:
             # --- Text (we combine name + definition) ---
             name = el.get("name", "").strip()
             definition = el.get("definition", "").strip()
-
-            if name and definition:
+            if phase == -2:
+                text = el.get("text", "").strip()
+            elif name and definition:
                 text = f"{name}. {definition}"
             elif name:
                 text = name
@@ -115,7 +116,7 @@ def load_go_texts_by_phase(go_text_folder: str, phase: int = 0) -> Dict[int, str
         else:
             fname = "go_texts_canonical.jsonl"
         path = os.path.join(go_text_folder, fname)
-        return load_go_texts_canonical(path)
+        return load_go_texts_canonical(path, phase=phase)
     else:
         fname = f"go_texts_phase_{phase+1}.jsonl"
         path = os.path.join(go_text_folder, fname)
