@@ -821,7 +821,7 @@ def run_training(args, schedule: TrainSchedule):
     # GO text dict per phase
     total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
-    if phase0 == -1 or phase0==3: # phase = 4 -> full token activation
+    if phase0 == -1 or phase0==3 or phase0 == -2: # phase = 4 -> full token activation
         go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
     else:
         for ph in range(total_phases):
