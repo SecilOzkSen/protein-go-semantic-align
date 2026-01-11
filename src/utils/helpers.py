@@ -110,7 +110,10 @@ def load_go_texts_canonical(go_text_path: str) -> Dict[int, str]:
 
 def load_go_texts_by_phase(go_text_folder: str, phase: int = 0) -> Dict[int, str]:
     if phase < 0: #ablation 1
-        fname = "go_texts_canonical.jsonl"
+        if phase == -2:
+            fname = "go_texts_canonical_2.jsonl"
+        else:
+            fname = "go_texts_canonical.jsonl"
         path = os.path.join(go_text_folder, fname)
         return load_go_texts_canonical(path)
     else:
