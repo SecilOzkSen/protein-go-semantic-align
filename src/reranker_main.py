@@ -662,10 +662,10 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         train_ids_path=str(stores.get("train_ids_path", "")),
         pid2pos=str(stores.get("pid2pos_path", "")),
         val_ids_path=str(stores.get("val_ids_path", "")),
-        embed_dir_res_path=str(stores.get("embed_dir_res_path", "")),
+        embed_dir_res=str(stores.get("embed_dir_res_path", "")),
         embed_dir_fused=str(stores.get("embed_dir_fused_path", "")),
-        seq_len_lookup_dir_path=str(stores.get("seq_len_lookup_dir_path", "")),
-        protein_manifest_file_path=str(stores.get("protein_manifest_file_path", "")),
+        seq_len_lookup_dir=str(stores.get("seq_len_lookup_dir", "")),
+        protein_manifest_file=str(stores.get("protein_manifest_file", "")),
         go_text_folder=str(stores.get("go_text_folder", "")),
         # data
         max_len=int(data.get("protein_max_len", 1024)),
