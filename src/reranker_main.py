@@ -670,6 +670,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         # data
         max_len=int(data.get("protein_max_len", 1024)),
         overlap=int(data.get("overlap", 128)),
+        fs_target_ratio=float(data.get("fs_target_ratio", 0.1))
     )
     return args
 

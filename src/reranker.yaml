@@ -5,6 +5,7 @@ model:
 data:
   protein_max_len: 1024
   overlap: 256
+  fs_target_ratio: 0.3
 
 training:
   retriever_ckpt: /workspace/checkpoints/checkpoint_epoch10.pt
