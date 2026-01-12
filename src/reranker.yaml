@@ -3,7 +3,7 @@ model:
   protein_dim: 1280
 
 training:
-  retriever_ckpt: /workspace/protein-go-semantic-align/run-3/checkpoint_epoch13.pt
+  retriever_ckpt: /workspace/checkpoints/checkpoint_epoch10.pt
   device: cuda
   fp16: true
   topk: 200
