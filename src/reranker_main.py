@@ -20,6 +20,7 @@ from transformers import AutoTokenizer
 
 # Retriever
 from src.models.alignment_model import ProteinGoAligner
+from src.encoders.go_encoder import BioMedBERTEncoder
 
 # Reranker
 from src.training.reranker_trainer import RerankerTrainer
@@ -596,28 +597,42 @@ def main(phase_id = -2):
     tokenizer = AutoTokenizer.from_pretrained(args.text_model_name)
     go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=tokenizer, phase=phase_id)
 
-    # 3) Load retriever checkpoint
+    # 1) Go encoder'ı oluştur
+    go_encoder = BioMedBERTEncoder(
+        model_name=args.text_model_name,
+        device=str(device),  # ya da "cpu" sonra .to(device)
+        max_length=512,
+    )
+    go_encoder = go_encoder.to(device)
+
+    # 2) Retriever'ı go_encoder ile oluştur
     retriever = ProteinGoAligner(
         d_h=args.protein_dim,
-        d_g=768,            # because you used go_encoder path usually
+        d_g=None,  # senin modelin içinde go_ln vs varsa genelde d_g otomatik, değilse doğru d_g ver
         d_z=512,
-        go_encoder=None,     # if retriever stores go_encoder inside checkpoint, you will load it with state_dict
+        go_encoder=go_encoder,  # kritik
         normalize=True,
-        mean_pool=False,     # you want token align pooler, not mean
+        mean_pool=False,
     ).to(device)
 
+    # 3) Checkpoint yükle ve state_dict'i normalize et (prefix temizliği gerekebilir)
     ckpt = torch.load(args.retriever_ckpt, map_location="cpu", weights_only=False)
     state = ckpt.get("model", ckpt)
+
+    # Eğer key'lerde "model." prefix'i varsa sök
+    if any(k.startswith("model.") for k in state.keys()):
+        state = {k[len("model."):]: v for k, v in state.items()}
+
     missing, unexpected = retriever.load_state_dict(state, strict=False)
-    print(f"[main] retriever load: missing={len(missing)} unexpected={len(unexpected)}")
+    print("missing", len(missing), "unexpected", len(unexpected))
+
     retriever.eval()
+    go_encoder = retriever.go_encoder  # artık None değil
 
     # If your retriever has go_encoder inside, use it to build eval_G_once.
     # Otherwise, you must load a GO encoder separately.
     if getattr(retriever, "go_encoder", None) is None:
         raise RuntimeError("retriever.go_encoder is None. Provide GO encoder or change build_eval_G_once logic.")
-    go_encoder = retriever.go_encoder
-
 
     res_store, fused_store = build_stores(args)
     go_cache = build_go_cache(go_index_paths(phase_id)["TEXT_EMB"])
