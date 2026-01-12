@@ -711,6 +711,8 @@ def main(phase_id = -2):
     state = ckpt.get("model", ckpt)
     state = state.get("model", state)
 
+    state = {k: v for k, v in state.items() if not k.startswith("go_encoder.")}
+
     # retriever yükle (topk üretmek için)
     missing, unexpected = retriever.load_state_dict(state, strict=False)
     print(f"[main] retriever load: missing={len(missing)} unexpected={len(unexpected)}")
