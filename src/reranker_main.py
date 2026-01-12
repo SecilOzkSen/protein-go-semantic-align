@@ -678,6 +678,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
 # Main loop
 # -----------------------------
 def main(phase_id = -2):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     args = load_structured_cfg()
     device = torch.device(args.device)
 
@@ -775,9 +776,9 @@ def main(phase_id = -2):
     step = 0
     for epoch in range(int(args.epochs)):
         print(f"\n[main] epoch={epoch}")
+        rr_trainer.model.train()
+
         for batch in train_loader:
-            # batch must include:
-            # prot_emb_pad: [B,T,Dh], prot_attn_mask: [B,T], pos_go_global: List[Tensor]
             H = batch["prot_emb_pad"].to(device, non_blocking=True)
             valid_mask = valid_mask_from_attn(batch["prot_attn_mask"].to(device, non_blocking=True))
             pos_go_global = batch["pos_go_global"]
@@ -793,14 +794,14 @@ def main(phase_id = -2):
                 chunk_k=2048,
             )  # [B,K] CPU
 
-            labels = make_labels_for_candidates(cand_ids, pos_go_global)  # [B,K] CPU float
+            labels = make_labels_for_candidates(cand_ids, pos_go_global)  # [B,K] CPU
 
             toks = tokenize_candidates_flat(go_text_store, cand_ids)
             go_input_ids = toks["input_ids"].to(device, non_blocking=True)
             go_attention_mask = toks["attention_mask"].to(device, non_blocking=True)
 
             B, K = cand_ids.shape
-            cand_valid = torch.ones((B, K), dtype=torch.bool).to(device, non_blocking=True)
+            cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
 
             rr_batch = dict(
                 H=H,
@@ -813,46 +814,42 @@ def main(phase_id = -2):
             )
 
             stats = rr_trainer.train_step(rr_batch)
-            if step % int(args.log_every) == 0:
-                print(f"[train] step={step} loss={stats.loss:.4f} pos_mean={stats.pos_mean:.4f} neg_mean={stats.neg_mean:.4f}")
 
-            if step > 0 and (step % int(args.eval_every) == 0):
-                metrics = evaluate_reranker(
-                    rr_trainer=rr_trainer,
-                    retriever=retriever,
-                    val_loader=val_loader,
-                    G_once_cpu=G_once_cpu,
-                    eval_go_ids=eval_go_ids,
-                    go_text_store=go_text_store,
-                    device=device,
-                    topk=int(args.topk),
-                    max_batches=0,
-                )
-                print(
-                    f"[val] step={step} "
-                    f"fmax={metrics['fmax']:.4f} aupr={metrics['aupr']:.4f} "
-                    f"hits@1={metrics['hits@1']:.4f} hits@5={metrics['hits@5']:.4f} hits@10={metrics['hits@10']:.4f}"
-                )
+        # ---- epoch-end eval + logging ----
+        metrics = evaluate_reranker(
+            rr_trainer=rr_trainer,
+            retriever=retriever,
+            val_loader=val_loader,
+            G_once_cpu=G_once_cpu,
+            eval_go_ids=eval_go_ids,
+            go_text_store=go_text_store,
+            device=device,
+            topk=int(args.topk),
+            max_batches=0,
+        )
 
-                key = "fmax" if str(args.save_metric).lower() == "fmax" else "aupr"
-                if metrics[key] > best[key]:
-                    best[key] = metrics[key]
-                    # you need access to optimizer inside trainer, assuming rr_trainer.optimizer exists
-                    opt = getattr(rr_trainer, "opt", None)  or getattr(rr_trainer, "optimizer", None)
-                    if opt is None:
-                        raise RuntimeError("rr_trainer.optimizer not found. Expose optimizer for checkpointing.")
-                    best_path = save_checkpoint(
-                        out_dir=out_dir,
-                        step=step,
-                        epoch=epoch,
-                        model=rr_trainer.model,
-                        optimizer=opt,
-                        metrics=metrics,
-                        tag=f"best_{key}",
-                    )
-                    print(f"[checkpoint] saved best_{key} -> {best_path}")
+        logging.info(
+            "[val] epoch %d :: fmax=%.4f aupr=%.4f hits@1=%.4f hits@5=%.4f hits@10=%.4f n_prot=%d",
+            epoch,
+            metrics["fmax"], metrics["aupr"],
+            metrics["hits@1"], metrics["hits@5"], metrics["hits@10"],
+            int(metrics["n_prot"]),
+        )
 
-            step += 1
+        key = "fmax" if str(args.save_metric).lower() == "fmax" else "aupr"
+        if metrics[key] > best[key]:
+            best[key] = metrics[key]
+            opt = getattr(rr_trainer, "opt", None) or getattr(rr_trainer, "optimizer", None)
+            best_path = save_checkpoint(
+                out_dir=out_dir,
+                step=step,  # istersen epoch yaz, step şart değil
+                epoch=epoch,
+                model=rr_trainer.model,
+                optimizer=opt,
+                metrics=metrics,
+                tag=f"best_{key}",
+            )
+            logging.info("[checkpoint] saved best_%s -> %s", key, best_path)
 
     print("[main] done")
 
