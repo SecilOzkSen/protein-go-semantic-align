@@ -585,7 +585,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
 # -----------------------------
 # Main loop
 # -----------------------------
-def main(phase_id = 3):
+def main(phase_id = -2):
     args = load_structured_cfg()
     device = torch.device(args.device)
 
