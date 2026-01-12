@@ -691,7 +691,6 @@ def main(phase_id = -2):
 
     ckpt = safe_torch_load(args.retriever_ckpt, map_location="cpu")
     state = ckpt.get("model", ckpt)
-    state = state.get("model", state)
 
     # retriever yükle (topk üretmek için)
     missing, unexpected = retriever.load_state_dict(state, strict=False)
@@ -704,7 +703,7 @@ def main(phase_id = -2):
         device=str(device),
         max_length=512,
         enable_lora=True,
-        use_special_tokens=True,  # retriever train’de eklediysen True
+        use_special_tokens=False,  # retriever train’de eklediysen True
         lora_parameters=lora_params,  # yukarıda oluşturduğun params
         gradient_checkpointing=False,
     )
