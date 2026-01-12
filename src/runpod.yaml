@@ -64,7 +64,7 @@ training:
   eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 512 # batch size for storing go text embeddings
   is_logit_scale_constant: false #false = trainable logit scale
-  go_token_dropout: false
+  go_token_dropout: true
   go_pooling: "none" # cls, mean, masked_mean -> NO NEED
 
 
