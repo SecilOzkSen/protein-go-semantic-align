@@ -843,7 +843,7 @@ def run_training(args, schedule: TrainSchedule):
         special_token_weights=None,
         enable_lora=args.use_lora,
         lora_parameters=lora_params,
-        use_special_tokens=False if args.ablation_id == "A1" else True,
+        use_special_tokens=False,
     )
 
     # GoTextStore + dataloaders

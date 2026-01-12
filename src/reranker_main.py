@@ -680,16 +680,18 @@ def main(phase_id = -2):
     go_id_to_text: Dict[int, Dict[int, str]] = {}
     go_id_to_text[phase_id] = load_go_texts_by_phase(args.go_text_folder, phase=phase_id)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.text_model_name)
-    go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=tokenizer, phase=phase_id)
-
     # 1) Go encoder'ı oluştur
     go_encoder = BioMedBERTEncoder(
         model_name=args.text_model_name,
         device=str(device),  # ya da "cpu" sonra .to(device)
         max_length=512,
+        use_special_tokens=True
     )
     go_encoder = go_encoder.to(device)
+    tokenizer = go_encoder.tokenizer
+    go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=tokenizer, phase=phase_id)
+
+
 
     # 2) Retriever'ı go_encoder ile oluştur
     retriever = ProteinGoAligner(
