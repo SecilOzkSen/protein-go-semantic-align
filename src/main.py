@@ -362,9 +362,10 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
 
     val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_cache=go_cache, fewzero_cfg=fz,
                               dag_parents=dag_parents, residue_store=res_store)
-    if fused_store is None:
-        raise RuntimeError("Query search için fused_store zorunlu.")
-    query_ds = ProteinFusedQueryDataset(train_ids+val_ids, fused_store=fused_store)
+    if fused_store is not None:
+        query_ds = ProteinFusedQueryDataset(train_ids+val_ids, fused_store=fused_store)
+    else:
+        query_ds = None
 
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds, "query_ds": query_ds}
