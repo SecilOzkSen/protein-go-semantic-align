@@ -660,7 +660,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         #stores
         out_dir=str(training.get("out_dir", "./reranker_out")),
         train_ids_path=str(stores.get("train_ids_path", "")),
-        pid2pos_path=str(stores.get("pid2pos_path", "")),
+        pid2pos=str(stores.get("pid2pos_path", "")),
         val_ids_path=str(stores.get("val_ids_path", "")),
         embed_dir_res_path=str(stores.get("embed_dir_res_path", "")),
         embed_dir_fused_path=str(stores.get("embed_dir_fused_path", "")),
