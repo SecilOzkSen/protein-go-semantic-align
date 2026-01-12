@@ -695,7 +695,7 @@ def main(phase_id = -2):
     )
     go_encoder = go_enc_wrap.model  # build_eval_G_once bunu çağırıyor
     go_encoder = go_encoder.to(device)
-    go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=go_encoder.model.tokenizer, phase=phase_id)
+    go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=go_enc_wrap.tokenizer, phase=phase_id)
 
     # 2) Retriever'ı go_encoder ile oluştur
     retriever = ProteinGoAligner(
