@@ -599,7 +599,7 @@ def main(phase_id = -2):
     # 3) Load retriever checkpoint
     retriever = ProteinGoAligner(
         d_h=args.protein_dim,
-        d_g=None,            # because you used go_encoder path usually
+        d_g=768,            # because you used go_encoder path usually
         d_z=512,
         go_encoder=None,     # if retriever stores go_encoder inside checkpoint, you will load it with state_dict
         normalize=True,
