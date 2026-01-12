@@ -606,7 +606,7 @@ def main(phase_id = -2):
         mean_pool=False,     # you want token align pooler, not mean
     ).to(device)
 
-    ckpt = torch.load(args.retriever_ckpt, map_location="cpu")
+    ckpt = torch.load(args.retriever_ckpt, map_location="cpu", weights_only=False)
     state = ckpt.get("model", ckpt)
     missing, unexpected = retriever.load_state_dict(state, strict=False)
     print(f"[main] retriever load: missing={len(missing)} unexpected={len(unexpected)}")
