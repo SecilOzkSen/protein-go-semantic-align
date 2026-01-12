@@ -681,19 +681,21 @@ def main(phase_id = -2):
     go_id_to_text: Dict[int, Dict[int, str]] = {}
     go_id_to_text[phase_id] = load_go_texts_by_phase(args.go_text_folder, phase=phase_id)
 
-    # 1) Go encoder'ı oluştur
-    go_encoder = BioMedBERTEncoder(
+    lora_params = LoRAParameters(adapter_name="go_encoder")
+    # go_encoder'ı ayrı yükle
+    go_enc_wrap = build_go_encoder_from_retriever_ckpt(
+        args.retriever_ckpt,
         model_name=args.text_model_name,
-        device=str(device),  # ya da "cpu" sonra .to(device)
+        device=str(device),
         max_length=512,
-        use_special_tokens=False
+        enable_lora=True,
+        use_special_tokens=True,  # retriever train’de eklediysen True
+        lora_parameters=lora_params,  # yukarıda oluşturduğun params
+        gradient_checkpointing=False,
     )
+    go_encoder = go_enc_wrap.model  # build_eval_G_once bunu çağırıyor
     go_encoder = go_encoder.to(device)
-    go_encoder.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
-    go_encoder.model.resize_token_embeddings(len(go_encoder.tokenizer))
     go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=go_encoder.tokenizer, phase=phase_id)
-
-
 
     # 2) Retriever'ı go_encoder ile oluştur
     retriever = ProteinGoAligner(
@@ -712,19 +714,7 @@ def main(phase_id = -2):
     # retriever yükle (topk üretmek için)
     missing, unexpected = retriever.load_state_dict(state, strict=False)
     print(f"[main] retriever load: missing={len(missing)} unexpected={len(unexpected)}")
-    lora_params = LoRAParameters(adapter_name="go_encoder")
-    # go_encoder'ı ayrı yükle
-    go_enc_wrap = build_go_encoder_from_retriever_ckpt(
-        args.retriever_ckpt,
-        model_name=args.text_model_name,
-        device=str(device),
-        max_length=512,
-        enable_lora=True,
-        use_special_tokens=False,  # retriever train’de eklediysen True
-        lora_parameters=lora_params,  # yukarıda oluşturduğun params
-        gradient_checkpointing=False,
-    )
-    go_encoder = go_enc_wrap.model  # build_eval_G_once bunu çağırıyor
+
 
     # If your retriever has go_encoder inside, use it to build eval_G_once.
     # Otherwise, you must load a GO encoder separately.
