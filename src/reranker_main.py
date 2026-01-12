@@ -619,6 +619,9 @@ def main(phase_id = -2):
     ckpt = torch.load(args.retriever_ckpt, map_location="cpu", weights_only=False)
     state = ckpt.get("model", ckpt)
 
+    go_keys = [k for k in state.keys() if "encoder" in k or "bert" in k or "go_" in k]
+    print(go_keys[:50])
+
     # Eğer key'lerde "model." prefix'i varsa sök
     if any(k.startswith("model.") for k in state.keys()):
         state = {k[len("model."):]: v for k, v in state.items()}
