@@ -639,6 +639,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
     model = cfg.get("model", {})
     training = cfg.get("training", {})
     stores = cfg.get("stores", {})
+    data = cfg.get("data", {})
 
     args = types.SimpleNamespace(
         #Model
@@ -666,7 +667,9 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         seq_len_lookup_dir_path=str(stores.get("seq_len_lookup_dir_path", "")),
         protein_manifest_file_path=str(stores.get("protein_manifest_file_path", "")),
         go_text_folder=str(stores.get("go_text_folder", "")),
-
+        # data
+        max_len=int(data.get("protein_max_len", 1024)),
+        overlap=int(data.get("overlap", 128)),
     )
     return args
 

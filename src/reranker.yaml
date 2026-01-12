@@ -2,6 +2,10 @@ model:
   text_model_name: microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext
   protein_dim: 1280
 
+data:
+  protein_max_len: 1024
+  overlap: 256
+
 training:
   retriever_ckpt: /workspace/checkpoints/checkpoint_epoch10.pt
   device: cuda
