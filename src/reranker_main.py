@@ -425,6 +425,7 @@ def evaluate_reranker(
         else:
             sc = rr_trainer.model(
                 H=H2,
+                K=K2,
                 valid_mask=vm,
                 go_input_ids=go_input_ids,
                 go_attention_mask=go_attention_mask,
