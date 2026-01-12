@@ -67,6 +67,32 @@ if torch.cuda.is_available():
 
 # ============== Utilities ==============
 
+# go_text_store içinde
+import random
+
+class ShuffledGoTextStore:
+    def __init__(self, base_store, seed=42):
+        self.base = base_store
+        self.rng = random.Random(seed)
+
+        self.go_ids = list(self.base.id2text.keys())
+        texts = [self.base.id2text[g] for g in self.go_ids]
+
+        shuffled = texts[:]
+        self.rng.shuffle(shuffled)
+
+        self.shuffled_map = {
+            g: shuffled[i] for i, g in enumerate(self.go_ids)
+        }
+
+    def batch(self, go_ids):
+        texts = [self.shuffled_map[int(g)] for g in go_ids]
+        return self.base.tokenize_texts(texts)
+
+    # opsiyonel
+    def get_text_by_id(self, gid):
+        return self.shuffled_map[int(gid)]
+
 def _collect_fused_ids(fused_dir: str) -> set:
     fused_dir = Path(fused_dir)
     have = set()
@@ -383,9 +409,14 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
     except RuntimeError:
         pass
 
+    shuffled = False
+    if args.ablation_id == "text_shuffle":
+        print("Go text store shuffling for training...")
+        shuffled = True
+
     train_collate = ContrastiveEmbCollator(
         go_lookup=go_cache,
-        go_text_store=go_text_store, #tokenizer
+        go_text_store= ShuffledGoTextStore(go_text_store,seed=int(args.seed)) if shuffled else go_text_store, #tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
         neg_k=args.neg_k,
@@ -411,8 +442,7 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
     #    prefetch_factor=2,
         collate_fn=train_collate,
     )
-    b = next(iter(train_loader))
-    assert "protein_ids" in b and isinstance(b["protein_ids"], list) and len(b["protein_ids"]) == b["prot_emb_pad"].shape[0]
+
     val_loader = None
     if datasets.get("val") is not None:
         val_loader = DataLoader(
@@ -809,7 +839,7 @@ def run_training(args, schedule: TrainSchedule):
         phase0 = 0
         go_cache_path = schedule.resolve_go_cache_path(phase0)
     else:
-        phase0 = -2 # ablation 1 - no phase: -1, full ablation phase 4
+        phase0 = -1 # ablation 1 - no phase: -1, full ablation phase 4, new text = -2
         print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
       #  print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
         go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
