@@ -76,6 +76,7 @@ def build_go_encoder_from_retriever_ckpt(
 ):
     ckpt = safe_torch_load(ckpt_path, map_location="cpu")
     state = ckpt.get("model", ckpt)
+    state = state.get("model", state)
 
     go_sd = extract_sub_state(state, "go_encoder")
     if not go_sd:
