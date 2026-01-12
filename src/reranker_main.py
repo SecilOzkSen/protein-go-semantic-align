@@ -689,10 +689,9 @@ def main(phase_id = -2):
         use_special_tokens=False
     )
     go_encoder = go_encoder.to(device)
-    tokenizer = AutoTokenizer.from_pretrained(args.text_model_name)
-    tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
-    go_encoder.resize_token_embeddings(len(tokenizer))
-    go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=tokenizer, phase=phase_id)
+    go_encoder.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
+    go_encoder.resize_token_embeddings(len(go_encoder.tokenizer))
+    go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=go_encoder.tokenizer, phase=phase_id)
 
 
 
