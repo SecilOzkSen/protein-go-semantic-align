@@ -690,6 +690,7 @@ def main(phase_id = -2):
 
     ckpt = safe_torch_load(args.retriever_ckpt, map_location="cpu")
     state = ckpt.get("model", ckpt)
+    state = state.get("model", state)
 
     # retriever yükle (topk üretmek için)
     missing, unexpected = retriever.load_state_dict(state, strict=False)
