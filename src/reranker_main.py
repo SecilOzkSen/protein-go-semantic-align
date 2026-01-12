@@ -22,6 +22,7 @@ from pathlib import PosixPath
 # Retriever
 from src.models.alignment_model import ProteinGoAligner
 from src.encoders.go_encoder import BioMedBERTEncoder, LoRAParameters
+from src.configs.parameters import GO_SPECIAL_TOKENS
 
 # Reranker
 from src.training.reranker_trainer import RerankerTrainer
@@ -685,10 +686,12 @@ def main(phase_id = -2):
         model_name=args.text_model_name,
         device=str(device),  # ya da "cpu" sonra .to(device)
         max_length=512,
-        use_special_tokens=True
+        use_special_tokens=False
     )
     go_encoder = go_encoder.to(device)
-    tokenizer = go_encoder.tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.text_model_name)
+    tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
+    go_encoder.resize_token_embeddings(len(tokenizer))
     go_text_store = GoTextStore(full_id2text=go_id_to_text, tokenizer=tokenizer, phase=phase_id)
 
 
