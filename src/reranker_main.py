@@ -503,7 +503,7 @@ def build_reranker_dataloaders(datasets, args, eval_go_ids: List[int]) -> Tuple[
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         collate_fn=collate,
         pin_memory=True,
     )
@@ -511,7 +511,7 @@ def build_reranker_dataloaders(datasets, args, eval_go_ids: List[int]) -> Tuple[
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         collate_fn=collate,
         pin_memory=True,
     )
