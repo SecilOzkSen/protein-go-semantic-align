@@ -63,6 +63,16 @@ def extract_sub_state(state: dict, prefix: str) -> dict:
             out[k[len(p):]] = v
     return out
 
+def strip_prefix_from_state(sd: dict, prefix: str) -> dict:
+    p = prefix if prefix.endswith(".") else prefix + "."
+    out = {}
+    for k, v in sd.items():
+        if k.startswith(p):
+            out[k[len(p):]] = v
+        else:
+            out[k] = v
+    return out
+
 def build_go_encoder_from_retriever_ckpt(
     ckpt_path: str,
     *,
@@ -79,6 +89,8 @@ def build_go_encoder_from_retriever_ckpt(
     state = state.get("model", state)
 
     go_sd = extract_sub_state(state, "go_encoder")
+    go_sd = strip_prefix_from_state(go_sd, "model")
+
     if not go_sd:
         raise RuntimeError("Checkpoint içinde go_encoder.* bulunamadı.")
 
