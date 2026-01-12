@@ -17,10 +17,11 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+from pathlib import PosixPath
 
 # Retriever
 from src.models.alignment_model import ProteinGoAligner
-from src.encoders.go_encoder import BioMedBERTEncoder
+from src.encoders.go_encoder import BioMedBERTEncoder, LoRAParameters
 
 # Reranker
 from src.training.reranker_trainer import RerankerTrainer
@@ -33,6 +34,78 @@ from src.utils.helpers import load_go_texts_by_phase
 from src.main import build_datasets, build_stores, build_go_cache
 
 RETRIEVER_YAML_PATH = SRC_DIR / "reranker.yaml"
+
+# Helpers for checkpoint loading
+
+def safe_torch_load(path: str, map_location="cpu"):
+    """
+    PyTorch 2.6+ weights_only default değişti.
+    Kendi checkpoint'in olduğu için weights_only=False ile yükle.
+    PosixPath allowlist de ekliyoruz.
+    """
+    try:
+        # bazı env'lerde gerekli
+        torch.serialization.add_safe_globals([PosixPath])
+    except Exception:
+        pass
+
+    return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def extract_sub_state(state: dict, prefix: str) -> dict:
+    """
+    state_dict içinden prefix ile başlayanları kırpıp döndürür.
+    """
+    out = {}
+    p = prefix if prefix.endswith(".") else (prefix + ".")
+    for k, v in state.items():
+        if k.startswith(p):
+            out[k[len(p):]] = v
+    return out
+
+def build_go_encoder_from_retriever_ckpt(
+    ckpt_path: str,
+    *,
+    model_name: str,
+    device: str,
+    max_length: int,
+    enable_lora: bool,
+    use_special_tokens: bool,
+    lora_parameters: LoRAParameters | None,
+    gradient_checkpointing: bool = False,  # eval için kapatmak daha temiz
+):
+    ckpt = safe_torch_load(ckpt_path, map_location="cpu")
+    state = ckpt.get("model", ckpt)
+
+    go_sd = extract_sub_state(state, "go_encoder")
+    if not go_sd:
+        raise RuntimeError("Checkpoint içinde go_encoder.* bulunamadı.")
+
+    # Encoder’ı checkpoint ile aynı şekilde kur
+    enc = BioMedBERTEncoder(
+        model_name=model_name,
+        device=device,
+        max_length=max_length,
+        enable_lora=enable_lora,
+        use_special_tokens=use_special_tokens,
+        lora_parameters=lora_parameters,
+        gradient_checkpointing=gradient_checkpointing,
+        # pooling head vs kullanıyorsan burada da aynı parametreleri ver
+        # use_attention_pool=..., attn_hidden=..., attn_dropout=...,
+        # special_token_weights=... (eğitimde varsa)
+    )
+    enc.eval()
+
+    # Not: BioMedBERTEncoder içindeki self.model, PEFT'li model
+    missing, unexpected = enc.model.load_state_dict(go_sd, strict=False)
+
+    print(f"[go_encoder load] missing={len(missing)} unexpected={len(unexpected)}")
+    if len(unexpected) > 0:
+        print("[go_encoder load] unexpected sample:", unexpected[:20])
+    if len(missing) > 0:
+        print("[go_encoder load] missing sample:", missing[:20])
+
+    return enc
 
 # -----------------------------
 # OOM-safe retriever scoring: chunk over Geval
@@ -615,23 +688,25 @@ def main(phase_id = -2):
         mean_pool=False,
     ).to(device)
 
-    # 3) Checkpoint yükle ve state_dict'i normalize et (prefix temizliği gerekebilir)
-    ckpt = torch.load(args.retriever_ckpt, map_location="cpu", weights_only=False)
+    ckpt = safe_torch_load(args.retriever_ckpt, map_location="cpu")
     state = ckpt.get("model", ckpt)
-    state = state.get("model", state)  # nested olabilir
 
-    go_keys = [k for k in state.keys() if "encoder" in k or "bert" in k or "go_" in k]
-    print(go_keys[:50])
-
-    # Eğer key'lerde "model." prefix'i varsa sök
-    if any(k.startswith("model.") for k in state.keys()):
-        state = {k[len("model."):]: v for k, v in state.items()}
-
+    # retriever yükle (topk üretmek için)
     missing, unexpected = retriever.load_state_dict(state, strict=False)
-    print("missing", len(missing), "unexpected", len(unexpected))
-
-    retriever.eval()
-    go_encoder = retriever.go_encoder  # artık None değil
+    print(f"[main] retriever load: missing={len(missing)} unexpected={len(unexpected)}")
+    lora_params = LoRAParameters(adapter_name="go_encoder")
+    # go_encoder'ı ayrı yükle
+    go_enc_wrap = build_go_encoder_from_retriever_ckpt(
+        args.retriever_ckpt,
+        model_name=args.text_model_name,
+        device=str(device),
+        max_length=512,
+        enable_lora=True,
+        use_special_tokens=True,  # retriever train’de eklediysen True
+        lora_parameters=lora_params,  # yukarıda oluşturduğun params
+        gradient_checkpointing=False,
+    )
+    go_encoder = go_enc_wrap.model  # build_eval_G_once bunu çağırıyor
 
     # If your retriever has go_encoder inside, use it to build eval_G_once.
     # Otherwise, you must load a GO encoder separately.
