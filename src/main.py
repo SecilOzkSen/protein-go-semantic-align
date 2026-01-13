@@ -87,7 +87,7 @@ class ShuffledGoTextStore:
 
     def batch(self, go_ids):
         texts = [self.shuffled_map[int(g)] for g in go_ids]
-        return self.base.tokenize_texts(texts)
+        return self.base.tokenize(texts)
 
     # opsiyonel
     def get_text_by_id(self, gid):
