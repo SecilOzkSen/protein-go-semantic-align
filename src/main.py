@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import time
@@ -66,32 +67,6 @@ if torch.cuda.is_available():
     print("Device 0 name ->", torch.cuda.get_device_name(0))
 
 # ============== Utilities ==============
-
-# go_text_store içinde
-import random
-
-class ShuffledGoTextStore:
-    def __init__(self, base_store, seed=42):
-        self.base = base_store
-        self.rng = random.Random(seed)
-
-        self.go_ids = list(self.base.id2text.keys())
-        texts = [self.base.id2text[g] for g in self.go_ids]
-
-        shuffled = texts[:]
-        self.rng.shuffle(shuffled)
-
-        self.shuffled_map = {
-            g: shuffled[i] for i, g in enumerate(self.go_ids)
-        }
-
-    def batch(self, go_ids):
-        texts = [self.shuffled_map[int(g)] for g in go_ids]
-        return self.base.tokenize(texts)
-
-    # opsiyonel
-    def get_text_by_id(self, gid):
-        return self.shuffled_map[int(gid)]
 
 def _collect_fused_ids(fused_dir: str) -> set:
     fused_dir = Path(fused_dir)
@@ -396,7 +371,6 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds, "query_ds": query_ds}
 
-
 def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore, go_dropout:GoTokenDropout=None):
     logger = logging.getLogger("build_dataloaders")
 
@@ -410,13 +384,16 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         pass
 
     shuffled = False
+    shuffled_text_store = None
     if args.ablation_id == "text_shuffle":
         print("Go text store shuffling for training...")
         shuffled = True
+        shuffled_text_store = copy.deepcopy(go_text_store)
+        shuffled_text_store.shuffle()
 
     train_collate = ContrastiveEmbCollator(
         go_lookup=go_cache,
-        go_text_store= ShuffledGoTextStore(go_text_store,seed=int(args.seed)) if shuffled else go_text_store, #tokenizer
+        go_text_store=shuffled_text_store if shuffled else go_text_store, #tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
         neg_k=args.neg_k,

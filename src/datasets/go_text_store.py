@@ -61,6 +61,19 @@ class GoTextStore:
 
         # ---- pickle safety (avoid mmap/shm explosions with num_workers>0) ----
 
+    def shuffle(self, seed: int = 42):
+        """Shuffle the id2text mapping for current phase."""
+        import random
+        go_ids = list(self.id2text.keys())
+        texts = [self.id2text[g] for g in go_ids]
+        rng = random.Random(seed)
+        shuffled = texts[:]
+        rng.shuffle(shuffled)
+        self.id2text = {
+            g: shuffled[i] for i, g in enumerate(self.go_ids)
+        }
+        self._tokenize_all()
+
     def __getstate__(self):
         s = self.__dict__.copy()
         # never ship full cache to workers
