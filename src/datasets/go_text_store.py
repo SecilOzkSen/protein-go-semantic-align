@@ -70,7 +70,7 @@ class GoTextStore:
         shuffled = texts[:]
         rng.shuffle(shuffled)
         self.id2text = {
-            g: shuffled[i] for i, g in enumerate(self.go_ids)
+            g: shuffled[i] for i, g in enumerate(go_ids)
         }
         self._tokenize_all()
 
