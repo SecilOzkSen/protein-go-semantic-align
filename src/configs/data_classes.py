@@ -81,7 +81,10 @@ class TrainSchedule:
         return min(ramp, base_lambda_attr if base_lambda_attr is not None else self.lambda_attr_max)
 
     def resolve_go_cache_path(self, phase: int) -> Path:
-        p1 = int(phase) + 1
+        if phase >= 0:
+            p1 = int(phase) + 1
+        else:
+            p1 = phase
         return go_index_paths(p1)["TEXT_EMB"]
 
     def resolve_faiss_path(self, phase: int) -> Optional[Path]:
@@ -218,8 +221,12 @@ class TrainingContext:
     fp16_enabled: bool = True
     logging: LoggingConfig = None
     use_queue_miner: bool = True
-    attribute_loss_enabled = False
+    attribute_loss_enabled: bool = False
+    return_alpha: bool = False
     fused_bank: Any = None
+    pooling_strategy: str = "mean"
+    eval_id_list: List[int] = None
+    logger: Any = None
 
 
     def to_dict(self):
@@ -235,6 +242,7 @@ class TrainingContext:
 @dataclass
 class AttrConfig:
     lambda_attr: float = 0.0
+    lambda_dag: float = 0.3
     lambda_entropy_alpha: float = 0.05
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64
@@ -257,3 +265,13 @@ class TrainerConfig:
     pos_chunk_t: int = 128
     k_hard_queue: int = 64
     queue_K:int = 65536
+    weight_decay: float = 1e-2
+    grad_clip: float = 1.0
+    batch_size: int = 64
+    eval_batch_size: int = 128
+    fp16: bool = True
+    monitor_metric: str = "cafa_fmax"
+    monitor_mode: str = "max",
+    is_logit_scale_constant: bool = False
+    go_pooling: str = "masked_mean"  # cls, mean, masked_mean
+    eval_go_bs: int = 256

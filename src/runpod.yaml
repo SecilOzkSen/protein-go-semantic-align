@@ -13,51 +13,60 @@ data:
   # Few/Zero-shot
   fs_target_ratio: 0.3
 
-general:
-  use_queue_miner: True
-  use_go_memory_bank: True
-  use_faiss: False
-
-memory_bank:
-  device: "cuda"
-  dtype: "fp16"
+general: #Ablation Purposes
+  ablation_id: "A0" #A0 sanity check
+  use_queue_miner: True #CHECKED
+  use_go_memory_bank: False #CHECKED
+  use_attention_pooling: False #CHECKED
+  use_lora: True #CHECKED
+  use_attribution_loss: False #CHECKED
+  return_alpha: False
+  phase_based: False #CHECKED
+  pooling_strategy: "mean" #  "mean", "go_token_align_pooler" #CHECKED
+  is_phasing: false # go token based phases are closed
 
 caches:
   go_cache: null
   faiss_index: null
-
   go_cache_template: /workspace/cache/go_cache_phase{phase}.pt
   faiss_template: /workspace/cache/faiss_phase{phase}.index
 
 training:
-  epochs: 5
-  batch_size: 1
-  eval_batch_size: 1
-  device: "cuda:0"
+  epochs: 15
+  batch_size: 4
+  eval_batch_size: 4
 
-  num_workers: 8
-  val_num_workers: 4
+  num_workers: 0
+  val_num_workers: 0
   pin_memory: true
-  persistent_workers: true
+  persistent_workers: false
   prefetch_factor: 2
 
   fp16: true
   cpu: false
   seed: 42
 
-  output_dir: /workspace/protein-go-align/outputs/run
-  save_every: 2000
+  output_dir: /workspace/protein-go-align/outputs/run-0
+  save_every: 10000
   keep_last_n: 3
-  resume: null
+ # resume: null #/workspace/checkpoints/checkpoint_step56000.pt
+  eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "cafa_fmax"   # "total" da olabilir
+  monitor_metric: "align_MRR"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 3        # 0 veya negatif => kapalı
-  cand_chunk_k: 256
-  pos_chunk_t: 64
-  k_hard_queue: 32
-  queue_K: 1024
+  early_stop_patience: 8        # 0 veya negatif => kapalı
+  cand_chunk_k: 4 #8
+  pos_chunk_t: 128
+  k_hard_queue: 128  #32 #128 #16
+  queue_K: 16384  #8192 #2048 #8192
+  max_refresh_go: 2000 #7500 # max go queue refresh per epoch - bc we do lora training!
+  eval_go_bs: 256 # eval go batch size for go embedding extraction
+  go_text_store_max_len: 512 # batch size for storing go text embeddings
+  is_logit_scale_constant: false #false = trainable logit scale
+  go_token_dropout: false
+  go_pooling: "none" # cls, mean, masked_mean -> NO NEED
+
 
 optim:
   lr: 0.0003
@@ -75,18 +84,19 @@ model:
 
 loss:
   lambda_con: 1.0
-  lambda_dag: 0.2
+  lambda_dag: 0.0
   lambda_attr: 0.0
+  lambda_entropy_alpha: 0.0
   dag_margin: 0.05
   dag_scale: 10.0
   lambda_vtrue: 0.0
-  tau_distill: 1.5
+  tau_distill: 1.0
 
 curriculum:
   epochs: 4
   warmup_frac: 0.1
   mode: cosine
-  hard_frac: [0.2, 0.7]
+  hard_frac: [0.2, 0.5]
   shortlist_M: [128, 64]
   k_hard: [4, 1]
   hier_up: [1, 0]
@@ -97,7 +107,7 @@ curriculum:
   curriculum_mode: cosine
 
 schedule:
-  phase_breaks: [5, 12, 25]
+  phase_breaks: [5, 9, 12]
   stageA_mix: [1.0, 0.0, 0.0]
   stageB_mix: [0.7, 0.3, 0.0]
   stageC_mix: [0.4, 0.4, 0.2]
@@ -109,12 +119,12 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  run_name: null
+  wandb_run_name: "protein-go-semantic-align-ablation0"
   mode: online
 
 stores:
   train_ids_path: /workspace/data/training_ready/proteins/protein_train_ids.txt
-  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives.json
+  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives.json #pid_to_positives_canonical
   val_ids_path: /workspace/data/training_ready/proteins/protein_val_ids.txt
 
   embed_dir: /workspace/esm_output #ESM3b
@@ -125,7 +135,7 @@ stores:
   seq_len_lookup_dir: /workspace/data/training_ready/proteins/seq_len_lookup.pkl
   protein_manifest_file: /workspace/data/training_ready/manifest_cache/esm_manifest.pkl
 
-  output_dir: /workspace/protein-go-align-outputs
-  logs: /workspace/protein-go-align-logs
+  output_dir: /workspace/protein-go-align-outputs-0
+  logs: /workspace/protein-go-align-logs-0
 
-  go_text_folder: /workspace/data/processed/go_terms/go_phases
+  go_text_folder: /workspace/data/processed/go_terms/canonical #go_phases #canonical #canonical2 #dont forget to change the phase num

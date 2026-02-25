@@ -13,12 +13,11 @@ class GoMemoryBank:
         self,
         init_embs: Union[torch.Tensor, np.memmap],
         row2id: Sequence[int],
-        device: str = "cuda:0",
+        device: str = "cuda",
         to_device: bool = True,
-        already_normalized: bool = False,
-        device_dtype: torch.dtype = torch.float16,   # <= SHARP: GPU'da fp16 varsayılan
-        pin_memory: bool = False,                    # <= SHARP: dataloader uyumu
-        persist_back: bool = True                   # <= SHARP: update() memmap'e yazsın mı?
+        device_dtype: torch.dtype = torch.float32,   #  GPU'da fp16 varsayılan
+        pin_memory: bool = False,                    # dataloader uyumu
+        persist_back: bool = True                   # update() memmap'e yazsın mı?
     ):
         self.device = torch.device(device)
         self.id2row = {int(i): int(r) for r, i in enumerate(row2id)}
@@ -32,10 +31,6 @@ class GoMemoryBank:
             t = torch.as_tensor(init_embs)               # CPU/GPU olabilir
             self._cpu_mmap = None
 
-        t = t.float()                                    # normalize için güvenli
-        if not already_normalized:
-            t = F.normalize(t, p=2, dim=1)
-
         # SHARP: isteğe bağlı pin + half
         if to_device:
             if pin_memory and t.device.type == "cpu":
@@ -43,7 +38,7 @@ class GoMemoryBank:
             t = t.to(self.device, non_blocking=True)
             if device_dtype is not None:
                 # sadece GPU'da half'a çevir (CPU memmap'le karışmasın)
-                if t.device.type == "cuda:0":
+                if t.device.type == "cuda":
                     t = t.to(device_dtype)
         self._embs = t.contiguous()
 
@@ -77,37 +72,41 @@ class GoMemoryBank:
         return m
 
     def __call__(self, go_ids: Sequence[int]) -> torch.Tensor:
-        idxs = self.to_local(go_ids, drop_missing=True)
-        if idxs.numel() == 0:
-            d = int(self._embs.size(1))
-            return torch.empty(0, d, dtype=self._embs.dtype, device=self._embs.device)
+        idxs = self.to_local(go_ids, drop_missing=False)
+        if (idxs < 0).any():
+            bad = [int(go_ids[i]) for i in (idxs < 0).nonzero(as_tuple=False).view(-1).tolist()[:5]]
+            raise KeyError(f"GoMemoryBank missing ids, example: {bad}")
         return self.index_select(idxs)
 
     @torch.no_grad()
     def update(self, ids: Sequence[int], new_embs: torch.Tensor) -> None:
         if not ids:
             return
-        # boyut/d eşleşmesi
+
         d = int(self._embs.size(1))
         new_embs = torch.as_tensor(new_embs)
         assert new_embs.dim() == 2 and new_embs.size(1) == d, \
             f"new_embs shape {tuple(new_embs.shape)} d={d} ile uyuşmuyor"
 
-        # normalize + cihaz
-        new_embs = F.normalize(new_embs.float(), p=2, dim=1).to(self._embs.device, non_blocking=True)
-        if self._device_dtype is not None and self._embs.device.type == "cuda:0":
-            new_embs = new_embs.to(self._device_dtype)
+        # normalize in fp32 for safety
+     #   new_embs = F.normalize(new_embs.float(), p=2, dim=1)
+        new_embs = torch.nan_to_num(new_embs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # move to same device
+        new_embs = new_embs.to(self._embs.device, non_blocking=True)
+
+        # HARD RULE: match dtype of bank
+        if new_embs.dtype != self._embs.dtype:
+            new_embs = new_embs.to(self._embs.dtype)
 
         rows = self.to_local(ids, drop_missing=False)
         ok = rows >= 0
         if ok.any():
             self._embs.index_copy_(0, rows[ok], new_embs[ok])
 
-            # SHARP: memmap'e kalıcı yaz (isteğe bağlı)
             if self._persist_back and (self._cpu_mmap is not None):
-                # sadece güncellenen satırları CPU'ya çekip yaz
+                # write-back should be fp32 on CPU
                 cpu_block = new_embs[ok].to(dtype=torch.float32, device="cpu").contiguous()
-                # float16 memmap varsa, cast etmeyi unutma:
                 np_block = cpu_block.numpy()
                 for off, r in enumerate(rows[ok].tolist()):
                     self._cpu_mmap[r] = np_block[off]
@@ -123,8 +122,7 @@ class GoLookupCache:
                  embs_or_blob: Union[torch.Tensor, Mapping, np.memmap],
                  id2row: Optional[dict] = None,
                  row2id: Optional[Sequence[int]] = None,
-                 device: str = "cpu",
-                 already_normalized: bool = False):
+                 device: str = "cpu"):
 
         # Güvenli başlangıç
         _id2row = id2row
@@ -169,8 +167,7 @@ class GoLookupCache:
             _embs_in,
             row2id=_row2id,
             device=device,
-            to_device=True,
-            already_normalized=already_normalized,
+            to_device=True
         )
 
         # Dış API alanları

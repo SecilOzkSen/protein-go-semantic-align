@@ -12,17 +12,6 @@ from src.go.go_cache import GoLookupCache
 from .residue_store import ESMResidueStore, ESMFusedStore  # <-- fused import
 
 class ProteinEmbDataset(Dataset):
-    """
-    CLIP-style protein<->GO training dataset.
-    ZORUNLU: residue store (ESMResidueStore), opsiyonel: fused store (sadece yan bilgi).
-    Dönen:
-      - protein_id: str
-      - prot_emb:   FloatTensor [L,D]   (EĞİTİM)
-      - pos_go_ids: LongTensor  [P]
-      - pos_go_weights: FloatTensor [P]
-      - is_fs: bool
-      - (opsiyonel) prot_fused: FloatTensor [D]  -- include_fused=True ise
-    """
     def __init__(
         self,
         protein_ids: Sequence[str],
@@ -53,25 +42,74 @@ class ProteinEmbDataset(Dataset):
         self.fused_store = fused_store
         self.include_fused = bool(include_fused)
 
-        self.pid2pos: Dict[str, List[int]] = pid2pos
+        # === CANONICAL GO UNIVERSE ===
+        # GoLookupCache row2id -> elimizde embedding/text olan global GO id'ler
+        valid_go_ids: Set[int] = set(int(g) for g in go_cache.row2id)
+
+        self.pid2pos: Dict[str, List[int]] = {}
         self.pos_weights_map: Dict[str, List[float]] = {}
         self.pos_is_generalized: Dict[str, List[bool]] = {}
 
+        new_pids: List[str] = []
+        dropped_prots = 0
+        dropped_terms: Set[int] = set()
+
         for pid in self.pids:
-            orig = self.pid2pos.get(pid, [])
-            # zero-shot sterilizasyon
-            pos = [g for g in orig if g not in fewzero.zero_shot_terms]
-            # az ise atalarla genişlet
-            expanded, weights, is_gen_map = expand_with_ancestors(
-                pos_terms=pos, parents=dag_parents,
-                zs_blocklist=fewzero.zero_shot_terms,
-                min_pos=min_pos_for_expand, max_add=max_ancestor_add,
-                max_hops=max_hops, stoplist=ancestor_stoplist, gamma=ancestor_gamma,
-                allowed_rels=set(ALLOWED_RELS_FOR_DAG)
-            )
-            self.pid2pos[pid] = expanded
-            self.pos_weights_map[pid] = [float(w) for w in weights]
-            self.pos_is_generalized[pid] = [bool(is_gen_map[int(t)]) for t in expanded]
+            orig = pid2pos.get(pid, [])
+            # ---- 1) Zero-shot sterilizasyon ----
+            pos = [int(g) for g in orig if int(g) not in fewzero.zero_shot_terms]
+            # ---- 2) DAG ile genişletme ----
+            if dag_parents is None:
+                expanded = pos
+                weights = [1.0] * len(pos)
+                is_gen_map = {int(g): False for g in pos}
+            else:
+                expanded, weights, is_gen_map = expand_with_ancestors(
+                    pos_terms=pos,
+                    parents=dag_parents,
+                    zs_blocklist=fewzero.zero_shot_terms,
+                    min_pos=min_pos_for_expand,
+                    max_add=max_ancestor_add,
+                    max_hops=max_hops,
+                    stoplist=ancestor_stoplist,
+                    gamma=ancestor_gamma,
+                    allowed_rels=set(ALLOWED_RELS_FOR_DAG),
+                )
+            # ---- 3) CANONICAL FILTRE: sadece GoTextStore / go_cache'in bildiği id'ler kalsın ----
+            expanded_filtered: List[int] = []
+            weights_filtered: List[float] = []
+            is_gen_filtered: List[bool] = []
+
+            for t, w in zip(expanded, weights):
+                t_int = int(t)
+                if t_int in valid_go_ids:
+                    expanded_filtered.append(t_int)
+                    weights_filtered.append(float(w))
+                    is_gen_filtered.append(bool(is_gen_map[int(t)]))
+                else:
+                    dropped_terms.add(t_int)
+
+            # Hiç label kalmadıysa bu proteini dataset'ten at
+            if not expanded_filtered:
+                dropped_prots += 1
+                continue
+
+            new_pids.append(pid)
+            self.pid2pos[pid] = expanded_filtered
+            self.pos_weights_map[pid] = weights_filtered
+            self.pos_is_generalized[pid] = is_gen_filtered
+
+        # Sadece en az bir canonical label'ı kalan proteinleri tut
+        self.pids = new_pids
+        print(
+            f"[ProteinEmbDataset] canonical filter after DAG: "
+            f"kept {len(self.pids)} proteins, "
+            f"dropped_proteins={dropped_prots}, "
+            f"dropped_terms={len(dropped_terms)}"
+        )
+        if dropped_terms:
+            sample = sorted(dropped_terms)[:10]
+            print(f"[ProteinEmbDataset] example dropped ancestor terms: {sample}")
 
         # Few-shot bayrak
         self.is_fs: List[bool] = []

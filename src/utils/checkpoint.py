@@ -1,5 +1,4 @@
 import torch
-import os
 from pathlib import Path
 
 def save_checkpoint(out_dir: str,
@@ -27,13 +26,13 @@ def save_checkpoint(out_dir: str,
     ema_state = {}
     if hasattr(trainer, "index_projector"):
         ema_state["index_projector"] = trainer.index_projector.state_dict()
-    if hasattr(trainer, "go_encoder_k"):
+    if hasattr(trainer, "go_encoder_k") and trainer.go_encoder_k is not None:
         ema_state["go_encoder_k"] = trainer.go_encoder_k.state_dict()
 
     # --- 3- Optimizer & Scheduler ---
     opt_state = {}
-    if hasattr(trainer, "optimizer"):
-        opt_state["optimizer"] = trainer.optimizer.state_dict()
+    if hasattr(trainer, "opt"):
+        opt_state["optimizer"] = trainer.opt.state_dict()
     if hasattr(trainer, "scheduler"):
         opt_state["scheduler"] = trainer.scheduler.state_dict() if hasattr(trainer.scheduler, "state_dict") else {}
 
@@ -59,7 +58,7 @@ def save_checkpoint(out_dir: str,
     return str(ckpt_path)
 
 def load_checkpoint(trainer, path: str, map_location="cuda"):
-    ckpt = torch.load(path, map_location=map_location)
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model_state = ckpt.get("model", {})
     if "model" in model_state and hasattr(trainer, "model"):
         trainer.model.load_state_dict(model_state["model"], strict=False)
@@ -70,7 +69,6 @@ def load_checkpoint(trainer, path: str, map_location="cuda"):
     if "go_encoder_k" in ema_state and hasattr(trainer, "go_encoder_k"):
         trainer.go_encoder_k.load_state_dict(ema_state["go_encoder_k"], strict=False)
 
-    if hasattr(trainer, "optimizer") and "optimizer" in ckpt.get("optimizer", {}):
-        trainer.optimizer.load_state_dict(ckpt["optimizer"]["optimizer"])
+    if hasattr(trainer, "opt") and "optimizer" in ckpt.get("optimizer", {}):
+        trainer.opt.load_state_dict(ckpt["optimizer"]["optimizer"])
     print(f"[checkpoint] Loaded from {path}")
-    return ckpt

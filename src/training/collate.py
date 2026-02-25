@@ -40,7 +40,8 @@ class ContrastiveEmbCollator:
                  faiss_miner: Optional[Callable[[List[int], int, torch.Tensor], List[List[int]]]] = None,
                  neg_k: int = 0,
                  num_labels=None,
-                 device: torch.device = torch.device("cpu")):
+                 device: torch.device = torch.device("cpu"),
+                 go_dropout=None):
         self.go_lookup = go_lookup
         self.device = device
         if zs_mask_vec is None:
@@ -54,6 +55,7 @@ class ContrastiveEmbCollator:
         self.go_text_store = go_text_store
         self.faiss_miner = faiss_miner
         self.neg_k = int(neg_k)
+        self.go_dropout = go_dropout
 
     def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         # ---------------- Protein padding ----------------
@@ -76,6 +78,8 @@ class ContrastiveEmbCollator:
         if len(pos_lists) > 0:
             uniq_go = torch.unique(torch.cat(pos_lists))
             uniq_go_embs = self.go_lookup(uniq_go.tolist())  # [G, Dg]
+            assert uniq_go_embs.size(0) == uniq_go.numel()
+
         else:
             uniq_go = torch.empty(0, dtype=torch.long)
             uniq_go_embs = torch.empty(0)
@@ -116,15 +120,12 @@ class ContrastiveEmbCollator:
         # over 'uniq_go_ids' is more deterministic and compute-friendly (G items).
         if self.go_text_store is not None and uniq_go.numel() > 0:
             pos_go_tokens = self.go_text_store.batch(uniq_go.tolist())  # dict of [G, L]
+        if pos_go_tokens is not None and self.go_dropout is not None:
+            pos_go_tokens["input_ids"], pos_go_tokens["attention_mask"] = self.go_dropout(pos_go_tokens["input_ids"], pos_go_tokens["attention_mask"])
 
-        # ---------------- NEW: negative mining (IDs only) ----------------
-        neg_go_ids: Optional[List[List[int]]] = None
-        if self.faiss_miner is not None and self.neg_k > 0:
-            seed_pos_ids: List[int] = []
-            for b in batch:
-                pids = b["pos_go_ids"].tolist()
-                seed_pos_ids.append(int(pids[0]) if len(pids) > 0 else -1)  # -1 → miner filtreleyebilir
-            neg_go_ids = self.faiss_miner(seed_pos_ids, self.neg_k, self.zs_mask_vec)  # List[List[int]]
+        if pos_go_tokens is not None:
+            assert pos_go_tokens["input_ids"].size(0) == uniq_go.numel()
+            assert pos_go_tokens["attention_mask"].size(0) == uniq_go.numel()
 
         # ---------------- Output dict ----------------
         out: Dict[str, Any] = dict(
@@ -142,8 +143,6 @@ class ContrastiveEmbCollator:
         # NEW fields (optional)
         if pos_go_tokens is not None:
             out["pos_go_tokens"] = pos_go_tokens      # dict: {"input_ids":[G,L], "attention_mask":[G,L]}
-        if neg_go_ids is not None:
-            out["neg_go_ids"] = neg_go_ids            # List[List[int]]  (B x K)
 
         # ---------------- Optional: GO→Protein buckets for symmetric loss ----------------
         if self.bidirectional:

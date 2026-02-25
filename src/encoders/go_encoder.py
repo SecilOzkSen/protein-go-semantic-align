@@ -9,7 +9,6 @@ from peft import LoraConfig, get_peft_model, PeftModel
 from src.configs.data_classes import LoRAParameters
 from src.configs.parameters import GO_SPECIAL_TOKENS
 
-
 class AttnPool(nn.Module):
     """
         Attention pooling that learns per-token importance and returns a single embedding.
@@ -72,11 +71,12 @@ class BioMedBERTEncoder(nn.Module):
                  model_name: str,
                  device: Union[str, torch.device],
                  max_length: int = 512,
-                 use_attention_pool: bool = True,  # Attention pooling head
+                 use_attention_pool: bool = False,  # Attention pooling head
                  attn_hidden: int = 0,  # 0 = linear scoring; >0 = tanh-MLP hidden size
                  attn_dropout: float = 0.0,
                  special_token_weights: Optional[Dict[str, float]] = None, # Optional token weights to bias attention (e.g., {"[GOPATH]":0.45, "[PATH]":0.45, "[ISA]":0.95, "[PART]":0.85})
-                 enable_lora: bool = True,
+                 enable_lora: bool = False,
+                 use_special_tokens: bool = False,
                  lora_parameters: Optional[LoRAParameters] = None,  # LoRA options (optional)
                  gradient_checkpointing: bool = True # re-calculate each activation instead of storing it -> huge space saver.
                  ):
@@ -84,10 +84,16 @@ class BioMedBERTEncoder(nn.Module):
         self.device = torch.device(device) if isinstance(device, str) else device
         self.max_length = max_length
         # Base model and tokenizer
-        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False)
+        self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False,
+                                               use_safetensors=True)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        old_vocab_size = len(self.tokenizer)
+        self.enable_lora = enable_lora
+        special_tokens_added = False
+        if self.enable_lora and use_special_tokens:
+            print("[INFO] Lora Enabled and Adding GO special tokens for LoRA training.")
+            self.tokenizer.add_special_tokens({"additional_special_tokens": list(GO_SPECIAL_TOKENS)})
+            special_tokens_added = True
         if gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
@@ -95,24 +101,29 @@ class BioMedBERTEncoder(nn.Module):
         self.use_attention_pool = use_attention_pool
         self.attn_head: Optional[AttnPool] = None
         if self.use_attention_pool:
+            print("[INFO] Using attention pooling head with hidden size:", attn_hidden)
             self.attn_head = AttnPool(self.model.config.hidden_size, attn_hidden, attn_dropout)
             for p in self.attn_head.parameters():
                 p.requires_grad_(True)
 
         # Optional: add special tokens and keep id->weight map for attention bias
-        self._id_weight_map: Dict[int, float] = {}
+        self._id_weight_map: Dict[int, float] = {} #TODO: fill with special tokens if any
         if special_token_weights:
             # Ensure tokens exist in the vocab
             self.tokenizer.add_special_tokens({"additional_special_tokens": list(special_token_weights.keys())})
-            self.model.resize_token_embeddings(len(self.tokenizer))
+            special_tokens_added = True
             # Build id->weight map
             for tok, w in special_token_weights.items():
                 tid = self.tokenizer.convert_tokens_to_ids(tok)
                 if tid != self.tokenizer.unk_token_id:  # keep even if newly added
                     self._id_weight_map[tid] = float(w)
+        if special_tokens_added:
+            self.model.resize_token_embeddings(len(self.tokenizer))
+            self.init_relation_token_embeds()
+            print("[tok] relation token embeddings initialized")
 
         # LoRA
-        self.enable_lora = enable_lora
+        print("[INFO] LoRA enabled:", self.enable_lora)
         self.lora_cfg = None
         if self.enable_lora:
             self.lora_cfg = LoraConfig(r=lora_parameters.lora_r,
@@ -127,33 +138,83 @@ class BioMedBERTEncoder(nn.Module):
                        )
             self.model = get_peft_model(self.model, self.lora_cfg, adapter_name=lora_parameters.adapter_name)
             for name, param in self.model.named_parameters():
-                if "lora_" not in name:
+                if "lora_" in name:
+                    param.requires_grad = True
+                else:
                     param.requires_grad = False
+            if use_special_tokens & special_tokens_added:
+                # Enable grad only for new tokens in embeddings
+                self._enable_new_token_grad_only(old_vocab_size)
+
             try:
                 self.model.print_trainable_parameters()
             except Exception:
                 pass
             assert isinstance(self.model, PeftModel), "[LoRA] get_peft_model failed; adapter not attached."
         self.to(device)
+        if use_special_tokens:
+            for tok in GO_SPECIAL_TOKENS:
+                tid = self.tokenizer.convert_tokens_to_ids(tok)
+                assert tid != self.tokenizer.unk_token_id, f"{tok} is UNK"
+
+    def copy_token_embed(self, new_tok: str, ref_tok: str):
+        emb = self.model.get_input_embeddings().weight.data  # [V,D]
+        new_id = self.tokenizer.convert_tokens_to_ids(new_tok)
+        ref_id = self.tokenizer.convert_tokens_to_ids(ref_tok)
+        if new_id is None or ref_id is None or new_id < 0 or ref_id < 0:
+            raise RuntimeError(f"bad token ids: {new_tok}={new_id}, {ref_tok}={ref_id}")
+        emb[new_id].copy_(emb[ref_id])
+
+    def init_relation_token_embeds(self):
+        mapping = {
+            "[IS_A]": "is",
+            "[PART]": "part",
+            "[GOPATH]": "relation",
+            "[PATH]": "path",
+        }
+        for new_tok, ref_tok in mapping.items():
+            try:
+                self.copy_token_embed(new_tok, ref_tok)
+            except Exception:
+                # fallback: copy from "the" if ref token not in vocab
+                self.copy_token_embed(new_tok, "the")
+
+    def _enable_new_token_grad_only(self, old_vocab_size: int):
+        # PEFT kullanıyorsun, path doğru: base_model.model...
+        emb = self.model.base_model.model.embeddings.word_embeddings
+        W = emb.weight  # [V, H]
+
+        new_vocab = W.shape[0]
+        if new_vocab <= old_vocab_size:
+            print(f"[DBG] no new tokens to train: old={old_vocab_size} new={new_vocab}")
+            return
+
+        # eski satırlar donacak, yeni satırlar update alacak
+        W.requires_grad_(True)
+
+        # mask: [V, 1] ile broadcast
+        mask = torch.zeros((new_vocab, 1), device=W.device, dtype=W.dtype)
+        mask[old_vocab_size:new_vocab] = 1.0
+
+        # hook: backward sırasında grad’i maskele
+        W.register_hook(lambda g: g * mask.to(device=g.device, dtype=g.dtype))
+
+        print(
+            f"[DBG] embedding grad mask enabled. old={old_vocab_size}, new={new_vocab}, train_rows={new_vocab - old_vocab_size}")
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-            Returns pooled embeddings for a tokenized batch.
-        """
-        if input_ids.device != self.device:
-            input_ids = input_ids.to(self.device, non_blocking=False)
-        if attention_mask.device != self.device:
-            attention_mask = attention_mask.to(self.device, non_blocking=False)
         out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        H = out.last_hidden_state  # (B, L, H)
+        H = out.last_hidden_state  # [B, L, H]
+
         if self.use_attention_pool and self.attn_head is not None:
-            return self.attn_head(H=H,
-                                  input_ids=input_ids,
-                                  attention_mask=attention_mask,
+            return self.attn_head(H=H, input_ids=input_ids, attention_mask=attention_mask,
                                   token_weight_map=self._id_weight_map)
-        # fallback: masked mean
-        m = attention_mask.unsqueeze(-1).float()
-        return (H * m).sum(1) / m.sum(1).clamp(min=1e-6)
+
+        # masked mean pooling (stable)
+        mf = attention_mask.unsqueeze(-1).float()
+        Hf = H.float()
+        pooled = (Hf * mf).sum(1) / mf.sum(1).clamp_min(1.0)
+        return pooled
 
     # Inference
     @torch.no_grad()

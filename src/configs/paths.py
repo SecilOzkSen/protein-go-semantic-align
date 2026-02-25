@@ -87,8 +87,18 @@ FEW_SHOT_IC_TERMS_ID_ONLY_JSON     = TRAINING_READY / "go_few_zero_common" / "ic
 COMMON_IC_GO_TERMS_ID_ONLY_JSON    = TRAINING_READY / "go_few_zero_common" / "ic_common_terms_id_only.json"
 
 # ---- GO indexes by phase -----------------------------
+GO_INDEX_NON_PHASE = TRAINING_READY / "go_indexes" / "canonical"
+GO_INDEX_NON_PHASE_2 = TRAINING_READY / "go_indexes" / "canonical2"
 _GO_IDX = lambda p: TRAINING_READY / "go_indexes" / "memmap" / f"phase{p}"
 GO_INDEX = {
+    -2: {
+        "TEXT_EMB": GO_INDEX_NON_PHASE_2 / "go_text_embeddings_canonical_2.npy",
+        "META":      GO_INDEX_NON_PHASE_2 / "go_text_embeddings_canonical_2.npy.meta.pt",
+        },
+    -1: {
+        "TEXT_EMB": GO_INDEX_NON_PHASE / "go_text_embeddings_canonical.npy",
+        "META":      GO_INDEX_NON_PHASE / "go_text_embeddings_canonical.npy.meta.pt",
+    },
     1: {
         "TEXT_EMB": _GO_IDX(1) / "go_text_embeddings.npy",
         "FAISS_IP":  _GO_IDX(1) / "go_faiss_ip.faiss",
@@ -122,7 +132,7 @@ GO_CHILDREN = TRAINING_READY / "go_dag" / "go_children.json"
 GO_ANCESTOR_STOPLIST = TRAINING_READY / "go_dag" / "ancestor_stoplist.txt"
 
 # PROTEINS
-PID_TO_POSITIVES    = TRAINING_READY / "proteins" / "pid_to_positives.json"
+PID_TO_POSITIVES    = TRAINING_READY / "proteins" / "pid_to_positives_canonical.json"
 P_SEQ_LEN_LOOKUP    = TRAINING_READY / "proteins" / "seq_len_lookup.pkl"
 PROTEIN_TRAIN_IDS   = TRAINING_READY / "proteins" / "protein_train_ids.txt"
 PROTEIN_VAL_IDS     = TRAINING_READY / "proteins" / "protein_val_ids.txt"
@@ -140,7 +150,7 @@ GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest
 
 # CONFIG
 
-TRAINING_CONFIG = SRC_DIR / "colab.yaml"
+TRAINING_CONFIG = SRC_DIR / "runpod.yaml"
 
 def create_data_folders() -> None:
     for path in [

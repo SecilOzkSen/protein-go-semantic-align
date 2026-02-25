@@ -15,20 +15,27 @@ class MoCoQueue(torch.nn.Module):
         return self.queue.device
 
     @torch.no_grad()
+    def reset(self):
+        self.valid.zero_()  # all False
+        self.ids.fill_(-1)
+        self._ptr = 0
+
+    @torch.no_grad()
     def on_change_dim(self, new_dim: int):
         new_dim = int(new_dim)
         cur_dim = int(self.queue.size(1))
         if new_dim == cur_dim:
             return
         dev, K = self.queue.device, self.K
-        self.queue = torch.zeros(K, new_dim, dtype=torch.float32, device=dev)
-        self.ids.zero_().sub_(1)    # tekrar -1 yap
-        self.valid.zero_()
+        self._buffers["queue"] = torch.zeros(K, new_dim, dtype=torch.float32, device=dev)
+        self._buffers["ids"] = torch.full((K,), -1, dtype=torch.long, device=dev)
+        self._buffers["valid"] = torch.zeros(K, dtype=torch.bool, device=dev)
         self._ptr = 0
 
     @torch.no_grad()
     def enqueue(self, vecs: torch.Tensor, ids: torch.Tensor):
         # vecs: [N, D], ids: [N]
+        assert vecs.size(1) == self.queue.size(1), "Queue dim mismatch, call on_change_dim first"
         dev = self.device
         # === cihaz + dtype hizalama ===
         if vecs.device != dev:
@@ -46,18 +53,19 @@ class MoCoQueue(torch.nn.Module):
 
     @torch.no_grad()
     def get_all_neg(self, convert_device: torch.device | str | None = None):
-        # Her durumda tuple döndür!
         if not self.valid.any():
-            return None, None
+            return None
         m = self.valid
+        vecs = self.queue[m]
+        ids = self.ids[m]
         if convert_device is not None and convert_device != self.device:
-            return self.queue[m].to(convert_device, non_blocking=True), \
-                   self.ids[m].to(convert_device, non_blocking=True)
-
-        return self.queue[m], self.ids[m]
+            vecs = vecs.to(convert_device, non_blocking=True)
+            ids = ids.to(convert_device, non_blocking=True)
+        return vecs, ids
 
     @torch.no_grad()
     def to_(self, dev: torch.device | str):
-        """ İsteğe bağlı: explicit taşıma kolaylığı """
-        self.queue = self.queue.to(dev, non_blocking=True)
+        self._buffers["queue"] = self.queue.to(dev, non_blocking=True)
+        self._buffers["ids"] = self.ids.to(dev, non_blocking=True)
+        self._buffers["valid"] = self.valid.to(dev, non_blocking=True)
         return self
