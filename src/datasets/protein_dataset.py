@@ -1,6 +1,5 @@
 # protein_emb_dataset.py
 from __future__ import annotations
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
@@ -26,21 +25,14 @@ class ProteinEmbDataset(Dataset):
         ancestor_stoplist: Optional[Set[int]] = None,
         ancestor_gamma: float = 0.7,
         store: ESMResidueStore,
-        fused_store: Optional[ESMFusedStore] = None,
-        include_fused: bool = False,
     ):
         super().__init__()
         if store is None:
             raise ValueError("ProteinEmbDataset requires 'store' (ESMResidueStore).")
-        if include_fused and fused_store is None:
-            raise ValueError("include_fused=True ama fused_store=None.")
 
         self.pids = list(protein_ids)
         self.n_go = go_cache.n_go
-        self.fewzero = fewzero
         self.store = store
-        self.fused_store = fused_store
-        self.include_fused = bool(include_fused)
 
         # === CANONICAL GO UNIVERSE ===
         # GoLookupCache row2id -> elimizde embedding/text olan global GO id'ler
@@ -136,9 +128,6 @@ class ProteinEmbDataset(Dataset):
             "pos_go_weights": torch.as_tensor(pos_wts, dtype=torch.float32),
             "is_fs": self.is_fs[idx],
         }
-        if self.include_fused:
-            z = self.fused_store.get(pid)  # [D]
-            item["prot_fused"] = z
         return item
 
 # protein_fused_query_dataset

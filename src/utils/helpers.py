@@ -12,7 +12,7 @@ def load_raw_txt(path:Path):
 
 def load_go_set(path: Path):
     if not path or not os.path.isfile(path): return []
-    original = load_raw_json(path)
+    original = load_raw_pickle(path)
     return set(int(str(x).replace("GO:", "")) for x in original)
 
 def load_raw_pickle(path: str):
@@ -111,10 +111,7 @@ def load_go_texts_canonical(go_text_path: str, phase=-2) -> Dict[int, str]:
 
 def load_go_texts_by_phase(go_text_folder: str, phase: int = 0) -> Dict[int, str]:
     if phase < 0: #ablation 1
-        if phase == -2:
-            fname = "go_texts_canonical_2.jsonl"
-        else:
-            fname = "go_texts_canonical.jsonl"
+        fname = "go_texts_canonical.jsonl"
         path = os.path.join(go_text_folder, fname)
         return load_go_texts_canonical(path, phase=phase)
     else:

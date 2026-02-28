@@ -150,7 +150,7 @@ GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest
 
 # CONFIG
 
-TRAINING_CONFIG = SRC_DIR / "runpod.yaml"
+YAML_FILE = SRC_DIR / "runpod.yaml"
 
 def create_data_folders() -> None:
     for path in [

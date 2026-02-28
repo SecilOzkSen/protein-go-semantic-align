@@ -85,7 +85,7 @@ class BioMedBERTEncoder(nn.Module):
         self.max_length = max_length
         # Base model and tokenizer
         self.model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True, trust_remote_code=False,
-                                               use_safetensors=True)
+                                               use_safetensors=False)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         old_vocab_size = len(self.tokenizer)
         self.enable_lora = enable_lora

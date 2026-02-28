@@ -124,7 +124,6 @@ class GOIndex:
 class FewZeroConfig:
     zero_shot_terms: Set[int]
     few_shot_terms: Set[int]
-    common_terms: Set[int]
     min_pos_per_protein: int = 1
     fs_target_ratio: float = 0.30
 
@@ -227,6 +226,9 @@ class TrainingContext:
     pooling_strategy: str = "mean"
     eval_id_list: List[int] = None
     logger: Any = None
+    eval_seen_go_ids: List[int] = None
+    eval_unseen_ids: List[int] = None
+    eval_rare_go_ids: List[int] = None
 
 
     def to_dict(self):
@@ -260,6 +262,8 @@ class TrainerConfig:
     d_z: int = 512
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
+    lr_lora: float = 5e-5
+    lora_warmup_steps: int = 2000
     max_epochs: int = 20,
     cand_chunk_k: int = 8
     pos_chunk_t: int = 128

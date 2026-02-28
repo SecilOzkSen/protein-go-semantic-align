@@ -3,14 +3,14 @@ import copy
 import torch
 import torch.nn.functional as F
 import math
-import re
 
 from src.models.alignment_model import ProteinGoAligner
-from src.loss.attribution import attribution_loss, windowed_attr_loss
+from src.loss.attribution import attribution_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
 from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
+
 
 # DEBUG
 def dbg_batch_labels_once(batch, go_text_store, cand_go_global, step: int, k: int = 2, show_text: int = 0):
@@ -44,7 +44,8 @@ def dbg_batch_labels_once(batch, go_text_store, cand_go_global, step: int, k: in
         pid = str(pids[i])
 
         loc = pos_local[i]
-        loc_cpu = loc.detach().cpu().long().flatten() if torch.is_tensor(loc) else torch.as_tensor(list(loc), dtype=torch.long)
+        loc_cpu = loc.detach().cpu().long().flatten() if torch.is_tensor(loc) else torch.as_tensor(list(loc),
+                                                                                                   dtype=torch.long)
 
         # local -> global (NO clamp)
         pos_go_global = uniq_go_ids.index_select(0, loc_cpu).tolist() if loc_cpu.numel() > 0 else []
@@ -65,6 +66,7 @@ def dbg_batch_labels_once(batch, go_text_store, cand_go_global, step: int, k: in
                         print(f"GO {g} text: {str(txt)[:120]}")
                 except Exception as e:
                     print(f"GO {g} text fetch failed: {e}")
+
 
 @torch.no_grad()
 def dbg_topk_pos_once(scores_cand, batch, cand_idx, step: int, topk: int = 10, i: int = 0):
@@ -115,6 +117,7 @@ def dbg_topk_pos_once(scores_cand, batch, cand_idx, step: int, topk: int = 10, i
         tag = "POS" if gid in pos_set else ""
         print(f"{r:02d} logit={float(vals[r]):+.4f} gid={gid} {tag}")
 
+
 @torch.no_grad()
 def dbg_cand_alignment_once(cand_go_embs, batch, cand_ids, go_text_store, step: int, j: int = 0, i: int = 0):
     if step != 0:
@@ -158,14 +161,17 @@ def dbg_cand_alignment_once(cand_go_embs, batch, cand_ids, go_text_store, step: 
     pid = str(batch["protein_ids"][i]) if "protein_ids" in batch else "?"
     print(f"\n[DBG-ALIGN] pid={pid} sample={i} cand_j={j} gid={gid} cos(cand_emb,store_emb)={cos:.4f}")
 
+
 # ------------- Helpers -------------
 def to_f32(x: torch.Tensor) -> torch.Tensor:
     return x if x.dtype == torch.float32 else x.float()
+
 
 def norm_f32(x: torch.Tensor, p: int = 2, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     norm = F.normalize(to_f32(x), p=p, dim=dim, eps=eps)
     norm = torch.nan_to_num(norm, nan=0.0, posinf=0.0, neginf=0.0)
     return norm
+
 
 def clone_as_target(module: torch.nn.Module) -> torch.nn.Module:
     k = copy.deepcopy(module).eval()
@@ -173,10 +179,12 @@ def clone_as_target(module: torch.nn.Module) -> torch.nn.Module:
         p.requires_grad_(False)
     return k
 
+
 @torch.no_grad()
 def ema_update(q: torch.nn.Module, k: torch.nn.Module, m: float):
     for p_q, p_k in zip(q.parameters(), k.parameters()):
         p_k.data.mul_(m).add_(p_q.data, alpha=1.0 - m)
+
 
 def entropy_regularizer(alpha: torch.Tensor, mask: torch.Tensor | None = None, eps: float = 1e-8) -> torch.Tensor:
     a = alpha.clamp_min(eps)
@@ -190,11 +198,12 @@ def entropy_regularizer(alpha: torch.Tensor, mask: torch.Tensor | None = None, e
         ent = ent / (L_valid.log() + eps)
     return ent.mean()
 
+
 def multi_positive_infonce_from_candidates_v2(
-    scores: torch.Tensor,
-    pos_mask: torch.Tensor,
-    tau: float,
-    cand_valid_mask: torch.Tensor | None = None,
+        scores: torch.Tensor,
+        pos_mask: torch.Tensor,
+        tau: float,
+        cand_valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     scores: (B, K)
@@ -263,16 +272,17 @@ def multi_positive_infonce_from_candidates(scores: torch.Tensor,
     loss = -(num - denom)
     return loss[pos_any].mean() if pos_any.any() else denom.mean() * 0.0
 
+
 @torch.no_grad()
 def delta_y_from_occlusion_windows(
-    H: torch.Tensor,                  # [B, L, Dh]
-    G_pos: torch.Tensor,              # [B, P, Dg]
-    model,                            # ProteinGoAligner
-    valid_mask: torch.Tensor | None = None,  # [B, L] bool
-    window: int = 32,
-    stride: int = 16,
-    mask_value: float = 0.0,
-    chunk_windows: int = 32,          # memory control
+        H: torch.Tensor,  # [B, L, Dh]
+        G_pos: torch.Tensor,  # [B, P, Dg]
+        model,  # ProteinGoAligner
+        valid_mask: torch.Tensor | None = None,  # [B, L] bool
+        window: int = 32,
+        stride: int = 16,
+        mask_value: float = 0.0,
+        chunk_windows: int = 32,  # memory control
 ) -> torch.Tensor:
     """
     Returns:
@@ -369,7 +379,6 @@ def delta_y_from_occlusion_windows(
     return delta  # [B, P, L]
 
 
-
 def surrogate_delta_y_from_mask_grad(H, G, model, mask=None, return_alpha=False):
     """
     Quick surrogate for attribution: use ||dy/dH|| as importance proxy.
@@ -406,6 +415,7 @@ def surrogate_delta_y_from_mask_grad(H, G, model, mask=None, return_alpha=False)
 
     return proxy, alpha_info
 
+
 def build_dag_ancestors(dag_parents: dict[int, list[int]]) -> dict[int, list[int]]:
     # child -> all ancestors (including itself)
     memo: dict[int, list[int]] = {}
@@ -429,11 +439,11 @@ def build_dag_ancestors(dag_parents: dict[int, list[int]]) -> dict[int, list[int
 
 
 def dag_consistency_loss_pos_ids(
-    scores_pos: torch.Tensor,          # [B,Pmax]
-    pos_go_ids: torch.Tensor,          # [B,Pmax] long, pad=-1
-    dag_parents: Optional[dict],
-    margin: float = 0.0,
-    scale: float = 1.0,
+        scores_pos: torch.Tensor,  # [B,Pmax]
+        pos_go_ids: torch.Tensor,  # [B,Pmax] long, pad=-1
+        dag_parents: Optional[dict],
+        margin: float = 0.0,
+        scale: float = 1.0,
 ) -> torch.Tensor:
     if dag_parents is None:
         return torch.zeros((), device=scores_pos.device)
@@ -466,7 +476,7 @@ def dag_consistency_loss_pos_ids(
     return torch.stack(losses).mean()
 
 
-def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = False):
+def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha=False):
     """
     Eval-time mask-out for full-length case.
     """
@@ -474,7 +484,7 @@ def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = Fals
     device = H.device
     delta = torch.zeros_like(alpha_full)
     out = model(H=H, G=G, mask=mask, return_alpha=return_alpha)  # (scores, alpha_info)
-    base_scores = out[0] if isinstance(out, tuple) else out   # (B, T)
+    base_scores = out[0] if isinstance(out, tuple) else out  # (B, T)
 
     for b in range(B):
         for t in range(T):
@@ -485,8 +495,8 @@ def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = Fals
                 Hminus[b, i, :] = 0.0
                 out_m = model(
                     H=Hminus,
-                    G=G[b:b+1],
-                    mask=mask[b:b+1] if mask is not None else None,
+                    G=G[b:b + 1],
+                    mask=mask[b:b + 1] if mask is not None else None,
                     return_alpha=return_alpha
                 )
                 y_minus = out_m[0] if isinstance(out_m, tuple) else out_m  # (1, T)
@@ -495,6 +505,8 @@ def topk_maskout_full(H, G, alpha_full, k, model, mask=None, return_alpha = Fals
             if m > 0:
                 delta[b, t] = delta[b, t] / m
     return delta
+
+
 def _tstats(x: torch.Tensor, name: str):
     if x is None:
         print(f"[DBG] {name}=None")
@@ -510,8 +522,11 @@ def _tstats(x: torch.Tensor, name: str):
     mx = float(xf32.max().item())
     mean = float(xf32.mean().item())
     std = float(xf32.std(unbiased=False).item())
-    nrm = float(torch.linalg.vector_norm(xf32, dim=-1).mean().item()) if xf32.dim() >= 2 else float(torch.linalg.vector_norm(xf32).item())
-    print(f"[DBG] {name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} nan={nan} inf={inf} min={mn:.4g} max={mx:.4g} mean={mean:.4g} std={std:.4g} mean_norm={nrm:.4g}")
+    nrm = float(torch.linalg.vector_norm(xf32, dim=-1).mean().item()) if xf32.dim() >= 2 else float(
+        torch.linalg.vector_norm(xf32).item())
+    print(
+        f"[DBG] {name}: shape={tuple(x.shape)} dtype={x.dtype} dev={x.device} nan={nan} inf={inf} min={mn:.4g} max={mx:.4g} mean={mean:.4g} std={std:.4g} mean_norm={nrm:.4g}")
+
 
 # ------------- Trainer -------------
 class OppTrainer:
@@ -521,6 +536,10 @@ class OppTrainer:
 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+
+        self._eval_cols_seen = None
+        self._eval_cols_rare = None
+        self._eval_cols_unseen = None
 
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
@@ -540,7 +559,7 @@ class OppTrainer:
         if getattr(self.model, "go_encoder", None) is not None:
             self.go_encoder_k = clone_as_target(self.model.go_encoder).to(self.device)
 
-        init_ln = math.log(10) #1.0 / 0.07
+        init_ln = math.log(10)  # 1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
         if getattr(cfg, "is_logit_scale_constant", None) is not None and cfg.is_logit_scale_constant is True:
             with torch.no_grad():
@@ -550,7 +569,7 @@ class OppTrainer:
         else:
             self.logit_scale.requires_grad_(True)
 
-       # self.opt = torch.optim.AdamW(list(self.model.parameters()) + [self.logit_scale], lr=cfg.lr)
+        # self.opt = torch.optim.AdamW(list(self.model.parameters()) + [self.logit_scale], lr=cfg.lr)
         # -------- Optimizer: main + GO encoder param groups --------
         wd = float(getattr(cfg, "weight_decay", 0.01))
         lr_main = float(cfg.lr)
@@ -568,24 +587,38 @@ class OppTrainer:
 
         param_groups = [
             {"params": main_params, "lr": lr_main, "weight_decay": wd},
-            {"params": [self.logit_scale], "lr": lr_main*0.05, "weight_decay": 0.0},
+            {"params": [self.logit_scale], "lr": lr_main * 0.05, "weight_decay": 0.0},
         ]
 
         # Add GO encoder groups (LoRA + embeddings + attn head), if present
         if self.model.go_encoder is not None:
             lr_lora = float(getattr(cfg, "lr_lora", lr_main * 0.1))
-            lr_emb = float(getattr(cfg, "lr_go_emb", lr_main * 0.5))
-            lr_attn = float(getattr(cfg, "lr_go_attn", lr_main * 0.1))
+            #   lr_emb = float(getattr(cfg, "lr_go_emb", lr_main * 0.5))
+            #   lr_attn = float(getattr(cfg, "lr_go_attn", lr_main * 0.1))
 
             # BioMedBERTEncoder implements this
             ge_groups = self.model.go_encoder.param_groups_for_optimizer(
-                lr_emb=lr_emb,
+                lr_emb=None,
                 lr_lora=lr_lora,
                 wd_lora=0.01,
-                lr_attn=lr_attn,
+                lr_attn=None,
                 wd_attn=0.0,
             )
+            for g in ge_groups:
+                g["name"] = "go_lora"
             param_groups.extend(ge_groups)
+
+        self._lora_lr_target = float(getattr(cfg, "lr_lora", lr_lora if self.model.go_encoder is not None else 0.0))
+        self._lora_warmup_steps = int(getattr(cfg, "lora_warmup_steps", 2000))
+        self._lora_lr_start = float(getattr(cfg, "lora_lr_start", self._lora_lr_target * 0.2))
+
+        # Optional: one-time sanity check that GO encoder is LoRA-only
+        if self.model.go_encoder is not None:
+            trainable = [n for n, p in self.model.go_encoder.named_parameters() if p.requires_grad]
+            if trainable:
+                bad = [n for n in trainable if "lora_" not in n]
+                if bad:
+                    print("[WARN] GO encoder has non-LoRA trainables (expected LoRA-only):", bad[:10])
 
         self.opt = torch.optim.AdamW(param_groups)
         self._global_step = 0
@@ -641,6 +674,26 @@ class OppTrainer:
                 f"[DBG-NORM]{tag} queue_mean_norm={qmn} queue_nz_frac={qnz:.3f} ptr={ptr} K={q.size(0)} D={q.size(1)}")
 
     # ----------------- basic helpers -----------------
+    def _set_group_lr(self, name: str, lr: float):
+        for g in self.opt.param_groups:
+            if g.get("name") == name:
+                g["lr"] = float(lr)
+
+    def _lora_lr_schedule(self, step: int):
+        """
+        Linear warmup. lr_start -> lr_target over warmup_steps, then constant lr_target
+        :param step:
+        :return:
+        """
+        if self._lora_warmup_steps <= 0:
+            return self._lora_lr_target
+        if step <= 0:
+            return self._lora_lr_start
+        if step < self._lora_warmup_steps:
+            t = step / self._lora_warmup_steps
+            return self._lora_lr_start + t * (self._lora_lr_target - self._lora_lr_start)
+        return self._lora_lr_target
+
     def _build_pos_go_ids(self, pos_local: List[torch.Tensor], uniq_go_ids: torch.Tensor) -> torch.Tensor:
         device = self.device
         B = len(pos_local)
@@ -716,7 +769,7 @@ class OppTrainer:
         else:
             raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
-        #embs = self.normalizer(embs, dim=1)
+        # embs = self.normalizer(embs, dim=1)
         embs = torch.nan_to_num(embs)
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
         return embs, ids
@@ -1070,6 +1123,12 @@ class OppTrainer:
             enc.train()
     @torch.no_grad()
     def _ensure_eval_cache_v2(self, chunk=1024):
+
+        def to_cols(go_ids):
+            cols = [id2col[int(g)] for g in go_ids if int(g) in id2col]
+            cols = sorted(set(cols))
+            return torch.tensor(cols, dtype=torch.long)  # CPU tensor,
+
         if getattr(self, "_eval_cache_ready", False):
             return
         print("Eval cache preparation...")
@@ -1100,11 +1159,16 @@ class OppTrainer:
         G_bank = self.ctx.go_cache.embs.index_select(0, rows).contiguous()
         G_once_cpu = G_bank.detach().float().cpu().contiguous()
 
+        self._eval_cols_seen = to_cols(getattr(self.ctx, "eval_seen_go_ids", []))
+        self._eval_cols_rare = to_cols(getattr(self.ctx, "eval_rare_go_ids", []))
+        self._eval_cols_unseen = to_cols(getattr(self.ctx, "eval_unseen_go_ids", []))
+
         # 4) store on trainer
         self._eval_ids_cpu = eval_ids_cpu
         self._eval_G_once_cpu = G_once_cpu
         self._eval_id2col = id2col
         self._eval_cache_ready = True
+
     @torch.no_grad()
     def _ensure_eval_cache(self):
         if getattr(self, "_eval_cache_ready", False):
@@ -1195,6 +1259,9 @@ class OppTrainer:
         self.model.train()
         device = self.device
 
+        if self.model.go_encoder is not None:
+            self._set_group_lr("go_lora", self._lora_lr_schedule(self._global_step))
+
         # === SANITY CHECK ===
         if debug:
             if ("pos_go_tokens" in batch) and ("uniq_go_ids" in batch):
@@ -1282,7 +1349,8 @@ class OppTrainer:
                     G_pos[b, :t] = uniq_go_embs.index_select(0, loc.to(uniq_go_embs.device))
 
             # attr train: keep as you had, but use return_alpha correctly
-            use_attr = self.ctx.attribute_loss_enabled and (epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
+            use_attr = self.ctx.attribute_loss_enabled and (
+                    epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0)
             if use_attr:
                 scores_pos, alpha_info = self.forward_scores(H, G_pos, attn_valid, return_alpha=True)
             else:
@@ -1308,7 +1376,7 @@ class OppTrainer:
             l_attr = torch.zeros((), device=device)
             l_ent = torch.zeros((), device=device)
 
-        #DAG: build explicit [B, Pmax] GO-id tensor, then apply pos_ids DAG loss.
+        # DAG: build explicit [B, Pmax] GO-id tensor, then apply pos_ids DAG loss.
         l_dag = torch.zeros((), device=device)
         if self.attr.lambda_dag > 0:
             # DAG: GO-only (protein path detached)
@@ -1370,6 +1438,8 @@ class OppTrainer:
                     "train/attr": float(l_attr.detach().item()),
                     "train/entropy": float(l_ent.detach().item()),
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
+                    "train/lr_go_lora": float(
+                        self._lora_lr_schedule(self._global_step - 1)) if self.model.go_encoder is not None else 0.0,
                 },
                 step=int(self._global_step),
             )
@@ -1377,6 +1447,126 @@ class OppTrainer:
             pass
 
         return {"total": total, "contrastive": l_con, "dag": l_dag, "attr": l_attr, "entropy": l_ent}
+
+    @torch.no_grad()
+    def _subset_cols_from_ids(self, ids: list[int] | set[int] | torch.Tensor | None):
+        """
+        ids: global GO ids (int), subset of eval_id_list
+        returns CPU LongTensor of column indices into OBSERVED eval matrix
+        """
+        if ids is None:
+            return torch.empty(0, dtype=torch.long)
+        if torch.is_tensor(ids):
+            ids_list = [int(x) for x in ids.detach().cpu().long().flatten().tolist()]
+        else:
+            ids_list = [int(x) for x in ids]
+        id2col = self._eval_id2col or {}
+        cols = [id2col[g] for g in ids_list if g in id2col]
+        cols = sorted(set(cols))
+        return torch.tensor(cols, dtype=torch.long)
+
+    @torch.no_grad()
+    def _ancestor_recall_at_k(self, scores_full: torch.Tensor, y_true_full: torch.Tensor, k: int):
+        """
+        No Post-processing.
+        Ranking observed (scores_full).
+        Ground truth = Ancestors(positives) ∩ observed_go
+        Returns: (mean_recall, num_valid_proteins)
+        """
+        device = scores_full.device
+        B, G = y_true_full.shape
+        k = min(int(k), int(G))
+        if k <= 0 or B == 0:
+            return 0.0, 0
+
+        # mapping: col -> global gid
+        eval_ids_cpu = self._eval_ids_cpu  # CPU LongTensor [G]
+        id2col = self._eval_id2col  # dict: gid -> col
+        dag_anc = getattr(self, "dag_ancestors", None)
+        if dag_anc is None:
+            return 0.0, 0
+
+        # topk over observed
+        topk = torch.topk(scores_full, k=k, dim=1).indices  # [B,k]
+        topk_cpu = topk.detach().cpu()
+
+        y_cpu = y_true_full.detach().cpu()
+
+        sum_rec = 0.0
+        num = 0
+
+        for b in range(B):
+            # positives in observed cols
+            pos_cols = torch.nonzero(y_cpu[b] > 0, as_tuple=False).flatten().tolist()
+            if not pos_cols:
+                continue
+
+            # positives -> global GO ids
+            pos_gids = eval_ids_cpu.index_select(0, torch.tensor(pos_cols, dtype=torch.long)).tolist()
+
+            # ancestor closure in global ids
+            anc_set = set()
+            for gid in pos_gids:
+                # dag_ancestors includes itself in your build_dag_ancestors
+                anc = dag_anc.get(int(gid), None)
+                if anc is None:
+                    anc_set.add(int(gid))
+                else:
+                    for a in anc:
+                        anc_set.add(int(a))
+
+            # restrict to observed by mapping to columns
+            anc_cols = set()
+            for a in anc_set:
+                j = id2col.get(int(a), None)
+                if j is not None:
+                    anc_cols.add(int(j))
+
+            denom = len(anc_cols)
+            if denom == 0:
+                continue
+
+            # hits among topk
+            pred_cols = topk_cpu[b].tolist()
+            hits = sum((int(c) in anc_cols) for c in pred_cols)
+            sum_rec += hits / denom
+            num += 1
+
+        if num == 0:
+            return 0.0, 0
+        return float(sum_rec / num), int(num)
+
+    @torch.no_grad()
+    def _recall_at_k_on_subset(self, scores_full: torch.Tensor, y_true_full: torch.Tensor,
+                               subset_cols_cpu: torch.Tensor, k: int):
+        """
+        Ranking is over FULL observed space (scores_full).
+        Hits counted only if the predicted GO is in subset_cols AND is a true positive.
+        Returns: (recall_mean, num_valid_proteins)
+        """
+        device = scores_full.device
+        B, G = y_true_full.shape
+        k = min(int(k), int(G))
+        if k <= 0:
+            return 0.0, 0
+
+        subset_cols = subset_cols_cpu.to(device, non_blocking=True)
+        if subset_cols.numel() == 0:
+            return 0.0, 0
+
+        # subset ground truth in full space
+        y_sub = torch.zeros((B, G), device=device, dtype=y_true_full.dtype)
+        y_sub[:, subset_cols] = y_true_full[:, subset_cols]
+
+        topk = torch.topk(scores_full, k=k, dim=1).indices  # [B,k] over OBSERVED
+        hits = torch.gather(y_sub, 1, topk)  # [B,k] 1s only for subset true positives
+
+        denom = y_sub.sum(dim=1)  # [B]
+        valid = denom > 0
+        if valid.any():
+            rec = (hits.sum(dim=1) / denom.clamp_min(1.0))
+            return float(rec[valid].mean().item()), int(valid.sum().item())
+        return 0.0, 0
 
     @torch.no_grad()
     def eval_epoch(self, loader, epoch_idx: int):
@@ -1387,20 +1577,51 @@ class OppTrainer:
         self._eval_cache_ready = False
         self._ensure_eval_cache_v2(chunk=self.cfg.eval_go_bs)
 
+        # ---- logs: add new keys, keep existing ones
         logs = {
-            "cafa_fmax": 0.0, "cafa_aupr": 0.0,
+            # observed (optional to keep)
+            "obs_fmax": 0.0, "obs_aupr": 0.0,
+
+            # seen-only
+            "seen_fmax": 0.0, "seen_aupr": 0.0,
+
+            # rare-only
+            "rare_fmax": 0.0, "rare_aupr": 0.0,
+
+            # unseen recall
+            "unseen_R@10": 0.0, "unseen_R@50": 0.0,
+            "unseen_num": 0,  # how many val proteins had unseen positives
+
+            # retrieval metrics over OBSERVED
             "align_R@1": 0.0, "align_R@5": 0.0, "align_R@10": 0.0,
             "align_R@50": 0.0, "align_R@100": 0.0, "align_R@200": 0.0,
-            "align_MRR": 0.0, "align_nDCG@10": 0.0
+            "align_MRR": 0.0, "align_nDCG@10": 0.0,
+            "anc_R@10": 0.0, "anc_R@50": 0.0, "anc_num": 0
         }
 
-        preds, trues = [], []
+        # ---- accumulators
+        preds_obs, trues_obs = [], []
+        preds_seen, trues_seen = [], []
+        preds_rare, trues_rare = [], []
 
         sum_num = 0
         sum_R1 = sum_R5 = sum_R10 = sum_R50 = sum_R100 = sum_R200 = 0.0
         sum_MRR = sum_nDCG = 0.0
 
+        sum_unseen_R10 = 0.0
+        sum_unseen_R50 = 0.0
+        sum_unseen_num = 0
+
+        sum_anc_R10 = 0.0
+        sum_anc_R50 = 0.0
+        sum_anc_num = 0
+
         scale = self.logit_scale_value()
+
+        seen_cols_cpu = self._eval_cols_seen if self._eval_cols_seen is not None else torch.empty(0, dtype=torch.long)
+        rare_cols_cpu = self._eval_cols_rare if self._eval_cols_rare is not None else torch.empty(0, dtype=torch.long)
+        unseen_cols_cpu = self._eval_cols_unseen if self._eval_cols_unseen is not None else torch.empty(0,
+                                                                                                        dtype=torch.long)
 
         for batch in loader:
             H = batch["prot_emb_pad"].to(device, non_blocking=True)
@@ -1408,14 +1629,16 @@ class OppTrainer:
                 H = self.to_f32(H)
             attn_valid, _ = self._valid_and_pad_masks(batch)
 
-            G_eval, y_true = self._build_eval_space(batch)
+            # OBSERVED eval space
+            G_eval, y_true = self._build_eval_space(batch)  # y_true is over OBSERVED columns
 
-            # raw (ideally cosine-ish) scores
-            scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)  # [B,Geval]
+            # raw scores (cosine-ish), shape [B, Geval]
+            scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
 
-            # retrieval metrics should use the SAME scores as training ranking signal
+            # ranking scores
             scores_rank = scores_raw * scale
 
+            # retrieval metrics over OBSERVED
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200))
             if m["num"] > 0:
                 sum_num += m["num"]
@@ -1428,22 +1651,58 @@ class OppTrainer:
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
-            # CAFA probability mapping: DO NOT use scaled scores
-            # If your scores_raw are cosine in [-1,1], this is the clean CAFA-style mapping:
+            # CAFA-style mapping for Fmax/AUPR (kept same)
             probs = (0.5 * (scores_raw + 1.0)).clamp(0, 1)
 
-            preds.append(probs.cpu())
-            trues.append(y_true.cpu())
+            # store OBSERVED
+            preds_obs.append(probs.detach().cpu())
+            trues_obs.append(y_true.detach().cpu())
 
-        if preds:
-            y_pred = torch.cat(preds, dim=0).numpy()
-            y_true_np = torch.cat(trues, dim=0).numpy()
+            # store SEEN subset
+            if seen_cols_cpu.numel() > 0:
+                cols = seen_cols_cpu.to(device, non_blocking=True)
+                preds_seen.append(probs.index_select(1, cols).detach().cpu())
+                trues_seen.append(y_true.index_select(1, cols).detach().cpu())
 
+            # store RARE subset
+            if rare_cols_cpu.numel() > 0:
+                cols = rare_cols_cpu.to(device, non_blocking=True)
+                preds_rare.append(probs.index_select(1, cols).detach().cpu())
+                trues_rare.append(y_true.index_select(1, cols).detach().cpu())
+
+            # unseen recall@10/50 (ranking over OBSERVED, hits only in unseen subset)
+            r10, n10 = self._recall_at_k_on_subset(scores_rank, y_true, unseen_cols_cpu, k=10)
+            r50, n50 = self._recall_at_k_on_subset(scores_rank, y_true, unseen_cols_cpu, k=50)
+            # n10 and n50 should match (same denom condition), but be safe:
+            n_u = max(n10, n50)
+            if n_u > 0:
+                sum_unseen_R10 += r10 * n_u
+                sum_unseen_R50 += r50 * n_u
+                sum_unseen_num += n_u
+
+            a10, an10 = self._ancestor_recall_at_k(scores_rank, y_true, k=10)
+            a50, an50 = self._ancestor_recall_at_k(scores_rank, y_true, k=50)
+            an = max(an10, an50)
+            if an > 0:
+                sum_anc_R10 += a10 * an
+                sum_anc_R50 += a50 * an
+                sum_anc_num += an
+
+        # ---- finalize Fmax/AUPR
+        def _finish_fmax_aupr(pred_list, true_list):
+            if not pred_list:
+                return 0.0, 0.0
+            y_pred = torch.cat(pred_list, dim=0).numpy()
+            y_true_np = torch.cat(true_list, dim=0).numpy()
             fmax, _ = compute_fmax(y_true=y_true_np, y_pred=y_pred, num_thresholds=101)
             aupr = compute_term_aupr(y_true_np, y_pred)
-        else:
-            fmax, aupr = 0.0, 0.0
+            return float(fmax), float(aupr)
 
+        logs["obs_fmax"], logs["obs_aupr"] = _finish_fmax_aupr(preds_obs, trues_obs)
+        logs["seen_fmax"], logs["seen_aupr"] = _finish_fmax_aupr(preds_seen, trues_seen)
+        logs["rare_fmax"], logs["rare_aupr"] = _finish_fmax_aupr(preds_rare, trues_rare)
+
+        # ---- finalize retrieval metrics
         if sum_num > 0:
             logs["align_R@1"] = sum_R1 / sum_num
             logs["align_R@5"] = sum_R5 / sum_num
@@ -1454,6 +1713,24 @@ class OppTrainer:
             logs["align_MRR"] = sum_MRR / sum_num
             logs["align_nDCG@10"] = sum_nDCG / sum_num
 
-        logs["cafa_fmax"] = float(fmax)
-        logs["cafa_aupr"] = float(aupr)
+        # ---- finalize unseen recall
+        if sum_unseen_num > 0:
+            logs["unseen_R@10"] = sum_unseen_R10 / sum_unseen_num
+            logs["unseen_R@50"] = sum_unseen_R50 / sum_unseen_num
+            logs["unseen_num"] = int(sum_unseen_num)
+        else:
+            logs["unseen_R@10"] = 0.0
+            logs["unseen_R@50"] = 0.0
+            logs["unseen_num"] = 0
+
+        # ---- finalize ancestor recall
+        if sum_anc_num > 0:
+            logs["anc_R@10"] = sum_anc_R10 / sum_anc_num
+            logs["anc_R@50"] = sum_anc_R50 / sum_anc_num
+            logs["anc_num"] = int(sum_anc_num)
+        else:
+            logs["anc_R@10"] = 0.0
+            logs["anc_R@50"] = 0.0
+            logs["anc_num"] = 0
+
         return logs
