@@ -17,17 +17,15 @@ import logging
 import json
 import numpy as np
 import torch
-import torch.nn.functional as F
 import argparse
 
 import wandb
-from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT, GO_INDEX
-from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore
-from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
-from src.training.collate import ContrastiveEmbCollator, fused_collator
+from src.datasets import ESMResidueStore, GoTextStore
+from src.datasets.protein_dataset import ProteinEmbDataset
+from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
 from src.configs.data_classes import (
-    FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
+    FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
 from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache, GoDropoutConfig, GoTokenDropout
@@ -39,18 +37,7 @@ from src.utils.checkpoint import save_checkpoint, load_checkpoint
 from src.encoders import BioMedBERTEncoder
 from math import inf
 
-from src.configs.paths import (
-    PROTEIN_TRAIN_IDS,
-    PROTEIN_VAL_IDS,
-    PID_TO_POSITIVES,
-    ZERO_SHOT_TERMS_ID_ONLY_JSON,
-    FEW_SHOT_IC_TERMS_ID_ONLY_JSON,
-    P_SEQ_LEN_LOOKUP,
-    GOOGLE_DRIVE_MANIFEST_CACHE,
-    TRAINING_CONFIG,
-    COMMON_IC_GO_TERMS_ID_ONLY_JSON,
-    GO_INDEX_NON_PHASE
-)
+from src.configs.paths import YAML_FILE
 
 # To prevent sigint (potential cause)
 try:
@@ -225,45 +212,20 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
     blob = torch.load(str(p), map_location="cpu", weights_only=False)
     return GoLookupCache(blob)
 
-
-
 def build_stores(args):
-    """
-    Returns:
-      res_store:  ESMResidueStore  ([L,D])
-      fused_store: ESMFusedStore or None  ([D])
-    CLI/args beklenen alanlar:
-      - args.seq_len_lookup (pickle path)
-      - args.embed_dir_res (residue kökü)   [zorunlu]
-      - args.embed_dir_fused (fused kökü)   [opsiyonel]
-      - args.fp16 (bool), args.max_len, args.overlap
-    """
-    import logging, os
     logger = logging.getLogger("build_stores")
     logger.info("Building residue+fused stores (lazy, no snapshot)...")
 
     # 1) seq len lookup
  #   seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
 
-    # 2) HF cache kökü (opsiyonel; şu an lazy fetch kapalı)
-    hub_local_dir = getattr(args, "hub_local_dir", None) or "/content/hf_cache"
-    Path(hub_local_dir).mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HOME", str(hub_local_dir))
-
     # 3) embed dirs
-    embed_dir_res = getattr(args, "embed_dir_res", None) or hub_local_dir
-
-    embed_dir_fused = getattr(args, "embed_dir_fused", None)  # None olabilir
-
+    embed_dir_res = getattr(args, "embed_dir_res", None)
     # 4) toggles
-    gdrive_cache = False
-    cache_shards = getattr(args, "no_cache_shards", False)
 
     logger.info(
         "Store config:\n"
         f"  embed_dir_res   = {embed_dir_res}\n"
-        f"  embed_dir_fused = {embed_dir_fused}\n"
-        f"  cache_shards    = {cache_shards}\n"
         f"  prefer_fp16     = {args.fp16}\n"
         f"  max_len/overlap = {getattr(args,'max_len',None)}/{getattr(args,'overlap',None)}"
     )
@@ -274,22 +236,11 @@ def build_stores(args):
       #  seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
-        gdrive_cache=gdrive_cache,
         prefer_fp16=args.fp16,
-        # HF lazy fetch paramlarını bilinçli olarak kapalı bırakıyoruz
     )
 
-    # 6) Build fused (opsiyonel)
-    fused_store = None
-    if embed_dir_fused:
-        fused_store = ESMFusedStore(
-            embed_dir=embed_dir_fused,
-            gdrive_cache=gdrive_cache,
-            prefer_fp16=args.fp16,
-        )
-
     logger.info("Stores ready.")
-    return res_store, fused_store
+    return res_store
 
 def build_val_dataset(
     val_pids,
@@ -306,48 +257,21 @@ def build_val_dataset(
         fewzero=fewzero_cfg,
         dag_parents=dag_parents,
         store=residue_store,
-        fused_store=None,
-        include_fused=False,   # validation için fused gereksiz
     )
     return ds_val
 
-def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, go_cache: GoLookupCache, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
-    logger = logging.getLogger("build_datasets")
-    logger.info("Building datasets...")
-
+def build_datasets(args, res_store: ESMResidueStore, go_cache: GoLookupCache, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
     logger.info(f"PID_TO_POSITIVES path = {args.pid2pos}")
 
     pid2pos = load_raw_json(args.pid2pos)
-    train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
-    val_ids = load_raw_txt(PROTEIN_VAL_IDS)
+    train_ids = load_raw_txt(args.train_ids_path)
+    val_ids = load_raw_txt(args.val_ids_path)
 
-    #test_pids = load_raw_pickle("/workspace/data/processed/test_ids.pkl")
-
-    fused_dir = str(Path(args.embed_dir_fused))  # senin kullandığın yol
-    have_fused = _collect_fused_ids(fused_dir)
-
-    def _filter_existing(ids):
-        kept = [pid for pid in ids if pid in have_fused]
-        missing = len(ids) - len(kept)
-        return kept, missing
-
-    train_ids_kept, train_missing = _filter_existing(train_ids)
-    val_ids_kept, val_missing = _filter_existing(val_ids)
-
-    if train_missing or val_missing:
-        logging.getLogger("build_datasets").warning(
-            "Fused bank'te olmayan ID'ler elendi: train_missing=%d, val_missing=%d",
-            train_missing, val_missing
-        )
-    train_ids = train_ids_kept
-    val_ids = val_ids_kept
-
-    zs = load_go_set(ZERO_SHOT_TERMS_ID_ONLY_JSON)
-    fs = load_go_set(FEW_SHOT_IC_TERMS_ID_ONLY_JSON)
-    common = load_go_set(COMMON_IC_GO_TERMS_ID_ONLY_JSON)
-    fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs, common_terms=common,
+    zs = load_go_set(args.zero_shot_path)
+    fs = load_go_set(args.few_shot_path)
+    fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs,
                        fs_target_ratio=args.fs_target_ratio)
 
     train_ds = ProteinEmbDataset(
@@ -357,19 +281,13 @@ def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, 
         fewzero=fz,
         dag_parents=dag_parents,
         store=res_store,
-        fused_store=None,  # eğitimde gerekmez
-        include_fused=False
     )
 
     val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_cache=go_cache, fewzero_cfg=fz,
                               dag_parents=dag_parents, residue_store=res_store)
-    if fused_store is not None:
-        query_ds = ProteinFusedQueryDataset(train_ids+val_ids, fused_store=fused_store)
-    else:
-        query_ds = None
 
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
-    return {"train": train_ds, "val": val_ds, "query_ds": query_ds}
+    return {"train": train_ds, "val": val_ds}
 
 def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore, go_dropout:GoTokenDropout=None):
     logger = logging.getLogger("build_dataloaders")
@@ -434,19 +352,8 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             drop_last=False
         )
 
-    if datasets.get("query_ds") is None:
-        raise RuntimeError("Query dataset is required for retrieval/indexing.")
-
-    query_loader = DataLoader(
-        datasets.get("query_ds"),
-        batch_size=1024,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        collate_fn=fused_collator)
-
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
-    return train_loader, val_loader, query_loader
+    return train_loader, val_loader
 
 
 def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
@@ -482,45 +389,6 @@ def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
         warmup=warmup,
     )
     return cfg
-
-# === Add near the other utils in main.py ===
-def materialize_fused_bank(query_loader, *, device: str = "cpu"):
-    """
-    Consume query_loader (ProteinFusedQueryDataset) once and build:
-      - ids:   List[str]               length N
-      - vecs:  torch.FloatTensor [N,D] on CPU (or device)
-      - id2row: Dict[str, int]
-    """
-    import logging
-    logger = logging.getLogger("fused_bank")
-    ids_all: List[str] = []
-    vecs_all: List[torch.Tensor] = []
-
-    with torch.no_grad():
-        for batch in query_loader:
-            # fused_collator -> {"protein_ids": [...], "prot_fused": [B,D]}
-            ids = batch["protein_ids"]
-            Z = batch["prot_fused"]  # [B,D] float32
-            if device and device != "cpu":
-                Z = Z.to(device, non_blocking=True)
-            ids_all.extend(ids)
-            vecs_all.append(Z.cpu() if device == "cpu" else Z)
-
-    if not vecs_all:
-        raise RuntimeError("query_loader yielded no fused vectors.")
-
-    vecs = torch.cat(vecs_all, dim=0).contiguous()  # [N,D]
-    if device != "cpu":  # keep one canonical CPU copy for indexing by row
-        vecs_cpu = vecs.detach().cpu()
-    else:
-        vecs_cpu = vecs
-    if len(ids_all) != vecs_cpu.size(0):
-        raise RuntimeError(f"IDs and vectors length mismatch: {len(ids_all)} vs {vecs_cpu.size(0)}")
-
-    id2row = {pid: i for i, pid in enumerate(ids_all)}
-    logger.info("Fused bank built: N=%d, D=%d", vecs_cpu.size(0), vecs_cpu.size(1))
-    return {"ids": ids_all, "vecs": vecs_cpu, "id2row": id2row}
-
 def refresh_go_cache_chunked(ids_to_update, go_text_store, go_encoder, go_cache, device, chunk_size=256):
     ids_to_update = list(ids_to_update)
     go_encoder.eval()
@@ -799,7 +667,7 @@ def sanity_check_go_text(train_ids, pid2pos, go_text_store):
 
 
 # ============== Runner ==============
-def run_training(args, schedule: TrainSchedule):
+def run_training(args):
     signal.signal(signal.SIGINT, _sigint_handler)
     logger = logging.getLogger("main")
     if args.general_device is not None:
@@ -811,32 +679,21 @@ def run_training(args, schedule: TrainSchedule):
         wandb.login()
 
 
-    # Phase 0 resources
-    if schedule is not None:
-        phase0 = 0
-        go_cache_path = schedule.resolve_go_cache_path(phase0)
-    else:
-        phase0 = -1 # ablation 1 - no phase: -1, full ablation phase 4, new text = -2
-        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
-      #  print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
-        go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
-        #go_cache_path = GO_INDEX[phase0+1]["TEXT_EMB"]
+    print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
+    #go_cache_path = GO_INDEX[args.phase]["TEXT_EMB"]
+    #go_cache_path = GO_INDEX[phase0+1]["TEXT_EMB"]
+    go_cache_path = args.go_cache_path
 
     go_cache = build_go_cache(str(go_cache_path))
     dag_parents = load_go_parents() if args.use_dag_in_ds else None
     dag_children = load_go_children() if args.use_dag_in_ds else None
 
     # GO text dict per phase
-    total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
     go_id_to_text: Dict[int, Dict[int, str]] = {}
-    if phase0 == -1 or phase0==3 or phase0 == -2: # phase = 4 -> full token activation
-        go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
-    else:
-        for ph in range(total_phases):
-            go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
+    go_id_to_text[args.phase] = load_go_texts_by_phase(args.go_text_folder, phase=args.phase)
 
-    res_store, fused_store = build_stores(args)
-    datasets = build_datasets(args, res_store, fused_store, go_cache)
+    res_store = build_stores(args)
+    datasets = build_datasets(args, res_store, go_cache)
     n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
     # Text encoder (GO)
@@ -855,8 +712,7 @@ def run_training(args, schedule: TrainSchedule):
     )
 
     # GoTextStore + dataloaders
-    lazy = True if phase0 >=0 and phase0!=3 else False
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=False, max_len=args.go_text_store_max_len)
+    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=args.phase, lazy=False, max_len=args.go_text_store_max_len)
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
@@ -870,7 +726,16 @@ def run_training(args, schedule: TrainSchedule):
     sanitize_dataset_with_go_text(datasets["val"], go_text_store)
     sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
 
-    eval_id_list = collect_eval_ids_from_datasets(datasets["train"], datasets["val"])
+    eval_space = getattr(args, "eval_space", "observed")
+    if eval_space == "seen":
+        eval_id_list = load_raw_pickle(args.go_path_seen) # seen on training (at least one positive on training.)
+    else:
+        eval_id_list = load_raw_pickle(args.go_path_observed) # observed: train+val+test positives
+
+    eval_seen_go_ids = load_raw_pickle(args.go_path_seen)
+    eval_unseen_ids = load_raw_pickle(args.zero_shot_path)
+    eval_rare_go_ids = load_raw_pickle(args.few_shot_path)
+
     logging.getLogger("main").info(
         "[eval] using %d GO terms in eval_id_list", len(eval_id_list)
     )
@@ -883,7 +748,7 @@ def run_training(args, schedule: TrainSchedule):
         go_dropout_config = GoDropoutConfig(enabled=True, p=0.08, pad_id=go_encoder.tokenizer.pad_token_id,
                     protect_ids=tuple(special_tokens_to_protect))
         go_token_dropout = GoTokenDropout(go_dropout_config)
-    train_loader, val_loader, query_loader = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
+    train_loader, val_loader = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
 
     # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
     memory_bank = go_cache if args.use_go_memory_bank else None
@@ -909,7 +774,6 @@ def run_training(args, schedule: TrainSchedule):
     # Lightweight runtime context
     training_context = TrainingContext(
         device=device,
-        schedule=schedule,
         go_cache=go_cache,
         faiss_index=None,
         vres=None, #For similarity searches etc.
@@ -929,7 +793,10 @@ def run_training(args, schedule: TrainSchedule):
         fp16_enabled=args.fp16,
         pooling_strategy=args.pooling_strategy,
         eval_id_list=eval_id_list,
-        logger=logger
+        logger=logger,
+        eval_seen_go_ids=eval_seen_go_ids,
+        eval_unseen_ids=eval_unseen_ids,
+        eval_rare_go_ids=eval_rare_go_ids,
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -940,72 +807,9 @@ def run_training(args, schedule: TrainSchedule):
         gospec_tau=0.02,
         gospec_topk=32,
     )
-    fused_bank = materialize_fused_bank(query_loader, device=("cpu" if args.cpu else "cuda:0"))
-    training_context.fused_bank = fused_bank
     missing = [int(g) for g in training_context.eval_id_list if int(g) not in training_context.go_cache.id2row]
     if missing:
         raise RuntimeError(f"go_cache missing {len(missing)} eval GO ids, e.g. {missing[:10]}")
-
-     # Sanity check
-
-    assert isinstance(fused_bank, dict) and {"ids", "vecs", "id2row"} <= fused_bank.keys()
-    assert len(fused_bank["ids"]) == fused_bank["vecs"].shape[0] > 0, "fused bank boş/eksik"
-
-    def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
-        if phase0 == -1:
-            return
-        new_phase = training_context.schedule.phase_for_epoch(current_epoch)
-        prev_phase = training_context.current_phase
-
-        if prev_phase is None:
-            training_context.current_phase = new_phase
-            training_context.last_refresh_epoch = current_epoch
-            training_context.last_refresh_reason = "init"
-            training_context.go_text_store.update_phase_and_tokenize(new_phase)
-            return
-
-        if force or (new_phase != prev_phase):
-            logger.info(f"[PHASE SWITCH] epoch={current_epoch} :: {prev_phase + 1} -> {new_phase + 1}")
-
-            # Phase değiştir
-            training_context.go_text_store.update_phase_and_tokenize(new_phase)
-
-            phase_ids = sorted(int(g) for g in training_context.go_text_store.id2text.keys())
-
-            refresh_go_cache_chunked(
-                ids_to_update=phase_ids,
-                go_text_store=training_context.go_text_store,
-                go_encoder=go_encoder,
-                go_cache=training_context.go_cache,  # aynı cache
-                device=device,
-                chunk_size=128
-            )
-
-            training_context.memory_bank = training_context.go_cache if args.use_go_memory_bank else None
-
-            # GoTextStore fazı
-            training_context.go_text_store.update_phase_and_tokenize(new_phase)
-
-            # Dataloader’ları yeniden kur
-            nonlocal train_loader, val_loader, query_loader
-            train_loader, val_loader, query_loader = build_dataloaders(datasets=datasets,
-                                                                                args=args,
-                                                                                go_cache=training_context.go_cache,
-                                                                                go_text_store=training_context.go_text_store,
-                                                                                go_dropout=go_token_dropout)
-            try:
-                trainer.queue_miner.reset()
-                logger.info("[queue] soft reset after phase change")
-            except Exception:
-                pass
-            fused_bank = materialize_fused_bank(query_loader, device="cpu")
-            training_context.fused_bank = fused_bank
-            training_context.current_phase = new_phase
-            training_context.last_refresh_epoch = current_epoch
-            training_context.last_refresh_reason = "phase_change" if not force else "force"
-
-    # expose refresher
-    training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources if args.is_phasing else None
 
     # infer dims
     with torch.no_grad():
@@ -1327,7 +1131,7 @@ def run_training(args, schedule: TrainSchedule):
 
 # ============== YAML parser ==============
 
-def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
+def load_structured_cfg(path: str):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
@@ -1356,17 +1160,15 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         pooling_strategy = general.get("pooling_strategy", "mean"),
         ablation_id = general.get("ablation_id", None),
         is_phasing = bool(general.get("is_phasing", False)),
+        phase=general.get("phase", -2),
+
         # paths / store
-        train_ids=Path(stores.get("train_ids_path", PROTEIN_TRAIN_IDS)),
-        pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),
-        val_ids=Path(stores.get("val_ids_path", PROTEIN_VAL_IDS)),
-        embed_dir=Path(stores.get("embed_dir", None) or stores.get("hub_local_dir", None)),
+        train_ids_path=Path(stores.get("train_ids_path")),
+        pid2pos=Path(stores.get("pid2pos_path")),
+        val_ids_path=Path(stores.get("val_ids_path")),
         embed_dir_res=Path(stores.get("embed_dir_res", None)),
-        embed_dir_fused=Path(stores.get("embed_dir_fused", None)),
-        seq_len_lookup=Path(stores.get("seq_len_lookup_dir", P_SEQ_LEN_LOOKUP)),
-        pro_manifest=Path(stores.get("protein_manifest_file", GOOGLE_DRIVE_MANIFEST_CACHE)),
         go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
-        hub_local_dir=Path(stores.get("hub_local_dir", None)),
+        go_cache_path=Path(stores.get("go_cache_path")) if stores.get("go_cache_path") else None,
 
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),
@@ -1378,8 +1180,8 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         max_ancestor_add=int(data.get("max_ancestor_add", 4)),
         max_hops=int(data.get("max_hops", 3)),
         ancestor_gamma=float(data.get("ancestor_gamma", 0.7)),
-        zero_shot_terms=stores.get("zero_shot_terms_file", ZERO_SHOT_TERMS_ID_ONLY_JSON),
-        few_shot_terms=stores.get("few_shot_terms_file", FEW_SHOT_IC_TERMS_ID_ONLY_JSON),
+        zero_shot_path=stores.get("zero_shot_path"),
+        few_shot_path=stores.get("few_shot_path"),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.3)),
 
         # caches (legacy keys kept for compatibility; FAISS yok)
@@ -1414,6 +1216,7 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         is_logit_scale_constant=bool(training.get("is_logit_scale_constant", False)),
         go_token_dropout=bool(training.get("go_token_dropout", False)),
         go_pooling=str(training.get("go_pooling", "mean")),
+        eval_space=str(training.get("eval_space", "seen")),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
@@ -1500,7 +1303,7 @@ def parse_args():
 
     args = parser.parse_args()
     if not args.config:
-        args.config = TRAINING_CONFIG
+        args.config = YAML_FILE
         print(f"[main] No --config passed, defaulting to {args.config}")
 
     args, schedule = load_structured_cfg(args.config)
@@ -1517,7 +1320,7 @@ def main():
     set_seed(args.seed)
     t0 = time.time()
     try:
-        run_training(args, schedule)
+        run_training(args)
     except Exception as e:
         logging.exception("Fatal error: %s", repr(e))
         raise

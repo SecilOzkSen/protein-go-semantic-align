@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# PyCharm / IDE files
+.idea/
+.vscode/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Jupyter / Colab
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Environment & secrets
+.env
+.env.example
+
+# PyCharm / IntelliJ project files
+.idea/
+
+/src/data/
+
