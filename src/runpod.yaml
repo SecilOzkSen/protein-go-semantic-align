@@ -136,7 +136,7 @@ stores:
   go_path_seen: /workspace/data/eval/go_eval_ids_seen.pkl # training seen
   go_path_observed: /workspace/data/go_eval_ids_observed.pkl # train+val+test seen at once.
 
-  embed_dir_res: /workspace/protein/residues
+  embed_dir_res: /workspace/protein/residues/embeddings_1b_npy
   go_text_folder: /workspace/data
   go_cache_path: /workspace/data/go_embeddings/normalized/go_text_embeddings_canonical.npy
 
