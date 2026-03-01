@@ -125,8 +125,8 @@ wandb:
   mode: online
 
 stores:
-  train_ids_path: /workspace/data/training_ready/proteins/splits/train_ids.txt
-  val_ids_path: /workspace/data/training_ready/proteins/splits/val_ids.txt
+  train_ids_path: /workspace/data/splits/train_ids.txt
+  val_ids_path: /workspace/data/splits/val_ids.txt
 
   pid2pos_path: /workspace/data/pid_to_positives_canonical.json #pid_to_positives_canonical
 
