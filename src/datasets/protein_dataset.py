@@ -110,6 +110,7 @@ class ProteinEmbDataset(Dataset):
             self.is_fs.append(any((g in fewzero.few_shot_terms) for g in labels))
 
         # Global ZS maskesi (ileride miner filtreleri için)
+        self.n_go = len(go_text_store.id2text.keys())
         self.zs_mask = self.mask_from_globals(list(go_text_store.id2text.keys()), fewzero.zero_shot_terms)
 
     def mask_from_globals(self, go_text_store_ids: List[int], terms: Sequence[int]) -> torch.BoolTensor:

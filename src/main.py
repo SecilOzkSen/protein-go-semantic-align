@@ -310,7 +310,6 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         shuffled_text_store.shuffle()
 
     train_collate = ContrastiveEmbCollator(
-        go_lookup=go_cache,
         go_text_store=shuffled_text_store if shuffled else go_text_store, #tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
@@ -318,7 +317,6 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         go_dropout=go_dropout
     )
     val_collate = ContrastiveEmbCollator(
-        go_lookup=go_cache,
         go_text_store=go_text_store,  # tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,

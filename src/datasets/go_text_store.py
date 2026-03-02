@@ -47,6 +47,7 @@ class GoTextStore:
             raise KeyError(f"phase={self.phase} not found in full_id2text keys={list(self.full_id2text.keys())[:5]}...")
 
         self.id2text = self.full_id2text[self.phase]
+        self.n_go = len(self.id2text)
 
         # {go_id: {"input_ids": [L], "attention_mask": [L]}}
         self.id2tok: Dict[int, Dict[str, torch.Tensor]] = {}

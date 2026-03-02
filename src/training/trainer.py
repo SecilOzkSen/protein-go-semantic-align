@@ -728,10 +728,11 @@ class OppTrainer:
     def _get_uniq_go_embs(self, batch):
         device = self.device
 
-        if self.model.go_encoder is None or ("pos_go_tokens" not in batch):
-            embs = batch["uniq_go_embs"].to(device, non_blocking=True)
-            ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
-            return embs, ids
+        if self.model.go_encoder is None:
+            raise RuntimeError("Training requires go_encoder (LoRA always on), but model.go_encoder is None.")
+
+        if "pos_go_tokens" not in batch:
+            raise RuntimeError("GO encoder present but pos_go_tokens missing. Fix collator to emit pos_go_tokens.")
 
         toks = batch["pos_go_tokens"]
         input_ids = toks["input_ids"].to(device, non_blocking=True)
@@ -739,37 +740,25 @@ class OppTrainer:
 
         out = self.model.go_encoder(input_ids=input_ids, attention_mask=attn)
 
-        # BioMedBERTEncoder returns [G,D] already
         if isinstance(out, torch.Tensor):
-            if out.dim() != 2:
-                raise RuntimeError(f"go_enc returned tensor with shape {tuple(out.shape)}, expected [G,D]")
             embs = out
         elif isinstance(out, tuple):
-            # if you ever return (pooled, attn) etc
             embs = out[0]
-            if embs.dim() != 2:
-                raise RuntimeError(f"go_enc returned tuple[0] shape {tuple(embs.shape)}, expected [G,D]")
         elif isinstance(out, dict):
-            # only if you ever swap in raw HF model
             hidden = out.get("last_hidden_state", None)
             pooled = out.get("pooler_output", None)
             if pooled is not None:
                 embs = pooled
             elif hidden is not None:
-                # if raw HF: choose pooling strategy here
-                pooling = getattr(self.cfg, "go_pooling", "cls")
-                if pooling == "cls":
-                    embs = hidden[:, 0]
-                else:
-                    m = attn.to(hidden.dtype).unsqueeze(-1)
-                    embs = (hidden * m).sum(1) / m.sum(1).clamp_min(1.0)
+                embs = hidden[:, 0]
             else:
                 raise RuntimeError("go_encoder dict output missing last_hidden_state/pooler_output")
-
         else:
             raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
-        # embs = self.normalizer(embs, dim=1)
+        if embs.dim() != 2:
+            raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
+
         embs = torch.nan_to_num(embs)
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
         return embs, ids
