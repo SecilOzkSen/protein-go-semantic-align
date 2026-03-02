@@ -113,8 +113,8 @@ class ProteinEmbDataset(Dataset):
 
         # Global ZS maskesi (ileride miner filtreleri için)
         self.n_go = len(go_text_store.id2text.keys())
-        go_index = build_go_index(self.fewzero.zero_shot_terms)
-        self.zs_mask = mask_from_globals(terms=self.fewzero.zero_shot_terms, go_index=go_index, n_go=self.n_go)
+        go_index = build_go_index(fewzero.zero_shot_terms)
+        self.zs_mask = mask_from_globals(terms=fewzero.zero_shot_terms, go_index=go_index, n_go=self.n_go)
 
     def __len__(self) -> int:
         return len(self.pids)
