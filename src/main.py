@@ -24,6 +24,7 @@ from src.datasets import ESMResidueStore, GoTextStore
 from src.datasets.protein_dataset import ProteinEmbDataset
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
+from src.utils.helpers import normalize_go_str
 from src.configs.data_classes import (
     FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
@@ -808,8 +809,12 @@ def run_training(args):
         gospec_tau=0.02,
         gospec_topk=32,
     )
-    missing = [int(g) for g in training_context.eval_id_list if int(g) not in training_context.go_cache.id2row]
-    if missing:
+    missing = []
+    for g in training_context.eval_id_list:
+        g_int = int(normalize_go_str(g))
+        if g_int not in training_context.go_cache.id2row:
+            missing.append(g_int)
+    if missing and len(missing) > 0:
         raise RuntimeError(f"go_cache missing {len(missing)} eval GO ids, e.g. {missing[:10]}")
 
     # infer dims
