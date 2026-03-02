@@ -1172,6 +1172,8 @@ def load_structured_cfg(path: str):
         embed_dir_res=Path(stores.get("embed_dir_res", None)),
         go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
         go_cache_path=Path(stores.get("go_cache_path")) if stores.get("go_cache_path") else None,
+        go_path_seen=Path(stores.get("go_path_seen")) if stores.get("go_path_seen") else None,
+        go_path_observed=Path(stores.get("go_path_observed")) if stores.get("go_path_observed") else None,
 
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),
