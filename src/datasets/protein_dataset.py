@@ -7,7 +7,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 from src.configs.parameters import ALLOWED_RELS_FOR_DAG
 from src.configs.data_classes import FewZeroConfig
 from src.go.go_dag import expand_with_ancestors
-from src.go.go_cache import GoLookupCache
+from . import GoTextStore
 from .residue_store import ESMResidueStore, ESMFusedStore  # <-- fused import
 
 class ProteinEmbDataset(Dataset):
@@ -15,8 +15,8 @@ class ProteinEmbDataset(Dataset):
         self,
         protein_ids: Sequence[str],
         pid2pos: Dict[str, List[int]],
-        go_cache: GoLookupCache,
         fewzero: FewZeroConfig,
+        go_text_store: GoTextStore,
         *,
         dag_parents: Optional[Mapping[int, Sequence[Tuple[int, str]]]] = None,
         min_pos_for_expand: int = 3,
@@ -31,12 +31,12 @@ class ProteinEmbDataset(Dataset):
             raise ValueError("ProteinEmbDataset requires 'store' (ESMResidueStore).")
 
         self.pids = list(protein_ids)
-        self.n_go = go_cache.n_go
         self.store = store
 
         # === CANONICAL GO UNIVERSE ===
         # GoLookupCache row2id -> elimizde embedding/text olan global GO id'ler
-        valid_go_ids: Set[int] = set(int(g) for g in go_cache.row2id)
+        go_text_store_ids = list(go_text_store.id2text.keys())
+        valid_go_ids: Set[int] = set(int(g) for g in go_text_store_ids)
 
         self.pid2pos: Dict[str, List[int]] = {}
         self.pos_weights_map: Dict[str, List[float]] = {}
@@ -108,9 +108,6 @@ class ProteinEmbDataset(Dataset):
         for pid in self.pids:
             labels = set(self.pid2pos.get(pid, []))
             self.is_fs.append(any((g in fewzero.few_shot_terms) for g in labels))
-
-        # Global ZS maskesi (ileride miner filtreleri için)
-        self.zs_mask = go_cache.mask_from_globals(fewzero.zero_shot_terms)
 
     def __len__(self) -> int:
         return len(self.pids)

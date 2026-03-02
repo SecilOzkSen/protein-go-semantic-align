@@ -245,7 +245,7 @@ def build_stores(args):
 def build_val_dataset(
     val_pids,
     pid2pos_val,
-    go_cache,
+    go_text_store,
     fewzero_cfg,
     dag_parents,
     residue_store: ESMResidueStore,
@@ -253,14 +253,14 @@ def build_val_dataset(
     ds_val = ProteinEmbDataset(
         protein_ids=val_pids,
         pid2pos=pid2pos_val,
-        go_cache=go_cache,
+        go_text_store=go_text_store,
         fewzero=fewzero_cfg,
         dag_parents=dag_parents,
         store=residue_store,
     )
     return ds_val
 
-def build_datasets(args, res_store: ESMResidueStore, go_cache: GoLookupCache, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
+def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
     logger.info(f"PID_TO_POSITIVES path = {args.pid2pos}")
@@ -277,13 +277,13 @@ def build_datasets(args, res_store: ESMResidueStore, go_cache: GoLookupCache, da
     train_ds = ProteinEmbDataset(
         protein_ids=train_ids,
         pid2pos=pid2pos,
-        go_cache=go_cache,
+        go_text_store=go_text_store,
         fewzero=fz,
         dag_parents=dag_parents,
         store=res_store,
     )
 
-    val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_cache=go_cache, fewzero_cfg=fz,
+    val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_text_store=go_text_store, fewzero_cfg=fz,
                               dag_parents=dag_parents, residue_store=res_store)
 
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
@@ -688,14 +688,6 @@ def run_training(args):
     dag_parents = load_go_parents() if args.use_dag_in_ds else None
     dag_children = load_go_children() if args.use_dag_in_ds else None
 
-    # GO text dict per phase
-    go_id_to_text: Dict[int, Dict[int, str]] = {}
-    go_id_to_text[args.phase] = load_go_texts_by_phase(args.go_text_folder, phase=args.phase)
-
-    res_store = build_stores(args)
-    datasets = build_datasets(args, res_store, go_cache)
-    n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
-
     # Text encoder (GO)
     lora_params = LoRAParameters(adapter_name="go_encoder")
     go_encoder = BioMedBERTEncoder(
@@ -711,20 +703,31 @@ def run_training(args):
         use_special_tokens=False,
     )
 
+    # GO text dict per phase
+    go_id_to_text: Dict[int, Dict[int, str]] = {}
+    go_id_to_text[args.phase] = load_go_texts_by_phase(args.go_text_folder, phase=args.phase)
+
     # GoTextStore + dataloaders
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=args.phase, lazy=False, max_len=args.go_text_store_max_len)
+    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=args.phase, lazy=False,
+                                max_len=args.go_text_store_max_len)
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
     # Training dataset cleaning
-    print("[MAIN] Sanitizing training dataset with GoTextStore...")
-    sanitize_dataset_with_go_text(datasets["train"], go_text_store)
-    sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
+    #print("[MAIN] Sanitizing training dataset with GoTextStore...")
+    #sanitize_dataset_with_go_text(datasets["train"], go_text_store)
+    #sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
 
     # Val dataset cleaning
-    print("[MAIN] Sanitizing validation dataset with GoTextStore...")
-    sanitize_dataset_with_go_text(datasets["val"], go_text_store)
-    sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
+    #print("[MAIN] Sanitizing validation dataset with GoTextStore...")
+    #sanitize_dataset_with_go_text(datasets["val"], go_text_store)
+    #sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
+
+    res_store = build_stores(args)
+    datasets = build_datasets(args, res_store, go_text_store)
+    n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
+
+
 
     eval_space = getattr(args, "eval_space", "observed")
     if eval_space == "seen":
