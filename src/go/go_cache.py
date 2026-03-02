@@ -13,6 +13,7 @@ class GoMemoryBank:
         self,
         init_embs: Union[torch.Tensor, np.memmap],
         row2id: Sequence[int],
+        id2row: Mapping[int, int],
         device: str = "cuda",
         to_device: bool = True,
         device_dtype: torch.dtype = torch.float32,   #  GPU'da fp16 varsayılan
@@ -20,7 +21,7 @@ class GoMemoryBank:
         persist_back: bool = True                   # update() memmap'e yazsın mı?
     ):
         self.device = torch.device(device)
-        self.id2row = {int(i): int(r) for r, i in enumerate(row2id)}
+        self.id2row = id2row
         self.row2id = torch.as_tensor(list(row2id), dtype=torch.long)
 
         # tensörü hazırla (CPU)
@@ -166,6 +167,7 @@ class GoLookupCache:
         self._mb = GoMemoryBank(
             _embs_in,
             row2id=_row2id,
+            id2row=_id2row,
             device=device,
             to_device=True
         )
