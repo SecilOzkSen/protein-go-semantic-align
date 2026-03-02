@@ -810,9 +810,10 @@ def run_training(args):
         gospec_topk=32,
     )
     missing = []
+    gos = set(training_context.go_cache.row2id.values())
     for g in training_context.eval_id_list:
         g_int = int(normalize_go_str(g))
-        if g_int not in training_context.go_cache.id2row.keys():
+        if g_int not in gos:
             missing.append(g_int)
     if missing and len(missing) > 0:
         raise RuntimeError(f"go_cache missing {len(missing)} eval GO ids, e.g. {missing[:10]}")
