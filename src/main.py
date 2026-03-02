@@ -749,7 +749,7 @@ def run_training(args):
         go_dropout_config = GoDropoutConfig(enabled=True, p=0.08, pad_id=go_encoder.tokenizer.pad_token_id,
                     protect_ids=tuple(special_tokens_to_protect))
         go_token_dropout = GoTokenDropout(go_dropout_config)
-    train_loader, val_loader = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
+    train_loader, val_loader = build_dataloaders(datasets, args, go_text_store, go_dropout=go_token_dropout)
 
     # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
     memory_bank = go_cache if args.use_go_memory_bank else None
