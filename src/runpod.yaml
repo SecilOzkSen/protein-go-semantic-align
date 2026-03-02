@@ -134,7 +134,7 @@ stores:
   few_shot_path: /workspace/data/eval/buckets/count_based/go_eval_ids_rare_lt20.pkl
 
   go_path_seen: /workspace/data/eval/go_eval_ids_seen.pkl # training seen
-  go_path_observed: /workspace/data/go_eval_ids_observed.pkl # train+val+test seen at once.
+  go_path_observed: /workspace/data/eval/go_eval_ids_observed.pkl # train+val+test seen at once.
 
   embed_dir_res: /workspace/protein/residues/embeddings_1b_npy
   go_text_folder: /workspace/data
