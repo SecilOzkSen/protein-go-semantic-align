@@ -114,7 +114,7 @@ class ProteinEmbDataset(Dataset):
         self.zs_mask = self.mask_from_globals(list(go_text_store.id2text.keys()), fewzero.zero_shot_terms)
 
     def mask_from_globals(self, go_text_store_ids: List[int], terms: Sequence[int]) -> torch.BoolTensor:
-        m = torch.zeros(self.n_go, dtype=torch.bool, device=self.store.device)
+        m = torch.zeros(self.n_go, dtype=torch.bool)
         if not terms:
             return m
         for g in terms:
