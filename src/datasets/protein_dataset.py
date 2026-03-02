@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from go.go_index import mask_from_globals, build_go_index
 from src.configs.parameters import ALLOWED_RELS_FOR_DAG
 from src.configs.data_classes import FewZeroConfig
 from src.go.go_dag import expand_with_ancestors
@@ -17,6 +18,7 @@ class ProteinEmbDataset(Dataset):
         pid2pos: Dict[str, List[int]],
         fewzero: FewZeroConfig,
         go_text_store: GoTextStore,
+
         *,
         dag_parents: Optional[Mapping[int, Sequence[Tuple[int, str]]]] = None,
         min_pos_for_expand: int = 3,
@@ -111,16 +113,8 @@ class ProteinEmbDataset(Dataset):
 
         # Global ZS maskesi (ileride miner filtreleri için)
         self.n_go = len(go_text_store.id2text.keys())
-        self.zs_mask = self.mask_from_globals(list(go_text_store.id2text.keys()), fewzero.zero_shot_terms)
-
-    def mask_from_globals(self, go_text_store_ids: List[int], terms: Sequence[int]) -> torch.BoolTensor:
-        m = torch.zeros(self.n_go, dtype=torch.bool)
-        if not terms:
-            return m
-        for g in terms:
-            if g in go_text_store_ids:
-                m[g] = True
-        return m
+        go_index = build_go_index(self.fewzero.zero_shot_terms)
+        self.zs_mask = mask_from_globals(terms=self.fewzero.zero_shot_terms, go_index=go_index, n_go=self.n_go)
 
     def __len__(self) -> int:
         return len(self.pids)

@@ -289,7 +289,7 @@ def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore,
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds}
 
-def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore, go_dropout:GoTokenDropout=None):
+def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout:GoTokenDropout=None):
     logger = logging.getLogger("build_dataloaders")
 
     train_ds = datasets["train"]
