@@ -810,7 +810,7 @@ def run_training(args):
         gospec_topk=32,
     )
     missing = []
-    gos = set(training_context.go_cache.row2id.values())
+    gos = set(training_context.go_cache.id2row.keys())
     for g in training_context.eval_id_list:
         g_int = int(normalize_go_str(g))
         if g_int not in gos:
