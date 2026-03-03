@@ -138,63 +138,6 @@ def collect_eval_ids_from_datasets(train_ds, val_ds=None) -> List[int]:
 
 # ============== Builders ==============
 
-def _filter_ids_by_residue_store(ids: List[str], store, *, tag: str = "") -> List[str]:
-    """
-    Keep only protein IDs that exist in residue embedding store.
-    Tries common store APIs: has(pid), available_ids, index/ids sets.
-    """
-    if not ids:
-        return ids
-
-    # Fast path: store.has(pid)
-    if hasattr(store, "has") and callable(getattr(store, "has")):
-        kept = [pid for pid in ids if store.has(pid)]
-        dropped = len(ids) - len(kept)
-        if dropped:
-            logging.getLogger("data").warning("[residue-filter]%s dropped=%d/%d (missing embeddings). ex=%s",
-                                              f" {tag}" if tag else "", dropped, len(ids), kept[:0])
-        return kept
-
-    # Alternative: store.available_ids
-    if hasattr(store, "available_ids"):
-        have = set(getattr(store, "available_ids"))
-        kept = [pid for pid in ids if pid in have]
-        dropped = len(ids) - len(kept)
-        if dropped:
-            logging.getLogger("data").warning("[residue-filter]%s dropped=%d/%d (missing embeddings).",
-                                              f" {tag}" if tag else "", dropped, len(ids))
-        return kept
-
-    # Alternative: store.ids / store.pids / store.index keys
-    for attr in ("ids", "pids"):
-        if hasattr(store, attr):
-            have = set(getattr(store, attr))
-            kept = [pid for pid in ids if pid in have]
-            dropped = len(ids) - len(kept)
-            if dropped:
-                logging.getLogger("data").warning("[residue-filter]%s dropped=%d/%d (missing embeddings).",
-                                                  f" {tag}" if tag else "", dropped, len(ids))
-            return kept
-
-    if hasattr(store, "index"):
-        idx = getattr(store, "index")
-        if isinstance(idx, dict):
-            have = set(idx.keys())
-            kept = [pid for pid in ids if pid in have]
-            dropped = len(ids) - len(kept)
-            if dropped:
-                logging.getLogger("data").warning("[residue-filter]%s dropped=%d/%d (missing embeddings).",
-                                                  f" {tag}" if tag else "", dropped, len(ids))
-            return kept
-
-    # No known API: do nothing
-    logging.getLogger("data").warning(
-        "[residue-filter]%s could not determine store coverage, leaving ids unchanged. "
-        "Consider adding store.has(pid) or store.available_ids.",
-        f" {tag}" if tag else ""
-    )
-    return ids
-
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
     p = Path(go_cache_path)
@@ -343,8 +286,22 @@ def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore,
     train_ids = load_raw_txt(args.train_ids_path)
     val_ids = load_raw_txt(args.val_ids_path)
 
-    train_ids = _filter_ids_by_residue_store(train_ids, res_store, tag="train")
-    val_ids = _filter_ids_by_residue_store(val_ids, res_store, tag="val")
+    have = set(res_store._pid2span.keys())
+
+    train_ids = [pid for pid in train_ids if pid in have]
+    val_ids = [pid for pid in val_ids if pid in have]
+
+    logging.getLogger("data").info(
+        "[residue-filter] train=%d val=%d (filtered by _pid2span)",
+        len(train_ids), len(val_ids)
+    )
+    # TODO: erase
+    dropped_train = [pid for pid in load_raw_txt(args.train_ids_path) if pid not in have]
+    dropped_val = [pid for pid in load_raw_txt(args.val_ids_path) if pid not in have]
+    logging.getLogger("data").warning(
+        "[residue-filter] dropped train=%d val=%d ex_train=%s ex_val=%s",
+        len(dropped_train), len(dropped_val), dropped_train[:5], dropped_val[:5]
+    )
 
     if zs is None:
         zs = load_go_set(args.zero_shot_path)
