@@ -138,7 +138,7 @@ stores:
 
   embed_dir_res: /workspace/protein/residues/embeddings_1b_npy
   go_text_folder: /workspace/data
-  go_cache_path: /workspace/data/go_embeddings/normalized/go_text_embeddings_canonical.npy
+  go_cache_path: /workspace/data/go_embeddings/raw/go_text_embeddings_canonical.npy
 
   output_dir: /workspace/protein-go-align-outputs
   logs: /workspace/protein-go-align-logs
