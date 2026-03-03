@@ -166,6 +166,60 @@ def _coerce_row2id_list_from_dict(d) -> List[int]:
 
     raise ValueError("row2id dict must be {row:gid} or {gid:row} with rows 0..N-1.")
 
+def go_str_to_int_any(x) -> int:
+    if isinstance(x, int):
+        return int(x)
+    s = str(x).strip()
+    try:
+        return int(normalize_go_str(s))
+    except Exception:
+        # fallback: GO:0001234
+        if s.upper().startswith("GO:"):
+            return int(s.split(":")[1])
+        return int(s)
+
+def build_altid_map_from_go_terms(go_terms: dict) -> dict[int, int]:
+    """
+    go_terms: {"GO:0008150": {"alt_id":[...], ...}, ...}
+    returns: {alt_int -> primary_int}
+    """
+    m: dict[int, int] = {}
+    for primary_go_str, info in (go_terms or {}).items():
+        try:
+            primary = go_str_to_int_any(primary_go_str)
+        except Exception:
+            continue
+        alts = info.get("alt_id", []) if isinstance(info, dict) else []
+        for a in alts or []:
+            try:
+                alt = go_str_to_int_any(a)
+                m[int(alt)] = int(primary)
+            except Exception:
+                pass
+    return m
+
+def canonicalize_id_list(ids: list, alt_map: dict[int, int]) -> list[int]:
+    out = []
+    for g in ids:
+        gi = go_str_to_int_any(g)
+        out.append(int(alt_map.get(gi, gi)))
+    # keep deterministic
+    return sorted(set(out))
+
+def canonicalize_pid2pos(pid2pos: dict, alt_map: dict[int, int]) -> dict:
+    """
+    pid2pos: {pid: [go_ids]}
+    returns NEW dict with canonicalized ids and duplicates removed.
+    """
+    new = {}
+    for pid, gos in pid2pos.items():
+        if not gos:
+            new[pid] = []
+            continue
+        can = canonicalize_id_list(list(gos), alt_map)
+        new[pid] = can
+    return new
+
 
 
 

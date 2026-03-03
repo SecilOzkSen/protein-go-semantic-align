@@ -24,7 +24,7 @@ from src.datasets import ESMResidueStore, GoTextStore
 from src.datasets.protein_dataset import ProteinEmbDataset
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
-from src.utils.helpers import normalize_go_str, _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict
+from src.utils.helpers import normalize_go_str, _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict, build_altid_map_from_go_terms, canonicalize_id_list, canonicalize_pid2pos, go_str_to_int_any
 from src.configs.data_classes import (
     FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
@@ -275,17 +275,23 @@ def build_val_dataset(
     )
     return ds_val
 
-def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
+def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore, dag_parents=None, pid2pos = None, zs=None, fs=None) -> Dict[str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
     logger.info(f"PID_TO_POSITIVES path = {args.pid2pos}")
 
-    pid2pos = load_raw_json(args.pid2pos)
+    if pid2pos == None:
+        pid2pos = load_raw_json(args.pid2pos)
+
     train_ids = load_raw_txt(args.train_ids_path)
     val_ids = load_raw_txt(args.val_ids_path)
 
-    zs = load_go_set(args.zero_shot_path)
-    fs = load_go_set(args.few_shot_path)
+    if zs is None:
+        zs = load_go_set(args.zero_shot_path)
+
+    if fs is None:
+        fs = load_go_set(args.few_shot_path)
+
     fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs,
                        fs_target_ratio=args.fs_target_ratio)
 
@@ -726,27 +732,11 @@ def run_training(args):
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
-    # Training dataset cleaning
-    #print("[MAIN] Sanitizing training dataset with GoTextStore...")
-    #sanitize_dataset_with_go_text(datasets["train"], go_text_store)
-    #sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
-
-    # Val dataset cleaning
-    #print("[MAIN] Sanitizing validation dataset with GoTextStore...")
-    #sanitize_dataset_with_go_text(datasets["val"], go_text_store)
-    #sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
-
-    res_store = build_stores(args)
-    datasets = build_datasets(args, res_store, go_text_store)
-    n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
-
-
-
     eval_space = getattr(args, "eval_space", "observed")
     if eval_space == "seen":
-        eval_id_list = load_raw_pickle(args.go_path_seen) # seen on training (at least one positive on training.)
+        eval_id_list = load_raw_pickle(args.go_path_seen)  # seen on training (at least one positive on training.)
     else:
-        eval_id_list = load_raw_pickle(args.go_path_observed) # observed: train+val+test positives
+        eval_id_list = load_raw_pickle(args.go_path_observed)  # observed: train+val+test positives
 
     eval_seen_go_ids = load_raw_pickle(args.go_path_seen)
     eval_unseen_ids = load_raw_pickle(args.zero_shot_path)
@@ -755,6 +745,38 @@ def run_training(args):
     logging.getLogger("main").info(
         "[eval] using %d GO terms in eval_id_list", len(eval_id_list)
     )
+
+
+    go_terms = load_raw_json(args.go_basic_json)
+
+    alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
+    logger.info("[canon] alt_id map size = %d", len(alt_map))
+
+    # 2) pid2pos canonicalize
+    pid2pos_raw = load_raw_json(args.pid2pos)  # sen zaten burada load ediyorsun
+    pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else pid2pos_raw
+    logger.info("[canon] pid2pos canonicalized=%s", "yes" if alt_map else "no")
+
+    zs = load_go_set(args.zero_shot_path)
+    fs = load_go_set(args.few_shot_path)
+
+    # 4) optional: also canonicalize few/zero shot sets used by FewZeroConfig
+    zs = canonicalize_id_list(list(zs), alt_map) if alt_map else zs
+    fs = canonicalize_id_list(list(fs), alt_map) if alt_map else fs
+
+    # 3) eval lists canonicalize (observed/seen/unseen/rare)
+    eval_id_list = canonicalize_id_list(eval_id_list, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                eval_id_list]
+    eval_seen_go_ids = canonicalize_id_list(eval_seen_go_ids, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                        eval_seen_go_ids]
+    eval_unseen_ids = canonicalize_id_list(eval_unseen_ids, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                      eval_unseen_ids]
+    eval_rare_go_ids = canonicalize_id_list(eval_rare_go_ids, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                        eval_rare_go_ids]
+
+    res_store = build_stores(args)
+    datasets = build_datasets(args, res_store, go_text_store, pid2pos=pid2pos, zs=zs, fs=fs)
+    n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     go_token_dropout = None
@@ -824,12 +846,12 @@ def run_training(args):
         gospec_topk=32,
     )
     missing = []
-    gos = set(training_context.go_cache.id2row.keys())
+    gos = set(int(x) for x in training_context.go_cache.id2row.keys())
     for g in training_context.eval_id_list:
-        g_int = int(normalize_go_str(g))
+        g_int = int(g)
         if g_int not in gos:
             missing.append(g_int)
-    if missing and len(missing) > 0:
+    if missing:
         raise RuntimeError(f"go_cache missing {len(missing)} eval GO ids, e.g. {missing[:10]}")
 
     # infer dims
@@ -1192,6 +1214,7 @@ def load_structured_cfg(path: str):
         go_cache_path=Path(stores.get("go_cache_path")) if stores.get("go_cache_path") else None,
         go_path_seen=Path(stores.get("go_path_seen")) if stores.get("go_path_seen") else None,
         go_path_observed=Path(stores.get("go_path_observed")) if stores.get("go_path_observed") else None,
+        go_basic_json=Path(stores.get("go_basic_json")) if stores.get("go_basic_json") else None,
 
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),

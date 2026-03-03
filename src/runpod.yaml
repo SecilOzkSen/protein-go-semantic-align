@@ -128,6 +128,8 @@ stores:
   train_ids_path: /workspace/data/splits/train_ids.txt
   val_ids_path: /workspace/data/splits/val_ids.txt
 
+  go_basic_json: /workspace/data/go_vocab.json
+
   pid2pos_path: /workspace/data/pid_to_positives_canonical.json #pid_to_positives_canonical
 
   zero_shot_path: /workspace/data/eval/buckets/count_based/go_eval_ids_zeroshot.pkl
@@ -137,7 +139,7 @@ stores:
   go_path_observed: /workspace/data/eval/go_eval_ids_observed.pkl # train+val+test seen at once.
 
   embed_dir_res: /workspace/protein/residues/embeddings_1b_npy
-  go_text_folder: /workspace/data
+  go_text_folder: /workspace/data/go_vocab.json
   go_cache_path: /workspace/data/go_embeddings/raw/go_text_embeddings_canonical.npy
 
   output_dir: /workspace/protein-go-align-outputs
