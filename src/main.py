@@ -973,8 +973,8 @@ def run_training(args):
         reinit=False,
     )
 
-    encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer, wandb_run=run)
+  #  encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=run)
 
  #   b = next(iter(train_loader))
  #   for i in range(20):
