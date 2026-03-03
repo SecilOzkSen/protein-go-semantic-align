@@ -24,7 +24,7 @@ from src.datasets import ESMResidueStore, GoTextStore
 from src.datasets.protein_dataset import ProteinEmbDataset
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
-from src.utils.helpers import normalize_go_str
+from src.utils.helpers import normalize_go_str, _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict
 from src.configs.data_classes import (
     FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
@@ -138,7 +138,6 @@ def collect_eval_ids_from_datasets(train_ds, val_ds=None) -> List[int]:
 
 # ============== Builders ==============
 
-
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
     p = Path(go_cache_path)
@@ -157,61 +156,76 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
                 memmap_path = alt
 
     if memmap_path is not None:
-        # Eşlemleri opsiyonel yan dosyalardan yükle (varsa)
-        id2row = row2id = None
+        id2row: Optional[Dict[int, int]] = None
+        row2id: Optional[List[int]] = None
+
+        # 1) sidecar mapping files
         for fname in ("id2row.json", "row2id.json", "ids.json", "ids.txt"):
             f = memmap_path.with_name(fname)
-            if f.exists():
-                if f.suffix == ".json":
-                    with open(f, "r") as fp:
-                        data = json.load(fp)
+            if not f.exists():
+                continue
+
+            if f.suffix == ".json":
+                with open(f, "r") as fp:
+                    data = json.load(fp)
+
+                if isinstance(data, dict):
                     if "id2row" in data and id2row is None:
-                        id2row = data["id2row"]
+                        id2row = _coerce_id2row(data["id2row"])
                     if "row2id" in data and row2id is None:
-                        row2id = data["row2id"]
-                    if "ids" in data and (id2row is None or row2id is None):
-                        ids = data["ids"]
-                        id2row = {pid: i for i, pid in enumerate(ids)}
-                        row2id = {i: pid for i, pid in enumerate(ids)}
+                        v = data["row2id"]
+                        if isinstance(v, dict):
+                            row2id = _coerce_row2id_list_from_dict(v)
+                        else:
+                            row2id = _coerce_int_list(v)
+                    if "ids" in data and (row2id is None or id2row is None):
+                        ids = _coerce_int_list(data["ids"])
+                        row2id = ids
+                        id2row = {int(g): i for i, g in enumerate(ids)}
                 else:
-                    # ids.txt (satır başına bir id)
-                    with open(f, "r") as fp:
-                        ids = [line.strip() for line in fp if line.strip()]
-                    id2row = {pid: i for i, pid in enumerate(ids)}
-                    row2id = {i: pid for i, pid in enumerate(ids)}
+                    raise ValueError(f"Unexpected JSON format in {f}")
 
-        # Yan dosyalar yoksa: boyutu okumadan basit map üret (isteğe bağlı)
-        if id2row is None or row2id is None:
-            try:
-                # Sadece shape öğrenmek için memmap aç (RAM'e yüklemez)
-                arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
-                n = int(arr.shape[0])
-                id2row = {str(i): i for i in range(n)}
-                row2id = {i: int(i) for i in range(n)}
-            except Exception:
-                # Eşlemeleri boş bırak; GoLookupCache içi tolere edebiliyorsa
-                id2row = None
-                row2id = None
+            else:
+                # ids.txt (one id per line)
+                with open(f, "r") as fp:
+                    ids = [line.strip() for line in fp if line.strip()]
+                ids = _coerce_int_list(ids)
+                row2id = ids
+                id2row = {int(g): i for i, g in enumerate(ids)}
 
+        # 2) fallback: if still missing, build identity mapping 0..n-1 based on memmap shape
+        if row2id is None:
+            arr0 = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
+            n = int(arr0.shape[0])
+            row2id = list(range(n))
+
+        if id2row is None:
+            id2row = {int(g): i for i, g in enumerate(row2id)}
+
+        # 3) sanity: shape must match mapping length
         arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)  # [N,D]
-        print("memmap path:", memmap_path)
+        if int(arr.shape[0]) != len(row2id):
+            raise RuntimeError(f"GO cache rows={int(arr.shape[0])} != len(row2id)={len(row2id)} for {memmap_path}")
+
+        # 4) sanity: reject zero rows
         norms = np.linalg.norm(arr.astype(np.float32), axis=1)
         n_zero = int((norms < 1e-8).sum())
         if n_zero > 0:
             raise RuntimeError(
                 f"GO cache has {n_zero} zero-embedding rows in {memmap_path}. "
-                "This will produce NaNs in contrastive loss. Rebuild GO embeddings."
+                "Rebuild GO embeddings."
             )
 
         blob = {
             "memmap_path": str(memmap_path),
-            "id2row": id2row,
-            "row2id": row2id,
+            "id2row": id2row,   # int->int
+            "row2id": row2id,   # LIST[int], not dict
         }
-        return GoLookupCache(blob)
+        return GoLookupCache(blob, device="cpu")  # or your desired device
 
+    # non-memmap blob
     blob = torch.load(str(p), map_location="cpu", weights_only=False)
-    return GoLookupCache(blob)
+    return GoLookupCache(blob, device="cpu")
 
 def build_stores(args):
     logger = logging.getLogger("build_stores")

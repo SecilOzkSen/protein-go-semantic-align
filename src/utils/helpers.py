@@ -131,6 +131,41 @@ def load_go_texts_by_phase(go_text_folder: str, phase: int = 0) -> Dict[int, str
                 out[go_int] = el["text"].strip() if "text" in el else el["name"].strip()
         return out
 
+def _coerce_int_list(xs) -> List[int]:
+    return [int(x) for x in xs]
+
+
+def _coerce_id2row(d) -> Dict[int, int]:
+    # json loads keys as str
+    return {int(k): int(v) for k, v in d.items()}
+
+
+def _coerce_row2id_list_from_dict(d) -> List[int]:
+    """
+    Accept {row: gid} or {gid: row}, return row2id list where row2id[row]=gid.
+    """
+    items = [(int(k), int(v)) for k, v in d.items()]
+    if not items:
+        return []
+
+    keys = [k for k, _ in items]
+    vals = [v for _, v in items]
+
+    def looks_like_rows(arr):
+        return min(arr) == 0 and max(arr) == len(arr) - 1 and len(set(arr)) == len(arr)
+
+    if looks_like_rows(keys):
+        # {row: gid}
+        items.sort(key=lambda kv: kv[0])
+        return [gid for _, gid in items]
+
+    if looks_like_rows(vals):
+        # {gid: row}
+        items.sort(key=lambda kv: kv[1])
+        return [gid for gid, _ in items]
+
+    raise ValueError("row2id dict must be {row:gid} or {gid:row} with rows 0..N-1.")
+
 
 
 
