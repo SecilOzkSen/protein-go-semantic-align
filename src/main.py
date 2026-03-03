@@ -684,6 +684,72 @@ def sanity_check_go_text(train_ids, pid2pos, go_text_store):
             f"GoTextStore is missing {len(missing)} GO ids, e.g. {missing[:10]}"
         )
 
+def enforce_cache_alignment(
+    *,
+    go_cache,
+    pid2pos: Dict[str, List[int]],
+    eval_id_list: List[int],
+    eval_seen_go_ids: List[int],
+    eval_unseen_ids: List[int],
+    eval_rare_go_ids: List[int],
+    logger=None,
+    drop_empty_proteins: bool = False,
+) -> Tuple[Dict[str, List[int]], List[int], List[int], List[int], List[int]]:
+    """
+    Drops any GO ids not present in go_cache.id2row from:
+      - training labels (pid2pos)
+      - eval spaces (eval_id_list, seen/unseen/rare)
+
+    Returns updated (pid2pos, eval_id_list, eval_seen_go_ids, eval_unseen_ids, eval_rare_go_ids).
+
+    Notes:
+      - Use after canonicalization (alt_id -> primary).
+      - Call BEFORE build_datasets.
+    """
+    cache_ids = set(int(x) for x in go_cache.id2row.keys())
+
+    def _filter_list(xs: Iterable[Any]) -> List[int]:
+        return sorted({int(x) for x in xs if int(x) in cache_ids})
+
+    # ---- eval lists ----
+    e0, s0, u0, r0 = len(eval_id_list), len(eval_seen_go_ids), len(eval_unseen_ids), len(eval_rare_go_ids)
+    eval_id_list_f = _filter_list(eval_id_list)
+    eval_seen_f = _filter_list(eval_seen_go_ids)
+    eval_unseen_f = _filter_list(eval_unseen_ids)
+    eval_rare_f = _filter_list(eval_rare_go_ids)
+
+    # ---- pid2pos ----
+    dropped_labels = 0
+    dropped_proteins = 0
+    new_pid2pos: Dict[str, List[int]] = {}
+
+    for pid, gos in pid2pos.items():
+        gos_i = [int(g) for g in (gos or [])]
+        kept = [g for g in gos_i if g in cache_ids]
+        dropped_labels += (len(gos_i) - len(kept))
+
+        if drop_empty_proteins and len(kept) == 0:
+            dropped_proteins += 1
+            continue
+
+        # keep deterministic + unique
+        new_pid2pos[pid] = sorted(set(kept))
+
+    msg = (
+        f"[align-cache] eval: {e0}->{len(eval_id_list_f)} | "
+        f"seen: {s0}->{len(eval_seen_f)} | unseen: {u0}->{len(eval_unseen_f)} | rare: {r0}->{len(eval_rare_f)} | "
+        f"train_labels_dropped={dropped_labels} | proteins_dropped={dropped_proteins}"
+    )
+    if logger is not None:
+        try:
+            logger.info(msg)
+        except Exception:
+            print(msg)
+    else:
+        print(msg)
+
+    return new_pid2pos, eval_id_list_f, eval_seen_f, eval_unseen_f, eval_rare_f
+
 
 # ============== Runner ==============
 def run_training(args):
@@ -775,6 +841,16 @@ def run_training(args):
                                                                                         eval_rare_go_ids]
 
     res_store = build_stores(args)
+    pid2pos, eval_id_list, eval_seen_go_ids, eval_unseen_ids, eval_rare_go_ids = enforce_cache_alignment(
+        go_cache=go_cache,
+        pid2pos=pid2pos,
+        eval_id_list=eval_id_list,
+        eval_seen_go_ids=eval_seen_go_ids,
+        eval_unseen_ids=eval_unseen_ids,
+        eval_rare_go_ids=eval_rare_go_ids,
+        logger=logger,
+        drop_empty_proteins=False,  # True yaparsan label'sız proteinleri de atar
+    )
     datasets = build_datasets(args, res_store, go_text_store, pid2pos=pid2pos, zs=zs, fs=fs)
     n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
