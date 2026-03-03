@@ -544,7 +544,7 @@ class OppTrainer:
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
-        self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents)
+        self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
