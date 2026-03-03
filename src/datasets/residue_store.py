@@ -329,6 +329,9 @@ class ESMResidueStore(_BaseStore):
 
         raise RuntimeError(f"No supported RESIDUE layout under {self.embed_dir}")
 
+    def has(self, pid: str) -> bool:
+        return pid in self._pid2span
+
     # --------------------------- Stitching ------------------------------
     def _stitch_with_overlap(self, H: torch.Tensor, L_seq: int) -> torch.Tensor:
         if self.max_len is None or self.overlap is None:

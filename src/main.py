@@ -286,16 +286,15 @@ def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore,
     train_ids = load_raw_txt(args.train_ids_path)
     val_ids = load_raw_txt(args.val_ids_path)
 
-    have = set(res_store._pid2span.keys())
-
-    train_ids = [pid for pid in train_ids if pid in have]
-    val_ids = [pid for pid in val_ids if pid in have]
+    train_ids = [pid for pid in train_ids if res_store.has(pid)]
+    val_ids = [pid for pid in val_ids if res_store.has(pid)]
 
     logging.getLogger("data").info(
         "[residue-filter] train=%d val=%d (filtered by _pid2span)",
         len(train_ids), len(val_ids)
     )
     # TODO: erase
+    have = set(res_store._pid2span.keys())
     dropped_train = [pid for pid in load_raw_txt(args.train_ids_path) if pid not in have]
     dropped_val = [pid for pid in load_raw_txt(args.val_ids_path) if pid not in have]
     logging.getLogger("data").warning(
