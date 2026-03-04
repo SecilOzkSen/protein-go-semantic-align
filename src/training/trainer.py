@@ -1665,14 +1665,26 @@ class OppTrainer:
             # OBSERVED eval space
             G_eval, y_true = self._build_eval_space(batch)  # y_true is over OBSERVED columns
 
-            # raw scores (cosine-ish), shape [B, Geval]
-            scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
+            # ---- Scores + (optional) logits ----
+            use_bce_head = getattr(self.model, "score_head", None) is not None
 
-            # ranking scores
+            if use_bce_head:
+                scores_raw, logits = self.forward_scores(
+                    H, G_eval, attn_valid,
+                    return_alpha=False,
+                    return_logits=True
+                )
+                probs = torch.sigmoid(logits)  # [B, Geval]
+            else:
+                scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
+                probs = (0.5 * (scores_raw + 1.0)).clamp(0, 1)
+
+            # ranking scores for retrieval metrics
             scores_rank = scores_raw * scale
 
             # retrieval metrics over OBSERVED
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200))
+
             if m["num"] > 0:
                 sum_num += m["num"]
                 sum_R1 += m["R@1"] * m["num"]
@@ -1683,9 +1695,6 @@ class OppTrainer:
                 sum_R200 += m["R@200"] * m["num"]
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
-
-            # CAFA-style mapping for Fmax/AUPR (kept same)
-            probs = (0.5 * (scores_raw + 1.0)).clamp(0, 1)
 
             # store OBSERVED
             preds_obs.append(probs.detach().cpu())
