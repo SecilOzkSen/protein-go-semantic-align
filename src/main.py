@@ -880,11 +880,6 @@ def run_training(args):
         go_token_dropout = GoTokenDropout(go_dropout_config)
     train_loader, val_loader = build_dataloaders(datasets, args, go_text_store, go_dropout=go_token_dropout)
 
-    # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
-    memory_bank = go_cache if args.use_go_memory_bank else None
-    if args.use_go_memory_bank:
-        logger.info(f"Using unified GoLookupCache as MemoryBank ({memory_bank.device} fp32, no copies).")
-
     seen_go_ids_prev: set = set()
 
     if args.wandb:
@@ -907,7 +902,6 @@ def run_training(args):
         go_cache=go_cache,
         faiss_index=None,
         vres=None, #For similarity searches etc.
-        memory_bank=memory_bank,
         current_phase=None,
         last_refresh_epoch=None,
         last_refresh_reason=None,
@@ -1288,7 +1282,6 @@ def load_structured_cfg(path: str):
         cfg = yaml.safe_load(f) or {}
 
     data = cfg.get("data", {})
-    caches = cfg.get("caches", {})
     training = cfg.get("training", {})
     optim = cfg.get("optim", {})
     model = cfg.get("model", {})
@@ -1303,15 +1296,12 @@ def load_structured_cfg(path: str):
     args = types.SimpleNamespace(
         # general
         use_queue_miner = bool(general.get("use_queue_miner", True)),
-        use_go_memory_bank = bool(general.get("use_go_memory_bank", False)),
         use_attention_pooling = bool(general.get("use_attention_pooling", False)),
         use_lora = bool(general.get("use_lora", False)),
         use_attribution_loss = bool(general.get("use_attribution_loss", False)),
         return_alpha = bool(general.get("return_alpha", False)),
-        phase_based = bool(general.get("phase_based", False)),
         pooling_strategy = general.get("pooling_strategy", "mean"),
         ablation_id = general.get("ablation_id", None),
-        is_phasing = bool(general.get("is_phasing", False)),
         phase=general.get("phase", -2),
 
         # paths / store
@@ -1327,20 +1317,12 @@ def load_structured_cfg(path: str):
 
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),
-        no_cache_shards=bool(data.get("no_cache_shards", False)),
 
         # dataset DAG / expansion / few-zero
         use_dag_in_ds=bool(data.get("use_dag_in_ds", False)),
-        min_pos_for_expand=int(data.get("min_pos_for_expand", 3)),
-        max_ancestor_add=int(data.get("max_ancestor_add", 4)),
-        max_hops=int(data.get("max_hops", 3)),
-        ancestor_gamma=float(data.get("ancestor_gamma", 0.7)),
         zero_shot_path=stores.get("zero_shot_path"),
         few_shot_path=stores.get("few_shot_path"),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.3)),
-
-        # caches (legacy keys kept for compatibility; FAISS yok)
-        go_cache=caches.get("go_cache"),
 
         # training
         epochs=int(training.get("epochs", 10)),
@@ -1433,20 +1415,7 @@ def load_structured_cfg(path: str):
         # misc
         n_go=cfg.get("n_go", None),
     )
-
-    if args.phase_based is False:
-        return args, None
-    schedule = None
-  #  schedule = TrainSchedule(
-  #      phase_breaks=tuple(sched.get("phase_breaks", (5, 12, 25))),
-  #      stageA_mix=tuple(sched.get("stageA_mix", (1.0, 0.0, 0.0))),
-  #      stageB_mix=tuple(sched.get("stageB_mix", (0.7, 0.3, 0.0))),
-  #      stageC_mix=tuple(sched.get("stageC_mix", (0.4, 0.4, 0.2))),
-  #     stageD_mix=tuple(sched.get("stageD_mix", (0.4, 0.4, 0.2))),
-  #      lambda_attr_start=int(sched.get("lambda_attr_start", 6)),
-  #      lambda_attr_max=float(sched.get("lambda_attr_max", 0.2)),
-  #  )
-    return args, schedule
+    return args
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Protein–GO Alignment Training")
@@ -1462,15 +1431,15 @@ def parse_args():
         args.config = YAML_FILE
         print(f"[main] No --config passed, defaulting to {args.config}")
 
-    args, schedule = load_structured_cfg(args.config)
+    args = load_structured_cfg(args.config)
 
     if args.ablation_id is not None:
         print("[Ablation] Applying ablation ID:", args.ablation_id)
 
-    return args, schedule
+    return args
 
 def main():
-    args, schedule = parse_args()
+    args = parse_args()
     out = Path(args.output_dir)
     setup_logging(out, level=args.log_level)
     set_seed(args.seed)

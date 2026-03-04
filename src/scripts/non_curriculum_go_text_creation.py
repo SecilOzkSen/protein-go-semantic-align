@@ -86,7 +86,7 @@ def write_jsonl(path: str, examples):
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
 
-def main(input_path: str, out_path: str, pid_positives_path: str = "/Users/secilsen/PhD/protein-go-semantic-align/src/scripts/pid_to_positives_canonical.json"):
+def main(input_path: str, out_path: str, pid_positives_path: str = "/Users/secilsen/PhD/protein_function_dataset/datav2/pid_to_positives_canonical.json"):
     terms = load_terms(input_path)
     pid_positives = load_positives(pid_positives_path)
 
@@ -97,8 +97,8 @@ def main(input_path: str, out_path: str, pid_positives_path: str = "/Users/secil
 
     examples = []
     for gid, data in terms.items():
-        if gid not in set_gid:
-            continue
+     #   if gid not in set_gid:
+     #       continue
         ex = build_entry(gid, data)
         examples.append(ex)
 
@@ -114,6 +114,6 @@ def main(input_path: str, out_path: str, pid_positives_path: str = "/Users/secil
 
 if __name__ == "__main__":
     main(
-        "/Users/secilsen/PhD/protein-go-semantic-align/src/data/raw/go_basic_obo_terms_v2.pkl",
-        "../data/processed/go_terms/canonical/go_texts_canonical.jsonl",
+        "/Users/secilsen/PhD/protein_function_dataset/datav2/go_vocab.pkl",
+        "/Users/secilsen/PhD/protein_function_dataset/datav2/go_texts_canonical.json",
     )

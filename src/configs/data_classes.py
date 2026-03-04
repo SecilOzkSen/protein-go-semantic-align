@@ -211,7 +211,6 @@ class TrainingContext:
     maybe_refresh_phase_resources: Optional[Callable[[int], None]] = None
     wandb_run: Any = None
     current_phase: Optional[int] = None
-    memory_bank: Any = None
     last_refresh_epoch: Any = None
     last_refresh_reason: Any = None
     batch_builder: Any = None
