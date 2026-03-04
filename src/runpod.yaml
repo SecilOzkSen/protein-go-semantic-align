@@ -23,7 +23,7 @@ general: #Ablation Purposes
   use_attribution_loss: False #CHECKED
   return_alpha: False
   phase_based: False #CHECKED
-  pooling_strategy: "mean" #  "mean", "go_token_align_pooler" #CHECKED
+  pooling_strategy: "go_token_align_pooler" #  "mean", "go_token_align_pooler" #CHECKED
   is_phasing: false # go token based phases are closed
 
 caches:
@@ -47,7 +47,7 @@ training:
   cpu: false
   seed: 42
 
-  output_dir: /workspace/protein-go-align/outputs/run-0
+  output_dir: /workspace/protein-go-align/outputs/run-A1
   save_every: 10000
   keep_last_n: 3
  # resume: null #/workspace/checkpoints/checkpoint_step56000.pt
@@ -93,7 +93,7 @@ loss:
   dag_scale: 10.0
   lambda_vtrue: 0.0
   tau_distill: 1.0
-  lambda_bce: 0.1
+  lambda_bce: 0.0
 
 curriculum:
   epochs: 4
@@ -122,7 +122,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation0"
+  wandb_run_name: "protein-go-semantic-align-ablation-a1"
   mode: online
 
 stores:
@@ -143,6 +143,6 @@ stores:
   go_text_folder: /workspace/data
   go_cache_path: /workspace/data/go_embeddings/raw/go_text_embeddings_canonical.npy
 
-  output_dir: /workspace/protein-go-align-outputs
-  logs: /workspace/protein-go-align-logs
+  output_dir: /workspace/protein-go-align-outputs-a1
+  logs: /workspace/protein-go-align-logs-a1
 
