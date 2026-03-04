@@ -1094,7 +1094,7 @@ def run_training(args):
             training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
 
         trainer.model.train()
-        running = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
+        running = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0, "bce": 0.0}
         n_batches = 0
 
         for batch in train_loader:
