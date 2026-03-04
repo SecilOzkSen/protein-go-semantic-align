@@ -9,6 +9,7 @@ from src.models.go_token_align_pooler import GoTokenAlignPooler
 class SharedInteractionMLP(nn.Module):
     def __init__(self, d: int, hidden: int = 256, dropout: float = 0.1):
         super().__init__()
+
         self.net = nn.Sequential(
             nn.Linear(4 * d, hidden),
             nn.ReLU(),
@@ -17,11 +18,15 @@ class SharedInteractionMLP(nn.Module):
         )
 
     def forward(self, zp: torch.Tensor, zg: torch.Tensor) -> torch.Tensor:
-        # zp: [B,D], zg: [B,K,D]
-        B, K, D = zg.shape
-        zp_exp = zp.unsqueeze(1).expand(B, K, D)
-        h = torch.cat([zp_exp, zg, zp_exp * zg, (zp_exp - zg).abs()], dim=-1)
-        return self.net(h).squeeze(-1)  # [B,K]
+        """
+        zp: [B,K,D]
+        zg: [B,K,D]
+        """
+        h = torch.cat([zp, zg, zp * zg, torch.abs(zp - zg),],
+            dim=-1,
+        )  # [B,K,4D]
+        logits = self.net(h).squeeze(-1)  # [B,K]
+        return logits
 
 
 class ProteinGoAligner(nn.Module):
@@ -108,8 +113,10 @@ class ProteinGoAligner(nn.Module):
         scores = (Zp * Gz).sum(dim=-1)  # [B,K]
 
         if return_logits and self.score_head is not None:
-            logits = self.score_head(Zp, Gz)  # [B,K]
-            return scores, logits if not return_alpha else (scores, logits), alpha_info
+            logits = self.score_head(Zp, Gz)
+            if return_alpha:
+                return (scores, logits), alpha_info
+            return scores, logits
 
         if return_alpha:
             return scores, alpha_info
