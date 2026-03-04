@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import math
 
+from go import load_go_parents
 from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig
@@ -1515,7 +1516,7 @@ class OppTrainer:
         # mapping: col -> global gid
         eval_ids_cpu = self._eval_ids_cpu  # CPU LongTensor [G]
         id2col = self._eval_id2col  # dict: gid -> col
-        dag_anc = getattr(self, "dag_ancestors", None)
+        dag_anc = load_go_parents()
         if dag_anc is None:
             return 0.0, 0
 
