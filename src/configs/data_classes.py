@@ -245,6 +245,7 @@ class TrainingContext:
 class AttrConfig:
     lambda_attr: float = 0.0
     lambda_dag: float = 0.3
+    lambda_bce: float = 0.1
     lambda_entropy_alpha: float = 0.05
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64

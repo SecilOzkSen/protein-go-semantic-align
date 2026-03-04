@@ -1,11 +1,27 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Dict, Tuple
 
 from src.models.projection import ProjectionHead
 from src.encoders import BioMedBERTEncoder
 from src.models.go_token_align_pooler import GoTokenAlignPooler
+
+class SharedInteractionMLP(nn.Module):
+    def __init__(self, d: int, hidden: int = 256, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(4 * d, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, zp: torch.Tensor, zg: torch.Tensor) -> torch.Tensor:
+        # zp: [B,D], zg: [B,K,D]
+        B, K, D = zg.shape
+        zp_exp = zp.unsqueeze(1).expand(B, K, D)
+        h = torch.cat([zp_exp, zg, zp_exp * zg, (zp_exp - zg).abs()], dim=-1)
+        return self.net(h).squeeze(-1)  # [B,K]
 
 
 class ProteinGoAligner(nn.Module):
@@ -18,10 +34,14 @@ class ProteinGoAligner(nn.Module):
         normalize: bool = True,
         mean_pool: bool = False,
         att_d: int = 256,
+        use_score_head: bool = True,
     ):
         super().__init__()
         self.normalize = bool(normalize)
         self.go_encoder = go_encoder
+
+        self.use_score_head = use_score_head # ya da direkt param
+        self.score_head = SharedInteractionMLP(d=d_z, hidden=256, dropout=0.1) if self.use_score_head else None
 
         if self.go_encoder is not None and d_g is None:
             d_g = int(self.go_encoder.model.config.hidden_size)
@@ -47,6 +67,7 @@ class ProteinGoAligner(nn.Module):
             G: torch.Tensor,  # [B,K,Dg]
             mask: Optional[torch.Tensor],  # [B,T] bool True=valid
             return_alpha: bool = False,
+            return_logits: bool = True,
             **kwargs
     ):
         if mask is not None and mask.dtype != torch.bool:
@@ -85,6 +106,10 @@ class ProteinGoAligner(nn.Module):
             Gz = self._norm(Gz, dim=-1)
 
         scores = (Zp * Gz).sum(dim=-1)  # [B,K]
+
+        if return_logits and self.score_head is not None:
+            logits = self.score_head(Zp, Gz)  # [B,K]
+            return scores, logits if not return_alpha else (scores, logits), alpha_info
 
         if return_alpha:
             return scores, alpha_info

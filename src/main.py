@@ -937,6 +937,22 @@ def run_training(args):
         gospec_tau=0.02,
         gospec_topk=32,
     )
+
+    # ---- SPLIT SANITY CHECK (no eval needed) ----
+    eval_set = set(int(x) for x in training_context.eval_id_list)
+    seen_set = set(int(x) for x in training_context.eval_seen_go_ids)
+    rare_set = set(int(x) for x in training_context.eval_rare_go_ids)
+    unseen_set = set(int(x) for x in training_context.eval_unseen_ids)
+
+    print("\n[DBG-SPLIT]")
+    print("|eval| =", len(eval_set))
+    print("|seen| =", len(seen_set), " intersection(eval) =", len(eval_set & seen_set))
+    print("|rare| =", len(rare_set), " intersection(eval) =", len(eval_set & rare_set))
+    print("|unseen| =", len(unseen_set), " intersection(eval) =", len(eval_set & unseen_set))
+    print("seen ∩ unseen =", len(seen_set & unseen_set))
+    print("rare ∩ unseen =", len(rare_set & unseen_set))
+
+
     missing = []
     gos = set(int(x) for x in training_context.go_cache.id2row.keys())
     for g in training_context.eval_id_list:
@@ -966,7 +982,7 @@ def run_training(args):
         queue_K=args.queue_K,
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
         go_pooling=args.go_pooling,
-        eval_go_bs=args.eval_go_bs
+        eval_go_bs=args.eval_go_bs,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -977,7 +993,8 @@ def run_training(args):
         temperature=float(getattr(args, "temperature", 0.07)),
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
-        lambda_dag=getattr(args, "lambda_dag", 0.3)
+        lambda_dag=getattr(args, "lambda_dag", 0.3),
+        lambda_bce=getattr(args, "lambda_bce", 0.1),
     )
     run = wandb.init(
         project=args.wandb_project or "protein-go-semantic-align",
@@ -1379,6 +1396,7 @@ def load_structured_cfg(path: str):
         dag_scale=float(loss.get("dag_scale", 10.0)),
         lambda_vtrue=float(loss.get("lambda_vtrue", 0.2)),
         tau_distill=float(loss.get("tau_distill", 1.5)),
+        lambda_bce=float(loss.get("lambda_bce", 0.1)),
 
         # curriculum
         curriculum_epochs=int(curriculum.get("epochs", 4)),

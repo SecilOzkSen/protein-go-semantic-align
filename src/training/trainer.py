@@ -1033,14 +1033,25 @@ class OppTrainer:
         return G_cand, pos_mask, cand_valid_mask
 
     # ----------------- forward scoring -----------------
-    def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
+    def forward_scores(self, H, G, mask, return_alpha=False, return_logits=True, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
         cand_chunk_k = int(getattr(self.cfg, "cand_chunk_k", cand_chunk_k))
         pos_chunk_t = int(getattr(self.cfg, "pos_chunk_t", pos_chunk_t))
 
         def _unpack(out):
-            if isinstance(out, tuple):
-                return out[0], (out[1] or {})
-            return out, {}
+            # 1) plain tensor: scores
+            if torch.is_tensor(out):
+                return out, None, {}
+            # 2) (scores, alpha_info)
+            if isinstance(out, tuple) and len(out) == 2 and isinstance(out[1], dict):
+                return out[0], None, (out[1] or {})
+            # 3) (scores, logits)
+            if isinstance(out, tuple) and len(out) == 2 and torch.is_tensor(out[1]):
+                return out[0], out[1], {}
+            # 4) ((scores, logits), alpha_info)
+            if isinstance(out, tuple) and len(out) == 2 and isinstance(out[0], tuple):
+                scores, logits = out[0]
+                return scores, logits, (out[1] or {})
+            raise RuntimeError(f"Unsupported model output type/shape: {type(out)}")
 
         if G.dim() == 4:  # [B,K,T,Dg] (kept for backward compat)
             if return_alpha:
@@ -1055,11 +1066,22 @@ class OppTrainer:
                 scores_all.append(sc)
             scores = torch.cat(scores_all, dim=1)
             return scores
-        out = self.model(H=H, G=G, mask=mask, return_alpha=return_alpha,
+        out = self.model(H=H, G=G, mask=mask, return_alpha=return_alpha, return_logits=return_logits,
                          cand_chunk_k=cand_chunk_k, pos_chunk_t=pos_chunk_t, **kwargs)
-        sc, alpha = _unpack(out)
+        sc, logits, alpha = _unpack(out)
         if G.dim() == 3:
             assert sc.dim() == 2 and sc.size(0) == H.size(0), "forward_scores: bad score shape"
+
+        if return_alpha:
+            # alpha is dict
+            if return_logits:
+                return (sc, logits), alpha
+            return sc, alpha
+
+        # no alpha
+        if return_logits:
+            return sc, logits
+        return sc
 
         return (sc, alpha) if return_alpha else sc
 
@@ -1150,7 +1172,7 @@ class OppTrainer:
 
         self._eval_cols_seen = to_cols(getattr(self.ctx, "eval_seen_go_ids", []))
         self._eval_cols_rare = to_cols(getattr(self.ctx, "eval_rare_go_ids", []))
-        self._eval_cols_unseen = to_cols(getattr(self.ctx, "eval_unseen_go_ids", []))
+        self._eval_cols_unseen = to_cols(getattr(self.ctx, "eval_unseen_ids", []))
 
         # 4) store on trainer
         self._eval_ids_cpu = eval_ids_cpu
@@ -1306,7 +1328,7 @@ class OppTrainer:
 
         with amp_ctx:
             # 2) scores
-            scores_cand = self.forward_scores(H, G_cand, attn_valid, return_alpha=False)
+            scores_cand, logits_cand = self.forward_scores(H, G_cand, attn_valid, return_alpha=False, return_logits=True)
             if self._global_step % 200 == 0:
                 _tstats(scores_cand, "scores_cand(pre_scale)")
                 scale = self.logit_scale_value()
@@ -1327,6 +1349,27 @@ class OppTrainer:
 
             if not torch.isfinite(l_con):
                 raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
+
+            l_bce = torch.zeros((), device=device)
+
+            if self.attr.lambda_bce > 0.0:
+                # y: [B,K] float
+                y = pos_mask.to(dtype=torch.float32)
+                if cand_valid_mask is not None:
+                    y = y.masked_fill(~cand_valid_mask, 0.0)
+                    # logits'i invalid yerlerde ignore etmek için mask weight kullanacağız
+                    w = cand_valid_mask.to(dtype=torch.float32)
+                else:
+                    w = None
+
+                # BCEWithLogitsLoss için reduction none + weight
+                bce_raw = F.binary_cross_entropy_with_logits(logits_cand, y, reduction="none")
+                if w is not None:
+                    bce_raw = bce_raw * w
+                    denom = w.sum().clamp_min(1.0)
+                    l_bce = bce_raw.sum() / denom
+                else:
+                    l_bce = bce_raw.mean()
 
             # positives-only
             B = H.size(0)
@@ -1375,7 +1418,7 @@ class OppTrainer:
             scores_pos_dag_f32 = scores_pos_dag.float()
             l_dag = dag_consistency_loss_pos_ids(scores_pos_dag_f32, pos_go_ids, self.ctx.dag_parents, margin=0.0,
                                                  scale=1.0)
-        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent
+        total = l_con + self.attr.lambda_bce * l_bce + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent
 
         # EMA
         self._global_step += 1
@@ -1429,6 +1472,7 @@ class OppTrainer:
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
                     "train/lr_go_lora": float(
                         self._lora_lr_schedule(self._global_step - 1)) if self.model.go_encoder is not None else 0.0,
+                    "train/bce": float(l_bce.detach().item())
                 },
                 step=int(self._global_step),
             )

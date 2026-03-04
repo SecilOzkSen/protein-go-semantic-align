@@ -93,6 +93,7 @@ loss:
   dag_scale: 10.0
   lambda_vtrue: 0.0
   tau_distill: 1.0
+  lambda_bce: 0.1
 
 curriculum:
   epochs: 4
