@@ -11,6 +11,7 @@ from src.configs.data_classes import TrainerConfig, AttrConfig
 from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
+from src.utils.helpers import go_str_to_int_any
 
 
 # DEBUG
@@ -1542,12 +1543,12 @@ class OppTrainer:
             anc_set = set()
             for gid in pos_gids:
                 # dag_ancestors includes itself in your build_dag_ancestors
-                anc = dag_anc.get(int(gid), None)
+                anc = dag_anc.get(go_str_to_int_any(gid), None)
                 if anc is None:
-                    anc_set.add(int(gid))
+                    anc_set.add(go_str_to_int_any(gid))
                 else:
                     for a in anc:
-                        anc_set.add(int(a))
+                        anc_set.add(go_str_to_int_any(a))
 
             # restrict to observed by mapping to columns
             anc_cols = set()
