@@ -1612,7 +1612,6 @@ class OppTrainer:
         self._eval_cache_ready = False
         self._ensure_eval_cache_v2(chunk=self.cfg.eval_go_bs)
 
-        # ---- logs: add new keys, keep existing ones
         logs = {
             # observed (optional to keep)
             "obs_fmax": 0.0, "obs_aupr": 0.0,
@@ -1667,7 +1666,6 @@ class OppTrainer:
             # OBSERVED eval space
             G_eval, y_true = self._build_eval_space(batch)  # y_true is over OBSERVED columns
 
-            # ---- Scores + (optional) logits ----
             use_bce_head = getattr(self.model, "score_head", None) is not None
 
             if use_bce_head:
@@ -1676,17 +1674,19 @@ class OppTrainer:
                     return_alpha=False,
                     return_logits=True
                 )
-                probs = torch.sigmoid(logits)  # [B, Geval]
+                # true probability for BCE head
+                scores_for_pr = torch.sigmoid(logits)  # [B, Geval] in [0,1]
             else:
                 scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-                probs = (0.5 * (scores_raw + 1.0)).clamp(0, 1)
+                # IMPORTANT: do NOT fabricate probabilities from cosine.
+                # Use scaled scores directly for PR/Fmax (threshold sweep on score range).
+                scores_for_pr = scores_raw * scale
 
-            # ranking scores for retrieval metrics
+            # ranking scores for retrieval metrics (same as above, keep explicit)
             scores_rank = scores_raw * scale
 
             # retrieval metrics over OBSERVED
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200))
-
             if m["num"] > 0:
                 sum_num += m["num"]
                 sum_R1 += m["R@1"] * m["num"]
@@ -1698,26 +1698,25 @@ class OppTrainer:
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
-            # store OBSERVED
-            preds_obs.append(probs.detach().cpu())
+            # store OBSERVED scores + labels
+            preds_obs.append(scores_for_pr.detach().cpu())
             trues_obs.append(y_true.detach().cpu())
 
             # store SEEN subset
             if seen_cols_cpu.numel() > 0:
                 cols = seen_cols_cpu.to(device, non_blocking=True)
-                preds_seen.append(probs.index_select(1, cols).detach().cpu())
+                preds_seen.append(scores_for_pr.index_select(1, cols).detach().cpu())
                 trues_seen.append(y_true.index_select(1, cols).detach().cpu())
 
             # store RARE subset
             if rare_cols_cpu.numel() > 0:
                 cols = rare_cols_cpu.to(device, non_blocking=True)
-                preds_rare.append(probs.index_select(1, cols).detach().cpu())
+                preds_rare.append(scores_for_pr.index_select(1, cols).detach().cpu())
                 trues_rare.append(y_true.index_select(1, cols).detach().cpu())
 
             # unseen recall@10/50 (ranking over OBSERVED, hits only in unseen subset)
             r10, n10 = self._recall_at_k_on_subset(scores_rank, y_true, unseen_cols_cpu, k=10)
             r50, n50 = self._recall_at_k_on_subset(scores_rank, y_true, unseen_cols_cpu, k=50)
-            # n10 and n50 should match (same denom condition), but be safe:
             n_u = max(n10, n50)
             if n_u > 0:
                 sum_unseen_R10 += r10 * n_u
@@ -1732,15 +1731,39 @@ class OppTrainer:
                 sum_anc_R50 += a50 * an
                 sum_anc_num += an
 
-        # ---- finalize Fmax/AUPR
+        # ---- finalize Fmax/AUPR (threshold sweep in SCORE space)
         def _finish_fmax_aupr(pred_list, true_list):
             if not pred_list:
                 return 0.0, 0.0
-            y_pred = torch.cat(pred_list, dim=0).numpy()
-            y_true_np = torch.cat(true_list, dim=0).numpy()
-            fmax, _ = compute_fmax(y_true=y_true_np, y_pred=y_pred, num_thresholds=101)
+            y_pred = torch.cat(pred_list, dim=0).numpy().astype(np.float32)
+            y_true_np = torch.cat(true_list, dim=0).numpy().astype(np.int32)
+
+            # Compute Fmax with thresholds over the score range
+            t_min = float(np.min(y_pred))
+            t_max = float(np.max(y_pred))
+            if not np.isfinite(t_min) or not np.isfinite(t_max) or t_min == t_max:
+                return 0.0, 0.0
+
+            thresholds = np.linspace(t_min, t_max, 101, dtype=np.float32)
+
+            # Micro-style sweep (consistent with typical CAFA-ish usage)
+            best_f, best_t = 0.0, thresholds[0]
+            # y_true_np and y_pred are [N, C]
+            for t in thresholds:
+                y_hat = (y_pred >= t).astype(np.int32)
+                tp = (y_hat & y_true_np).sum()
+                fp = (y_hat & (1 - y_true_np)).sum()
+                fn = ((1 - y_hat) & y_true_np).sum()
+
+                prec = tp / (tp + fp + 1e-12)
+                rec = tp / (tp + fn + 1e-12)
+                f = (2 * prec * rec) / (prec + rec + 1e-12)
+                if f > best_f:
+                    best_f, best_t = float(f), float(t)
+
+            # AUPR: compute_term_aupr typically accepts scores (not necessarily probs)
             aupr = compute_term_aupr(y_true_np, y_pred)
-            return float(fmax), float(aupr)
+            return float(best_f), float(aupr)
 
         logs["obs_fmax"], logs["obs_aupr"] = _finish_fmax_aupr(preds_obs, trues_obs)
         logs["seen_fmax"], logs["seen_aupr"] = _finish_fmax_aupr(preds_seen, trues_seen)
