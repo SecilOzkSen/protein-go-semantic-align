@@ -12,6 +12,7 @@ from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import compute_fmax, compute_term_aupr
 from src.metrics.retrieval import retrieval_metrics_from_scores
 from src.utils.helpers import go_str_to_int_any
+import numpy as np
 
 
 # DEBUG
