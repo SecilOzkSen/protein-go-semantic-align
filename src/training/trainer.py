@@ -1548,7 +1548,7 @@ class OppTrainer:
                     anc_set.add(go_str_to_int_any(gid))
                 else:
                     for a in anc:
-                        anc_set.add(go_str_to_int_any(a))
+                        anc_set.add(go_str_to_int_any(a[0]))
 
             # restrict to observed by mapping to columns
             anc_cols = set()
