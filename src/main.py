@@ -1313,6 +1313,7 @@ def load_structured_cfg(path: str):
         go_path_seen=Path(stores.get("go_path_seen")) if stores.get("go_path_seen") else None,
         go_path_observed=Path(stores.get("go_path_observed")) if stores.get("go_path_observed") else None,
         go_basic_json=Path(stores.get("go_basic_json")) if stores.get("go_basic_json") else None,
+        seq_len_lookup=Path(stores.get("seq_len_lookup")) if stores.get("seq_len_lookup") else None,
 
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),
