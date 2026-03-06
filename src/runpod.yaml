@@ -10,13 +10,13 @@ data:
 
 general: #Ablation Purposes
   phase: -2
-  ablation_id: "A1" #A0 sanity check
+  ablation_id: "A2" #A0 sanity check
   use_queue_miner: True #CHECKED
-  use_attention_pooling: False #CHECKED
+  go_pooling_strategy: "attn" #CHECKED -> Go attention strategy "attn" or "mean"
   use_lora: True #CHECKED
   use_attribution_loss: False #CHECKED
   return_alpha: False
-  pooling_strategy: "go_token_align_pooler" #  "mean", "go_token_align_pooler" #CHECKED
+  protein_pooling_strategy: "attn" #  Protein pooling strategy "attn" or "mean"
 
 training:
   epochs: 15
@@ -49,7 +49,7 @@ training:
   eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 512 # batch size for storing go text embeddings
   is_logit_scale_constant: false #false = trainable logit scale
-  go_token_dropout: true
+  go_token_dropout: false
   go_pooling: "none" # cls, mean, masked_mean -> NO NEED
   eval_space: "observed" #seen -> # observed: all go must be included to make evaluation reliable.
   # eval space: observed = observed go ids. train+val+test seen once.
@@ -126,6 +126,8 @@ stores:
   embed_dir_res: /workspace/protein/residues/embeddings_1b_npy
   go_text_folder: /workspace/data
   go_cache_path: /workspace/data/go_embeddings/raw/go_text_embeddings_canonical.npy
+
+  seq_len_lookup: /workspace/data/seq_len_lookup.pkl
 
   output_dir: /workspace/protein-go-align-outputs-a1
   logs: /workspace/protein-go-align-logs-a1

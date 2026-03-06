@@ -232,7 +232,7 @@ def build_stores(args):
     logger.info("Building residue+fused stores (lazy, no snapshot)...")
 
     # 1) seq len lookup
- #   seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
+    seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
 
     # 3) embed dirs
     embed_dir_res = getattr(args, "embed_dir_res", None)
@@ -248,7 +248,7 @@ def build_stores(args):
     # 5) Build residue
     res_store = ESMResidueStore(
         embed_dir=embed_dir_res,
-      #  seq_len_lookup=seq_len_lookup,
+        seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
         prefer_fp16=args.fp16,
@@ -795,7 +795,7 @@ def run_training(args):
         model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
         device=device,
         max_length=512,
-        use_attention_pool=args.use_attention_pooling,
+        attention_pooling_strategy=args.go_pooling_strategy,
         attn_hidden=128,
         attn_dropout=0.1,
         special_token_weights=None,
@@ -915,7 +915,7 @@ def run_training(args):
         attribute_loss_enabled=bool(args.use_attribution_loss),
         return_alpha = bool(args.return_alpha),
         fp16_enabled=args.fp16,
-        pooling_strategy=args.pooling_strategy,
+        protein_pooling_strategy=args.protein_pooling_strategy,
         eval_id_list=eval_id_list,
         logger=logger,
         eval_seen_go_ids=eval_seen_go_ids,
@@ -1288,7 +1288,6 @@ def load_structured_cfg(path: str):
     loss = cfg.get("loss", {})
     curriculum = cfg.get("curriculum", {})
     wandb_block = cfg.get("wandb", {})
-    sched = cfg.get("schedule", {})
     stores = cfg.get("stores", {})
     general = cfg.get("general", {})
     memory_bank = cfg.get("memory_bank", {})
@@ -1296,11 +1295,11 @@ def load_structured_cfg(path: str):
     args = types.SimpleNamespace(
         # general
         use_queue_miner = bool(general.get("use_queue_miner", True)),
-        use_attention_pooling = bool(general.get("use_attention_pooling", False)),
+        go_pooling_strategy = bool(general.get("go_pooling_strategy", False)),
         use_lora = bool(general.get("use_lora", False)),
         use_attribution_loss = bool(general.get("use_attribution_loss", False)),
         return_alpha = bool(general.get("return_alpha", False)),
-        pooling_strategy = general.get("pooling_strategy", "mean"),
+        protein_pooling_strategy = general.get("protein_pooling_strategy", "mean"),
         ablation_id = general.get("ablation_id", None),
         phase=general.get("phase", -2),
 

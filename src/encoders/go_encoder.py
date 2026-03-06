@@ -71,7 +71,7 @@ class BioMedBERTEncoder(nn.Module):
                  model_name: str,
                  device: Union[str, torch.device],
                  max_length: int = 512,
-                 use_attention_pool: bool = False,  # Attention pooling head
+                 attention_pooling_strategy: str = "attn",  # Attention pooling head
                  attn_hidden: int = 0,  # 0 = linear scoring; >0 = tanh-MLP hidden size
                  attn_dropout: float = 0.0,
                  special_token_weights: Optional[Dict[str, float]] = None, # Optional token weights to bias attention (e.g., {"[GOPATH]":0.45, "[PATH]":0.45, "[ISA]":0.95, "[PART]":0.85})
@@ -98,7 +98,7 @@ class BioMedBERTEncoder(nn.Module):
             self.model.gradient_checkpointing_enable()
 
         # Attention pooling head (Optional - nice to use)
-        self.use_attention_pool = use_attention_pool
+        self.use_attention_pool = True if attention_pooling_strategy == "attn" else False
         self.attn_head: Optional[AttnPool] = None
         if self.use_attention_pool:
             print("[INFO] Using attention pooling head with hidden size:", attn_hidden)

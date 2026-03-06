@@ -222,7 +222,7 @@ class TrainingContext:
     attribute_loss_enabled: bool = False
     return_alpha: bool = False
     fused_bank: Any = None
-    pooling_strategy: str = "mean"
+    protein_pooling_strategy: str = "mean"
     eval_id_list: List[int] = None
     logger: Any = None
     eval_seen_go_ids: List[int] = None

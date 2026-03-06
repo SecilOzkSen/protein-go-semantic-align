@@ -554,7 +554,7 @@ class OppTrainer:
             d_z=cfg.d_z,
             go_encoder=go_encoder,
             normalize=True,
-            mean_pool=(ctx.pooling_strategy == "mean"),
+            protein_pool_type=ctx.protein_pooling_strategy
         ).to(self.device)
 
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))
