@@ -34,13 +34,14 @@ class AttentionPool1D(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                      # [B, T, D]
-        mask: Optional[torch.Tensor] = None  # [B, T], bool, True=valid
+        x: torch.Tensor,              # [B, T, D]
+        mask: Optional[torch.Tensor] = None  # [B, T] bool, True=valid
     ):
         s = self.score(self.dropout(x)).squeeze(-1)   # [B, T]
 
         if mask is not None:
-            s = s.masked_fill(~mask, -1e9)
+            neg_inf = torch.finfo(s.dtype).min
+            s = s.masked_fill(~mask, neg_inf)
 
         a = torch.softmax(s, dim=1)                   # [B, T]
         pooled = torch.sum(x * a.unsqueeze(-1), dim=1)  # [B, D]
