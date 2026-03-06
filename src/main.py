@@ -1295,7 +1295,7 @@ def load_structured_cfg(path: str):
     args = types.SimpleNamespace(
         # general
         use_queue_miner = bool(general.get("use_queue_miner", True)),
-        go_pooling_strategy = bool(general.get("go_pooling_strategy", False)),
+        go_pooling_strategy = general.get("go_pooling_strategy", "mean"),
         use_lora = bool(general.get("use_lora", False)),
         use_attribution_loss = bool(general.get("use_attribution_loss", False)),
         return_alpha = bool(general.get("return_alpha", False)),
