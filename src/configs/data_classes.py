@@ -279,3 +279,4 @@ class TrainerConfig:
     is_logit_scale_constant: bool = False
     go_pooling: str = "masked_mean"  # cls, mean, masked_mean
     eval_go_bs: int = 256
+    queue_start_step: int = 0

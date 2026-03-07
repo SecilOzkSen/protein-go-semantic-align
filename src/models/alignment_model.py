@@ -6,26 +6,6 @@ from src.models.projection import ProjectionHead
 from src.encoders import BioMedBERTEncoder
 
 
-class SharedInteractionMLP(nn.Module):
-    def __init__(self, d: int, hidden: int = 256, dropout: float = 0.1):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(4 * d, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, zp: torch.Tensor, zg: torch.Tensor) -> torch.Tensor:
-        """
-        zp: [B, K, D]
-        zg: [B, K, D]
-        """
-        h = torch.cat([zp, zg, zp * zg, torch.abs(zp - zg)], dim=-1)  # [B, K, 4D]
-        logits = self.net(h).squeeze(-1)  # [B, K]
-        return logits
-
-
 class AttentionPool1D(nn.Module):
     def __init__(self, d_in: int, dropout: float = 0.0):
         super().__init__()
@@ -56,7 +36,6 @@ class ProteinGoAligner(nn.Module):
         d_z: int = 768,
         go_encoder: Optional[BioMedBERTEncoder] = None,
         normalize: bool = True,
-        use_score_head: bool = False,
         protein_pool_type: str = "mean",   # "mean" | "attn"
     ):
         super().__init__()
@@ -67,12 +46,6 @@ class ProteinGoAligner(nn.Module):
         self.normalize = bool(normalize)
         self.go_encoder = go_encoder
         self.protein_pool_type = protein_pool_type
-
-        self.use_score_head = use_score_head
-        self.score_head = (
-            SharedInteractionMLP(d=d_z, hidden=256, dropout=0.1)
-            if self.use_score_head else None
-        )
 
         if self.go_encoder is not None and d_g is None:
             d_g = int(self.go_encoder.model.config.hidden_size)
@@ -98,7 +71,6 @@ class ProteinGoAligner(nn.Module):
         G: torch.Tensor,                     # [B, K, Dg]
         mask: Optional[torch.Tensor],        # [B, T], bool, True=valid
         return_alpha: bool = False,
-        return_logits: bool = True,
         **kwargs
     ):
         if mask is not None and mask.dtype != torch.bool:
@@ -141,12 +113,6 @@ class ProteinGoAligner(nn.Module):
             Gz = self._norm(Gz, dim=-1)
 
         scores = (Zp * Gz).sum(dim=-1)                      # [B, K]
-
-        if return_logits and self.score_head is not None:
-            logits = self.score_head(Zp, Gz)
-            if return_alpha:
-                return (scores, logits), alpha_info
-            return scores, logits
 
         if return_alpha:
             return scores, alpha_info

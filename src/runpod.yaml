@@ -53,6 +53,7 @@ training:
   go_pooling: "none" # cls, mean, masked_mean -> NO NEED
   eval_space: "observed" #seen -> # observed: all go must be included to make evaluation reliable.
   # eval space: observed = observed go ids. train+val+test seen once.
+  queue_start_step : 3000
 
 optim:
   lr: 0.0003

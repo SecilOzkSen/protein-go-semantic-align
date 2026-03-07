@@ -977,6 +977,7 @@ def run_training(args):
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
         go_pooling=args.go_pooling,
         eval_go_bs=args.eval_go_bs,
+        queue_start_step=args.queue_start_step
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1354,6 +1355,7 @@ def load_structured_cfg(path: str):
         go_token_dropout=bool(training.get("go_token_dropout", False)),
         go_pooling=str(training.get("go_pooling", "mean")),
         eval_space=str(training.get("eval_space", "seen")),
+        queue_start_step=int(training.get("queue_start_step", 0)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
