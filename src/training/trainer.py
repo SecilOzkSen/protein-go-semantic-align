@@ -547,6 +547,7 @@ class OppTrainer:
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
+        self.queue_weight = 0.5
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
         self.model = ProteinGoAligner(
@@ -591,7 +592,7 @@ class OppTrainer:
 
         param_groups = [
             {"params": main_params, "lr": lr_main, "weight_decay": wd},
-            {"params": [self.logit_scale], "lr": lr_main * 0.05, "weight_decay": 0.0},
+            {"params": [self.logit_scale], "lr": 1e-3, "weight_decay": 0.0},
         ]
 
         # Add GO encoder groups (LoRA + embeddings + attn head), if present
@@ -1085,7 +1086,7 @@ class OppTrainer:
             else:
                 cand_valid_mask[:, U:U + kq] = neg_valid_from_queue.to(device)
 
-        return G_cand, pos_mask, cand_valid_mask
+        return G_cand, pos_mask, cand_valid_mask, U, kq
 
     # ----------------- forward scoring -----------------
     def forward_scores(self, H, G, mask, return_alpha=False, cand_chunk_k=32, pos_chunk_t=256, **kwargs):
@@ -1398,7 +1399,7 @@ class OppTrainer:
             except Exception:
                 max_inbatch = None
 
-        G_cand, pos_mask, cand_valid_mask = self._build_candidates(
+        G_cand, pos_mask, cand_valid_mask, U, kq = self._build_candidates(
             uniq_go_embs,
             pos_local,
             neg_raw_from_queue=neg_raw_from_queue,
@@ -1419,6 +1420,8 @@ class OppTrainer:
             # 3) scale
             scale = self.logit_scale_value()
             scores_cand = scores_cand * scale
+            if kq > 0:
+                scores_cand[:, U:U + kq] *= self.queue_weight
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
