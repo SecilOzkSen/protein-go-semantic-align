@@ -1289,11 +1289,11 @@ class OppTrainer:
 
         return G_eval, y_true
 
-    def logit_scale_value(self) -> float:
+    def logit_scale_tensor(self):
         if not self.cfg.is_logit_scale_constant:
-            return float(self.logit_scale.clamp(min=-10.0, max=4.6).exp())
+            return self.logit_scale.clamp(min=-10.0, max=4.6).exp()
         else:
-            return float(self.logit_scale.exp())
+            return self.logit_scale.exp()
 
     def debug_queue(self):
         q = self.queue_miner
@@ -1412,7 +1412,6 @@ class OppTrainer:
             scores_cand = self.forward_scores(H, G_cand, attn_valid, return_alpha=False)
             if self._global_step % 200 == 0:
                 _tstats(scores_cand, "scores_cand(pre_scale)")
-                scale = self.logit_scale_value()
                 grad = self.logit_scale.grad.item() if self.logit_scale.grad is not None else None
                 print(
                     f"[DBG] logit_scale_raw={self.logit_scale.item():.8f} "
@@ -1423,7 +1422,7 @@ class OppTrainer:
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
 
             # 3) scale
-            scale = self.logit_scale_value()
+            scale = self.logit_scale_tensor()
             scores_cand = scores_cand * scale
             if kq > 0:
                 scores_cand[:, U:U + kq] *= self.queue_weight
@@ -1715,7 +1714,7 @@ class OppTrainer:
         sum_anc_R50 = 0.0
         sum_anc_num = 0
 
-        scale = self.logit_scale_value()
+        scale = self.logit_scale_tensor()
 
         seen_cols_cpu = self._eval_cols_seen if self._eval_cols_seen is not None else torch.empty(0, dtype=torch.long)
         rare_cols_cpu = self._eval_cols_rare if self._eval_cols_rare is not None else torch.empty(0, dtype=torch.long)
