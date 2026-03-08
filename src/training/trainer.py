@@ -547,7 +547,7 @@ class OppTrainer:
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
-        self.queue_weight = 0.5
+        self.queue_weight = 0.25
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
         self.model = ProteinGoAligner(
@@ -1413,8 +1413,13 @@ class OppTrainer:
             if self._global_step % 200 == 0:
                 _tstats(scores_cand, "scores_cand(pre_scale)")
                 scale = self.logit_scale_value()
+                grad = self.logit_scale.grad.item() if self.logit_scale.grad is not None else None
                 print(
-                    f"[DBG] logit_scale_exp={scale:.4g} requires_grad={bool(getattr(self.logit_scale, 'requires_grad', False))}")
+                    f"[DBG] logit_scale_raw={self.logit_scale.item():.8f} "
+                    f"logit_scale_exp={self.logit_scale.exp().item():.8f} "
+                    f"logit_scale_clamped_exp={self.logit_scale.clamp(min=-10.0, max=4.6).exp().item():.8f} "
+                    f"logit_scale_grad={grad}"
+                )
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
 
             # 3) scale
