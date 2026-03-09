@@ -54,7 +54,7 @@ training:
   eval_space: "observed" #seen -> # observed: all go must be included to make evaluation reliable.
   # eval space: observed = observed go ids. train+val+test seen once.
   queue_start_step : 3000
-  queue_weight: 0.25
+  queue_weight: 1.0
   max_inbatch: 160
 
 optim:

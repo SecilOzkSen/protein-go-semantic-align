@@ -1252,6 +1252,8 @@ class OppTrainer:
                 cand_valid_mask[:, s:e] = True
             else:
                 cand_valid_mask[:, s:e] = neg_valid_from_queue.to(device)
+            if neg_raw_from_queue is not None:
+                U = s
 
         return G_cand, pos_mask, cand_valid_mask, U, kq
 
