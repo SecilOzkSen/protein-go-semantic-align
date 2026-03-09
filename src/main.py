@@ -5,7 +5,7 @@ import time
 import math
 import yaml
 import random
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from typing import Dict, List, Set, Iterable, Tuple, Any, Optional
 import torch.multiprocessing as mp
 from datetime import datetime
@@ -37,7 +37,6 @@ from src.utils import (
 from src.utils.checkpoint import save_checkpoint, load_checkpoint
 from src.encoders import BioMedBERTEncoder
 from math import inf
-
 from src.configs.paths import YAML_FILE
 
 # To prevent sigint (potential cause)
@@ -326,6 +325,15 @@ def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore,
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds}
 
+def build_dataset_sample_weights(dataset):
+    weights = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        n_rare = int(sample.get("num_rare_go", 0))
+        w = 1.0 + np.log1p(n_rare)
+        weights.append(w)
+    return torch.as_tensor(weights, dtype=torch.double)
+
 def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout:GoTokenDropout=None):
     logger = logging.getLogger("build_dataloaders")
 
@@ -360,16 +368,20 @@ def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout:GoT
         neg_k=args.neg_k,
         go_dropout=None # dropout off
     )
-
+    train_weights = build_dataset_sample_weights(datasets["train"])
+    train_sampler = WeightedRandomSampler(
+        weights=train_weights,
+        num_samples=len(train_weights),
+        replacement=True,
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         persistent_workers=(args.num_workers > 0),
-#        multiprocessing_context="forkserver",
         pin_memory=True,
-    #    prefetch_factor=2,
         collate_fn=train_collate,
     )
 
@@ -867,7 +879,7 @@ def run_training(args):
         logger=logger,
         drop_empty_proteins=False,  # True yaparsan label'sız proteinleri de atar
     )
-    datasets = build_datasets(args, res_store, go_text_store, pid2pos=pid2pos, zs=zs, fs=fs)
+    datasets = build_datasets(args, res_store, go_text_store, pid2pos=pid2pos, zs=zs, fs=fs, dag_parents=dag_parents)
     n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
@@ -977,7 +989,9 @@ def run_training(args):
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
         go_pooling=args.go_pooling,
         eval_go_bs=args.eval_go_bs,
-        queue_start_step=args.queue_start_step
+        queue_start_step=args.queue_start_step,
+        queue_weight=args.queue_weight,
+        max_inbatch=args.max_inbatch,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1356,6 +1370,8 @@ def load_structured_cfg(path: str):
         go_pooling=str(training.get("go_pooling", "mean")),
         eval_space=str(training.get("eval_space", "seen")),
         queue_start_step=int(training.get("queue_start_step", 0)),
+        queue_weight=float(training.get("queue_weight", 1)),
+        max_inbatch=int(training.get("max_inbatch", 64)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

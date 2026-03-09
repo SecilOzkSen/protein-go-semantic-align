@@ -115,6 +115,7 @@ class ProteinEmbDataset(Dataset):
         self.n_go = len(go_text_store.id2text.keys())
         go_index = build_go_index(fewzero.zero_shot_terms)
         self.zs_mask = mask_from_globals(terms=fewzero.zero_shot_terms, go_index=go_index, n_go=self.n_go)
+        self.rare_go_set = set(fewzero.few_shot_terms)
 
     def __len__(self) -> int:
         return len(self.pids)
@@ -125,12 +126,18 @@ class ProteinEmbDataset(Dataset):
         pos_list = self.pid2pos.get(pid, [])
         pos_wts = self.pos_weights_map.get(pid, [1.0] * len(pos_list))
 
+        num_rare_go = 0
+        if hasattr(self, "rare_go_set") and self.rare_go_set is not None:
+            pos_ids_list = list(pos_list)
+            num_rare_go = sum(1 for g in pos_ids_list if int(g) in self.rare_go_set)
+
         item = {
             "protein_id": pid,
             "prot_emb": prot_emb,  # [L,D]
             "pos_go_ids": torch.as_tensor(pos_list, dtype=torch.long),
             "pos_go_weights": torch.as_tensor(pos_wts, dtype=torch.float32),
             "is_fs": self.is_fs[idx],
+            "num_rare_go": num_rare_go,
         }
         return item
 

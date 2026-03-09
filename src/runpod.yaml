@@ -3,7 +3,7 @@ data:
   max_len: 1024
 
   # DAG & expansion
-  use_dag_in_ds: false
+  use_dag_in_ds: true
 
   # Few/Zero-shot
   fs_target_ratio: 0.3
@@ -54,6 +54,8 @@ training:
   eval_space: "observed" #seen -> # observed: all go must be included to make evaluation reliable.
   # eval space: observed = observed go ids. train+val+test seen once.
   queue_start_step : 3000
+  queue_weight: 0.25
+  max_inbatch: 160
 
 optim:
   lr: 0.0001

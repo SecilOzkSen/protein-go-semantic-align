@@ -280,3 +280,5 @@ class TrainerConfig:
     go_pooling: str = "masked_mean"  # cls, mean, masked_mean
     eval_go_bs: int = 256
     queue_start_step: int = 0
+    queue_weight: float = 0.25
+    max_inbatch: int = 64

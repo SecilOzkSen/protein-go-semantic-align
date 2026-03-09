@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import List, Optional
 import copy
 import torch
 import torch.nn.functional as F
@@ -163,6 +163,70 @@ def dbg_cand_alignment_once(cand_go_embs, batch, cand_ids, go_text_store, step: 
     cos = float((e1 * e2).sum().item())
     pid = str(batch["protein_ids"][i]) if "protein_ids" in batch else "?"
     print(f"\n[DBG-ALIGN] pid={pid} sample={i} cand_j={j} gid={gid} cos(cand_emb,store_emb)={cos:.4f}")
+
+@torch.no_grad()
+def _debug_pos_neg_cosines(self, H: torch.Tensor, attn_valid: torch.Tensor, y_true: torch.Tensor, max_neg: int = 32):
+    """
+    H: [B, L, Dh]
+    attn_valid: [B, L]
+    y_true: [B, G] over observed eval space
+    """
+    device = H.device
+
+    # protein query in projected space
+    Dz = self._get_Dz()
+    prot_query = self._get_prot_query(H, attn_valid, Dz)  # [B, Dz]
+    prot_query = F.normalize(prot_query.float(), dim=-1)
+
+    # eval GO raw embeddings -> projected space
+    G_once = self._eval_G_once_cpu.to(device, non_blocking=True)  # [G, Dg]
+    G_proj = self.model.go_ln(G_once)
+    G_proj = self.model.proj_g(G_proj)
+    G_proj = F.normalize(G_proj.float(), dim=-1)  # [G, Dz]
+
+    pos_vals = []
+    neg_vals = []
+
+    B, G = y_true.shape
+    for b in range(B):
+        pos_idx = torch.nonzero(y_true[b] > 0, as_tuple=False).flatten()
+        if pos_idx.numel() == 0:
+            continue
+
+        neg_mask = (y_true[b] <= 0)
+        neg_idx = torch.nonzero(neg_mask, as_tuple=False).flatten()
+        if neg_idx.numel() == 0:
+            continue
+
+        if neg_idx.numel() > max_neg:
+            perm = torch.randperm(neg_idx.numel(), device=device)[:max_neg]
+            neg_idx = neg_idx[perm]
+
+        q = prot_query[b:b+1]  # [1, Dz]
+
+        pos_cos = (q * G_proj.index_select(0, pos_idx)).sum(dim=-1)  # [P]
+        neg_cos = (q * G_proj.index_select(0, neg_idx)).sum(dim=-1)  # [N]
+
+        pos_vals.append(pos_cos.mean())
+        neg_vals.append(neg_cos.mean())
+
+    if len(pos_vals) == 0:
+        return {
+            "pos_cos_mean": 0.0,
+            "neg_cos_mean": 0.0,
+            "margin": 0.0,
+            "num_debug_samples": 0,
+        }
+
+    pos_mean = torch.stack(pos_vals).mean().item()
+    neg_mean = torch.stack(neg_vals).mean().item()
+
+    return {
+        "pos_cos_mean": float(pos_mean),
+        "neg_cos_mean": float(neg_mean),
+        "margin": float(pos_mean - neg_mean),
+        "num_debug_samples": int(len(pos_vals)),
+    }
 
 
 # ------------- Helpers -------------
@@ -547,7 +611,6 @@ class OppTrainer:
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
-        self.queue_weight = 0.25
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
         self.model = ProteinGoAligner(
@@ -1393,9 +1456,9 @@ class OppTrainer:
 
         # candidates: in-batch + optional queue
         max_inbatch = None
-        if getattr(self.ctx, "scheduler", None) is not None:
+        if getattr(self.cfg, "max_inbatch", None) is not None:
             try:
-                max_inbatch = int(self.ctx.scheduler(self._global_step)["shortlist_M"])
+                max_inbatch = int(self.cfg.max_inbatch)
             except Exception:
                 max_inbatch = None
 
@@ -1425,7 +1488,7 @@ class OppTrainer:
             scale = self.logit_scale_tensor()
             scores_cand = scores_cand * scale
             if kq > 0:
-                scores_cand[:, U:U + kq] *= self.queue_weight
+                scores_cand[:, U:U + kq] *= self.cfg.queue_weight
             # 4) loss (pad candidate'ları mask’le)
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
@@ -1694,7 +1757,11 @@ class OppTrainer:
             "align_R@1": 0.0, "align_R@5": 0.0, "align_R@10": 0.0,
             "align_R@50": 0.0, "align_R@100": 0.0, "align_R@200": 0.0,
             "align_MRR": 0.0, "align_nDCG@10": 0.0,
-            "anc_R@10": 0.0, "anc_R@50": 0.0, "anc_num": 0
+            "anc_R@10": 0.0, "anc_R@50": 0.0, "anc_num": 0,
+            "debug_pos_cos": 0.0,
+            "debug_neg_cos": 0.0,
+            "debug_margin": 0.0,
+            "debug_num": 0,
         }
 
         # ---- accumulators
@@ -1781,6 +1848,15 @@ class OppTrainer:
                 sum_anc_R50 += a50 * an
                 sum_anc_num += an
 
+        # DEBUG TODO: erase later
+
+        dbg = self._debug_pos_neg_cosines(H, attn_valid, y_true, max_neg=32)
+        if dbg["num_debug_samples"] > 0:
+            logs["debug_pos_cos"] += dbg["pos_cos_mean"] * dbg["num_debug_samples"]
+            logs["debug_neg_cos"] += dbg["neg_cos_mean"] * dbg["num_debug_samples"]
+            logs["debug_margin"] += dbg["margin"] * dbg["num_debug_samples"]
+            logs["debug_num"] += dbg["num_debug_samples"]
+
         # ---- finalize Fmax/AUPR (threshold sweep in SCORE space)
         def _finish_fmax_aupr(pred_list, true_list):
             if not pred_list:
@@ -1849,5 +1925,14 @@ class OppTrainer:
             logs["anc_R@10"] = 0.0
             logs["anc_R@50"] = 0.0
             logs["anc_num"] = 0
+
+        if logs["debug_num"] > 0:
+            logs["debug_pos_cos"] /= logs["debug_num"]
+            logs["debug_neg_cos"] /= logs["debug_num"]
+            logs["debug_margin"] /= logs["debug_num"]
+        else:
+            logs["debug_pos_cos"] = 0.0
+            logs["debug_neg_cos"] = 0.0
+            logs["debug_margin"] = 0.0
 
         return logs
