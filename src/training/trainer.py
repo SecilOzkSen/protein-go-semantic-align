@@ -164,70 +164,6 @@ def dbg_cand_alignment_once(cand_go_embs, batch, cand_ids, go_text_store, step: 
     pid = str(batch["protein_ids"][i]) if "protein_ids" in batch else "?"
     print(f"\n[DBG-ALIGN] pid={pid} sample={i} cand_j={j} gid={gid} cos(cand_emb,store_emb)={cos:.4f}")
 
-@torch.no_grad()
-def _debug_pos_neg_cosines(self, H: torch.Tensor, attn_valid: torch.Tensor, y_true: torch.Tensor, max_neg: int = 32):
-    """
-    H: [B, L, Dh]
-    attn_valid: [B, L]
-    y_true: [B, G] over observed eval space
-    """
-    device = H.device
-
-    # protein query in projected space
-    Dz = self._get_Dz()
-    prot_query = self._get_prot_query(H, attn_valid, Dz)  # [B, Dz]
-    prot_query = F.normalize(prot_query.float(), dim=-1)
-
-    # eval GO raw embeddings -> projected space
-    G_once = self._eval_G_once_cpu.to(device, non_blocking=True)  # [G, Dg]
-    G_proj = self.model.go_ln(G_once)
-    G_proj = self.model.proj_g(G_proj)
-    G_proj = F.normalize(G_proj.float(), dim=-1)  # [G, Dz]
-
-    pos_vals = []
-    neg_vals = []
-
-    B, G = y_true.shape
-    for b in range(B):
-        pos_idx = torch.nonzero(y_true[b] > 0, as_tuple=False).flatten()
-        if pos_idx.numel() == 0:
-            continue
-
-        neg_mask = (y_true[b] <= 0)
-        neg_idx = torch.nonzero(neg_mask, as_tuple=False).flatten()
-        if neg_idx.numel() == 0:
-            continue
-
-        if neg_idx.numel() > max_neg:
-            perm = torch.randperm(neg_idx.numel(), device=device)[:max_neg]
-            neg_idx = neg_idx[perm]
-
-        q = prot_query[b:b+1]  # [1, Dz]
-
-        pos_cos = (q * G_proj.index_select(0, pos_idx)).sum(dim=-1)  # [P]
-        neg_cos = (q * G_proj.index_select(0, neg_idx)).sum(dim=-1)  # [N]
-
-        pos_vals.append(pos_cos.mean())
-        neg_vals.append(neg_cos.mean())
-
-    if len(pos_vals) == 0:
-        return {
-            "pos_cos_mean": 0.0,
-            "neg_cos_mean": 0.0,
-            "margin": 0.0,
-            "num_debug_samples": 0,
-        }
-
-    pos_mean = torch.stack(pos_vals).mean().item()
-    neg_mean = torch.stack(neg_vals).mean().item()
-
-    return {
-        "pos_cos_mean": float(pos_mean),
-        "neg_cos_mean": float(neg_mean),
-        "margin": float(pos_mean - neg_mean),
-        "num_debug_samples": int(len(pos_vals)),
-    }
-
 
 # ------------- Helpers -------------
 def to_f32(x: torch.Tensor) -> torch.Tensor:
@@ -754,6 +690,72 @@ class OppTrainer:
 
             self._queue_was_active = True
     # ----------------- debug -----------------
+    @torch.no_grad()
+    def _debug_pos_neg_cosines(
+            self,
+            H: torch.Tensor,
+            attn_valid: torch.Tensor,
+            y_true: torch.Tensor,
+            max_neg: int = 32,
+    ):
+        """
+        H: [B, L, Dh]
+        attn_valid: [B, L]
+        y_true: [B, G] over observed eval space
+        """
+        device = H.device
+
+        Dz = self._get_Dz()
+        prot_query = self._get_prot_query(H, attn_valid, Dz)
+        prot_query = F.normalize(prot_query.float(), dim=-1)
+
+        G_once = self._eval_G_once_cpu.to(device, non_blocking=True)
+        G_proj = self.model.go_ln(G_once)
+        G_proj = self.model.proj_g(G_proj)
+        G_proj = F.normalize(G_proj.float(), dim=-1)
+
+        pos_vals = []
+        neg_vals = []
+
+        B, G = y_true.shape
+        for b in range(B):
+            pos_idx = torch.nonzero(y_true[b] > 0, as_tuple=False).flatten()
+            if pos_idx.numel() == 0:
+                continue
+
+            neg_idx = torch.nonzero(y_true[b] <= 0, as_tuple=False).flatten()
+            if neg_idx.numel() == 0:
+                continue
+
+            if neg_idx.numel() > max_neg:
+                perm = torch.randperm(neg_idx.numel(), device=device)[:max_neg]
+                neg_idx = neg_idx[perm]
+
+            q = prot_query[b:b + 1]
+
+            pos_cos = (q * G_proj.index_select(0, pos_idx)).sum(dim=-1)
+            neg_cos = (q * G_proj.index_select(0, neg_idx)).sum(dim=-1)
+
+            pos_vals.append(pos_cos.mean())
+            neg_vals.append(neg_cos.mean())
+
+        if len(pos_vals) == 0 or len(neg_vals) == 0:
+            return {
+                "pos_cos_mean": 0.0,
+                "neg_cos_mean": 0.0,
+                "margin": 0.0,
+                "num_debug_samples": 0,
+            }
+
+        pos_mean = torch.stack(pos_vals).mean().item()
+        neg_mean = torch.stack(neg_vals).mean().item()
+
+        return {
+            "pos_cos_mean": float(pos_mean),
+            "neg_cos_mean": float(neg_mean),
+            "margin": float(pos_mean - neg_mean),
+            "num_debug_samples": int(len(pos_vals)),
+        }
     @torch.no_grad()
     def _dbg_norms(self, *, prot_query=None, pos_vecs=None, uniq_go_embs=None, tag=""):
         def _mean_norm(x):
@@ -1848,31 +1850,32 @@ class OppTrainer:
         self._ensure_eval_cache_v2(chunk=self.cfg.eval_go_bs)
 
         logs = {
-            # observed (optional to keep)
-            "obs_fmax": 0.0, "obs_aupr": 0.0,
-
-            # seen-only
-            "seen_fmax": 0.0, "seen_aupr": 0.0,
-
-            # rare-only
-            "rare_fmax": 0.0, "rare_aupr": 0.0,
-
-            # unseen recall
-            "unseen_R@10": 0.0, "unseen_R@50": 0.0,
-            "unseen_num": 0,  # how many val proteins had unseen positives
-
-            # retrieval metrics over OBSERVED
-            "align_R@1": 0.0, "align_R@5": 0.0, "align_R@10": 0.0,
-            "align_R@50": 0.0, "align_R@100": 0.0, "align_R@200": 0.0,
-            "align_MRR": 0.0, "align_nDCG@10": 0.0,
-            "anc_R@10": 0.0, "anc_R@50": 0.0, "anc_num": 0,
+            "obs_fmax": 0.0,
+            "obs_aupr": 0.0,
+            "seen_fmax": 0.0,
+            "seen_aupr": 0.0,
+            "rare_fmax": 0.0,
+            "rare_aupr": 0.0,
+            "unseen_R@10": 0.0,
+            "unseen_R@50": 0.0,
+            "unseen_num": 0,
+            "align_R@1": 0.0,
+            "align_R@5": 0.0,
+            "align_R@10": 0.0,
+            "align_R@50": 0.0,
+            "align_R@100": 0.0,
+            "align_R@200": 0.0,
+            "align_MRR": 0.0,
+            "align_nDCG@10": 0.0,
+            "anc_R@10": 0.0,
+            "anc_R@50": 0.0,
+            "anc_num": 0,
             "debug_pos_cos": 0.0,
             "debug_neg_cos": 0.0,
             "debug_margin": 0.0,
             "debug_num": 0,
         }
 
-        # ---- accumulators
         preds_obs, trues_obs = [], []
         preds_seen, trues_seen = [], []
         preds_rare, trues_rare = [], []
@@ -1900,17 +1903,16 @@ class OppTrainer:
             H = batch["prot_emb_pad"].to(device, non_blocking=True)
             if self.to_f32 is not None:
                 H = self.to_f32(H)
+
             attn_valid, _ = self._valid_and_pad_masks(batch)
 
-            # OBSERVED eval space
-            G_eval, y_true = self._build_eval_space(batch)  # y_true is over OBSERVED columns
+            # observed eval space
+            G_eval, y_true = self._build_eval_space(batch)
 
             scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-
-            # ranking scores for retrieval metrics (same as above, keep explicit)
             scores_rank = scores_raw * scale
 
-            # retrieval metrics over OBSERVED
+            # retrieval over observed space
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200))
             if m["num"] > 0:
                 sum_num += m["num"]
@@ -1923,23 +1925,20 @@ class OppTrainer:
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
-            # store OBSERVED scores + labels
             preds_obs.append(scores_rank.detach().cpu())
             trues_obs.append(y_true.detach().cpu())
 
-            # store SEEN subset
             if seen_cols_cpu.numel() > 0:
                 cols = seen_cols_cpu.to(device, non_blocking=True)
                 preds_seen.append(scores_rank.index_select(1, cols).detach().cpu())
                 trues_seen.append(y_true.index_select(1, cols).detach().cpu())
 
-            # store RARE subset
             if rare_cols_cpu.numel() > 0:
                 cols = rare_cols_cpu.to(device, non_blocking=True)
                 preds_rare.append(scores_rank.index_select(1, cols).detach().cpu())
                 trues_rare.append(y_true.index_select(1, cols).detach().cpu())
 
-            # unseen recall@10/50 (ranking over OBSERVED, hits only in unseen subset)
+            # unseen recall on observed ranking
             r10, n10 = self._recall_at_k_on_subset(scores_rank, y_true, unseen_cols_cpu, k=10)
             r50, n50 = self._recall_at_k_on_subset(scores_rank, y_true, unseen_cols_cpu, k=50)
             n_u = max(n10, n50)
@@ -1948,6 +1947,7 @@ class OppTrainer:
                 sum_unseen_R50 += r50 * n_u
                 sum_unseen_num += n_u
 
+            # ancestor recall
             a10, an10 = self._ancestor_recall_at_k(scores_rank, y_true, k=10)
             a50, an50 = self._ancestor_recall_at_k(scores_rank, y_true, k=50)
             an = max(an10, an50)
@@ -1956,23 +1956,21 @@ class OppTrainer:
                 sum_anc_R50 += a50 * an
                 sum_anc_num += an
 
-        # DEBUG TODO: erase later
+            # debug cosine separation
+            dbg = self._debug_pos_neg_cosines(H, attn_valid, y_true, max_neg=32)
+            if dbg["num_debug_samples"] > 0:
+                logs["debug_pos_cos"] += dbg["pos_cos_mean"] * dbg["num_debug_samples"]
+                logs["debug_neg_cos"] += dbg["neg_cos_mean"] * dbg["num_debug_samples"]
+                logs["debug_margin"] += dbg["margin"] * dbg["num_debug_samples"]
+                logs["debug_num"] += dbg["num_debug_samples"]
 
-        dbg = self._debug_pos_neg_cosines(H, attn_valid, y_true, max_neg=32)
-        if dbg["num_debug_samples"] > 0:
-            logs["debug_pos_cos"] += dbg["pos_cos_mean"] * dbg["num_debug_samples"]
-            logs["debug_neg_cos"] += dbg["neg_cos_mean"] * dbg["num_debug_samples"]
-            logs["debug_margin"] += dbg["margin"] * dbg["num_debug_samples"]
-            logs["debug_num"] += dbg["num_debug_samples"]
-
-        # ---- finalize Fmax/AUPR (threshold sweep in SCORE space)
         def _finish_fmax_aupr(pred_list, true_list):
             if not pred_list:
                 return 0.0, 0.0
+
             y_pred = torch.cat(pred_list, dim=0).numpy().astype(np.float32)
             y_true_np = torch.cat(true_list, dim=0).numpy().astype(np.int32)
 
-            # Compute Fmax with thresholds over the score range
             t_min = float(np.min(y_pred))
             t_max = float(np.max(y_pred))
             if not np.isfinite(t_min) or not np.isfinite(t_max) or t_min == t_max:
@@ -1980,9 +1978,7 @@ class OppTrainer:
 
             thresholds = np.linspace(t_min, t_max, 101, dtype=np.float32)
 
-            # Micro-style sweep (consistent with typical CAFA-ish usage)
-            best_f, best_t = 0.0, thresholds[0]
-            # y_true_np and y_pred are [N, C]
+            best_f = 0.0
             for t in thresholds:
                 y_hat = (y_pred >= t).astype(np.int32)
                 tp = (y_hat & y_true_np).sum()
@@ -1993,9 +1989,8 @@ class OppTrainer:
                 rec = tp / (tp + fn + 1e-12)
                 f = (2 * prec * rec) / (prec + rec + 1e-12)
                 if f > best_f:
-                    best_f, best_t = float(f), float(t)
+                    best_f = float(f)
 
-            # AUPR: compute_term_aupr typically accepts scores (not necessarily probs)
             aupr = compute_term_aupr(y_true_np, y_pred)
             return float(best_f), float(aupr)
 
@@ -2003,7 +1998,6 @@ class OppTrainer:
         logs["seen_fmax"], logs["seen_aupr"] = _finish_fmax_aupr(preds_seen, trues_seen)
         logs["rare_fmax"], logs["rare_aupr"] = _finish_fmax_aupr(preds_rare, trues_rare)
 
-        # ---- finalize retrieval metrics
         if sum_num > 0:
             logs["align_R@1"] = sum_R1 / sum_num
             logs["align_R@5"] = sum_R5 / sum_num
@@ -2014,7 +2008,6 @@ class OppTrainer:
             logs["align_MRR"] = sum_MRR / sum_num
             logs["align_nDCG@10"] = sum_nDCG / sum_num
 
-        # ---- finalize unseen recall
         if sum_unseen_num > 0:
             logs["unseen_R@10"] = sum_unseen_R10 / sum_unseen_num
             logs["unseen_R@50"] = sum_unseen_R50 / sum_unseen_num
@@ -2024,7 +2017,6 @@ class OppTrainer:
             logs["unseen_R@50"] = 0.0
             logs["unseen_num"] = 0
 
-        # ---- finalize ancestor recall
         if sum_anc_num > 0:
             logs["anc_R@10"] = sum_anc_R10 / sum_anc_num
             logs["anc_R@50"] = sum_anc_R50 / sum_anc_num
