@@ -230,9 +230,6 @@ def build_stores(args):
     logger = logging.getLogger("build_stores")
     logger.info("Building residue+fused stores (lazy, no snapshot)...")
 
-    # 1) seq len lookup
-    seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
-
     # 3) embed dirs
     embed_dir_res = getattr(args, "embed_dir_res", None)
     # 4) toggles
@@ -247,7 +244,6 @@ def build_stores(args):
     # 5) Build residue
     res_store = ESMResidueStore(
         embed_dir=embed_dir_res,
-        seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
         prefer_fp16=args.fp16,
