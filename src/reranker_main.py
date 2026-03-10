@@ -666,15 +666,15 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         grad_clip_norm=training.get("grad_clip_norm", None),
 
         # stores
-        train_ids_path=str(stores.get("train_ids_path", "")),
-        pid2pos=str(stores.get("pid2pos_path", "")),
-        val_ids_path=str(stores.get("val_ids_path", "")),
-        embed_dir_res=str(stores.get("embed_dir_res", "")),
-        embed_dir_fused=str(stores.get("embed_dir_fused", "")),
-        seq_len_lookup_dir=str(stores.get("seq_len_lookup_dir", "")),
-        go_text_folder=str(stores.get("go_text_folder", "")),
-        dag_parents_path=str(stores.get("dag_parents_path", "")),
-        go_cache_path=str(stores.get("go_cache_path", "")),
+        train_ids_path=Path(stores.get("train_ids_path", "")),
+        pid2pos=Path(stores.get("pid2pos_path", "")),
+        val_ids_path=Path(stores.get("val_ids_path", "")),
+        embed_dir_res=Path(stores.get("embed_dir_res", "")),
+        embed_dir_fused=Path(stores.get("embed_dir_fused", "")),
+        seq_len_lookup_dir=Path(stores.get("seq_len_lookup_dir", "")),
+        go_text_folder=Path(stores.get("go_text_folder", "")),
+        dag_parents_path=Path(stores.get("dag_parents_path", "")),
+        go_cache_path=Path(stores.get("go_cache_path", "")),
 
         # data
         max_len=int(data.get("protein_max_len", 1024)),
