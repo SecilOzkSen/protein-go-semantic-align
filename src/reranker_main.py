@@ -708,7 +708,7 @@ def main(phase_id: int = -2):
         device=str(device),
         max_length=512,
         enable_lora=True,
-        use_special_tokens=True,
+        use_special_tokens=False,
         lora_parameters=lora_params,
         gradient_checkpointing=False,
     )
