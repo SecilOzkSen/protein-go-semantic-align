@@ -1,6 +1,15 @@
 model:
   text_model_name: microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext
   protein_dim: 1280
+  reranker_hidden_dim: 512
+  reranker_dropout: 0.1
+  freeze_text_encoder: true
+  use_protein_ln: true
+  use_go_ln: true
+  use_go_token_align_pooler: true
+  go_align_attn_dim: 256
+  go_align_dropout: 0.1
+  use_go_residual: true
 
 data:
   protein_max_len: 1024
@@ -8,27 +17,28 @@ data:
   fs_target_ratio: 0.3
 
 training:
-  retriever_ckpt: /workspace/checkpoints/checkpoint_epoch10.pt
+  retriever_ckpt: /workspace/retriever_checkpoints/checkpoint_A1_best.pt
   device: cuda
   fp16: true
   topk: 200
-  batch_size: 16
+  batch_size: 4
   epochs: 10
   lr: 2e-4
   weight_decay: 0.01
-  log_every: 500
-  eval_every: 2000
-  save_metric: "fmax"
+  log_every: 50
+  eval_every: 500
+  save_metric: "fmax_full"
+  out_dir: /workspace/protein-go-align/outputs/reranker/run-1
+  use_dag_loss: false
+  lambda_dag: 0.05
+  dag_margin: 0.0
+  grad_clip_norm: 1.0
 
 stores:
-  out_dir: /workspace/protein-go-align/outputs/reranker/run-1
-  train_ids_path: /workspace/data/training_ready/proteins/protein_train_ids.txt
-  pid2pos_path: /workspace/data/training_ready/proteins/pid_to_positives.json #pid_to_positives_canonical
-  val_ids_path: /workspace/data/training_ready/proteins/protein_val_ids.txt
-
-  embed_dir_res: /workspace/protein/residues
-  embed_dir_fused: /workspace/protein/fused
-
-  seq_len_lookup_dir: /workspace/data/training_ready/proteins/seq_len_lookup.pkl
-  protein_manifest_file: /workspace/data/training_ready/manifest_cache/esm_manifest.pkl
-  go_text_folder: /workspace/data/processed/go_terms/canonical2
+  train_ids_path: /workspace/data/splits/train_ids.txt
+  pid2pos_path: /workspace/data/pid_to_positives_canonical.json
+  val_ids_path: /workspace/data/splits/val_ids.txt
+  embed_dir_res: /workspace/protein/residues/embeddings_1b_npy
+  seq_len_lookup_dir: /workspace/data/seq_len_lookup.pkl
+  go_text_folder: /workspace/data
+  dag_parents_path: /workspace/data/go_parents.json
