@@ -827,6 +827,18 @@ def main(phase_id: int = -2):
             )
 
             labels = make_labels_for_candidates(cand_ids, pos_go_global)
+
+            dag_parent_mask = make_dag_parent_mask_for_candidates(
+                cand_ids=cand_ids,
+                go_child_to_parents=go_child_to_parents,
+            )
+            toks = tokenize_candidates_flat(go_text_store, cand_ids)
+            go_input_ids = toks["input_ids"].to(device, non_blocking=True)
+            go_attention_mask = toks["attention_mask"].to(device, non_blocking=True)
+
+            B, K = cand_ids.shape
+            cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
+
             if step < 5 or step % 50 == 0:
                 pos_counts = []
                 for b in range(len(pos_go_global)):
@@ -849,17 +861,6 @@ def main(phase_id: int = -2):
                     ex_cand = cand_ids[0].detach().cpu().tolist()
                     logging.info("[debug] first pos sample=%s", ex_pos[:10])
                     logging.info("[debug] first cand sample=%s", ex_cand[:10])
-            dag_parent_mask = make_dag_parent_mask_for_candidates(
-                cand_ids=cand_ids,
-                go_child_to_parents=go_child_to_parents,
-            )
-
-            toks = tokenize_candidates_flat(go_text_store, cand_ids)
-            go_input_ids = toks["input_ids"].to(device, non_blocking=True)
-            go_attention_mask = toks["attention_mask"].to(device, non_blocking=True)
-
-            B, K = cand_ids.shape
-            cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
 
             rr_batch = dict(
                 H=H,
