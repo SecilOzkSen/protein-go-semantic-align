@@ -827,6 +827,28 @@ def main(phase_id: int = -2):
             )
 
             labels = make_labels_for_candidates(cand_ids, pos_go_global)
+            if step < 5 or step % 50 == 0:
+                pos_counts = []
+                for b in range(len(pos_go_global)):
+                    pos_set = set(int(x) for x in
+                                  (pos_go_global[b].detach().cpu().tolist() if pos_go_global[b] is not None else []))
+                    cand_set = set(int(x) for x in cand_ids[b].detach().cpu().tolist())
+                    pos_counts.append(len(pos_set & cand_set))
+
+                logging.info(
+                    "[debug] step=%d label_sum=%.1f avg_pos_in_topk=%.3f max_pos_in_topk=%d cand_valid=%d",
+                    step,
+                    float(labels.sum().item()),
+                    float(sum(pos_counts) / max(1, len(pos_counts))),
+                    int(max(pos_counts) if pos_counts else 0),
+                    int(cand_valid.sum().item()),
+                )
+
+                if len(pos_go_global) > 0:
+                    ex_pos = pos_go_global[0].detach().cpu().tolist() if pos_go_global[0] is not None else []
+                    ex_cand = cand_ids[0].detach().cpu().tolist()
+                    logging.info("[debug] first pos sample=%s", ex_pos[:10])
+                    logging.info("[debug] first cand sample=%s", ex_cand[:10])
             dag_parent_mask = make_dag_parent_mask_for_candidates(
                 cand_ids=cand_ids,
                 go_child_to_parents=go_child_to_parents,
