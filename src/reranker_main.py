@@ -740,7 +740,7 @@ def main(phase_id: int = -2):
         raise RuntimeError("retriever.go_encoder is None. Provide GO encoder or change build_eval_G_once logic.")
 
     res_store, fused_store = build_stores(args)
-    go_cache = build_go_cache(go_index_paths(phase_id)["TEXT_EMB"])
+    go_cache = build_go_cache(str(args.go_cache_path))
 
     if getattr(args, "dag_parents_path", ""):
         go_child_to_parents = load_child_to_parents_json(args.dag_parents_path)
