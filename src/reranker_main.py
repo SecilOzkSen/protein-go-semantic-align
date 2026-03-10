@@ -308,11 +308,9 @@ def build_reranker_dataloaders(datasets, args, eval_go_ids: List[int]) -> Tuple[
     val_ds = datasets["val"]
 
     collate = ContrastiveEmbCollator(
-        go_lookup=lambda ids: torch.zeros(len(ids), 1),
         zs_mask_vec=torch.ones(len(eval_go_ids), dtype=torch.bool),
         bidirectional=False,
         go_text_store=None,
-        faiss_miner=None,
         neg_k=0,
         device=torch.device("cpu"),
     )
