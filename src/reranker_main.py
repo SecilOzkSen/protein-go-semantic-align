@@ -13,7 +13,6 @@ from torch.utils.data import DataLoader
 import yaml
 import types
 
-from datasets import go_text_store
 # Retriever
 from src.models.alignment_model import ProteinGoAligner
 from src.encoders.go_encoder import BioMedBERTEncoder, LoRAParameters
@@ -22,6 +21,7 @@ from src.encoders.go_encoder import BioMedBERTEncoder, LoRAParameters
 from src.training.reranker_trainer import RerankerTrainer
 from src.models.reranker_model import RerankerMeanPoolConcatMLP
 from src.datasets.go_text_store import GoTextStore
+
 # dataset + collator
 from src.training.collate import ContrastiveEmbCollator
 from src.configs.paths import SRC_DIR, go_index_paths
@@ -302,7 +302,7 @@ def load_id_list(path: str) -> List[int]:
     return out
 
 
-def build_reranker_dataloaders(datasets, args, eval_go_ids: List[int]) -> Tuple[DataLoader, DataLoader]:
+def build_reranker_dataloaders(datasets, args, eval_go_ids: List[int], go_text_store) -> Tuple[DataLoader, DataLoader]:
     logger = logging.getLogger("build_dataloaders")
 
     train_ds = datasets["train"]
@@ -772,7 +772,7 @@ def main(phase_id: int = -2):
     )
     print(f"[main] G_once_cpu={tuple(G_once_cpu.shape)}")
 
-    train_loader, val_loader = build_reranker_dataloaders(datasets, args, eval_go_ids)
+    train_loader, val_loader = build_reranker_dataloaders(datasets=datasets, args=args, eval_go_ids=eval_go_ids, go_text_store=go_text_store)
 
     reranker_model = RerankerMeanPoolConcatMLP(
         text_model_name=args.text_model_name,
