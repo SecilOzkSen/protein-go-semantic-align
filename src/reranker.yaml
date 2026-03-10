@@ -43,3 +43,8 @@ stores:
   go_text_folder: /workspace/data
   dag_parents_path: /workspace/data/go_parents.json
   go_cache_path: /workspace/data/go_embeddings/raw/go_text_embeddings_canonical.npy
+  go_basic_json: /workspace/data/go_vocab.json
+  zero_shot_path: /workspace/data/eval/buckets/count_based/go_eval_ids_zeroshot.pkl
+  few_shot_path: /workspace/data/eval/buckets/count_based/go_eval_ids_rare_lt20.pkl
+  go_path_seen: /workspace/data/eval/go_eval_ids_seen.pkl # training seen
+  go_path_observed: /workspace/data/eval/go_eval_ids_observed.pkl # train+val+test seen at once.

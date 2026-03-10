@@ -675,6 +675,11 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         go_text_folder=Path(stores.get("go_text_folder", "")),
         dag_parents_path=Path(stores.get("dag_parents_path", "")),
         go_cache_path=Path(stores.get("go_cache_path", "")),
+        go_basic_json=Path(stores.get("go_basic_json", "")),
+        zero_shot_path=Path(stores.get("zero_shot_path", "")),
+        few_shot_path=Path(stores.get("few_shot_path", "")),
+        go_path_seen=Path(stores.get("go_path_seen", "")),
+        go_path_observed=Path(stores.get("go_path_observed", "")),
 
         # data
         max_len=int(data.get("protein_max_len", 1024)),
