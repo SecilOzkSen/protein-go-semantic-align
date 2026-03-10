@@ -749,7 +749,7 @@ def main(phase_id: int = -2):
         go_child_to_parents = {}
         logging.warning("[main] dag_parents_path not set, DAG loss will stay inactive.")
 
-    datasets = build_datasets(args, res_store, fused_store, go_cache)
+    datasets = build_datasets(args, res_store, go_text_store)
 
     text_ids = set(int(x) for x in go_id_to_text[phase_id].keys())
     cache_ids = [int(x) for x in go_cache.row2id]

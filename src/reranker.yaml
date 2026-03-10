@@ -42,3 +42,4 @@ stores:
   seq_len_lookup_dir: /workspace/data/seq_len_lookup.pkl
   go_text_folder: /workspace/data
   dag_parents_path: /workspace/data/go_parents.json
+  go_cache_path: /workspace/data/go_embeddings/raw/go_text_embeddings_canonical.npy
