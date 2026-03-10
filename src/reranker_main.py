@@ -725,7 +725,7 @@ def main(phase_id: int = -2):
         d_z=768,
         go_encoder=go_encoder,
         normalize=True,
-        mean_pool=False,
+        protein_pool_type="attn"
     ).to(device)
 
     ckpt = safe_torch_load(args.retriever_ckpt, map_location="cpu")
