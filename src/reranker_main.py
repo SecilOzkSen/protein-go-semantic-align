@@ -739,7 +739,7 @@ def main(phase_id: int = -2):
     if getattr(retriever, "go_encoder", None) is None:
         raise RuntimeError("retriever.go_encoder is None. Provide GO encoder or change build_eval_G_once logic.")
 
-    res_store, fused_store = build_stores(args)
+    res_store = build_stores(args)
     go_cache = build_go_cache(str(args.go_cache_path))
 
     if getattr(args, "dag_parents_path", ""):
