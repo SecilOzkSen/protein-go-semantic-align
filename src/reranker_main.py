@@ -674,6 +674,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         seq_len_lookup_dir=str(stores.get("seq_len_lookup_dir", "")),
         go_text_folder=str(stores.get("go_text_folder", "")),
         dag_parents_path=str(stores.get("dag_parents_path", "")),
+        go_cache_path=str(stores.get("go_cache_path", "")),
 
         # data
         max_len=int(data.get("protein_max_len", 1024)),
