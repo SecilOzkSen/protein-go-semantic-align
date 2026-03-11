@@ -760,6 +760,37 @@ def main(phase_id: int = -2):
     cache_ids = [int(x) for x in go_cache.row2id]
     eval_go_ids = [g for g in cache_ids if g in text_ids]
 
+    eval_go_id_set = set(int(x) for x in eval_go_ids)
+
+    sample_total_pos = 0
+    sample_pos_in_eval = 0
+
+    for ds_name in ["train", "val"]:
+        ds = datasets[ds_name]
+        upper = min(len(ds), 500)
+
+        for i in range(upper):
+            item = ds[i]
+            pos = item.get("pos_go_global", None)
+
+            if pos is None:
+                continue
+
+            if torch.is_tensor(pos):
+                pos_list = [int(x) for x in pos.tolist()]
+            else:
+                pos_list = [int(x) for x in pos]
+
+            sample_total_pos += len(pos_list)
+            sample_pos_in_eval += sum(1 for x in pos_list if x in eval_go_id_set)
+
+    logging.info(
+        "[debug-coverage] total_pos=%d pos_in_eval=%d frac=%.4f",
+        sample_total_pos,
+        sample_pos_in_eval,
+        sample_pos_in_eval / max(1, sample_total_pos),
+    )
+
     print(f"[main] cache_ids={len(cache_ids)} text_ids={len(text_ids)} eval_go_ids(intersect)={len(eval_go_ids)}")
     assert len(eval_go_ids) > 0
 
