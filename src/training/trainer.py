@@ -897,30 +897,35 @@ class OppTrainer:
         """
         H: [B,T,Dh]
         attn_valid: [B,T] bool True=valid
-        Return: q [B,Dz] (same space as GO vectors)
+        Return: q [B,Dz] (GO-independent protein query for queue mining)
+
+        Note:
+          If model.protein_pool_type == "go_align", we still need a single
+          protein-level query for mining. Since go_align is GO-conditioned,
+          we fall back to a GO-independent pooled protein representation here.
         """
         if attn_valid is not None and attn_valid.dtype != torch.bool:
             attn_valid = attn_valid != 0
 
-        if self.model.protein_pool_type == "mean":
+        # For queue mining we always need a single GO-independent query.
+        if self.model.protein_pool_type in {"mean", "go_align"}:
             if attn_valid is not None:
                 w = attn_valid.to(H.dtype).unsqueeze(-1)
                 denom = w.sum(dim=1).clamp_min(1.0)
                 h_pool = (H * w).sum(dim=1) / denom
             else:
                 h_pool = H.mean(dim=1)
+
         elif self.model.protein_pool_type == "attn":
             h_pool, _ = self.model.protein_attn_pool(H, attn_valid)
+
         else:
             raise ValueError(f"Unsupported protein_pool_type: {self.model.protein_pool_type}")
 
-        # 2) LN after pool (match forward mean_pool path)
+        # same LN + projection path
         h_pool = self.model.protein_ln(h_pool)  # [B,Dh]
-
-        # 3) same projection head
         q = self.model.proj_p(h_pool)  # [B,Dz]
 
-        # 4) same normalization rule as scoring
         if getattr(self.model, "normalize", False):
             q = self.model._norm(q, dim=-1)
 
