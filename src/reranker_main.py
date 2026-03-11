@@ -621,6 +621,80 @@ def evaluate_reranker(
 
     return out
 
+def inject_true_positives_into_candidates(
+    cand_ids: torch.Tensor,                 # [B,K] CPU
+    pos_go_global: List[torch.Tensor],      # list of [Pi]
+    inject_n: int = 3,
+) -> torch.Tensor:
+    """
+    Train-time only:
+    Add up to inject_n missing true GO ids into candidate set for each protein.
+    Keeps output shape [B,K] by replacing tail entries.
+    """
+    cand_cpu = cand_ids.detach().cpu().clone()
+    B, K = cand_cpu.shape
+
+    for b in range(B):
+        pos = pos_go_global[b]
+        if pos is None or pos.numel() == 0:
+            continue
+
+        orig_row = [int(x) for x in cand_cpu[b].tolist()]
+        row_set = set(orig_row)
+
+        pos_list = [int(x) for x in pos.detach().cpu().tolist()]
+        pos_in = [g for g in pos_list if g in row_set]
+        missing_pos = [g for g in pos_list if g not in row_set]
+
+        if len(missing_pos) == 0:
+            continue
+
+        # dynamic injection rule
+        if len(pos_in) == 0:
+            inject = missing_pos[:inject_n]
+        elif len(pos_in) == 1:
+            inject = missing_pos[:max(0, inject_n - 1)]
+        else:
+            inject = []
+
+        if len(inject) == 0:
+            continue
+
+        # Replace tail positions
+        row = orig_row[:]
+        replace_positions = list(range(K - len(inject), K))
+        for j, g in zip(replace_positions, inject):
+            row[j] = int(g)
+
+        # Deduplicate while preserving order
+        new_row = []
+        seen = set()
+        for g in row:
+            if g not in seen:
+                new_row.append(g)
+                seen.add(g)
+
+        # Refill from original row if dedup made it shorter
+        for g in orig_row:
+            if len(new_row) >= K:
+                break
+            if g not in seen:
+                new_row.append(g)
+                seen.add(g)
+
+        # Final safety, should almost never trigger
+        if len(new_row) < K:
+            for g in pos_list:
+                if len(new_row) >= K:
+                    break
+                if g not in seen:
+                    new_row.append(g)
+                    seen.add(g)
+
+        cand_cpu[b] = torch.tensor(new_row[:K], dtype=torch.long)
+
+    return cand_cpu
+
 
 # -----------------------------
 # Config
@@ -860,6 +934,13 @@ def main(phase_id: int = -2):
                 topk=int(args.topk),
                 device=device,
                 chunk_k=2048,
+            )
+
+            # train-time positive injection
+            cand_ids = inject_true_positives_into_candidates(
+                cand_ids=cand_ids,
+                pos_go_global=pos_go_global,
+                inject_n=3,
             )
 
             labels = make_labels_for_candidates(cand_ids, pos_go_global)

@@ -993,10 +993,20 @@ class OppTrainer:
         for g in batch_global_pos:
             parents = dag_parents.get(int(g), [])
             for p_item in parents:
-                parent_id = int(p_item)
-                sibs = dag_children.get(int(parent_id), [])
+                # p_item can be (parent_id, rel) or just parent_id
+                if isinstance(p_item, (list, tuple)):
+                    parent_id = int(p_item[0])
+                else:
+                    parent_id = int(p_item)
+
+                sibs = dag_children.get(parent_id, [])
                 for sib_item in sibs:
-                    sib = int(sib_item[0])
+                    # sib_item can be (child_id, rel) or just child_id
+                    if isinstance(sib_item, (list, tuple)):
+                        sib = int(sib_item[0])
+                    else:
+                        sib = int(sib_item)
+
                     if sib in batch_global_pos:
                         continue
                     if sib in structured_set:
