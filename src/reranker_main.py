@@ -308,6 +308,11 @@ def build_reranker_dataloaders(datasets, args, eval_go_ids: List[int], go_text_s
     train_ds = datasets["train"]
     val_ds = datasets["val"]
 
+    sample0 = train_ds[0]
+    print("train_ds[0] keys:", sample0.keys() if isinstance(sample0, dict) else type(sample0))
+    print("train_ds[0].get('pos_go_global'):",
+          sample0.get("pos_go_global", None) if isinstance(sample0, dict) else None)
+
     collate = ContrastiveEmbCollator(
         zs_mask_vec=torch.ones(len(eval_go_ids), dtype=torch.bool),
         go_text_store=go_text_store,
@@ -869,6 +874,11 @@ def main(phase_id: int = -2):
 
             B, K = cand_ids.shape
             cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
+
+            if step == 0:
+                logging.info("[debug-batch-keys] %s", list(batch.keys()))
+                logging.info("[debug-pos-type] %s", type(batch.get("pos_go_global", None)))
+                logging.info("[debug-pos-value] %s", batch.get("pos_go_global", None))
 
             if step < 5 or step % 50 == 0:
                 pos_counts = []
