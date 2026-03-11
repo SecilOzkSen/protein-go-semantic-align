@@ -545,6 +545,8 @@ class OppTrainer:
         self._eval_cols_unseen = None
         self._current_uniq_go_ids_for_shortlist = None
 
+        self.hard_frac_queue = cfg.hard_frac_queue
+
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
@@ -959,6 +961,80 @@ class OppTrainer:
         valid = torch.ones(B, Kq, device=device, dtype=torch.bool)
         return raw_sel, valid
 
+    def _collect_structured_negatives(
+            self,
+            batch_global_pos: set[int],
+            need: int,
+    ) -> list[int]:
+        """
+        Build structured negatives from:
+          1) siblings via parent->children
+          2) same-namespace GO terms
+
+        Returns:
+          list of global GO ids
+        """
+        if need <= 0:
+            return []
+
+        dag_parents = getattr(self.ctx, "dag_parents", {}) or {}
+        dag_children = getattr(self.ctx, "dag_children", {}) or {}
+        go_ns = getattr(self.ctx, "go_namespace_map", {}) or {}
+
+        structured = []
+        structured_set = set()
+
+        # ---- 1) sibling negatives ----
+        for g in batch_global_pos:
+            parents = dag_parents.get(int(g), [])
+            for p_item in parents:
+                parent_id = int(p_item)
+                sibs = dag_children.get(int(parent_id), [])
+                for sib_item in sibs:
+                    sib = int(sib_item[0])
+                    if sib in batch_global_pos:
+                        continue
+                    if sib in structured_set:
+                        continue
+                    structured.append(sib)
+                    structured_set.add(sib)
+                    if len(structured) >= need:
+                        return structured
+
+        # ---- 2) same-namespace negatives ----
+        pos_namespaces = set()
+        for g in batch_global_pos:
+            ns = go_ns.get(int(g), None)
+            if ns is not None:
+                pos_namespaces.add(ns)
+
+        if len(structured) < need and len(pos_namespaces) > 0:
+            seen_go_ids = getattr(self, "_eval_seen_go_ids_cpu", None)
+            if seen_go_ids is not None:
+                if torch.is_tensor(seen_go_ids):
+                    pool_ids = [int(x) for x in seen_go_ids.tolist()]
+                else:
+                    pool_ids = [int(x) for x in seen_go_ids]
+
+                ns_pool = [
+                    gid for gid in pool_ids
+                    if gid not in batch_global_pos
+                       and gid not in structured_set
+                       and go_ns.get(int(gid), None) in pos_namespaces
+                ]
+
+                if len(ns_pool) > 0:
+                    # randomize a bit
+                    perm = torch.randperm(len(ns_pool)).tolist()
+                    for idx in perm:
+                        gid = int(ns_pool[idx])
+                        structured.append(gid)
+                        structured_set.add(gid)
+                        if len(structured) >= need:
+                            break
+
+        return structured
+
     @torch.no_grad()
     def _mine_queue_hard_neg_ids(self, prot_query, pos_local, uniq_go_ids):
         """
@@ -1166,47 +1242,61 @@ class OppTrainer:
 
             # batch global positive ids
             batch_global_pos = set()
-            if hasattr(self,
-                       "_current_uniq_go_ids_for_shortlist") and self._current_uniq_go_ids_for_shortlist is not None:
+            if hasattr(self, "_current_uniq_go_ids_for_shortlist") and self._current_uniq_go_ids_for_shortlist is not None:
                 uniq_go_ids = self._current_uniq_go_ids_for_shortlist
                 if torch.is_tensor(uniq_go_ids):
                     batch_global_pos.update(int(x) for x in uniq_go_ids.detach().cpu().tolist())
                 else:
                     batch_global_pos.update(int(x) for x in uniq_go_ids)
 
-            # seen GO global id pool, must be set on trainer beforehand
-            seen_go_ids = getattr(self, "_eval_seen_go_ids_cpu", None)
-            if seen_go_ids is not None:
-                if torch.is_tensor(seen_go_ids):
-                    pool_ids = [int(x) for x in seen_go_ids.tolist()]
-                else:
-                    pool_ids = [int(x) for x in seen_go_ids]
+            chosen = []
 
-                # exclude current batch positives
-                pool_ids = [g for g in pool_ids if g not in batch_global_pos]
+            # ---- 1) structured negatives: siblings + same namespace ----
+            structured = self._collect_structured_negatives(
+                batch_global_pos=batch_global_pos,
+                need=need,
+            )
+            chosen.extend(structured)
 
-                if len(pool_ids) > 0 and need > 0:
-                    if len(pool_ids) > need:
-                        perm = torch.randperm(len(pool_ids))[:need]
-                        chosen = [pool_ids[i] for i in perm.tolist()]
+            # ---- 2) fallback random seen negatives ----
+            remain = need - len(chosen)
+            if remain > 0:
+                seen_go_ids = getattr(self, "_eval_seen_go_ids_cpu", None)
+                if seen_go_ids is not None:
+                    if torch.is_tensor(seen_go_ids):
+                        pool_ids = [int(x) for x in seen_go_ids.tolist()]
                     else:
-                        chosen = pool_ids
+                        pool_ids = [int(x) for x in seen_go_ids]
 
-                    # global GO ids -> go_cache rows
-                    rows = []
-                    for gid in chosen:
-                        row = self.ctx.go_cache.id2row.get(int(gid), None)
-                        if row is not None:
-                            rows.append(int(row))
+                    chosen_set = set(chosen)
+                    pool_ids = [
+                        g for g in pool_ids
+                        if g not in batch_global_pos and g not in chosen_set
+                    ]
 
-                    if len(rows) > 0:
-                        rows_t = torch.tensor(rows, dtype=torch.long, device=self.ctx.go_cache.embs.device)
-                        extra_raw_negs = self.ctx.go_cache.embs.index_select(0, rows_t).to(
-                            device=device,
-                            dtype=uniq_go_embs.dtype,
-                            non_blocking=True
-                        ).contiguous()
-                        extra_n = int(extra_raw_negs.size(0))
+                    if len(pool_ids) > 0:
+                        if len(pool_ids) > remain:
+                            perm = torch.randperm(len(pool_ids))[:remain]
+                            extra = [pool_ids[i] for i in perm.tolist()]
+                        else:
+                            extra = pool_ids
+                        chosen.extend(extra)
+
+            # global GO ids -> go_cache rows
+            rows = []
+            for gid in chosen:
+                row = self.ctx.go_cache.id2row.get(int(gid), None)
+                if row is not None:
+                    rows.append(int(row))
+
+            if len(rows) > 0:
+                rows_t = torch.tensor(rows, dtype=torch.long, device=self.ctx.go_cache.embs.device)
+                extra_raw_negs = self.ctx.go_cache.embs.index_select(0, rows_t).to(
+                    device=device,
+                    dtype=uniq_go_embs.dtype,
+                    non_blocking=True
+                ).contiguous()
+                extra_n = int(extra_raw_negs.size(0))
 
         # --------------------------------------------------
         # 3) Queue negatives
@@ -1256,6 +1346,9 @@ class OppTrainer:
                 cand_valid_mask[:, s:e] = neg_valid_from_queue.to(device)
             if neg_raw_from_queue is not None:
                 U = s
+
+        if getattr(self, "_global_step", 0) % 200 == 0:
+            print(f"[DBG-NEG] U={U} extra_n={extra_n} kq={kq} K={K}")
 
         return G_cand, pos_mask, cand_valid_mask, U, kq
 

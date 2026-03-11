@@ -3,6 +3,10 @@ import os
 import json
 from pathlib import Path
 import pickle
+
+from configs.paths import GO_VOCAB
+
+
 def load_raw_json(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -177,6 +181,21 @@ def go_str_to_int_any(x) -> int:
         if s.upper().startswith("GO:"):
             return int(s.split(":")[1])
         return int(s)
+
+def load_go_namespaces() -> dict[int, str]:
+    with open(GO_VOCAB, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    out = {}
+    for k, v in raw.items():
+        gid = go_str_to_int_any(k)
+        if isinstance(v, dict):
+            ns = v.get("namespace", None)
+        else:
+            ns = None
+        if ns is not None:
+            out[gid] = str(ns)
+    return out
 
 def build_altid_map_from_go_terms(go_terms: dict) -> dict[int, int]:
     """

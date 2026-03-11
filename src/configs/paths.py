@@ -129,6 +129,7 @@ def go_index_paths(phase: int) -> dict[str, Path]:
 # GO helpers
 GO_PARENTS  = DATA_DIR / "go_parents.json"
 GO_CHILDREN = DATA_DIR / "go_children.json"
+GO_VOCAB    = DATA_DIR / "go_vocab.json"
 GO_ANCESTOR_STOPLIST = TRAINING_READY / "go_dag" / "ancestor_stoplist.txt"
 
 # PROTEINS

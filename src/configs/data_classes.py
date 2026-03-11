@@ -204,6 +204,7 @@ class TrainingContext:
     go_cache: Any
     dag_parents: Optional[dict] = None
     dag_children: Optional[dict] = None
+    go_namespace_map: Optional[dict] = None
     scheduler: Any = None
     device: Any = "cpu"
     schedule: Any = None
@@ -282,3 +283,4 @@ class TrainerConfig:
     queue_start_step: int = 0
     queue_weight: float = 0.25
     max_inbatch: int = 64
+    hard_frac_queue: float = 0.8

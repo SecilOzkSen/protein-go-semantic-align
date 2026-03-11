@@ -16,7 +16,7 @@ general: #Ablation Purposes
   use_lora: True #CHECKED
   use_attribution_loss: False #CHECKED
   return_alpha: False
-  protein_pooling_strategy: "attn" #  Protein pooling strategy "attn" or "mean"
+  protein_pooling_strategy: "go_align" #  Protein pooling strategy "attn" or "mean" or "go_align"
 
 training:
   epochs: 15
@@ -53,9 +53,10 @@ training:
   go_pooling: "none" # cls, mean, masked_mean -> NO NEED
   eval_space: "observed" #seen -> # observed: all go must be included to make evaluation reliable.
   # eval space: observed = observed go ids. train+val+test seen once.
-  queue_start_step : 3000
+  queue_start_step : 500
   queue_weight: 1.0
   max_inbatch: 160
+  hard_frac_queue: 0.8
 
 optim:
   lr: 0.0001

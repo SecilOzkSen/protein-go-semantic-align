@@ -4,6 +4,7 @@ from typing import Optional
 
 from src.models.projection import ProjectionHead
 from src.encoders import BioMedBERTEncoder
+from src.models.go_token_align_pooler import GoTokenAlignPooler
 
 
 class AttentionPool1D(nn.Module):
@@ -36,11 +37,11 @@ class ProteinGoAligner(nn.Module):
         d_z: int = 768,
         go_encoder: Optional[BioMedBERTEncoder] = None,
         normalize: bool = True,
-        protein_pool_type: str = "mean",   # "mean" | "attn"
+        protein_pool_type: str = "mean",   # "mean" | "attn" | "go_align"
     ):
         super().__init__()
 
-        if protein_pool_type not in {"mean", "attn"}:
+        if protein_pool_type not in {"mean", "attn", "go_align"}:
             raise ValueError(f"Unsupported protein_pool_type: {protein_pool_type}")
 
         self.normalize = bool(normalize)
@@ -51,6 +52,15 @@ class ProteinGoAligner(nn.Module):
             d_g = int(self.go_encoder.model.config.hidden_size)
         if d_g is None:
             raise ValueError("d_g must be provided if go_encoder is None.")
+
+        self.go_token_align_pooler = None
+        if self.protein_pool_type == "go_align":
+            self.go_token_align_pooler = GoTokenAlignPooler(
+                d_h=d_h,
+                d_g=d_g,
+                d_att=256,
+                dropout=0.05,
+            )
 
         self.protein_attn_pool = AttentionPool1D(d_h, dropout=0.05)
 
@@ -84,7 +94,7 @@ class ProteinGoAligner(nn.Module):
 
         alpha_info = {}
 
-        # Protein pooling
+        # Protein side -> build Z directly
         if self.protein_pool_type == "mean":
             if mask is not None:
                 w = mask.to(H.dtype).unsqueeze(-1)          # [B, T, 1]
@@ -93,13 +103,23 @@ class ProteinGoAligner(nn.Module):
             else:
                 h_pool = H.mean(dim=1)                      # [B, Dh]
 
-        else:  # "attn"
+            h_pool = self.protein_ln(h_pool)                # [B, Dh]
+            Z = h_pool.unsqueeze(1).expand(B, K, Dh)        # [B, K, Dh]
+
+        elif self.protein_pool_type == "attn":
             h_pool, attn = self.protein_attn_pool(H, mask)  # [B, Dh], [B, T]
+            h_pool = self.protein_ln(h_pool)                # [B, Dh]
+            Z = h_pool.unsqueeze(1).expand(B, K, Dh)        # [B, K, Dh]
+
             if return_alpha:
                 alpha_info["protein_attn"] = attn
 
-        h_pool = self.protein_ln(h_pool)                    # [B, Dh]
-        Z = h_pool.unsqueeze(1).expand(B, K, Dh)            # [B, K, Dh]
+        else:  # "go_align"
+            Z, gtap_alpha = self.go_token_align_pooler(H, G, mask, return_alpha=return_alpha)  # [B, K, Dh]
+            Z = self.protein_ln(Z)  # LayerNorm works on last dim
+
+            if return_alpha:
+                alpha_info.update(gtap_alpha)
 
         # GO side
         G = self.go_ln(G)                                   # [B, K, Dg]

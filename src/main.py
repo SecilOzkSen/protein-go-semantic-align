@@ -24,7 +24,7 @@ from src.datasets import ESMResidueStore, GoTextStore
 from src.datasets.protein_dataset import ProteinEmbDataset
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
-from src.utils.helpers import normalize_go_str, _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict, build_altid_map_from_go_terms, canonicalize_id_list, canonicalize_pid2pos, go_str_to_int_any
+from src.utils.helpers import _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict, build_altid_map_from_go_terms, canonicalize_id_list, canonicalize_pid2pos, go_str_to_int_any, load_go_namespaces
 from src.configs.data_classes import (
     FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
 )
@@ -917,6 +917,7 @@ def run_training(args):
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
+        go_namespace_map=load_go_namespaces(),
         scheduler=None, #scheduler,
         go_text_store=go_text_store,
         use_queue_miner=bool(args.use_queue_miner),
@@ -988,6 +989,7 @@ def run_training(args):
         queue_start_step=args.queue_start_step,
         queue_weight=args.queue_weight,
         max_inbatch=args.max_inbatch,
+        hard_frac_queue=args.hard_frac_queue,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1368,6 +1370,7 @@ def load_structured_cfg(path: str):
         queue_start_step=int(training.get("queue_start_step", 0)),
         queue_weight=float(training.get("queue_weight", 1)),
         max_inbatch=int(training.get("max_inbatch", 64)),
+        hard_frac_queue=float(training.get("hard_frac_queue", 0.8)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
