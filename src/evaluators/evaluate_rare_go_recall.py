@@ -62,14 +62,13 @@ def strip_prefix_from_state(sd: dict, prefix: str) -> dict:
             out[k] = v
     return out
 
-def load_id_list(path: str) -> List[int]:
-
-    if path.endswith(".json"):
+def load_id_list(path: Path) -> List[int]:
+    if path.name.endswith(".json"):
         with open(path, "r") as f:
             xs = json.load(f)
         return [int(x) for x in xs]
 
-    if path.endswith(".pkl") or path.endswith(".pickle"):
+    if path.name.endswith(".pkl") or path.name.endswith(".pickle"):
         with open(path, "rb") as f:
             xs = pickle.load(f)
         return [int(x) for x in xs]
