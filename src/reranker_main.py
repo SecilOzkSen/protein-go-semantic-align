@@ -913,7 +913,7 @@ def main(phase_id: int = -2):
     out_dir = args.out_dir
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    best = {"fmax": -1.0, "aupr": -1.0}
+    best = {"fmax_full": -1.0, "aupr": -1.0}
     step = 0
 
     for epoch in range(int(args.epochs)):
@@ -961,7 +961,7 @@ def main(phase_id: int = -2):
                 logging.info("[debug-pos-type] %s", type(batch.get("pos_go_global", None)))
                 logging.info("[debug-pos-value] %s", batch.get("pos_go_global", None))
 
-            if step < 5 or step % 50 == 0:
+            if step < 5 or step % 500 == 0:
                 pos_counts = []
                 for b in range(len(pos_go_global)):
                     pos_set = set(int(x) for x in

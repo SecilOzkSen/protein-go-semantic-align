@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Dict, Tuple, Union
 from transformers import AutoModel
 
@@ -139,6 +140,7 @@ class RerankerMeanPoolConcatMLP(nn.Module):
                 p.requires_grad = False
 
         self.use_go_token_align_pooler = bool(use_go_token_align_pooler)
+        self.hidden_dim = int(hidden_dim)
 
         self.pool = MaskedMeanPool()
         self.protein_ln = nn.LayerNorm(d_h) if use_protein_ln else nn.Identity()
@@ -156,8 +158,15 @@ class RerankerMeanPoolConcatMLP(nn.Module):
         else:
             self.go_token_align_pooler = None
 
+        # Project both modalities to a shared scorer space
+        self.prot_proj = nn.Linear(d_h, hidden_dim)
+        self.go_proj = nn.Linear(d_g, hidden_dim)
+
+        # Features: prot, go, |prot-go|, prot*go, cosine
+        scorer_in_dim = hidden_dim * 4 + 1
+
         self.scorer = nn.Sequential(
-            nn.Linear(d_h + d_g, hidden_dim),
+            nn.Linear(scorer_in_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity(),
             nn.Linear(hidden_dim, 1),
@@ -166,9 +175,9 @@ class RerankerMeanPoolConcatMLP(nn.Module):
     def forward(
         self,
         H: torch.Tensor,                       # [B,T,Dh]
-        valid_mask: Optional[torch.Tensor],    # [B,T]
-        go_input_ids: torch.Tensor,            # [B*K,L]
-        go_attention_mask: torch.Tensor,       # [B*K,L]
+        valid_mask: Optional[torch.Tensor],   # [B,T]
+        go_input_ids: torch.Tensor,           # [B*K,L]
+        go_attention_mask: torch.Tensor,      # [B*K,L]
         K: int,
         return_alpha: bool = False,
         **kwargs,
@@ -201,10 +210,18 @@ class RerankerMeanPoolConcatMLP(nn.Module):
 
         go_vec = self.go_ln(go_vec)
 
-        # 4) score
-        x = torch.cat([prot_rep, go_vec], dim=-1)   # [BK, Dh+Dg]
-        s = self.scorer(x).squeeze(-1)              # [BK]
-        logits = s.view(B, K)                       # [B,K]
+        # 4) shared scorer space
+        prot_h = self.prot_proj(prot_rep)           # [BK,H]
+        go_h = self.go_proj(go_vec)                 # [BK,H]
+
+        # 5) richer interaction features
+        diff = torch.abs(prot_h - go_h)             # [BK,H]
+        prod = prot_h * go_h                        # [BK,H]
+        cos = F.cosine_similarity(prot_h, go_h, dim=-1).unsqueeze(-1)  # [BK,1]
+
+        x = torch.cat([prot_h, go_h, diff, prod, cos], dim=-1)         # [BK, 4H+1]
+        s = self.scorer(x).squeeze(-1)                                    # [BK]
+        logits = s.view(B, K)                                             # [B,K]
 
         if return_alpha:
             if alpha is not None:

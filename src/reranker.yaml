@@ -25,7 +25,7 @@ training:
   epochs: 10
   lr: 2e-4
   weight_decay: 0.01
-  log_every: 50
+  log_every: 500
   eval_every: 500
   save_metric: "fmax_full"
   out_dir: /workspace/protein-go-align/outputs/reranker/run-1
