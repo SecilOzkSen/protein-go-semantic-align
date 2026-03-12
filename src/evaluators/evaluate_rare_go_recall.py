@@ -117,7 +117,7 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         overlap=int(data.get("overlap", 128)),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.1)),
         embed_dir_res=Path(stores.get("embed_dir_res", None)),
-        pid2pos_path=Path(stores.get("pid2pos", None)),
+        pid2pos=Path(stores.get("pid2pos_path", None)),
     )
     return args
 
