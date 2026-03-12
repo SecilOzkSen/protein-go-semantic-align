@@ -7,6 +7,7 @@ import pickle
 from pathlib import Path, PosixPath
 from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional
+from src.utils.helpers import go_str_to_int_any
 
 import torch
 import yaml
@@ -66,12 +67,12 @@ def load_id_list(path: Path) -> List[int]:
     if path.name.endswith(".json"):
         with open(path, "r") as f:
             xs = json.load(f)
-        return [int(x) for x in xs]
+        return [go_str_to_int_any(x) for x in xs]
 
     if path.name.endswith(".pkl") or path.name.endswith(".pickle"):
         with open(path, "rb") as f:
             xs = pickle.load(f)
-        return [int(x) for x in xs]
+        return [go_str_to_int_any(x) for x in xs]
 
     # default txt
     out = []
