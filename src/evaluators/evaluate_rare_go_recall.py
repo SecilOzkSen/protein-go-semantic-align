@@ -29,9 +29,9 @@ from src.utils.helpers import load_go_texts_by_phase
 DEFAULT_YAML_PATH = SRC_DIR / "reranker.yaml"
 PHASE_ID = -2
 TOPK = 200
-BATCH_SIZE = 4
-GO_EMB_CHUNK = 256
-SCORE_CHUNK = 2048
+BATCH_SIZE = 1
+GO_EMB_CHUNK = 128
+SCORE_CHUNK = 512
 OUTPUT_DIR = Path("outputs/rare_go_analysis")
 
 RARE_IDS_PATH_OVERRIDE: Optional[str] = None
@@ -326,9 +326,15 @@ def retriever_topk_ids_chunked(
         C = G_chunk.size(0)
         G_eval = G_chunk.unsqueeze(0).expand(B, C, G_chunk.size(1)).contiguous()
 
-        sc = retriever(H=H, G=G_eval, mask=valid_mask, return_alpha=False)
-        if isinstance(sc, tuple):
-            sc = sc[0]
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=(device.type == "cuda"),
+        ):
+            sc = retriever(H=H, G=G_eval, mask=valid_mask, return_alpha=False)
+            if isinstance(sc, tuple):
+                sc = sc[0]
+
         sc = sc.float()
 
         cur_scores, cur_rel = torch.topk(sc, k=min(K, C), dim=1)
@@ -341,6 +347,11 @@ def retriever_topk_ids_chunked(
         new_idx = merged_idx.gather(1, new_pos)
 
         best_scores, best_idx = new_scores, new_idx
+
+        del G_chunk, G_eval, sc, cur_scores, cur_rel, cur_idx
+        del merged_scores, merged_idx, new_scores, new_pos, new_idx
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     cand_ids = eval_ids_t.index_select(0, best_idx.reshape(-1).cpu()).view(B, K)
     return cand_ids.cpu(), best_scores.cpu()
