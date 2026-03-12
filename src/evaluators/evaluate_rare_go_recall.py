@@ -1,52 +1,83 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import logging
 import pickle
 from pathlib import Path, PosixPath
 from types import SimpleNamespace
-from typing import Dict, List, Tuple, Optional
-from src.utils.helpers import go_str_to_int_any
+from typing import Dict, List, Tuple, Optional, Any
 
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
-# Project imports
+from src.utils.helpers import go_str_to_int_any, load_go_texts_by_phase
 from src.configs.paths import SRC_DIR
 from src.main import build_datasets, build_stores, build_go_cache
 from src.training.collate import ContrastiveEmbCollator
 from src.models.alignment_model import ProteinGoAligner
 from src.encoders.go_encoder import BioMedBERTEncoder, LoRAParameters
 from src.datasets.go_text_store import GoTextStore
-from src.utils.helpers import load_go_texts_by_phase
 
 
 # =========================================================
-# CHANGE ONLY THESE IF NEEDED
+# SAFE DEFAULTS
 # =========================================================
 DEFAULT_YAML_PATH = SRC_DIR / "reranker.yaml"
 PHASE_ID = -2
+
 TOPK = 200
 BATCH_SIZE = 1
-GO_EMB_CHUNK = 128
-SCORE_CHUNK = 512
+GO_EMB_CHUNK = 64
+SCORE_CHUNK = 256
+
 OUTPUT_DIR = Path("outputs/rare_go_analysis")
 
+# None bırakırsan yaml içindeki few_shot_path kullanılır
 RARE_IDS_PATH_OVERRIDE: Optional[str] = None
 
-def safe_torch_load(path: str, map_location="cpu"):
+# Debug için önce küçük subset koşmak istersen sayı ver, full val için None bırak
+VAL_SUBSET_SIZE: Optional[int] = None
+
+# true ise bazı büyük objeleri temizledikten sonra gc çağırır
+FORCE_GC = True
+
+
+# =========================================================
+# Basic utils
+# =========================================================
+def safe_path(x: Any) -> Optional[Path]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    return Path(s)
+
+
+def maybe_empty_cache(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def maybe_gc():
+    if FORCE_GC:
+        gc.collect()
+
+
+def safe_torch_load(path: str | Path, map_location="cpu"):
     try:
         torch.serialization.add_safe_globals([PosixPath])
     except Exception:
         pass
-    return torch.load(path, map_location=map_location, weights_only=False)
+    return torch.load(str(path), map_location=map_location, weights_only=False)
 
 
 def extract_sub_state(state: dict, prefix: str) -> dict:
     out = {}
-    p = prefix if prefix.endswith(".") else (prefix + ".")
+    p = prefix if prefix.endswith(".") else prefix + "."
     for k, v in state.items():
         if k.startswith(p):
             out[k[len(p):]] = v
@@ -63,26 +94,30 @@ def strip_prefix_from_state(sd: dict, prefix: str) -> dict:
             out[k] = v
     return out
 
+
 def load_id_list(path: Path) -> List[int]:
-    if path.name.endswith(".json"):
-        with open(path, "r") as f:
+    if not path.exists():
+        raise FileNotFoundError(f"ID list path not found: {path}")
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        with open(path, "r", encoding="utf-8") as f:
             xs = json.load(f)
         return [go_str_to_int_any(x) for x in xs]
 
-    if path.name.endswith(".pkl") or path.name.endswith(".pickle"):
+    if suffix in {".pkl", ".pickle"}:
         with open(path, "rb") as f:
             xs = pickle.load(f)
         return [go_str_to_int_any(x) for x in xs]
 
-    # default txt
     out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s:
                 continue
-            out.append(int(s))
-
+            out.append(go_str_to_int_any(s))
     return out
 
 
@@ -92,6 +127,30 @@ def valid_mask_from_attn(attn: torch.Tensor) -> torch.Tensor:
     return attn
 
 
+def save_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def save_csv(path: Path, rows: List[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write("")
+        return
+
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+
+# =========================================================
+# Config
+# =========================================================
 def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
@@ -114,15 +173,18 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         retriever_ckpt=str(training.get("retriever_ckpt", "")),
         batch_size=int(training.get("batch_size", BATCH_SIZE)),
         topk=int(training.get("topk", TOPK)),
-        go_cache_path=Path(stores.get("go_cache_path", "")),
-        go_text_folder=Path(stores.get("go_text_folder", "")),
-        few_shot_path=Path(stores.get("few_shot_path", "")),
-        go_path_observed=Path(stores.get("go_path_observed", "")),
+
+        go_cache_path=safe_path(stores.get("go_cache_path")),
+        go_text_folder=safe_path(stores.get("go_text_folder")),
+        few_shot_path=safe_path(stores.get("few_shot_path")),
+        go_path_observed=safe_path(stores.get("go_path_observed")),
+
         max_len=int(data.get("protein_max_len", 1024)),
         overlap=int(data.get("overlap", 128)),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.1)),
-        embed_dir_res=Path(stores.get("embed_dir_res", None)),
-        pid2pos=Path(stores.get("pid2pos_path", None)),
+
+        embed_dir_res=safe_path(stores.get("embed_dir_res")),
+        pid2pos=safe_path(stores.get("pid2pos_path")),
         reranker_hidden_dim=int(model.get("reranker_hidden_dim", 512)),
         reranker_dropout=float(model.get("reranker_dropout", 0.1)),
         freeze_text_encoder=bool(model.get("freeze_text_encoder", True)),
@@ -133,7 +195,6 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         go_align_dropout=float(model.get("go_align_dropout", 0.1)),
         use_go_residual=bool(model.get("use_go_residual", True)),
 
-        # training
         lr=float(training.get("lr", 2e-4)),
         weight_decay=float(training.get("weight_decay", 0.01)),
         epochs=int(training.get("epochs", 2)),
@@ -146,21 +207,23 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         dag_margin=float(training.get("dag_margin", 0.0)),
         grad_clip_norm=training.get("grad_clip_norm", None),
 
-        # stores
-        train_ids_path=Path(stores.get("train_ids_path", "")),
-        val_ids_path=Path(stores.get("val_ids_path", "")),
-        embed_dir_fused=Path(stores.get("embed_dir_fused", "")),
-        seq_len_lookup_dir=Path(stores.get("seq_len_lookup_dir", "")),
-        dag_parents_path=Path(stores.get("dag_parents_path", "")),
-        go_basic_json=Path(stores.get("go_basic_json", "")),
-        zero_shot_path=Path(stores.get("zero_shot_path", "")),
-        go_path_seen=Path(stores.get("go_path_seen", "")),
+        train_ids_path=safe_path(stores.get("train_ids_path")),
+        val_ids_path=safe_path(stores.get("val_ids_path")),
+        embed_dir_fused=safe_path(stores.get("embed_dir_fused")),
+        seq_len_lookup_dir=safe_path(stores.get("seq_len_lookup_dir")),
+        dag_parents_path=safe_path(stores.get("dag_parents_path")),
+        go_basic_json=safe_path(stores.get("go_basic_json")),
+        zero_shot_path=safe_path(stores.get("zero_shot_path")),
+        go_path_seen=safe_path(stores.get("go_path_seen")),
     )
     return args
 
 
+# =========================================================
+# GO encoder restore
+# =========================================================
 def build_go_encoder_from_retriever_ckpt(
-    ckpt_path: str,
+    ckpt_path: str | Path,
     *,
     model_name: str,
     device: str,
@@ -201,6 +264,9 @@ def build_go_encoder_from_retriever_ckpt(
     return enc
 
 
+# =========================================================
+# GO embedding build, memory-safe
+# =========================================================
 def build_eval_G_once(
     eval_go_ids: List[int],
     go_text_store: GoTextStore,
@@ -209,23 +275,32 @@ def build_eval_G_once(
     chunk: int = GO_EMB_CHUNK,
 ) -> Tuple[torch.Tensor, Dict[int, int]]:
     """
-    Returns:
-      G_once: [Geval, Dg] on CPU
-      id2col: global_go_id -> column index
+    Memory-safe version:
+    tokenize chunk by chunk instead of all GO ids at once
     """
     id2col = {int(g): i for i, g in enumerate(eval_go_ids)}
-    toks = go_text_store.batch(eval_go_ids)
-    input_ids = toks["input_ids"]
-    attn = toks["attention_mask"]
-
     out_cpu = []
+
     go_encoder.eval()
-    for s in range(0, input_ids.size(0), chunk):
-        e = min(input_ids.size(0), s + chunk)
-        embs = go_encoder(
-            input_ids=input_ids[s:e].to(device, non_blocking=True),
-            attention_mask=attn[s:e].to(device, non_blocking=True),
-        )
+
+    for s in range(0, len(eval_go_ids), chunk):
+        e = min(len(eval_go_ids), s + chunk)
+        go_ids_chunk = eval_go_ids[s:e]
+
+        toks = go_text_store.batch(go_ids_chunk)
+        input_ids = toks["input_ids"]
+        attn = toks["attention_mask"]
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=(device.type == "cuda"),
+        ):
+            embs = go_encoder(
+                input_ids=input_ids.to(device, non_blocking=True),
+                attention_mask=attn.to(device, non_blocking=True),
+            )
+
         if isinstance(embs, tuple):
             embs = embs[0]
         if isinstance(embs, dict):
@@ -238,10 +313,24 @@ def build_eval_G_once(
 
         out_cpu.append(torch.nan_to_num(embs).float().cpu().contiguous())
 
+        del toks, input_ids, attn, embs
+        maybe_empty_cache(device)
+        maybe_gc()
+
+        if ((s // chunk) + 1) % 20 == 0:
+            logging.info("GO embedding chunks processed: %d / %d", e, len(eval_go_ids))
+
     G_once = torch.cat(out_cpu, dim=0).contiguous()
+
+    del out_cpu
+    maybe_gc()
+
     return G_once, id2col
 
 
+# =========================================================
+# DataLoader
+# =========================================================
 def build_val_loader(val_ds, go_text_store, eval_go_ids: List[int], batch_size: int) -> DataLoader:
     collate = ContrastiveEmbCollator(
         zs_mask_vec=torch.ones(len(eval_go_ids), dtype=torch.bool),
@@ -256,11 +345,14 @@ def build_val_loader(val_ds, go_text_store, eval_go_ids: List[int], batch_size: 
         shuffle=False,
         num_workers=0,
         collate_fn=collate,
-        pin_memory=True,
+        pin_memory=False,
     )
     return loader
 
 
+# =========================================================
+# Retriever restore
+# =========================================================
 def load_retriever_model(
     args,
     device: torch.device,
@@ -280,7 +372,6 @@ def load_retriever_model(
     state = ckpt.get("model", ckpt)
     state = state.get("model", state)
 
-    # go_encoder already restored separately
     state = {k: v for k, v in state.items() if not k.startswith("go_encoder.")}
 
     missing, unexpected = retriever.load_state_dict(state, strict=False)
@@ -294,6 +385,9 @@ def load_retriever_model(
     return retriever
 
 
+# =========================================================
+# Chunked top-k retrieval
+# =========================================================
 @torch.no_grad()
 def retriever_topk_ids_chunked(
     retriever: ProteinGoAligner,
@@ -305,11 +399,6 @@ def retriever_topk_ids_chunked(
     device: torch.device,
     chunk_k: int = SCORE_CHUNK,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-      cand_ids: [B,K] global GO ids on CPU
-      cand_scores: [B,K] scores on CPU
-    """
     B = H.size(0)
     eval_ids_t = torch.as_tensor(eval_go_ids, dtype=torch.long)
 
@@ -350,13 +439,21 @@ def retriever_topk_ids_chunked(
 
         del G_chunk, G_eval, sc, cur_scores, cur_rel, cur_idx
         del merged_scores, merged_idx, new_scores, new_pos, new_idx
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        maybe_empty_cache(device)
 
     cand_ids = eval_ids_t.index_select(0, best_idx.reshape(-1).cpu()).view(B, K)
-    return cand_ids.cpu(), best_scores.cpu()
+    cand_scores = best_scores.cpu()
+
+    del best_scores, best_idx
+    maybe_empty_cache(device)
+    maybe_gc()
+
+    return cand_ids, cand_scores
 
 
+# =========================================================
+# Rare GO evaluation
+# =========================================================
 @torch.no_grad()
 def evaluate_rare_go_recall(
     retriever: ProteinGoAligner,
@@ -393,7 +490,7 @@ def evaluate_rare_go_recall(
         pos_go_global = batch["pos_go_global"]
         protein_ids = batch["protein_ids"]
 
-        cand_ids_cpu, cand_scores_cpu = retriever_topk_ids_chunked(
+        cand_ids_cpu, _ = retriever_topk_ids_chunked(
             retriever=retriever,
             H=H,
             valid_mask=valid_mask,
@@ -414,7 +511,6 @@ def evaluate_rare_go_recall(
                 continue
 
             true_pos_list = [int(x) for x in true_pos.detach().cpu().tolist()]
-            # keep only observed eval-space positives
             true_pos_eval = [g for g in true_pos_list if g in eval_go_set]
             rare_true = [g for g in true_pos_eval if g in rare_go_set]
 
@@ -444,9 +540,9 @@ def evaluate_rare_go_recall(
             total_rare_hits_at_50 += len(hit50)
             total_rare_hits_at_200 += len(hit200)
 
-            if len(hit50) > 0:
+            if hit50:
                 proteins_with_rare_hit_at_50 += 1
-            if len(hit200) > 0:
+            if hit200:
                 proteins_with_rare_hit_at_200 += 1
 
             for gid in hit50:
@@ -468,7 +564,11 @@ def evaluate_rare_go_recall(
                 "top20_candidate_go_ids": "|".join(map(str, row_ids[:20])),
             })
 
-        if (batch_idx + 1) % 50 == 0:
+        del H, valid_mask, pos_go_global, protein_ids, cand_ids_cpu
+        maybe_empty_cache(device)
+        maybe_gc()
+
+        if (batch_idx + 1) % 25 == 0:
             logging.info("Processed %d validation batches", batch_idx + 1)
 
     metrics = {
@@ -523,27 +623,6 @@ def evaluate_rare_go_recall(
     return metrics, protein_rows, go_rows
 
 
-def save_json(path: Path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-
-
-def save_csv(path: Path, rows: List[dict]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write("")
-        return
-
-    fieldnames = list(rows[0].keys())
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-
 # =========================================================
 # Main
 # =========================================================
@@ -558,17 +637,14 @@ def main():
 
     if not args.retriever_ckpt:
         raise RuntimeError("training.retriever_ckpt yaml içinde boş görünüyor.")
+    if args.go_text_folder is None:
+        raise RuntimeError("stores.go_text_folder boş.")
+    if args.go_cache_path is None:
+        raise RuntimeError("stores.go_cache_path boş.")
 
-    if RARE_IDS_PATH_OVERRIDE is not None:
-        rare_ids_path = Path(RARE_IDS_PATH_OVERRIDE)
-    else:
-        rare_ids_path = args.few_shot_path
-
-    if not rare_ids_path or not rare_ids_path.exists():
-        raise RuntimeError(
-            f"Rare GO ids path bulunamadı: {rare_ids_path}. "
-            f"RARE_IDS_PATH_OVERRIDE ya da few_shot_path düzelt."
-        )
+    rare_ids_path = Path(RARE_IDS_PATH_OVERRIDE) if RARE_IDS_PATH_OVERRIDE is not None else args.few_shot_path
+    if rare_ids_path is None or not rare_ids_path.exists():
+        raise RuntimeError(f"Rare GO ids path bulunamadı: {rare_ids_path}")
 
     logging.info("Device: %s", device)
     logging.info("Retriever checkpoint: %s", args.retriever_ckpt)
@@ -602,13 +678,17 @@ def main():
     datasets = build_datasets(args, res_store, go_text_store)
 
     val_ds = datasets["val"]
-    logging.info("Validation dataset size: %d", len(val_ds))
+    if VAL_SUBSET_SIZE is not None:
+        val_ds = Subset(val_ds, list(range(min(VAL_SUBSET_SIZE, len(val_ds)))))
+        logging.info("Using validation subset: %d", len(val_ds))
+    else:
+        logging.info("Validation dataset size: %d", len(val_ds))
 
-    # 3) Eval GO ids, use observed if available
+    # 3) Eval GO ids
     text_ids = set(int(x) for x in go_id_to_text[PHASE_ID].keys())
     cache_ids = set(int(x) for x in go_cache.row2id)
 
-    if args.go_path_observed and Path(args.go_path_observed).exists():
+    if args.go_path_observed is not None and args.go_path_observed.exists():
         observed_ids = set(load_id_list(args.go_path_observed))
         eval_go_ids = sorted(list(observed_ids & text_ids & cache_ids))
         logging.info("Using observed eval GO ids")
@@ -617,7 +697,7 @@ def main():
         logging.info("Observed eval GO ids not found, using text_ids ∩ cache_ids")
 
     if len(eval_go_ids) == 0:
-        raise RuntimeError("eval_go_ids boş çıktı, GO text / cache / observed dosyalarını kontrol et.")
+        raise RuntimeError("eval_go_ids boş çıktı.")
 
     logging.info("Eval GO count: %d", len(eval_go_ids))
 
@@ -640,7 +720,7 @@ def main():
         batch_size=args.batch_size,
     )
 
-    # 6) Build G_once
+    # 6) Build GO embeddings
     G_once_cpu, _ = build_eval_G_once(
         eval_go_ids=eval_go_ids,
         go_text_store=go_text_store,
@@ -668,7 +748,7 @@ def main():
         topk=args.topk,
     )
 
-    # 9) Save outputs
+    # 9) Save
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     save_json(OUTPUT_DIR / "rare_metrics.json", metrics)
     save_csv(OUTPUT_DIR / "rare_per_protein.csv", protein_rows)
