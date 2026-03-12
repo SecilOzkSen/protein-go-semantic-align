@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import csv
 import gc
 import json
@@ -9,8 +12,8 @@ from pathlib import Path, PosixPath
 from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional, Any
 
-import torch
 import yaml
+import torch
 from torch.utils.data import DataLoader, Subset
 
 from src.utils.helpers import go_str_to_int_any, load_go_texts_by_phase
@@ -30,18 +33,17 @@ PHASE_ID = -2
 
 TOPK = 200
 BATCH_SIZE = 1
-GO_EMB_CHUNK = 64
-SCORE_CHUNK = 256
+GO_EMB_CHUNK = 16
+SCORE_CHUNK = 64
 
 OUTPUT_DIR = Path("outputs/rare_go_analysis")
 
-# None bırakırsan yaml içindeki few_shot_path kullanılır
+# None bırak: yaml içindeki few_shot_path kullanılır
 RARE_IDS_PATH_OVERRIDE: Optional[str] = None
 
-# Debug için önce küçük subset koşmak istersen sayı ver, full val için None bırak
-VAL_SUBSET_SIZE: Optional[int] = None
+# Önce küçük subset ile test et. Full val için None yap.
+VAL_SUBSET_SIZE: Optional[int] = 100
 
-# true ise bazı büyük objeleri temizledikten sonra gc çağırır
 FORCE_GC = True
 
 
@@ -167,7 +169,6 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         ),
         protein_dim=int(model.get("protein_dim", 1280)),
         protein_pool_type=str(model.get("protein_pool_type", "go_align")),
-        protein_n_slots=int(model.get("protein_n_slots", 4)),
         device=str(training.get("device", "cuda")),
         fp16=bool(training.get("fp16", True)),
         retriever_ckpt=str(training.get("retriever_ckpt", "")),
@@ -185,6 +186,7 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
 
         embed_dir_res=safe_path(stores.get("embed_dir_res")),
         pid2pos=safe_path(stores.get("pid2pos_path")),
+
         reranker_hidden_dim=int(model.get("reranker_hidden_dim", 512)),
         reranker_dropout=float(model.get("reranker_dropout", 0.1)),
         freeze_text_encoder=bool(model.get("freeze_text_encoder", True)),
@@ -265,7 +267,7 @@ def build_go_encoder_from_retriever_ckpt(
 
 
 # =========================================================
-# GO embedding build, memory-safe
+# GO embedding build, CPU-safe
 # =========================================================
 def build_eval_G_once(
     eval_go_ids: List[int],
@@ -275,12 +277,13 @@ def build_eval_G_once(
     chunk: int = GO_EMB_CHUNK,
 ) -> Tuple[torch.Tensor, Dict[int, int]]:
     """
-    Memory-safe version:
-    tokenize chunk by chunk instead of all GO ids at once
+    GPU OOM almamak için GO embeddingleri CPU'da çıkarılır.
     """
     id2col = {int(g): i for i, g in enumerate(eval_go_ids)}
     out_cpu = []
 
+    cpu_device = torch.device("cpu")
+    go_encoder = go_encoder.to(cpu_device)
     go_encoder.eval()
 
     for s in range(0, len(eval_go_ids), chunk):
@@ -288,17 +291,13 @@ def build_eval_G_once(
         go_ids_chunk = eval_go_ids[s:e]
 
         toks = go_text_store.batch(go_ids_chunk)
-        input_ids = toks["input_ids"]
-        attn = toks["attention_mask"]
+        input_ids = toks["input_ids"].to(cpu_device)
+        attn = toks["attention_mask"].to(cpu_device)
 
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-            enabled=(device.type == "cuda"),
-        ):
+        with torch.no_grad():
             embs = go_encoder(
-                input_ids=input_ids.to(device, non_blocking=True),
-                attention_mask=attn.to(device, non_blocking=True),
+                input_ids=input_ids,
+                attention_mask=attn,
             )
 
         if isinstance(embs, tuple):
@@ -314,7 +313,6 @@ def build_eval_G_once(
         out_cpu.append(torch.nan_to_num(embs).float().cpu().contiguous())
 
         del toks, input_ids, attn, embs
-        maybe_empty_cache(device)
         maybe_gc()
 
         if ((s // chunk) + 1) % 20 == 0:
@@ -351,21 +349,20 @@ def build_val_loader(val_ds, go_text_store, eval_go_ids: List[int], batch_size: 
 
 
 # =========================================================
-# Retriever restore
+# Retriever restore, no GO encoder on GPU
 # =========================================================
 def load_retriever_model(
     args,
     device: torch.device,
-    go_encoder_wrapper,
+    d_g: int = 768,
 ):
     retriever = ProteinGoAligner(
         d_h=args.protein_dim,
-        d_g=None,
+        d_g=d_g,
         d_z=768,
-        go_encoder=go_encoder_wrapper.model,
+        go_encoder=None,
         normalize=True,
         protein_pool_type=args.protein_pool_type,
-        protein_n_slots=getattr(args, "protein_n_slots", 4),
     ).to(device)
 
     ckpt = safe_torch_load(args.retriever_ckpt, map_location="cpu")
@@ -501,7 +498,7 @@ def evaluate_rare_go_recall(
             chunk_k=SCORE_CHUNK,
         )
 
-        B, K = cand_ids_cpu.shape
+        B, _ = cand_ids_cpu.shape
 
         for i in range(B):
             pid = str(protein_ids[i])
@@ -658,7 +655,7 @@ def main():
     go_enc_wrap = build_go_encoder_from_retriever_ckpt(
         args.retriever_ckpt,
         model_name=args.text_model_name,
-        device=str(device),
+        device="cpu",
         max_length=512,
         enable_lora=True,
         use_special_tokens=False,
@@ -720,21 +717,28 @@ def main():
         batch_size=args.batch_size,
     )
 
-    # 6) Build GO embeddings
+    # 6) Build GO embeddings on CPU
     G_once_cpu, _ = build_eval_G_once(
         eval_go_ids=eval_go_ids,
         go_text_store=go_text_store,
-        go_encoder=go_enc_wrap.model.to(device),
+        go_encoder=go_enc_wrap.model,
         device=device,
         chunk=GO_EMB_CHUNK,
     )
     logging.info("G_once shape: %s", tuple(G_once_cpu.shape))
 
-    # 7) Retriever model
+    # GO encoder artık gereksiz
+    del go_enc_wrap
+    maybe_gc()
+    maybe_empty_cache(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # 7) Retriever model, no GO encoder attached
     retriever = load_retriever_model(
         args=args,
         device=device,
-        go_encoder_wrapper=go_enc_wrap,
+        d_g=768,
     )
 
     # 8) Evaluate
