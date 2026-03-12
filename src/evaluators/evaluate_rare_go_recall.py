@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import pickle
 from pathlib import Path, PosixPath
 from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional
@@ -61,23 +62,27 @@ def strip_prefix_from_state(sd: dict, prefix: str) -> dict:
             out[k] = v
     return out
 
+def load_id_list(path: str) -> List[int]:
 
-def load_id_list(path: str | Path) -> List[int]:
-    path = str(path)
     if path.endswith(".json"):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r") as f:
             xs = json.load(f)
         return [int(x) for x in xs]
 
+    if path.endswith(".pkl") or path.endswith(".pickle"):
+        with open(path, "rb") as f:
+            xs = pickle.load(f)
+        return [int(x) for x in xs]
+
+    # default txt
     out = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s:
                 continue
-            if s.upper().startswith("GO:"):
-                s = s.split(":", 1)[1]
             out.append(int(s))
+
     return out
 
 
