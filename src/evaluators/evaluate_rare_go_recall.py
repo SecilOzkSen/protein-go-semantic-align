@@ -118,6 +118,38 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         fs_target_ratio=float(data.get("fs_target_ratio", 0.1)),
         embed_dir_res=Path(stores.get("embed_dir_res", None)),
         pid2pos=Path(stores.get("pid2pos_path", None)),
+        reranker_hidden_dim=int(model.get("reranker_hidden_dim", 512)),
+        reranker_dropout=float(model.get("reranker_dropout", 0.1)),
+        freeze_text_encoder=bool(model.get("freeze_text_encoder", True)),
+        use_protein_ln=bool(model.get("use_protein_ln", True)),
+        use_go_ln=bool(model.get("use_go_ln", True)),
+        use_go_token_align_pooler=bool(model.get("use_go_token_align_pooler", True)),
+        go_align_attn_dim=model.get("go_align_attn_dim", None),
+        go_align_dropout=float(model.get("go_align_dropout", 0.1)),
+        use_go_residual=bool(model.get("use_go_residual", True)),
+
+        # training
+        lr=float(training.get("lr", 2e-4)),
+        weight_decay=float(training.get("weight_decay", 0.01)),
+        epochs=int(training.get("epochs", 2)),
+        log_every=int(training.get("log_every", 50)),
+        eval_every=int(training.get("eval_every", 500)),
+        save_metric=str(training.get("save_metric", "fmax")),
+        out_dir=str(training.get("out_dir", "./reranker_out")),
+        use_dag_loss=bool(training.get("use_dag_loss", False)),
+        lambda_dag=float(training.get("lambda_dag", 0.1)),
+        dag_margin=float(training.get("dag_margin", 0.0)),
+        grad_clip_norm=training.get("grad_clip_norm", None),
+
+        # stores
+        train_ids_path=Path(stores.get("train_ids_path", "")),
+        val_ids_path=Path(stores.get("val_ids_path", "")),
+        embed_dir_fused=Path(stores.get("embed_dir_fused", "")),
+        seq_len_lookup_dir=Path(stores.get("seq_len_lookup_dir", "")),
+        dag_parents_path=Path(stores.get("dag_parents_path", "")),
+        go_basic_json=Path(stores.get("go_basic_json", "")),
+        zero_shot_path=Path(stores.get("zero_shot_path", "")),
+        go_path_seen=Path(stores.get("go_path_seen", "")),
     )
     return args
 
