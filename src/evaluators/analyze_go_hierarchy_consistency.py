@@ -11,7 +11,6 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-# Project imports
 from src.configs.paths import SRC_DIR
 from src.main import build_datasets, build_stores, build_go_cache
 from src.training.collate import ContrastiveEmbCollator
@@ -21,18 +20,13 @@ from src.datasets.go_text_store import GoTextStore
 from src.utils.helpers import load_go_texts_by_phase
 
 
-# =========================================================
-# CHANGE ONLY THESE IF NEEDED
-# =========================================================
 DEFAULT_YAML_PATH = SRC_DIR / "reranker.yaml"
 PHASE_ID = -2
 TOPK = 200
-BATCH_SIZE = 4
 GO_EMB_CHUNK = 256
 SCORE_CHUNK = 2048
-OUTPUT_DIR = Path("outputs/rare_go_analysis")
+OUTPUT_DIR = Path("outputs/go_hierarchy_consistency")
 
-RARE_IDS_PATH_OVERRIDE: Optional[str] = None
 
 def safe_torch_load(path: str, map_location="cpu"):
     try:
@@ -62,12 +56,21 @@ def strip_prefix_from_state(sd: dict, prefix: str) -> dict:
     return out
 
 
+def _go_str_to_int(x) -> int:
+    if isinstance(x, int):
+        return x
+    s = str(x).strip()
+    if s.upper().startswith("GO:"):
+        s = s.split(":", 1)[1]
+    return int(s)
+
+
 def load_id_list(path: str | Path) -> List[int]:
     path = str(path)
     if path.endswith(".json"):
         with open(path, "r", encoding="utf-8") as f:
             xs = json.load(f)
-        return [int(x) for x in xs]
+        return [_go_str_to_int(x) for x in xs]
 
     out = []
     with open(path, "r", encoding="utf-8") as f:
@@ -75,10 +78,33 @@ def load_id_list(path: str | Path) -> List[int]:
             s = line.strip()
             if not s:
                 continue
-            if s.upper().startswith("GO:"):
-                s = s.split(":", 1)[1]
-            out.append(int(s))
+            out.append(_go_str_to_int(s))
     return out
+
+
+def load_child_to_parents_json(path: str | Path) -> Dict[int, List[int]]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    child_to_parents: Dict[int, List[int]] = {}
+    for child, parents in raw.items():
+        child_id = _go_str_to_int(child)
+
+        if not parents:
+            child_to_parents[child_id] = []
+            continue
+
+        parent_ids = []
+        for item in parents:
+            if isinstance(item, (list, tuple)):
+                parent_go = item[0]
+            else:
+                parent_go = item
+            parent_ids.append(_go_str_to_int(parent_go))
+
+        child_to_parents[child_id] = parent_ids
+
+    return child_to_parents
 
 
 def valid_mask_from_attn(attn: torch.Tensor) -> torch.Tensor:
@@ -107,16 +133,15 @@ def load_structured_cfg(path: str | Path = DEFAULT_YAML_PATH):
         device=str(training.get("device", "cuda")),
         fp16=bool(training.get("fp16", True)),
         retriever_ckpt=str(training.get("retriever_ckpt", "")),
-        batch_size=int(training.get("batch_size", BATCH_SIZE)),
+        batch_size=int(training.get("batch_size", 4)),
         topk=int(training.get("topk", TOPK)),
         go_cache_path=Path(stores.get("go_cache_path", "")),
         go_text_folder=Path(stores.get("go_text_folder", "")),
-        few_shot_path=Path(stores.get("few_shot_path", "")),
         go_path_observed=Path(stores.get("go_path_observed", "")),
+        dag_parents_path=Path(stores.get("dag_parents_path", "")),
         max_len=int(data.get("protein_max_len", 1024)),
         overlap=int(data.get("overlap", 128)),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.1)),
-        embed_dir_res=Path(stores.get("embed_dir_res", None)),
     )
     return args
 
@@ -170,11 +195,6 @@ def build_eval_G_once(
     device: torch.device,
     chunk: int = GO_EMB_CHUNK,
 ) -> Tuple[torch.Tensor, Dict[int, int]]:
-    """
-    Returns:
-      G_once: [Geval, Dg] on CPU
-      id2col: global_go_id -> column index
-    """
     id2col = {int(g): i for i, g in enumerate(eval_go_ids)}
     toks = go_text_store.batch(eval_go_ids)
     input_ids = toks["input_ids"]
@@ -223,11 +243,7 @@ def build_val_loader(val_ds, go_text_store, eval_go_ids: List[int], batch_size: 
     return loader
 
 
-def load_retriever_model(
-    args,
-    device: torch.device,
-    go_encoder_wrapper,
-):
+def load_retriever_model(args, device: torch.device, go_encoder_wrapper):
     retriever = ProteinGoAligner(
         d_h=args.protein_dim,
         d_g=None,
@@ -241,8 +257,6 @@ def load_retriever_model(
     ckpt = safe_torch_load(args.retriever_ckpt, map_location="cpu")
     state = ckpt.get("model", ckpt)
     state = state.get("model", state)
-
-    # go_encoder already restored separately
     state = {k: v for k, v in state.items() if not k.startswith("go_encoder.")}
 
     missing, unexpected = retriever.load_state_dict(state, strict=False)
@@ -267,11 +281,6 @@ def retriever_topk_ids_chunked(
     device: torch.device,
     chunk_k: int = SCORE_CHUNK,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-      cand_ids: [B,K] global GO ids on CPU
-      cand_scores: [B,K] scores on CPU
-    """
     B = H.size(0)
     eval_ids_t = torch.as_tensor(eval_go_ids, dtype=torch.long)
 
@@ -309,34 +318,31 @@ def retriever_topk_ids_chunked(
 
 
 @torch.no_grad()
-def evaluate_rare_go_recall(
+def evaluate_go_hierarchy_consistency(
     retriever: ProteinGoAligner,
     val_loader: DataLoader,
     G_once_cpu: torch.Tensor,
     eval_go_ids: List[int],
-    rare_go_ids: List[int],
+    child_to_parents: Dict[int, List[int]],
     device: torch.device,
     topk: int = 200,
 ):
-    rare_go_set = set(int(x) for x in rare_go_ids)
     eval_go_set = set(int(x) for x in eval_go_ids)
 
-    proteins_with_rare = 0
-    proteins_with_rare_hit_at_50 = 0
-    proteins_with_rare_hit_at_200 = 0
+    total_true_child_parent_pairs = 0
+    total_true_child_parent_pairs_hit = 0
 
-    rare_r50_sum = 0.0
-    rare_r200_sum = 0.0
+    total_pred_child_parent_pairs = 0
+    total_pred_child_parent_pairs_hit = 0
 
-    total_rare_true = 0
-    total_rare_hits_at_50 = 0
-    total_rare_hits_at_200 = 0
+    proteins_with_true_child_parent_pair = 0
+    proteins_strict_consistent_true_pair = 0
 
-    per_go_total = {}
-    per_go_hit50 = {}
-    per_go_hit200 = {}
+    proteins_with_pred_child_parent_pair = 0
+    proteins_strict_consistent_pred_pair = 0
 
     protein_rows = []
+    go_rows_map = {}
 
     for batch_idx, batch in enumerate(val_loader):
         H = batch["prot_emb_pad"].to(device, non_blocking=True)
@@ -365,111 +371,150 @@ def evaluate_rare_go_recall(
                 continue
 
             true_pos_list = [int(x) for x in true_pos.detach().cpu().tolist()]
-            # keep only observed eval-space positives
-            true_pos_eval = [g for g in true_pos_list if g in eval_go_set]
-            rare_true = [g for g in true_pos_eval if g in rare_go_set]
-
-            if len(rare_true) == 0:
-                continue
-
-            proteins_with_rare += 1
-            total_rare_true += len(rare_true)
-
-            for gid in rare_true:
-                per_go_total[gid] = per_go_total.get(gid, 0) + 1
+            true_pos_eval = sorted(set(g for g in true_pos_list if g in eval_go_set))
 
             row_ids = [int(x) for x in cand_ids_cpu[i].tolist()]
-            row_top50 = row_ids[:50]
-            row_top200 = row_ids[:200]
+            row_set = set(row_ids)
 
-            rare_true_set = set(rare_true)
-            hit50 = sorted(list(rare_true_set.intersection(row_top50)))
-            hit200 = sorted(list(rare_true_set.intersection(row_top200)))
+            # Case 1: true child exists in labels, do its true parent(s) appear in top200?
+            true_pairs = []
+            for child in true_pos_eval:
+                parents = child_to_parents.get(child, [])
+                parents = [p for p in parents if p in eval_go_set]
+                for p in parents:
+                    true_pairs.append((child, p))
 
-            r50 = len(hit50) / len(rare_true_set)
-            r200 = len(hit200) / len(rare_true_set)
+            if len(true_pairs) > 0:
+                proteins_with_true_child_parent_pair += 1
 
-            rare_r50_sum += r50
-            rare_r200_sum += r200
+            true_hits = 0
+            for child, parent in true_pairs:
+                total_true_child_parent_pairs += 1
+                ok = (child in row_set) and (parent in row_set)
+                if ok:
+                    total_true_child_parent_pairs_hit += 1
+                    true_hits += 1
 
-            total_rare_hits_at_50 += len(hit50)
-            total_rare_hits_at_200 += len(hit200)
+                key = (child, parent)
+                if key not in go_rows_map:
+                    go_rows_map[key] = {
+                        "child_go": child,
+                        "parent_go": parent,
+                        "num_true_pairs": 0,
+                        "num_true_pairs_hit": 0,
+                        "num_pred_child_cases": 0,
+                        "num_pred_child_cases_hit_parent": 0,
+                    }
+                go_rows_map[key]["num_true_pairs"] += 1
+                if ok:
+                    go_rows_map[key]["num_true_pairs_hit"] += 1
 
-            if len(hit50) > 0:
-                proteins_with_rare_hit_at_50 += 1
-            if len(hit200) > 0:
-                proteins_with_rare_hit_at_200 += 1
+            strict_true_consistent = (len(true_pairs) > 0 and true_hits == len(true_pairs))
+            if strict_true_consistent:
+                proteins_strict_consistent_true_pair += 1
 
-            for gid in hit50:
-                per_go_hit50[gid] = per_go_hit50.get(gid, 0) + 1
-            for gid in hit200:
-                per_go_hit200[gid] = per_go_hit200.get(gid, 0) + 1
+            # Case 2: predicted child is in top200, do its parents also appear in top200?
+            pred_pairs = []
+            for child in row_ids:
+                parents = child_to_parents.get(child, [])
+                parents = [p for p in parents if p in eval_go_set]
+                for p in parents:
+                    pred_pairs.append((child, p))
+
+            if len(pred_pairs) > 0:
+                proteins_with_pred_child_parent_pair += 1
+
+            pred_hits = 0
+            for child, parent in pred_pairs:
+                total_pred_child_parent_pairs += 1
+                ok = parent in row_set
+                if ok:
+                    total_pred_child_parent_pairs_hit += 1
+                    pred_hits += 1
+
+                key = (child, parent)
+                if key not in go_rows_map:
+                    go_rows_map[key] = {
+                        "child_go": child,
+                        "parent_go": parent,
+                        "num_true_pairs": 0,
+                        "num_true_pairs_hit": 0,
+                        "num_pred_child_cases": 0,
+                        "num_pred_child_cases_hit_parent": 0,
+                    }
+                go_rows_map[key]["num_pred_child_cases"] += 1
+                if ok:
+                    go_rows_map[key]["num_pred_child_cases_hit_parent"] += 1
+
+            strict_pred_consistent = (len(pred_pairs) > 0 and pred_hits == len(pred_pairs))
+            if strict_pred_consistent:
+                proteins_strict_consistent_pred_pair += 1
 
             protein_rows.append({
                 "protein_id": pid,
                 "num_true_pos_eval": len(true_pos_eval),
-                "num_true_rare": len(rare_true),
-                "num_rare_hit_at_50": len(hit50),
-                "num_rare_hit_at_200": len(hit200),
-                "rare_recall_at_50": r50,
-                "rare_recall_at_200": r200,
-                "rare_true_go_ids": "|".join(map(str, rare_true)),
-                "rare_hit_go_ids_at_50": "|".join(map(str, hit50)),
-                "rare_hit_go_ids_at_200": "|".join(map(str, hit200)),
+                "num_true_child_parent_pairs": len(true_pairs),
+                "num_true_child_parent_pairs_hit": true_hits,
+                "true_pair_coverage": (
+                    true_hits / len(true_pairs) if len(true_pairs) > 0 else 0.0
+                ),
+                "strict_true_pair_consistent": int(strict_true_consistent),
+                "num_pred_child_parent_pairs": len(pred_pairs),
+                "num_pred_child_parent_pairs_hit": pred_hits,
+                "pred_pair_coverage": (
+                    pred_hits / len(pred_pairs) if len(pred_pairs) > 0 else 0.0
+                ),
+                "strict_pred_pair_consistent": int(strict_pred_consistent),
                 "top20_candidate_go_ids": "|".join(map(str, row_ids[:20])),
             })
 
         if (batch_idx + 1) % 50 == 0:
             logging.info("Processed %d validation batches", batch_idx + 1)
 
-    metrics = {
-        "proteins_with_rare": proteins_with_rare,
-        "proteins_with_rare_hit_at_50": proteins_with_rare_hit_at_50,
-        "proteins_with_rare_hit_at_200": proteins_with_rare_hit_at_200,
-        "rare_hit_protein_rate_at_50": (
-            proteins_with_rare_hit_at_50 / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "rare_hit_protein_rate_at_200": (
-            proteins_with_rare_hit_at_200 / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "rare_R_at_50_macro": (
-            rare_r50_sum / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "rare_R_at_200_macro": (
-            rare_r200_sum / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "avg_num_rare_true_per_protein": (
-            total_rare_true / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "avg_num_rare_hits_at_50": (
-            total_rare_hits_at_50 / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "avg_num_rare_hits_at_200": (
-            total_rare_hits_at_200 / proteins_with_rare if proteins_with_rare > 0 else 0.0
-        ),
-        "total_rare_true_labels": total_rare_true,
-        "total_rare_hits_at_50": total_rare_hits_at_50,
-        "total_rare_hits_at_200": total_rare_hits_at_200,
-    }
-
     go_rows = []
-    for gid, total_cnt in per_go_total.items():
-        h50 = per_go_hit50.get(gid, 0)
-        h200 = per_go_hit200.get(gid, 0)
-        go_rows.append({
-            "go_id": gid,
-            "num_proteins_with_go": total_cnt,
-            "num_hits_at_50": h50,
-            "num_hits_at_200": h200,
-            "hit_rate_at_50": h50 / total_cnt if total_cnt > 0 else 0.0,
-            "hit_rate_at_200": h200 / total_cnt if total_cnt > 0 else 0.0,
-        })
+    for _, row in go_rows_map.items():
+        row = dict(row)
+        row["true_pair_hit_rate"] = (
+            row["num_true_pairs_hit"] / row["num_true_pairs"] if row["num_true_pairs"] > 0 else 0.0
+        )
+        row["pred_pair_parent_coverage"] = (
+            row["num_pred_child_cases_hit_parent"] / row["num_pred_child_cases"]
+            if row["num_pred_child_cases"] > 0 else 0.0
+        )
+        go_rows.append(row)
 
     go_rows = sorted(
         go_rows,
-        key=lambda x: (x["hit_rate_at_200"], x["num_proteins_with_go"]),
+        key=lambda x: (x["true_pair_hit_rate"], x["num_true_pairs"]),
         reverse=True,
     )
+
+    metrics = {
+        "total_true_child_parent_pairs": total_true_child_parent_pairs,
+        "total_true_child_parent_pairs_hit": total_true_child_parent_pairs_hit,
+        "parent_coverage_given_true_child_at_200": (
+            total_true_child_parent_pairs_hit / total_true_child_parent_pairs
+            if total_true_child_parent_pairs > 0 else 0.0
+        ),
+        "proteins_with_true_child_parent_pair": proteins_with_true_child_parent_pair,
+        "proteins_strict_consistent_true_pair": proteins_strict_consistent_true_pair,
+        "strict_hierarchy_consistency_true_pair_at_200": (
+            proteins_strict_consistent_true_pair / proteins_with_true_child_parent_pair
+            if proteins_with_true_child_parent_pair > 0 else 0.0
+        ),
+        "total_pred_child_parent_pairs": total_pred_child_parent_pairs,
+        "total_pred_child_parent_pairs_hit": total_pred_child_parent_pairs_hit,
+        "parent_coverage_given_predicted_child_at_200": (
+            total_pred_child_parent_pairs_hit / total_pred_child_parent_pairs
+            if total_pred_child_parent_pairs > 0 else 0.0
+        ),
+        "proteins_with_pred_child_parent_pair": proteins_with_pred_child_parent_pair,
+        "proteins_strict_consistent_pred_pair": proteins_strict_consistent_pred_pair,
+        "strict_hierarchy_consistency_pred_pair_at_200": (
+            proteins_strict_consistent_pred_pair / proteins_with_pred_child_parent_pair
+            if proteins_with_pred_child_parent_pair > 0 else 0.0
+        ),
+    }
 
     return metrics, protein_rows, go_rows
 
@@ -495,9 +540,6 @@ def save_csv(path: Path, rows: List[dict]):
             writer.writerow(r)
 
 
-# =========================================================
-# Main
-# =========================================================
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -509,23 +551,13 @@ def main():
 
     if not args.retriever_ckpt:
         raise RuntimeError("training.retriever_ckpt yaml içinde boş görünüyor.")
-
-    if RARE_IDS_PATH_OVERRIDE is not None:
-        rare_ids_path = Path(RARE_IDS_PATH_OVERRIDE)
-    else:
-        rare_ids_path = args.few_shot_path
-
-    if not rare_ids_path or not rare_ids_path.exists():
-        raise RuntimeError(
-            f"Rare GO ids path bulunamadı: {rare_ids_path}. "
-            f"RARE_IDS_PATH_OVERRIDE ya da few_shot_path düzelt."
-        )
+    if not args.dag_parents_path or not Path(args.dag_parents_path).exists():
+        raise RuntimeError("stores.dag_parents_path bulunamadı.")
 
     logging.info("Device: %s", device)
     logging.info("Retriever checkpoint: %s", args.retriever_ckpt)
-    logging.info("Rare GO ids path: %s", rare_ids_path)
+    logging.info("DAG parents path: %s", args.dag_parents_path)
 
-    # 1) GO text store
     go_id_to_text: Dict[int, Dict[int, str]] = {}
     go_id_to_text[PHASE_ID] = load_go_texts_by_phase(args.go_text_folder, phase=PHASE_ID)
 
@@ -547,7 +579,6 @@ def main():
         phase=PHASE_ID,
     )
 
-    # 2) Stores and datasets
     res_store = build_stores(args)
     go_cache = build_go_cache(str(args.go_cache_path))
     datasets = build_datasets(args, res_store, go_text_store)
@@ -555,7 +586,6 @@ def main():
     val_ds = datasets["val"]
     logging.info("Validation dataset size: %d", len(val_ds))
 
-    # 3) Eval GO ids, use observed if available
     text_ids = set(int(x) for x in go_id_to_text[PHASE_ID].keys())
     cache_ids = set(int(x) for x in go_cache.row2id)
 
@@ -568,22 +598,13 @@ def main():
         logging.info("Observed eval GO ids not found, using text_ids ∩ cache_ids")
 
     if len(eval_go_ids) == 0:
-        raise RuntimeError("eval_go_ids boş çıktı, GO text / cache / observed dosyalarını kontrol et.")
+        raise RuntimeError("eval_go_ids boş çıktı.")
 
     logging.info("Eval GO count: %d", len(eval_go_ids))
 
-    # 4) Rare GO ids
-    rare_go_ids = sorted(set(load_id_list(rare_ids_path)))
-    logging.info("Rare GO count, raw: %d", len(rare_go_ids))
+    child_to_parents = load_child_to_parents_json(args.dag_parents_path)
+    logging.info("Loaded child->parents entries: %d", len(child_to_parents))
 
-    eval_go_set = set(eval_go_ids)
-    rare_go_ids = [g for g in rare_go_ids if g in eval_go_set]
-    logging.info("Rare GO count inside eval space: %d", len(rare_go_ids))
-
-    if len(rare_go_ids) == 0:
-        raise RuntimeError("Eval space içinde rare GO kalmadı.")
-
-    # 5) Dataloader
     val_loader = build_val_loader(
         val_ds=val_ds,
         go_text_store=go_text_store,
@@ -591,7 +612,6 @@ def main():
         batch_size=args.batch_size,
     )
 
-    # 6) Build G_once
     G_once_cpu, _ = build_eval_G_once(
         eval_go_ids=eval_go_ids,
         go_text_store=go_text_store,
@@ -601,35 +621,32 @@ def main():
     )
     logging.info("G_once shape: %s", tuple(G_once_cpu.shape))
 
-    # 7) Retriever model
     retriever = load_retriever_model(
         args=args,
         device=device,
         go_encoder_wrapper=go_enc_wrap,
     )
 
-    # 8) Evaluate
-    metrics, protein_rows, go_rows = evaluate_rare_go_recall(
+    metrics, protein_rows, go_rows = evaluate_go_hierarchy_consistency(
         retriever=retriever,
         val_loader=val_loader,
         G_once_cpu=G_once_cpu,
         eval_go_ids=eval_go_ids,
-        rare_go_ids=rare_go_ids,
+        child_to_parents=child_to_parents,
         device=device,
         topk=args.topk,
     )
 
-    # 9) Save outputs
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    save_json(OUTPUT_DIR / "rare_metrics.json", metrics)
-    save_csv(OUTPUT_DIR / "rare_per_protein.csv", protein_rows)
-    save_csv(OUTPUT_DIR / "rare_per_go.csv", go_rows)
+    save_json(OUTPUT_DIR / "hierarchy_metrics.json", metrics)
+    save_csv(OUTPUT_DIR / "hierarchy_per_protein.csv", protein_rows)
+    save_csv(OUTPUT_DIR / "hierarchy_per_pair.csv", go_rows)
 
-    logging.info("Saved metrics -> %s", OUTPUT_DIR / "rare_metrics.json")
-    logging.info("Saved protein csv -> %s", OUTPUT_DIR / "rare_per_protein.csv")
-    logging.info("Saved GO csv -> %s", OUTPUT_DIR / "rare_per_go.csv")
+    logging.info("Saved metrics -> %s", OUTPUT_DIR / "hierarchy_metrics.json")
+    logging.info("Saved protein csv -> %s", OUTPUT_DIR / "hierarchy_per_protein.csv")
+    logging.info("Saved pair csv -> %s", OUTPUT_DIR / "hierarchy_per_pair.csv")
 
-    print("\n=== RARE GO RETRIEVAL METRICS ===")
+    print("\n=== GO HIERARCHY CONSISTENCY METRICS ===")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
 
 
