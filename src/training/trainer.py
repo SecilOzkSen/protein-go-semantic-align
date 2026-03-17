@@ -558,7 +558,9 @@ class OppTrainer:
             d_z=cfg.d_z,
             go_encoder=go_encoder,
             normalize=True,
-            protein_pool_type=ctx.protein_pooling_strategy
+            protein_pool_type=ctx.protein_pooling_strategy,
+            protein_n_slots=ctx.protein_n_slots,
+            go_pool_type=ctx.go_pool_type,
         ).to(self.device)
 
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))

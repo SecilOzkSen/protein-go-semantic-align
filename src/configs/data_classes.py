@@ -224,6 +224,8 @@ class TrainingContext:
     return_alpha: bool = False
     fused_bank: Any = None
     protein_pooling_strategy: str = "mean"
+    protein_n_slots: int = 0,
+    go_pool_type: str = "mean"
     eval_id_list: List[int] = None
     logger: Any = None
     eval_seen_go_ids: List[int] = None
