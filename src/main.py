@@ -26,9 +26,8 @@ from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
 from src.utils.helpers import _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict, build_altid_map_from_go_terms, canonicalize_id_list, canonicalize_pid2pos, go_str_to_int_any, load_go_namespaces
 from src.configs.data_classes import (
-    FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
+    FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig, QueueConfig
 )
-from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache, GoDropoutConfig, GoTokenDropout
 from src.go import load_go_parents, load_go_children
 from src.utils import (
@@ -398,40 +397,6 @@ def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout:GoT
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
     return train_loader, val_loader
 
-
-def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
-    total_steps = max(1, n_steps_per_epoch * args.curriculum_epochs)
-    warmup = int(args.warmup_frac * n_steps_per_epoch)
-
-    hier_dn_start = int(getattr(args, "hier_dn_start", 0))
-    hier_dn_end = int(getattr(args, "hier_dn_end", 0))
-    hier_up_start = int(getattr(args, "hier_up_start", 0))
-    hier_up_end = int(getattr(args, "hier_up_end", 0))
-
-    shortlist_M_start = int(getattr(args, "shortlist_M_start", 256))
-    shortlist_M_end = int(getattr(args, "shortlist_M_end", 1024))
-    k_hard_start = int(getattr(args, "k_hard_start", 16))
-    k_hard_end = int(getattr(args, "k_hard_end", 64))
-    hard_frac_start = float(getattr(args, "hard_frac_start", 0.2))
-    hard_frac_end = float(getattr(args, "hard_frac_end", 0.7))
-    inbatch_easy_start = float(getattr(args, "inbatch_easy_start", 1.0))
-    inbatch_easy_end = float(getattr(args, "inbatch_easy_end", 0.0))
-    random_k_start = int(getattr(args, "random_k_start", 8))
-    random_k_end = int(getattr(args, "random_k_end", 0))
-
-    cfg = CurriculumConfig(
-        total_steps=total_steps,
-        hard_frac=(hard_frac_start, hard_frac_end),
-        shortlist_M=(shortlist_M_start, shortlist_M_end),
-        k_hard=(k_hard_start, k_hard_end),
-        hier_max_hops_up=(hier_up_start, hier_up_end),
-        hier_max_hops_down=(hier_dn_start, hier_dn_end),
-        random_k=(random_k_start, random_k_end),
-        use_inbatch_easy=(inbatch_easy_start, inbatch_easy_end),
-        mode=args.curriculum_mode,
-        warmup=warmup,
-    )
-    return cfg
 def refresh_go_cache_chunked(ids_to_update, go_text_store, go_encoder, go_cache, device, chunk_size=256):
     ids_to_update = list(ids_to_update)
     go_encoder.eval()
@@ -896,12 +861,6 @@ def run_training(args):
         except Exception:
             pass
 
-    if args.ablation_id == "A1" or args.ablation_id == "A0":
-        scheduler = None
-    else:
-        cur_cfg = build_scheduler_cfg(args, n_spe)
-        scheduler = CurriculumScheduler(cur_cfg)
-
     out_dir = Path(args.output_dir)
 
     # Lightweight runtime context
@@ -932,6 +891,7 @@ def run_training(args):
         eval_rare_go_ids=eval_rare_go_ids,
         protein_n_slots=args.protein_n_slots,
         go_pool_type=args.go_pool_type,
+        go_encoder_output_mode=args.go_encoder_output_mode,
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -983,15 +943,11 @@ def run_training(args):
         max_epochs=args.epochs,
         cand_chunk_k=args.cand_chunk_k,
         pos_chunk_t=args.pos_chunk_t,
-        k_hard_queue=args.k_hard_queue,
-        queue_K=args.queue_K,
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
         go_pooling=args.go_pooling,
         eval_go_bs=args.eval_go_bs,
-        queue_start_step=args.queue_start_step,
-        queue_weight=args.queue_weight,
         max_inbatch=args.max_inbatch,
-        hard_frac_queue=args.hard_frac_queue,
+        eval_cand_chunk_k=args.eval_cand_chunk_k,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1014,17 +970,21 @@ def run_training(args):
         settings=wandb.Settings(code_dir=".", _disable_stats=True),
         reinit=False,
     )
+    queue_cfg = QueueConfig(
+        queue_K=args.queue_K,
+        queue_start_step=args.queue_start_step,
+        queue_hard_frac_start=args.queue_hard_frac_start,
+        queue_hard_frac_end=args.queue_hard_frac_end,
+        queue_hard_frac_warmup_steps=args.queue_hard_frac_warmup_steps,
+        queue_weight_start=args.queue_weight_start,
+        queue_weight_end=args.queue_weight_end,
+        queue_weight_warmup_steps=args.queue_weight_warmup_steps,
+        k_hard_queue_start=args.k_hard_queue_start,
+        k_hard_queue_end=args.k_hard_queue_end,
+        k_hard_queue_warmup_steps=args.k_hard_queue_warmup_steps,
+    )
 
-  #  encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=go_encoder, wandb_run=run)
-
- #   b = next(iter(train_loader))
- #   for i in range(20):
- #       losses = trainer.step_losses(b, epoch_idx=0, debug=True)
- #       print(i, {k: float(v) for k, v in losses.items()})
- #       trainer.opt.zero_grad(set_to_none=True)
- #       losses["total"].backward()
- #       trainer.opt.step()
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, queue_cfg=queue_cfg, go_encoder=go_encoder, wandb_run=run)
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
@@ -1305,7 +1265,7 @@ def load_structured_cfg(path: str):
     wandb_block = cfg.get("wandb", {})
     stores = cfg.get("stores", {})
     general = cfg.get("general", {})
-    memory_bank = cfg.get("memory_bank", {})
+    queue = cfg.get("queue", {})
 
     args = types.SimpleNamespace(
         # general
@@ -1319,6 +1279,7 @@ def load_structured_cfg(path: str):
         phase=general.get("phase", -2),
         protein_n_slots=int(general.get("protein_n_slots", 0)),
         go_pool_type=general.get("go_pool_type", "mean"),
+        go_encoder_output_mode=general.get("go_encoder_output_mode", "pool"),
 
         # paths / store
         train_ids_path=Path(stores.get("train_ids_path")),
@@ -1332,10 +1293,9 @@ def load_structured_cfg(path: str):
         go_basic_json=Path(stores.get("go_basic_json")) if stores.get("go_basic_json") else None,
         seq_len_lookup=Path(stores.get("seq_len_lookup")) if stores.get("seq_len_lookup") else None,
 
+        # dataset DAG / expansion / few-zero
         overlap=data.get("overlap"),
         max_len=data.get("max_len", 1024),
-
-        # dataset DAG / expansion / few-zero
         use_dag_in_ds=bool(data.get("use_dag_in_ds", False)),
         zero_shot_path=stores.get("zero_shot_path"),
         few_shot_path=stores.get("few_shot_path"),
@@ -1361,8 +1321,6 @@ def load_structured_cfg(path: str):
         early_stop_patience=int(training.get("early_stop_patience", 0)),
         cand_chunk_k=int(training.get("cand_chunk_k", 8)),
         pos_chunk_t=int(training.get("pos_chunk_t", 128)),
-        k_hard_queue=int(training.get("k_hard_queue", 128)),
-        queue_K=int(training.get("queue_K", 65536)),
         general_device=str(training.get("device", "cuda:0")),
         max_refresh_go=int(training.get("max_refresh_go", 5000)),
         eval_go_bs=int(training.get("eval_go_bs", 256)),
@@ -1371,15 +1329,26 @@ def load_structured_cfg(path: str):
         go_token_dropout=bool(training.get("go_token_dropout", False)),
         go_pooling=str(training.get("go_pooling", "mean")),
         eval_space=str(training.get("eval_space", "seen")),
-        queue_start_step=int(training.get("queue_start_step", 0)),
-        queue_weight=float(training.get("queue_weight", 1)),
         max_inbatch=int(training.get("max_inbatch", 64)),
-        hard_frac_queue=float(training.get("hard_frac_queue", 0.8)),
+        eval_cand_chunk_k=int(training.get("eval_cand_chunk_k", 8)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
         weight_decay=float(optim.get("weight_decay", 0.01)),
         grad_clip=float(optim.get("grad_clip", 1.0)),
+
+        # queue params
+        queue_K=int(queue.get("queue_K"), 16384),
+        queue_start_step=int(queue.get("queue_start_step", 0)),
+        queue_hard_frac_start=float(queue.get("queue_hard_frac_start", 0.0)),
+        queue_hard_frac_end=float(queue.get("queue_hard_frac_end", 0.0)),
+        queue_hard_frac_warmup_steps=float(queue.get("queue_hard_frac_warmup_steps", 0.0)),
+        queue_weight_start=float(queue.get("queue_weight_start", 0.01)),
+        queue_weight_end=float(queue.get("queue_weight_end", 0.01)),
+        queue_weight_warmup_steps=float(queue.get("queue_weight_warmup_steps", 0.0)),
+        k_hard_queue_start=int(queue.get("k_hard_queue_start", 0)),
+        k_hard_queue_end=int(queue.get("k_hard_queue_end", 0)),
+        k_hard_queue_warmup_steps=int(queue.get("k_hard_queue_warmup_steps", 0.0)),
 
         # model / attention
         align_dim=int(model.get("align_dim", 768)),
@@ -1421,20 +1390,12 @@ def load_structured_cfg(path: str):
         inbatch_easy_end=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[1]),
         neg_k=int(curriculum.get("neg_k", 4)),
 
-        #memory_bank
-        memory_bank_device=str(memory_bank.get("device", "cuda")),
-        memory_bank_dtype=str(memory_bank.get("d_type", "fp16")),
-
-
         # wandb
         wandb=bool(wandb_block.get("enabled", False)),
         wandb_project=wandb_block.get("project", "protein-go-align"),
         wandb_entity=wandb_block.get("entity"),
         wandb_run_name=wandb_block.get("wandb_run_name"),
         wandb_mode=wandb_block.get("mode", "online"),
-
-        # misc
-        n_go=cfg.get("n_go", None),
     )
     return args
 

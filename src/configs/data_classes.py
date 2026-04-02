@@ -153,27 +153,6 @@ class LoRAParameters:
     task_type: str = "FEATURE_EXTRACTION"
 
 
-@dataclass
-class CurriculumConfig:
-    """
-    Scheduling knobs for FAISS negative mining.
-    """
-    total_steps: int
-    hard_frac: Tuple[float, float] = (0.2, 0.8)
-    shortlist_M: Tuple[int, int] = (32, 256)
-    k_hard: Tuple[int, int] = (8, 32)
-    hier_max_hops_up: Tuple[int, int] = (0, 2)
-    hier_max_hops_down: Tuple[int, int] = (0, 1)
-    random_k: Tuple[int, int] = (8, 0)
-    use_inbatch_easy: Tuple[float, float] = (1.0, 0.0)
-    mix_sibling_queue: Dict[str, float] = field(
-        default_factory=lambda: {"SIBLING": 0.7, "QUEUE": 0.3}
-    )
-    allow_siblings_prob: Tuple[float, float] = (0.0, 1.0)
-    mode: str = "cosine"
-    warmup: int = 0
-
-
 @dataclass(frozen=True)
 class TrainingReadyDataPaths:
     # Few/Zero/Common ID-only json
@@ -226,6 +205,7 @@ class TrainingContext:
     protein_pooling_strategy: str = "mean"
     protein_n_slots: int = 0,
     go_pool_type: str = "mean"
+    go_encoder_output_mode: str = "pool"
     eval_id_list: List[int] = None
     logger: Any = None
     eval_seen_go_ids: List[int] = None
@@ -270,8 +250,6 @@ class TrainerConfig:
     max_epochs: int = 20,
     cand_chunk_k: int = 8
     pos_chunk_t: int = 128
-    k_hard_queue: int = 64
-    queue_K:int = 65536
     weight_decay: float = 1e-2
     grad_clip: float = 1.0
     batch_size: int = 64
@@ -282,7 +260,19 @@ class TrainerConfig:
     is_logit_scale_constant: bool = False
     go_pooling: str = "masked_mean"  # cls, mean, masked_mean
     eval_go_bs: int = 256
-    queue_start_step: int = 0
-    queue_weight: float = 0.25
     max_inbatch: int = 64
-    hard_frac_queue: float = 0.8
+    eval_cand_chunk_k: int = 64
+
+@dataclass
+class QueueConfig:
+    queue_K: int = 65536
+    queue_start_step:int = 0
+    queue_hard_frac_start: float = 0.0
+    queue_hard_frac_end: float = 0.0
+    queue_hard_frac_warmup_steps: int = 2000
+    queue_weight_start: float = 0.0
+    queue_weight_end: float = 0.0
+    queue_weight_warmup_steps: int = 2000
+    k_hard_queue_start: int = 0
+    k_hard_queue_end: int = 0
+    k_hard_queue_warmup_steps: int = 2000
