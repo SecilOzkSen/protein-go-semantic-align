@@ -1338,7 +1338,7 @@ def load_structured_cfg(path: str):
         grad_clip=float(optim.get("grad_clip", 1.0)),
 
         # queue params
-        queue_K=int(queue.get("queue_K"), 16384),
+        queue_K=int(queue.get("queue_K", 16384)),
         queue_start_step=int(queue.get("queue_start_step", 0)),
         queue_hard_frac_start=float(queue.get("queue_hard_frac_start", 0.0)),
         queue_hard_frac_end=float(queue.get("queue_hard_frac_end", 0.0)),
