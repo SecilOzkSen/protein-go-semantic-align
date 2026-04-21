@@ -1297,45 +1297,80 @@ class OppTrainer:
         input_ids = toks["input_ids"].to(device, non_blocking=True)
         attn = toks["attention_mask"].to(device, non_blocking=True)
 
+        mode = self.ctx.go_encoder_output_mode
+
         out = self.model.go_encoder(
             input_ids=input_ids,
             attention_mask=attn,
-            output_mode=self.ctx.go_encoder_output_mode,
+            output_mode=mode,
         )
 
         pooled_embs = None
         token_embs = None
         token_mask = None
 
+        # ------------------------------------------
+        # 1) Plain tensor output
+        # ------------------------------------------
         if isinstance(out, torch.Tensor):
-            pooled_embs = out
+            if mode == "tokens":
+                token_embs = out
+                token_mask = attn
+            else:
+                pooled_embs = out
 
+        # ------------------------------------------
+        # 2) Tuple output, usually (pooled, attn_weights)
+        # ------------------------------------------
         elif isinstance(out, tuple):
-            pooled_embs = out[0]
+            if mode == "tokens":
+                token_embs = out[0]
+                token_mask = attn
+            else:
+                pooled_embs = out[0]
 
+        # ------------------------------------------
+        # 3) Dict output
+        # ------------------------------------------
         elif isinstance(out, dict):
             pooled_embs = out.get("pooled", None)
             token_embs = out.get("tokens", None)
             token_mask = out.get("attention_mask", None)
 
+            # if tokens exist but mask is not explicitly returned, use batch mask
+            if token_embs is not None and token_mask is None:
+                token_mask = attn
+
+            # backward compatibility fallback
             if pooled_embs is None and token_embs is None:
                 hidden = out.get("last_hidden_state", None)
                 pooled = out.get("pooler_output", None)
 
-                if pooled is not None:
-                    pooled_embs = pooled
-                elif hidden is not None:
-                    token_embs = hidden
-                    token_mask = attn
+                if mode == "tokens":
+                    if hidden is not None:
+                        token_embs = hidden
+                        token_mask = attn
+                    else:
+                        raise RuntimeError(
+                            "go_encoder output_mode='tokens' but dict output has no token embeddings."
+                        )
                 else:
-                    raise RuntimeError(
-                        "go_encoder dict output missing supported keys: "
-                        "'pooled', 'tokens', 'attention_mask', "
-                        "or legacy 'last_hidden_state'/'pooler_output'"
-                    )
+                    if pooled is not None:
+                        pooled_embs = pooled
+                    elif hidden is not None:
+                        pooled_embs = hidden[:, 0]
+                    else:
+                        raise RuntimeError(
+                            "go_encoder dict output missing supported keys: "
+                            "'pooled', 'tokens', 'attention_mask', "
+                            "or legacy 'last_hidden_state'/'pooler_output'"
+                        )
         else:
             raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
 
+        # ------------------------------------------
+        # sanitize
+        # ------------------------------------------
         if pooled_embs is not None:
             pooled_embs = torch.nan_to_num(pooled_embs)
 
@@ -1348,6 +1383,42 @@ class OppTrainer:
                 token_mask = token_mask != 0
 
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
+
+        # ------------------------------------------
+        # validate by requested mode
+        # ------------------------------------------
+        if mode == "pooled":
+            if pooled_embs is None:
+                raise RuntimeError("go_encoder_output_mode='pooled' but pooled_embs is None.")
+            if pooled_embs.dim() != 2:
+                raise RuntimeError(f"Expected pooled_embs [G,D], got {tuple(pooled_embs.shape)}")
+
+        elif mode == "tokens":
+            if token_embs is None:
+                raise RuntimeError("go_encoder_output_mode='tokens' but token_embs is None.")
+            if token_embs.dim() != 3:
+                raise RuntimeError(f"Expected token_embs [G,L,D], got {tuple(token_embs.shape)}")
+            if token_mask is None:
+                raise RuntimeError("go_encoder_output_mode='tokens' but token_mask is None.")
+            if token_mask.dim() != 2:
+                raise RuntimeError(f"Expected token_mask [G,L], got {tuple(token_mask.shape)}")
+
+        elif mode == "both":
+            if pooled_embs is None:
+                raise RuntimeError("go_encoder_output_mode='both' but pooled_embs is None.")
+            if pooled_embs.dim() != 2:
+                raise RuntimeError(f"Expected pooled_embs [G,D], got {tuple(pooled_embs.shape)}")
+            if token_embs is None:
+                raise RuntimeError("go_encoder_output_mode='both' but token_embs is None.")
+            if token_embs.dim() != 3:
+                raise RuntimeError(f"Expected token_embs [G,L,D], got {tuple(token_embs.shape)}")
+            if token_mask is None:
+                raise RuntimeError("go_encoder_output_mode='both' but token_mask is None.")
+            if token_mask.dim() != 2:
+                raise RuntimeError(f"Expected token_mask [G,L], got {tuple(token_mask.shape)}")
+
+        else:
+            raise RuntimeError(f"Unsupported go_encoder_output_mode: {mode}")
 
         return {
             "pooled_embs": pooled_embs,   # [G,D] or None
