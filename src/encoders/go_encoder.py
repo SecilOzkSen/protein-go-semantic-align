@@ -116,11 +116,11 @@ class BioMedBERTEncoder(nn.Module):
     ):
         super().__init__()
 
-        if attention_pooling_strategy not in {"attn", "mean"}:
-            raise ValueError(
-                f"Unsupported attention_pooling_strategy: {attention_pooling_strategy}. "
-                f"Use 'attn' or 'mean'."
-            )
+    #    if attention_pooling_strategy not in {"attn", "mean", "none"}:
+    #        raise ValueError(
+    #            f"Unsupported attention_pooling_strategy: {attention_pooling_strategy}. "
+    #            f"Use 'attn' or 'mean'."
+    #        )
 
         self.device = torch.device(device) if isinstance(device, str) else device
         self.max_length = max_length
