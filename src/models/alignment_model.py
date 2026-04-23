@@ -117,7 +117,8 @@ class ProteinSlotExtractor(nn.Module):
         scores = torch.einsum("bsd,btd->bst", q, k) / self.scale  # [B,S,T]
 
         if mask is not None:
-            scores = scores.masked_fill(~mask.unsqueeze(1), -1e9)
+            mask_expanded = ~mask.unsqueeze(1)  # [B,1,T]
+            scores = scores.masked_fill(mask_expanded, -1e4)
 
         attn = torch.softmax(scores, dim=-1)  # [B,S,T]
         attn = self.dropout(attn)
