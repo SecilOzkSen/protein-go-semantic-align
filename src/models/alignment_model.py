@@ -401,7 +401,8 @@ class ProteinGoAligner(nn.Module):
                 if go_mask.dtype != torch.bool:
                     go_mask = go_mask != 0
 
-                sim = sim.masked_fill(~go_mask.unsqueeze(1), -1e9)
+                fill_value = -1e4 if sim.dtype == torch.float16 else -1e9
+                sim = sim.masked_fill(~go_mask.unsqueeze(1), fill_value)
 
                 # best token per slot -> [B,S,K]
                 best_token = sim.max(dim=-1).values
