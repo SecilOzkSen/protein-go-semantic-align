@@ -75,7 +75,7 @@ class ProteinSlotExtractor(nn.Module):
         n_slots: int = 4,
         d_attn: Optional[int] = None,
         dropout: float = 0.1,
-        use_residual: bool = True,
+        use_residual: bool = False,
         use_output_ln: bool = True,
     ):
         super().__init__()
@@ -182,7 +182,7 @@ class ProteinGoAligner(nn.Module):
                 n_slots=self.protein_n_slots,
                 d_attn=d_h,
                 dropout=0.05,
-                use_residual=True,
+                use_residual=False,
                 use_output_ln=True,
             )
 
@@ -191,6 +191,8 @@ class ProteinGoAligner(nn.Module):
 
         self.protein_ln = nn.LayerNorm(d_h)
         self.go_ln = nn.LayerNorm(d_g)
+        #TODO: Erase
+        self.step = 0
 
     @staticmethod
     def _norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -347,17 +349,19 @@ class ProteinGoAligner(nn.Module):
 
                 eye = torch.eye(slot_sim.size(1), dtype=torch.bool, device=slot_sim.device)
                 offdiag = slot_sim[:, ~eye]
-
-                print("\n[DBG-SLOT]")
-                print("slots:", tuple(slots.shape), slots.dtype)
-                print("slot cosine b0:")
-                print(slot_sim[0].detach().cpu())
-                print(
-                    "offdiag mean/max/min:",
-                    offdiag.mean().item(),
-                    offdiag.max().item(),
-                    offdiag.min().item(),
-                )
+                #TODO: erase
+                if self.step % 100 == 0:
+                    print("\n[DBG-SLOT]")
+                    print("slots:", tuple(slots.shape), slots.dtype)
+                    print("slot cosine b0:")
+                    print(slot_sim[0].detach().cpu())
+                    print(
+                        "offdiag mean/max/min:",
+                        offdiag.mean().item(),
+                        offdiag.max().item(),
+                        offdiag.min().item(),
+                    )
+                self.step += 1
 
             if return_alpha:
                 alpha_info["protein_slot_attn"] = slot_attn
