@@ -1382,6 +1382,25 @@ class OppTrainer:
             if token_mask.dtype != torch.bool:
                 token_mask = token_mask != 0
 
+        #TODO: Erase later
+        if token_embs is not None:
+            with torch.no_grad():
+                print("\n[DBG-GO-MASK]")
+                print("token_embs:", tuple(token_embs.shape), token_embs.dtype, token_embs.device)
+
+                if token_mask is None:
+                    print("WARNING: token_mask is None")
+                else:
+                    print("token_mask:", tuple(token_mask.shape), token_mask.dtype, token_mask.device)
+                    print("valid tokens first rows:", token_mask.sum(dim=-1).detach().cpu().tolist()[:8])
+
+                    pad_frac = (~token_mask.bool()).float().mean().item()
+                    print("pad_frac:", pad_frac)
+
+                    assert token_mask.shape[-1] == token_embs.shape[-2], (
+                        f"token_mask length {token_mask.shape[-1]} vs token_embs length {token_embs.shape[-2]}"
+                    )
+
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
 
         # ------------------------------------------
@@ -2073,6 +2092,61 @@ class OppTrainer:
                 queue_w = self._queue_weight_schedule(self._global_step)
                 scores_cand[:, q_start:q_start + kq] *= queue_w
 
+            #TODO: Erase debug
+            with torch.no_grad():
+                print("\n[DBG-TARGET]")
+                print("scores_cand:", tuple(scores_cand.shape), scores_cand.dtype)
+
+                if "cand_ids" in batch:
+                    cand_ids = batch["cand_ids"]
+                    print("cand_ids:", tuple(cand_ids.shape))
+                    print("cand_ids[0][:20]:", cand_ids[0, :20].detach().cpu().tolist())
+
+                if "labels" in batch:
+                    labels = batch["labels"]
+                    print("labels:", tuple(labels.shape), labels.dtype)
+                    print("labels unique:", torch.unique(labels.detach().cpu()).tolist())
+                    print("labels positives per row:", labels.sum(dim=1).detach().cpu().tolist())
+                    print("labels[0][:20]:", labels[0, :20].detach().cpu().tolist())
+
+                    pos_mask = labels.bool()
+                    assert scores_cand.shape == pos_mask.shape, (
+                        f"scores_cand {scores_cand.shape} vs pos_mask {pos_mask.shape}"
+                    )
+
+                    pos_per_row = pos_mask.sum(dim=1)
+                    assert (pos_per_row > 0).all(), f"Some rows have no positives: {pos_per_row.tolist()}"
+                    assert (pos_per_row < pos_mask.size(1)).all(), f"All-positive rows: {pos_per_row.tolist()}"
+
+            with torch.no_grad():
+                sc = scores_cand.detach().float()
+                print("\n[DBG-SCORES]")
+                print(
+                    "min/max/mean/std:",
+                    sc.min().item(),
+                    sc.max().item(),
+                    sc.mean().item(),
+                    sc.std().item(),
+                )
+
+                if "labels" in batch:
+                    pos_mask = batch["labels"].bool().to(sc.device)
+                    pos_scores = sc[pos_mask]
+                    neg_scores = sc[~pos_mask]
+
+                    print(
+                        "pos mean/std/n:",
+                        pos_scores.mean().item() if pos_scores.numel() else None,
+                        pos_scores.std().item() if pos_scores.numel() > 1 else None,
+                        pos_scores.numel(),
+                    )
+                    print(
+                        "neg mean/std/n:",
+                        neg_scores.mean().item() if neg_scores.numel() else None,
+                        neg_scores.std().item() if neg_scores.numel() > 1 else None,
+                        neg_scores.numel(),
+                    )
+
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
                 pos_mask,
@@ -2149,6 +2223,7 @@ class OppTrainer:
                 margin=0.0,
                 scale=1.0
             )
+
 
         total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent
 

@@ -340,6 +340,24 @@ class ProteinGoAligner(nn.Module):
         else:  # "slots"
             slots, slot_attn = self.slot_extractor(H, mask)  # [B,S,Dh], [B,S,T]
             slots = self.protein_ln(slots)
+            import torch.nn.functional as F
+            with torch.no_grad():
+                s = F.normalize(slots.detach().float(), dim=-1)
+                slot_sim = torch.matmul(s, s.transpose(1, 2))  # [B,S,S]
+
+                eye = torch.eye(slot_sim.size(1), dtype=torch.bool, device=slot_sim.device)
+                offdiag = slot_sim[:, ~eye]
+
+                print("\n[DBG-SLOT]")
+                print("slots:", tuple(slots.shape), slots.dtype)
+                print("slot cosine b0:")
+                print(slot_sim[0].detach().cpu())
+                print(
+                    "offdiag mean/max/min:",
+                    offdiag.mean().item(),
+                    offdiag.max().item(),
+                    offdiag.min().item(),
+                )
 
             if return_alpha:
                 alpha_info["protein_slot_attn"] = slot_attn
@@ -366,6 +384,35 @@ class ProteinGoAligner(nn.Module):
 
                 # [B,S,K]
                 sim = torch.einsum("bsd,bkd->bsk", Zp, Gz)
+
+                #TODO: Erase later
+                with torch.no_grad():
+                    sim_f = sim.detach().float()
+
+                    print("\n[DBG-SIM]")
+                    print("sim:", tuple(sim.shape))
+                    print(
+                        "sim min/max/mean/std:",
+                        sim_f.min().item(),
+                        sim_f.max().item(),
+                        sim_f.mean().item(),
+                        sim_f.std().item(),
+                    )
+
+                    max_over_slots = sim_f.max(dim=1).values  # [B,K]
+                    mean_over_slots = sim_f.mean(dim=1)
+
+                    print(
+                        "max_over_slots mean/std:",
+                        max_over_slots.mean().item(),
+                        max_over_slots.std().item(),
+                    )
+
+                    print(
+                        "mean_over_slots mean/std:",
+                        mean_over_slots.mean().item(),
+                        mean_over_slots.std().item(),
+                    )
 
                 # [B,K]
                 scores = sim.max(dim=1).values

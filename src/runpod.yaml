@@ -31,7 +31,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align/outputs/run-A1
+  output_dir: /workspace/protein-go-align-outputs-A2
   save_every: 10000
   keep_last_n: 3
  # resume: null #/workspace/checkpoints/checkpoint_step56000.pt
@@ -119,7 +119,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-a1"
+  wandb_run_name: "protein-go-semantic-align-ablation-a2minmax"
   mode: online
 
 stores:
@@ -142,6 +142,5 @@ stores:
 
   seq_len_lookup: /workspace/data/seq_len_lookup.pkl
 
-  output_dir: /workspace/protein-go-align-outputs-a1
   logs: /workspace/protein-go-align-logs-a1
 
