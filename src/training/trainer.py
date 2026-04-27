@@ -2083,8 +2083,20 @@ class OppTrainer:
 
             assert scores_cand.requires_grad, "scores_cand grad not enabled"
 
+            scores_cand_pre = scores_cand
+
+            with torch.no_grad():
+                pre = scores_cand_pre.detach().float()
+                print("\n[DBG-SCORES-PRE]")
+                print("pre min/max/mean/std:", pre.min().item(), pre.max().item(), pre.mean().item(), pre.std().item())
+
             scale = self.logit_scale_tensor()
             scores_cand = scores_cand * scale
+
+            with torch.no_grad():
+                post = scores_cand.detach().float()
+                print("\n[DBG-SCORES-POST]")
+                print("post min/max/mean/std:", post.min().item(), post.max().item(), post.mean().item())
 
             # queue weighting only on queue tail
             if kq > 0:
@@ -2093,30 +2105,21 @@ class OppTrainer:
                 scores_cand[:, q_start:q_start + kq] *= queue_w
 
             #TODO: Erase debug
+            # DEBUG TARGET, use meta pos_mask, not batch["labels"]
             with torch.no_grad():
                 print("\n[DBG-TARGET]")
                 print("scores_cand:", tuple(scores_cand.shape), scores_cand.dtype)
+                print("pos_mask:", tuple(pos_mask.shape), pos_mask.dtype)
+                print("pos_mask unique:", torch.unique(pos_mask.detach().cpu()).tolist())
+                print("positives per row:", pos_mask.sum(dim=1).detach().cpu().tolist())
 
-                if "cand_ids" in batch:
-                    cand_ids = batch["cand_ids"]
-                    print("cand_ids:", tuple(cand_ids.shape))
-                    print("cand_ids[0][:20]:", cand_ids[0, :20].detach().cpu().tolist())
+                assert scores_cand.shape == pos_mask.shape, (
+                    f"scores_cand {scores_cand.shape} vs pos_mask {pos_mask.shape}"
+                )
 
-                if "labels" in batch:
-                    labels = batch["labels"]
-                    print("labels:", tuple(labels.shape), labels.dtype)
-                    print("labels unique:", torch.unique(labels.detach().cpu()).tolist())
-                    print("labels positives per row:", labels.sum(dim=1).detach().cpu().tolist())
-                    print("labels[0][:20]:", labels[0, :20].detach().cpu().tolist())
-
-                    pos_mask = labels.bool()
-                    assert scores_cand.shape == pos_mask.shape, (
-                        f"scores_cand {scores_cand.shape} vs pos_mask {pos_mask.shape}"
-                    )
-
-                    pos_per_row = pos_mask.sum(dim=1)
-                    assert (pos_per_row > 0).all(), f"Some rows have no positives: {pos_per_row.tolist()}"
-                    assert (pos_per_row < pos_mask.size(1)).all(), f"All-positive rows: {pos_per_row.tolist()}"
+                pos_per_row = pos_mask.sum(dim=1)
+                assert (pos_per_row > 0).all(), f"Some rows have no positives: {pos_per_row.tolist()}"
+                assert (pos_per_row < pos_mask.size(1)).all(), f"All-positive rows: {pos_per_row.tolist()}"
 
             with torch.no_grad():
                 sc = scores_cand.detach().float()

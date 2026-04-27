@@ -341,6 +341,29 @@ class ProteinGoAligner(nn.Module):
         # --------------------------------------------------
         else:  # "slots"
             slots, slot_attn = self.slot_extractor(H, mask)  # [B,S,Dh], [B,S,T]
+            #TODO: Erase later
+            with torch.no_grad():
+                import torch.nn.functional as F
+                a = F.normalize(slot_attn.detach().float(), dim=-1)  # [B,S,T]
+                attn_sim = torch.matmul(a, a.transpose(1, 2))  # [B,S,S]
+
+                eye = torch.eye(attn_sim.size(1), dtype=torch.bool, device=attn_sim.device)
+                offdiag = attn_sim[:, ~eye]
+
+                print("\n[DBG-SLOT-ATTN]")
+                print("slot_attn:", tuple(slot_attn.shape), slot_attn.dtype)
+                print("attn cosine b0:")
+                print(attn_sim[0].detach().cpu())
+                print(
+                    "attn offdiag mean/max/min:",
+                    offdiag.mean().item(),
+                    offdiag.max().item(),
+                    offdiag.min().item(),
+                )
+
+                entropy = -(slot_attn.detach().float() * (slot_attn.detach().float() + 1e-8).log()).sum(dim=-1)
+                print("attn entropy mean:", entropy.mean().item())
+                print("attn entropy b0:", entropy[0].detach().cpu())
             slots = self.protein_ln(slots)
             import torch.nn.functional as F
             with torch.no_grad():
@@ -389,35 +412,6 @@ class ProteinGoAligner(nn.Module):
                 # [B,S,K]
                 sim = torch.einsum("bsd,bkd->bsk", Zp, Gz)
 
-                #TODO: Erase later
-                with torch.no_grad():
-                    sim_f = sim.detach().float()
-
-                    print("\n[DBG-SIM]")
-                    print("sim:", tuple(sim.shape))
-                    print(
-                        "sim min/max/mean/std:",
-                        sim_f.min().item(),
-                        sim_f.max().item(),
-                        sim_f.mean().item(),
-                        sim_f.std().item(),
-                    )
-
-                    max_over_slots = sim_f.max(dim=1).values  # [B,K]
-                    mean_over_slots = sim_f.mean(dim=1)
-
-                    print(
-                        "max_over_slots mean/std:",
-                        max_over_slots.mean().item(),
-                        max_over_slots.std().item(),
-                    )
-
-                    print(
-                        "mean_over_slots mean/std:",
-                        mean_over_slots.mean().item(),
-                        mean_over_slots.std().item(),
-                    )
-
                 # [B,K]
                 scores = sim.max(dim=1).values
 
@@ -448,6 +442,35 @@ class ProteinGoAligner(nn.Module):
 
                 # [B,S,K,L]
                 sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
+
+                # TODO: Erase later
+                with torch.no_grad():
+                    sim_f = sim.detach().float()
+
+                    print("\n[DBG-SIM]")
+                    print("sim:", tuple(sim.shape))
+                    print(
+                        "sim min/max/mean/std:",
+                        sim_f.min().item(),
+                        sim_f.max().item(),
+                        sim_f.mean().item(),
+                        sim_f.std().item(),
+                    )
+
+                    max_over_slots = sim_f.max(dim=1).values  # [B,K]
+                    mean_over_slots = sim_f.mean(dim=1)
+
+                    print(
+                        "max_over_slots mean/std:",
+                        max_over_slots.mean().item(),
+                        max_over_slots.std().item(),
+                    )
+
+                    print(
+                        "mean_over_slots mean/std:",
+                        mean_over_slots.mean().item(),
+                        mean_over_slots.std().item(),
+                    )
 
                 if go_mask.dtype != torch.bool:
                     go_mask = go_mask != 0
