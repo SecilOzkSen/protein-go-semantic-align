@@ -107,6 +107,17 @@ def multi_positive_infonce_from_candidates_v2(
     # return 0 with correct dtype/device
     return denom.mean() * 0.0
 
+def slot_attention_diversity_loss(slot_attn: torch.Tensor) -> torch.Tensor:
+    # slot_attn: [B, S, T]
+    a = F.normalize(slot_attn.float(), dim=-1)
+    sim = torch.matmul(a, a.transpose(1, 2))  # [B,S,S]
+
+    S = sim.size(1)
+    eye = torch.eye(S, dtype=torch.bool, device=sim.device)
+    offdiag = sim[:, ~eye]
+
+    return offdiag.pow(2).mean()
+
 
 @torch.no_grad()
 def delta_y_from_occlusion_windows(
@@ -312,6 +323,7 @@ class OppTrainer:
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
+        self.return_slot_attn = ctx.return_slot_attn
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
         self.model = ProteinGoAligner(
@@ -1383,23 +1395,23 @@ class OppTrainer:
                 token_mask = token_mask != 0
 
         #TODO: Erase later
-        if token_embs is not None:
-            with torch.no_grad():
-                print("\n[DBG-GO-MASK]")
-                print("token_embs:", tuple(token_embs.shape), token_embs.dtype, token_embs.device)
+        if self._global_step % 200 == 0 and token_embs is not None:
+                with torch.no_grad():
+                    print("\n[DBG-GO-MASK]")
+                    print("token_embs:", tuple(token_embs.shape), token_embs.dtype, token_embs.device)
 
-                if token_mask is None:
-                    print("WARNING: token_mask is None")
-                else:
-                    print("token_mask:", tuple(token_mask.shape), token_mask.dtype, token_mask.device)
-                    print("valid tokens first rows:", token_mask.sum(dim=-1).detach().cpu().tolist()[:8])
+                    if token_mask is None:
+                        print("WARNING: token_mask is None")
+                    else:
+                        print("token_mask:", tuple(token_mask.shape), token_mask.dtype, token_mask.device)
+                        print("valid tokens first rows:", token_mask.sum(dim=-1).detach().cpu().tolist()[:8])
 
-                    pad_frac = (~token_mask.bool()).float().mean().item()
-                    print("pad_frac:", pad_frac)
+                        pad_frac = (~token_mask.bool()).float().mean().item()
+                        print("pad_frac:", pad_frac)
 
-                    assert token_mask.shape[-1] == token_embs.shape[-2], (
-                        f"token_mask length {token_mask.shape[-1]} vs token_embs length {token_embs.shape[-2]}"
-                    )
+                        assert token_mask.shape[-1] == token_embs.shape[-2], (
+                            f"token_mask length {token_mask.shape[-1]} vs token_embs length {token_embs.shape[-2]}"
+                        )
 
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
 
@@ -1873,53 +1885,30 @@ class OppTrainer:
 
         # token candidates [B,K,L,D]
         if G.dim() == 4:
+            if return_alpha:
+                raise RuntimeError("return_alpha=True is not supported in cached slot token-align mode.")
+
             scores_all = []
-            alpha_all = [] if return_alpha else None
             B, K, L, Dg = G.shape
+
+            # protein slots / protein representation computed ONCE
+            Zp = self.model.encode_protein_for_scoring(H, mask)
+
             for ks in range(0, K, cand_chunk_k):
                 ke = min(K, ks + cand_chunk_k)
+
                 g_chunk = G[:, ks:ke].contiguous()
                 gm_chunk = None if go_mask is None else go_mask[:, ks:ke].contiguous()
 
-                out = self.model(
-                    H=H,
+                sc = self.model.score_from_encoded_protein(
+                    Zp=Zp,
                     G=g_chunk,
-                    mask=mask,
                     go_mask=gm_chunk,
-                    return_alpha=return_alpha,
-                    cand_chunk_k=None,
-                    pos_chunk_t=pos_chunk_t,
-                    **kwargs,
                 )
-                sc, _, alpha = _unpack(out)
+
                 scores_all.append(sc)
-                if return_alpha:
-                    alpha_all.append(alpha)
 
             scores = torch.cat(scores_all, dim=1)
-
-            if return_alpha:
-                merged = {}
-                if len(alpha_all) > 0:
-                    # keep only keys that can be concatenated on candidate dim
-                    keys = set()
-                    for a in alpha_all:
-                        keys.update(a.keys())
-                    for k in keys:
-                        vals = [a[k] for a in alpha_all if k in a]
-                        if len(vals) == 0:
-                            continue
-                        try:
-                            # candidate dim assumed dim=2 for slot_token_sim [B,S,K,L]
-                            # or dim=2 for best_token_per_slot [B,S,K]
-                            merged[k] = torch.cat(vals, dim=2)
-                        except Exception:
-                            try:
-                                merged[k] = torch.cat(vals, dim=1)
-                            except Exception:
-                                merged[k] = vals[0]
-                return scores, merged
-
             return scores
 
         out = self.model(
@@ -2070,6 +2059,10 @@ class OppTrainer:
                 go_mask=G_cand_mask,
                 return_alpha=False,
             )
+            l_slot_div = torch.zeros((), device=device)
+            slot_extractor = getattr(self.model, "slot_extractor", None)
+            if slot_extractor is not None and getattr(slot_extractor, "last_slot_div_loss", None) is not None:
+                l_slot_div = slot_extractor.last_slot_div_loss
 
             if self._global_step % 200 == 0:
                 _tstats(scores_cand, "scores_cand(pre_scale)")
@@ -2085,18 +2078,22 @@ class OppTrainer:
 
             scores_cand_pre = scores_cand
 
-            with torch.no_grad():
-                pre = scores_cand_pre.detach().float()
-                print("\n[DBG-SCORES-PRE]")
-                print("pre min/max/mean/std:", pre.min().item(), pre.max().item(), pre.mean().item(), pre.std().item())
+            if self._global_step % 200 == 0:
+                with torch.no_grad():
+                    pre = scores_cand_pre.detach().float()
+                    print("\n[DBG-SCORES-PRE]")
+                    print("pre min/max/mean/std:", pre.min().item(), pre.max().item(), pre.mean().item(),
+                          pre.std().item())
 
             scale = self.logit_scale_tensor()
             scores_cand = scores_cand * scale
 
-            with torch.no_grad():
-                post = scores_cand.detach().float()
-                print("\n[DBG-SCORES-POST]")
-                print("post min/max/mean/std:", post.min().item(), post.max().item(), post.mean().item())
+            if self._global_step % 200 == 0:
+                with torch.no_grad():
+                    post = scores_cand.detach().float()
+                    print("\n[DBG-SCORES-POST]")
+                    print("post min/max/mean/std:", post.min().item(), post.max().item(), post.mean().item(),
+                          post.std().item())
 
             # queue weighting only on queue tail
             if kq > 0:
@@ -2106,36 +2103,36 @@ class OppTrainer:
 
             #TODO: Erase debug
             # DEBUG TARGET, use meta pos_mask, not batch["labels"]
-            with torch.no_grad():
-                print("\n[DBG-TARGET]")
-                print("scores_cand:", tuple(scores_cand.shape), scores_cand.dtype)
-                print("pos_mask:", tuple(pos_mask.shape), pos_mask.dtype)
-                print("pos_mask unique:", torch.unique(pos_mask.detach().cpu()).tolist())
-                print("positives per row:", pos_mask.sum(dim=1).detach().cpu().tolist())
+            if self._global_step % 200 == 0:
+                with torch.no_grad():
+                    print("\n[DBG-TARGET]")
+                    print("scores_cand:", tuple(scores_cand.shape), scores_cand.dtype)
+                    print("pos_mask:", tuple(pos_mask.shape), pos_mask.dtype)
+                    print("pos_mask unique:", torch.unique(pos_mask.detach().cpu()).tolist())
+                    print("positives per row:", pos_mask.sum(dim=1).detach().cpu().tolist())
 
-                assert scores_cand.shape == pos_mask.shape, (
-                    f"scores_cand {scores_cand.shape} vs pos_mask {pos_mask.shape}"
-                )
+                    assert scores_cand.shape == pos_mask.shape, (
+                        f"scores_cand {scores_cand.shape} vs pos_mask {pos_mask.shape}"
+                    )
 
-                pos_per_row = pos_mask.sum(dim=1)
-                assert (pos_per_row > 0).all(), f"Some rows have no positives: {pos_per_row.tolist()}"
-                assert (pos_per_row < pos_mask.size(1)).all(), f"All-positive rows: {pos_per_row.tolist()}"
+                    pos_per_row = pos_mask.sum(dim=1)
+                    assert (pos_per_row > 0).all(), f"Some rows have no positives: {pos_per_row.tolist()}"
+                    assert (pos_per_row < pos_mask.size(1)).all(), f"All-positive rows: {pos_per_row.tolist()}"
 
-            with torch.no_grad():
-                sc = scores_cand.detach().float()
-                print("\n[DBG-SCORES]")
-                print(
-                    "min/max/mean/std:",
-                    sc.min().item(),
-                    sc.max().item(),
-                    sc.mean().item(),
-                    sc.std().item(),
-                )
+                with torch.no_grad():
+                    sc = scores_cand.detach().float()
+                    print("\n[DBG-SCORES]")
+                    print(
+                        "min/max/mean/std:",
+                        sc.min().item(),
+                        sc.max().item(),
+                        sc.mean().item(),
+                        sc.std().item(),
+                    )
 
-                if "labels" in batch:
-                    pos_mask = batch["labels"].bool().to(sc.device)
-                    pos_scores = sc[pos_mask]
-                    neg_scores = sc[~pos_mask]
+                    pm = pos_mask.bool().to(sc.device)
+                    pos_scores = sc[pm]
+                    neg_scores = sc[~pm]
 
                     print(
                         "pos mean/std/n:",
@@ -2228,7 +2225,7 @@ class OppTrainer:
             )
 
 
-        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent
+        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent + 0.01*l_slot_div
 
         self._global_step += 1
 
@@ -2296,6 +2293,7 @@ class OppTrainer:
                     "train/queue_hard_frac": float(self._queue_hard_frac_schedule(self._global_step)),
                     "train/queue_weight_eff": float(self._queue_weight_schedule(self._global_step)),
                     "train/k_hard_queue_eff": int(self._k_hard_queue_schedule(self._global_step)),
+                    "train/slot_div": float(l_slot_div.detach().item()),
                 },
                 step=int(self._global_step),
             )

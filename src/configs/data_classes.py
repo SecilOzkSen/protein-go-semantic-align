@@ -201,6 +201,7 @@ class TrainingContext:
     use_queue_miner: bool = True
     attribute_loss_enabled: bool = False
     return_alpha: bool = False
+    return_slot_attn: bool = False
     fused_bank: Any = None
     protein_pooling_strategy: str = "mean"
     protein_n_slots: int = 0,

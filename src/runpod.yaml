@@ -14,6 +14,7 @@ general: #Ablation Purposes
   use_lora: True #CHECKED
   use_attribution_loss: False #CHECKED
   return_alpha: False
+  return_slot_attn: True
   protein_pooling_strategy: "slots" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots"
   protein_n_slots: 4
   go_pool_type: "token_align"

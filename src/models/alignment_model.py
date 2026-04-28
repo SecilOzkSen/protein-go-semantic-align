@@ -22,6 +22,14 @@ Note:
     1.	protein_pool_type="slots", go_pool_type="mean"
 	2.	protein_pool_type="slots", go_pool_type="token_align"
 
+ProteinSlotExtractor
+        ↓
+encode_protein_for_scoring
+        ↓
+score_from_encoded_protein
+        ↓
+scores
+
 '''
 
 import math
@@ -33,6 +41,7 @@ import torch.nn as nn
 from src.models.projection import ProjectionHead
 from src.encoders import BioMedBERTEncoder
 from src.models.go_token_align_pooler import GoTokenAlignPooler
+import torch.nn.functional as F
 
 
 class AttentionPool1D(nn.Module):
@@ -42,9 +51,9 @@ class AttentionPool1D(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(
-        self,
-        x: torch.Tensor,                     # [B, T, D]
-        mask: Optional[torch.Tensor] = None # [B, T] bool, True=valid
+            self,
+            x: torch.Tensor,  # [B, T, D]
+            mask: Optional[torch.Tensor] = None  # [B, T] bool, True=valid
     ):
         s = self.score(self.dropout(x)).squeeze(-1)  # [B, T]
 
@@ -52,7 +61,7 @@ class AttentionPool1D(nn.Module):
             neg_inf = torch.finfo(s.dtype).min
             s = s.masked_fill(~mask, neg_inf)
 
-        a = torch.softmax(s, dim=1)                  # [B, T]
+        a = torch.softmax(s, dim=1)  # [B, T]
         pooled = torch.sum(x * a.unsqueeze(-1), dim=1)  # [B, D]
         return pooled, a
 
@@ -69,14 +78,15 @@ class ProteinSlotExtractor(nn.Module):
         slots: [B, S, D]
         attn:  [B, S, T]
     """
+
     def __init__(
-        self,
-        d_in: int,
-        n_slots: int = 4,
-        d_attn: Optional[int] = None,
-        dropout: float = 0.1,
-        use_residual: bool = False,
-        use_output_ln: bool = True,
+            self,
+            d_in: int,
+            n_slots: int = 4,
+            d_attn: Optional[int] = None,
+            dropout: float = 0.1,
+            use_residual: bool = False,
+            use_output_ln: bool = True,
     ):
         super().__init__()
         self.d_in = int(d_in)
@@ -92,6 +102,7 @@ class ProteinSlotExtractor(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
         self.out_ln = nn.LayerNorm(self.d_in) if use_output_ln else nn.Identity()
         self.use_residual = bool(use_residual)
+        self.last_slot_div_loss = None
 
         if self.use_residual:
             self.residual_proj = nn.Linear(self.d_attn, self.d_in)
@@ -101,9 +112,9 @@ class ProteinSlotExtractor(nn.Module):
         self.scale = math.sqrt(float(self.d_attn))
 
     def forward(
-        self,
-        H: torch.Tensor,                     # [B, T, D]
-        mask: Optional[torch.Tensor] = None # [B, T] bool
+            self,
+            H: torch.Tensor,  # [B, T, D]
+            mask: Optional[torch.Tensor] = None  # [B, T] bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, D = H.shape
 
@@ -123,6 +134,18 @@ class ProteinSlotExtractor(nn.Module):
         attn = torch.softmax(scores, dim=-1)  # [B,S,T]
         attn = self.dropout(attn)
 
+        # dropout sonrası attention toplamı bozulmasın
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        a = F.normalize(attn.float(), dim=-1)
+        attn_sim = torch.matmul(a, a.transpose(1, 2))  # [B,S,S]
+
+        S = attn_sim.size(1)
+        eye = torch.eye(S, dtype=torch.bool, device=attn_sim.device)
+        offdiag = attn_sim[:, ~eye]
+
+        self.last_slot_div_loss = offdiag.pow(2).mean()
+
         slots = torch.einsum("bst,btd->bsd", attn, v)  # [B,S,D]
 
         if self.use_residual:
@@ -134,15 +157,15 @@ class ProteinSlotExtractor(nn.Module):
 
 class ProteinGoAligner(nn.Module):
     def __init__(
-        self,
-        d_h: int,
-        d_g: Optional[int] = None,
-        d_z: int = 768,
-        go_encoder: Optional[BioMedBERTEncoder] = None,
-        normalize: bool = True,
-        protein_pool_type: str = "mean",   # "mean" | "attn" | "go_align" | "slots"
-        protein_n_slots: int = 4,
-        go_pool_type: str = "mean",        # used when protein_pool_type == "slots": "mean" | "token_align"
+            self,
+            d_h: int,
+            d_g: Optional[int] = None,
+            d_z: int = 768,
+            go_encoder: Optional[BioMedBERTEncoder] = None,
+            normalize: bool = True,
+            protein_pool_type: str = "mean",  # "mean" | "attn" | "go_align" | "slots"
+            protein_n_slots: int = 4,
+            go_pool_type: str = "mean",  # used when protein_pool_type == "slots": "mean" | "token_align"
     ):
         super().__init__()
 
@@ -191,8 +214,6 @@ class ProteinGoAligner(nn.Module):
 
         self.protein_ln = nn.LayerNorm(d_h)
         self.go_ln = nn.LayerNorm(d_g)
-        #TODO: Erase
-        self.step = 0
 
     @staticmethod
     def _norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -201,8 +222,8 @@ class ProteinGoAligner(nn.Module):
 
     @staticmethod
     def _masked_mean(
-        x: torch.Tensor,                     # [N, L, D]
-        mask: Optional[torch.Tensor] = None # [N, L] bool
+            x: torch.Tensor,  # [N, L, D]
+            mask: Optional[torch.Tensor] = None  # [N, L] bool
     ) -> torch.Tensor:
         if mask is None:
             return x.mean(dim=1)
@@ -210,282 +231,146 @@ class ProteinGoAligner(nn.Module):
         if mask.dtype != torch.bool:
             mask = mask != 0
 
-        w = mask.to(x.dtype).unsqueeze(-1)   # [N,L,1]
+        w = mask.to(x.dtype).unsqueeze(-1)  # [N,L,1]
         denom = w.sum(dim=1).clamp_min(1.0)  # [N,1]
-        return (x * w).sum(dim=1) / denom    # [N,D]
+        return (x * w).sum(dim=1) / denom  # [N,D]
 
-    def forward(
-        self,
-        H: torch.Tensor,                       # [B, T, Dh]
-        G: torch.Tensor,                       # [B, K, Dg] OR [B, K, L, Dg]
-        mask: Optional[torch.Tensor],          # [B, T], bool, True=valid
-        go_mask: Optional[torch.Tensor] = None,# [B, K, L] for token GO
-        return_alpha: bool = False,
-        **kwargs
-    ):
+    def encode_protein_for_scoring(self, H, mask=None):
+        """
+        Returns projected protein representation used for scoring.
+        For slots: [B, S, Dz]
+        For pooled: [B, Dz]
+        """
         if mask is not None and mask.dtype != torch.bool:
             mask = mask != 0
 
-        alpha_info = {}
-
-        if G.dim() not in {3, 4}:
-            raise ValueError("G must be [B, K, Dg] or [B, K, L, Dg].")
-
-        B, T, Dh = H.shape
-        if G.dim() == 3:
-            _, K, Dg = G.shape
-            L = None
-        else:
-            _, K, L, Dg = G.shape
-
-        # --------------------------------------------------
-        # mean pooling baseline
-        # --------------------------------------------------
-        if self.protein_pool_type == "mean":
-            if mask is not None:
-                w = mask.to(H.dtype).unsqueeze(-1)      # [B,T,1]
-                denom = w.sum(dim=1).clamp_min(1.0)     # [B,1]
-                h_pool = (H * w).sum(dim=1) / denom     # [B,Dh]
-            else:
-                h_pool = H.mean(dim=1)                  # [B,Dh]
-
-            h_pool = self.protein_ln(h_pool)            # [B,Dh]
-            Z = h_pool.unsqueeze(1).expand(B, K, Dh)    # [B,K,Dh]
-
-            if G.dim() == 4:
-                if go_mask is None:
-                    raise ValueError("go_mask must be provided when G is [B,K,L,Dg].")
-                G_flat = G.view(B * K, L, Dg)
-                go_mask_flat = go_mask.view(B * K, L)
-                G = self._masked_mean(G_flat, go_mask_flat).view(B, K, Dg)
-
-            G = self.go_ln(G)
-            Zp = self.proj_p(Z)
-            Gz = self.proj_g(G)
-
-            if self.normalize:
-                Zp = self._norm(Zp, dim=-1)
-                Gz = self._norm(Gz, dim=-1)
-
-            scores = (Zp * Gz).sum(dim=-1)              # [B,K]
-
-            if return_alpha:
-                return scores, alpha_info
-            return scores
-
-        # --------------------------------------------------
-        # attention pooling baseline
-        # --------------------------------------------------
-        elif self.protein_pool_type == "attn":
-            h_pool, attn = self.protein_attn_pool(H, mask)  # [B,Dh], [B,T]
-            h_pool = self.protein_ln(h_pool)
-            Z = h_pool.unsqueeze(1).expand(B, K, Dh)
-
-            if return_alpha:
-                alpha_info["protein_attn"] = attn
-
-            if G.dim() == 4:
-                if go_mask is None:
-                    raise ValueError("go_mask must be provided when G is [B,K,L,Dg].")
-                G_flat = G.view(B * K, L, Dg)
-                go_mask_flat = go_mask.view(B * K, L)
-                G = self._masked_mean(G_flat, go_mask_flat).view(B, K, Dg)
-
-            G = self.go_ln(G)
-            Zp = self.proj_p(Z)
-            Gz = self.proj_g(G)
-
-            if self.normalize:
-                Zp = self._norm(Zp, dim=-1)
-                Gz = self._norm(Gz, dim=-1)
-
-            scores = (Zp * Gz).sum(dim=-1)              # [B,K]
-
-            if return_alpha:
-                return scores, alpha_info
-            return scores
-
-        # --------------------------------------------------
-        # go_align branch
-        # --------------------------------------------------
-        elif self.protein_pool_type == "go_align":
-            if G.dim() != 3:
-                raise ValueError("For protein_pool_type='go_align', G must be [B, K, Dg].")
-
-            Z, gtap_alpha = self.go_token_align_pooler(
-                H, G, mask, return_alpha=return_alpha
-            )  # [B,K,Dh] depending on your external implementation
-
-            Z = self.protein_ln(Z)
-
-            if return_alpha:
-                alpha_info.update(gtap_alpha)
-
-            G = self.go_ln(G)
-
-            Zp = self.proj_p(Z)
-            Gz = self.proj_g(G)
-
-            if self.normalize:
-                Zp = self._norm(Zp, dim=-1)
-                Gz = self._norm(Gz, dim=-1)
-
-            scores = (Zp * Gz).sum(dim=-1)
-
-            if return_alpha:
-                return scores, alpha_info
-            return scores
-
-        # --------------------------------------------------
-        # slots branch
-        # --------------------------------------------------
-        else:  # "slots"
+        if self.protein_pool_type == "slots":
             slots, slot_attn = self.slot_extractor(H, mask)  # [B,S,Dh], [B,S,T]
-            #TODO: Erase later
-            with torch.no_grad():
-                import torch.nn.functional as F
-                a = F.normalize(slot_attn.detach().float(), dim=-1)  # [B,S,T]
-                attn_sim = torch.matmul(a, a.transpose(1, 2))  # [B,S,S]
 
-                eye = torch.eye(attn_sim.size(1), dtype=torch.bool, device=attn_sim.device)
-                offdiag = attn_sim[:, ~eye]
+            # slot diversity loss already stored inside slot_extractor if you added it there
+            Zp = self.protein_ln(slots)
+            Zp = self.proj_p(Zp)
 
-                print("\n[DBG-SLOT-ATTN]")
-                print("slot_attn:", tuple(slot_attn.shape), slot_attn.dtype)
-                print("attn cosine b0:")
-                print(attn_sim[0].detach().cpu())
-                print(
-                    "attn offdiag mean/max/min:",
-                    offdiag.mean().item(),
-                    offdiag.max().item(),
-                    offdiag.min().item(),
-                )
+            if self.normalize:
+                Zp = self._norm(Zp, dim=-1)
 
-                entropy = -(slot_attn.detach().float() * (slot_attn.detach().float() + 1e-8).log()).sum(dim=-1)
-                print("attn entropy mean:", entropy.mean().item())
-                print("attn entropy b0:", entropy[0].detach().cpu())
-            slots = self.protein_ln(slots)
-            import torch.nn.functional as F
-            with torch.no_grad():
-                s = F.normalize(slots.detach().float(), dim=-1)
-                slot_sim = torch.matmul(s, s.transpose(1, 2))  # [B,S,S]
+            return Zp
 
-                eye = torch.eye(slot_sim.size(1), dtype=torch.bool, device=slot_sim.device)
-                offdiag = slot_sim[:, ~eye]
-                #TODO: erase
-                if self.step % 100 == 0:
-                    print("\n[DBG-SLOT]")
-                    print("slots:", tuple(slots.shape), slots.dtype)
-                    print("slot cosine b0:")
-                    print(slot_sim[0].detach().cpu())
-                    print(
-                        "offdiag mean/max/min:",
-                        offdiag.mean().item(),
-                        offdiag.max().item(),
-                        offdiag.min().item(),
-                    )
-                self.step += 1
+        elif self.protein_pool_type == "attn":
+            h_pool, _ = self.protein_attn_pool(H, mask)
+            Zp = self.protein_ln(h_pool)
+            Zp = self.proj_p(Zp)
 
-            if return_alpha:
-                alpha_info["protein_slot_attn"] = slot_attn
+            if self.normalize:
+                Zp = self._norm(Zp, dim=-1)
 
-            # ----------------------------------------------
-            # slots + mean GO
-            # ----------------------------------------------
-            if self.go_pool_type == "mean":
-                if G.dim() == 4:
-                    if go_mask is None:
-                        raise ValueError("go_mask must be provided when G is [B,K,L,Dg].")
-                    G_flat = G.view(B * K, L, Dg)
-                    go_mask_flat = go_mask.view(B * K, L)
-                    G = self._masked_mean(G_flat, go_mask_flat).view(B, K, Dg)
+            return Zp
 
-                G = self.go_ln(G)                        # [B,K,Dg]
+        elif self.protein_pool_type == "mean":
+            if mask is not None:
+                w = mask.to(H.dtype).unsqueeze(-1)
+                h_pool = (H * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+            else:
+                h_pool = H.mean(dim=1)
 
-                Zp = self.proj_p(slots)                 # [B,S,Dz]
-                Gz = self.proj_g(G)                     # [B,K,Dz]
+            Zp = self.protein_ln(h_pool)
+            Zp = self.proj_p(Zp)
 
-                if self.normalize:
-                    Zp = self._norm(Zp, dim=-1)
-                    Gz = self._norm(Gz, dim=-1)
+            if self.normalize:
+                Zp = self._norm(Zp, dim=-1)
 
-                # [B,S,K]
-                sim = torch.einsum("bsd,bkd->bsk", Zp, Gz)
+            return Zp
+        elif self.protein_pool_type == "go_align":
+            raise RuntimeError("go_align is not supported in the unified scoring path. Use mean, attn, or slots.")
 
-                # [B,K]
-                scores = sim.max(dim=1).values
+        else:
+            raise ValueError(f"Unsupported protein_pool_type: {self.protein_pool_type}")
 
-                if return_alpha:
-                    alpha_info["slot_go_sim"] = sim
-                    return scores, alpha_info
-                return scores
+    def score_from_encoded_protein(self, Zp, G, go_mask=None):
+        """
+        Zp:
+          slots mode: [B,S,Dz]
+          pooled mode: [B,Dz]
 
-            # ----------------------------------------------
-            # slots + token-level GO alignment
-            # ----------------------------------------------
-            else:  # go_pool_type == "token_align"
-                if G.dim() != 4:
-                    raise ValueError(
-                        "For go_pool_type='token_align', G must be [B, K, L, Dg]."
-                    )
-                if go_mask is None:
-                    raise ValueError("go_mask must be provided for token_align mode.")
+        G:
+          pooled candidates: [B,K,Dg]
+          token candidates:  [B,K,L,Dg]
+        """
 
-                G = self.go_ln(G)                       # [B,K,L,Dg]
+        # token-align case: G = [B,K,L,Dg]
+        if G.dim() == 4:
+            if Zp.dim() != 3:
+                raise RuntimeError("Token-align scoring requires slot protein representation [B,S,Dz].")
+            B, K, L, Dg = G.shape
 
-                Zp = self.proj_p(slots)                # [B,S,Dz]
-                Gz = self.proj_g(G)                    # [B,K,L,Dz]
+            Gz = self.go_ln(G)
+            Gz = self.proj_g(Gz)
 
-                if self.normalize:
-                    Zp = self._norm(Zp, dim=-1)
-                    Gz = self._norm(Gz, dim=-1)
+            if self.normalize:
+                Gz = self._norm(Gz, dim=-1)
 
-                # [B,S,K,L]
-                sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
+            # Zp [B,S,D], Gz [B,K,L,D] -> sim [B,S,K,L]
+            sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
 
-                # TODO: Erase later
-                with torch.no_grad():
-                    sim_f = sim.detach().float()
+            # max over protein slots -> [B,K,L]
+            token_scores = sim.max(dim=1).values
 
-                    print("\n[DBG-SIM]")
-                    print("sim:", tuple(sim.shape))
-                    print(
-                        "sim min/max/mean/std:",
-                        sim_f.min().item(),
-                        sim_f.max().item(),
-                        sim_f.mean().item(),
-                        sim_f.std().item(),
-                    )
-
-                    max_over_slots = sim_f.max(dim=1).values  # [B,K]
-                    mean_over_slots = sim_f.mean(dim=1)
-
-                    print(
-                        "max_over_slots mean/std:",
-                        max_over_slots.mean().item(),
-                        max_over_slots.std().item(),
-                    )
-
-                    print(
-                        "mean_over_slots mean/std:",
-                        mean_over_slots.mean().item(),
-                        mean_over_slots.std().item(),
-                    )
-
+            if go_mask is not None:
                 if go_mask.dtype != torch.bool:
                     go_mask = go_mask != 0
+                fill_value = -1e4 if token_scores.dtype == torch.float16 else -1e9
+                token_scores = token_scores.masked_fill(~go_mask, fill_value)
 
-                fill_value = -1e4 if sim.dtype == torch.float16 else -1e9
-                sim = sim.masked_fill(~go_mask.unsqueeze(1), fill_value)
+            # max over GO tokens -> [B,K]
+            scores = token_scores.max(dim=-1).values
+            return scores
 
-                # best token per slot -> [B,S,K]
-                best_token = sim.max(dim=-1).values
+        # pooled GO case: G = [B,K,Dg]
+        elif G.dim() == 3:
+            Gz = self.go_ln(G)
+            Gz = self.proj_g(Gz)
 
-                # best slot per GO -> [B,K]
-                scores = best_token.max(dim=1).values
+            if self.normalize:
+                Gz = self._norm(Gz, dim=-1)
 
-                if return_alpha:
-                    alpha_info["slot_token_sim"] = sim
-                    alpha_info["best_token_per_slot"] = best_token
-                    return scores, alpha_info
-                return scores
+            if Zp.dim() == 3:
+                # slots: [B,S,D] x [B,K,D] -> [B,S,K] -> [B,K]
+                sim = torch.einsum("bsd,bkd->bsk", Zp, Gz)
+                scores = sim.max(dim=1).values
+            else:
+                # pooled: [B,D] x [B,K,D] -> [B,K]
+                scores = torch.einsum("bd,bkd->bk", Zp, Gz)
+
+            return scores
+
+        else:
+            raise RuntimeError(f"Unsupported G shape: {tuple(G.shape)}")
+
+    def forward(
+            self,
+            H: torch.Tensor,  # [B, T, Dh]
+            G: torch.Tensor,  # [B, K, Dg] OR [B, K, L, Dg]
+            mask: Optional[torch.Tensor],
+            go_mask: Optional[torch.Tensor] = None,
+            return_alpha: bool = False,
+            **kwargs
+    ):
+        if return_alpha:
+            raise RuntimeError(
+                "return_alpha=True is disabled in the unified scoring path. "
+                "Use explicit debug hooks instead."
+            )
+
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask != 0
+
+        if G.dim() not in {3, 4}:
+            raise ValueError("G must be [B,K,Dg] or [B,K,L,Dg].")
+
+        if G.dim() == 4 and go_mask is None:
+            raise ValueError("go_mask must be provided when G is [B,K,L,Dg].")
+
+        Zp = self.encode_protein_for_scoring(H, mask)
+        scores = self.score_from_encoded_protein(Zp, G, go_mask=go_mask)
+
+        return scores
