@@ -313,16 +313,34 @@ class ProteinGoAligner(nn.Module):
             sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
 
             # max over protein slots -> [B,K,L]
+            # max over protein slots -> [B,K,L]
             token_scores = sim.max(dim=1).values
 
             if go_mask is not None:
                 if go_mask.dtype != torch.bool:
                     go_mask = go_mask != 0
+
                 fill_value = -1e4 if token_scores.dtype == torch.float16 else -1e9
                 token_scores = token_scores.masked_fill(~go_mask, fill_value)
 
-            # max over GO tokens -> [B,K]
-            scores = token_scores.max(dim=-1).values
+                valid_counts = go_mask.sum(dim=-1).clamp_min(1)  # [B,K]
+            else:
+                valid_counts = torch.full(
+                    token_scores.shape[:2],
+                    token_scores.size(-1),
+                    device=token_scores.device,
+                    dtype=torch.long,
+                )
+
+            k_eff = torch.clamp(valid_counts, max=5)  # [B,K]
+
+            topk = min(5, token_scores.size(-1))
+            topk_vals = token_scores.topk(k=topk, dim=-1).values  # [B,K,topk]
+
+            rank = torch.arange(topk, device=token_scores.device).view(1, 1, topk)
+            topk_mask = rank < k_eff.unsqueeze(-1)
+
+            scores = (topk_vals * topk_mask.to(topk_vals.dtype)).sum(dim=-1) / k_eff.to(topk_vals.dtype)
             return scores
 
         # pooled GO case: G = [B,K,Dg]
