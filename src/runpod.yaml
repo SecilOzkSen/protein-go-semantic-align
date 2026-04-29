@@ -18,7 +18,7 @@ general: #Ablation Purposes
   protein_pooling_strategy: "slots" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots"
   protein_n_slots: 4
   go_pool_type: "mean" #token_align
-  go_encoder_output_mode: "pool" # "pool" | "tokens" | "both"
+  go_encoder_output_mode: "pooled" # "pooled" | "tokens" | "both"
 
 training:
   epochs: 15
