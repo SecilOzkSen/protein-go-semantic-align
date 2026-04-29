@@ -587,9 +587,9 @@ class OppTrainer:
     def _queue_weight_schedule(self, step: int):
         return float(self._linear_schedule(
             step=step,
-            start=self._queue_weight_start,
-            end=self._queue_weight_end,
-            warmup_steps=self._queue_weight_warmup_steps,
+            start=self.queue_cfg.queue_weight_start,
+            end=self.queue_cfg.queue_weight_end,
+            warmup_steps=self.queue_cfg.queue_weight_warmup_steps,
         ))
 
     def _k_hard_queue_schedule(self, step: int):
