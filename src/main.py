@@ -990,20 +990,26 @@ def run_training(args):
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
     # Resume
+    start_epoch = 0
+    global_step = 0
+
     if getattr(args, "resume", None):
         ckpt_path = str(args.resume)
-        load_checkpoint(trainer, ckpt_path, map_location=trainer.device)
+        start_epoch = load_checkpoint(trainer, ckpt_path, map_location=trainer.device)
+
+        global_step = int(getattr(trainer, "_global_step", 0))
+        logger.info(f"[resume] start_epoch={start_epoch}, global_step={global_step}")
+    else:
+        start_epoch = 0
+        global_step = 0
 
         # --- EVAL ONLY MODU ---
     if getattr(args, "eval_only", False):
         logger.info("Eval-only mode: running validation and exiting, no training.")
         val_logs = trainer.eval_epoch(val_loader, epoch_idx=0)
-        logger.info(
-                "[eval_only] total={total:.4f} contrastive={contrastive:.4f} "
-                "dag={dag:.4f} attr={attr:.4f} entropy={entropy:.4f} "
-                "cafa_fmax={cafa_fmax:.4f} cafa_aupr={cafa_aupr:.4f}".format(**val_logs)
-            )
-        return  # KRİTİK: training loop'a girmeden çık
+        msg = " | ".join([f"{k}: {v:.4f}" for k, v in val_logs.items()])
+        logger.info(f"[eval_only] {msg}")
+        return
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
@@ -1013,12 +1019,11 @@ def run_training(args):
         training_context.maybe_refresh_phase_resources(current_epoch=0, force=False)
 
     best_val = -inf if args.monitor_mode == "max" else inf
-    best_step = 0
+    best_step = global_step
     no_improve_epochs = 0
     EPS = 1e-6
-    global_step = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         # ---- Partial MemoryBank refresh  ----
@@ -1182,8 +1187,9 @@ def run_training(args):
             # --- monitor ---
             metric_name = args.monitor_metric
             if metric_name not in val_logs:
-                # fallback: total loss’u minimize et
-                metric_name = "total"
+                logger.warning(f"monitor_metric={metric_name} not in val_logs. Falling back to align_MRR.")
+                metric_name = "align_MRR"
+
             score = float(val_logs[metric_name])
 
             improved = (score > best_val + EPS) if args.monitor_mode == "max" else (score < best_val - EPS)
@@ -1223,7 +1229,7 @@ def run_training(args):
         # epoch checkpoint
         try:
             ckpt_path = save_checkpoint(
-                out_dir=out_dir.name,
+                out_dir=str(out_dir),
                 tag=f"epoch{epoch + 1}",
                 trainer=trainer,
                 args=args,
@@ -1236,7 +1242,7 @@ def run_training(args):
 
     # final checkpoint
     try:
-        final_path = save_checkpoint(out_dir.name, tag="final", trainer=trainer,
+        final_path = save_checkpoint(str(out_dir), tag="final", trainer=trainer,
                                      args=args, epoch=epoch, step=global_step)
     except Exception:
         pass
@@ -1281,7 +1287,7 @@ def load_structured_cfg(path: str):
         phase=general.get("phase", -2),
         protein_n_slots=int(general.get("protein_n_slots", 0)),
         go_pool_type=general.get("go_pool_type", "mean"),
-        go_encoder_output_mode=general.get("go_encoder_output_mode", "pool"),
+        go_encoder_output_mode=general.get("go_encoder_output_mode", "pooled"),
 
         # paths / store
         train_ids_path=Path(stores.get("train_ids_path")),
@@ -1318,7 +1324,7 @@ def load_structured_cfg(path: str):
         eval_only=bool(training.get("eval_only", False)),
         log_every=int(training.get("log_every", 50)),
         log_level=training.get("log_level", "INFO"),
-        monitor_metric=training.get("monitor_metric", "cafa_fmax"),
+        monitor_metric=training.get("monitor_metric", "align_MRR"),
         monitor_mode=training.get("monitor_mode", "max"),
         early_stop_patience=int(training.get("early_stop_patience", 0)),
         cand_chunk_k=int(training.get("cand_chunk_k", 8)),

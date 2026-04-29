@@ -59,16 +59,37 @@ def save_checkpoint(out_dir: str,
 
 def load_checkpoint(trainer, path: str, map_location="cuda"):
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
-    model_state = ckpt.get("model", {})
-    if "model" in model_state and hasattr(trainer, "model"):
-        trainer.model.load_state_dict(model_state["model"], strict=False)
 
+    # -----------------
+    # MODEL
+    # -----------------
+    if "model" not in ckpt:
+        raise RuntimeError(f"No 'model' key in checkpoint. Keys: {ckpt.keys()}")
+
+    trainer.model.load_state_dict(ckpt["model"], strict=False)
+
+    # -----------------
+    # EMA
+    # -----------------
     ema_state = ckpt.get("ema", {})
-    if "index_projector" in ema_state and hasattr(trainer, "index_projector"):
-        trainer.index_projector.load_state_dict(ema_state["index_projector"], strict=False)
-    if "go_encoder_k" in ema_state and hasattr(trainer, "go_encoder_k"):
+    if "go_encoder_k" in ema_state and getattr(trainer, "go_encoder_k", None) is not None:
         trainer.go_encoder_k.load_state_dict(ema_state["go_encoder_k"], strict=False)
 
-    if hasattr(trainer, "opt") and "optimizer" in ckpt.get("optimizer", {}):
-        trainer.opt.load_state_dict(ckpt["optimizer"]["optimizer"])
+    # -----------------
+    # OPTIMIZER
+    # -----------------
+    if "optimizer" in ckpt and hasattr(trainer, "opt"):
+        trainer.opt.load_state_dict(ckpt["optimizer"])
+
+    # -----------------
+    # META (CRITICAL)
+    # -----------------
+    meta = ckpt.get("meta", {})
+
+    trainer._global_step = int(meta.get("global_step", meta.get("step", 0)))
+    start_epoch = int(meta.get("epoch", -1)) + 1
+
     print(f"[checkpoint] Loaded from {path}")
+    print(f"[checkpoint] Resume from epoch={start_epoch}, step={trainer._global_step}")
+
+    return start_epoch
