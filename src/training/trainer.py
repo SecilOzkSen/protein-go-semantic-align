@@ -1098,7 +1098,7 @@ class OppTrainer:
             if neg_raw_from_queue is not None:
                 U = s
 
-        if getattr(self, "_global_step", 0) % 200 == 0:
+        if getattr(self, "_global_step", 0) % 1000 == 0:
             print(f"[DBG-NEG] U={U} extra_n={extra_n} kq={kq} K={K}")
 
         return G_cand, pos_mask, cand_valid_mask, U, kq
@@ -1395,7 +1395,7 @@ class OppTrainer:
                 token_mask = token_mask != 0
 
         #TODO: Erase later
-        if self._global_step % 200 == 0 and token_embs is not None:
+        if self._global_step % 1000 == 0 and token_embs is not None:
                 with torch.no_grad():
                     print("\n[DBG-GO-MASK]")
                     print("token_embs:", tuple(token_embs.shape), token_embs.dtype, token_embs.device)
@@ -2078,7 +2078,7 @@ class OppTrainer:
 
             scores_cand_pre = scores_cand
 
-            if self._global_step % 200 == 0:
+            if self._global_step % 1000 == 0:
                 with torch.no_grad():
                     pre = scores_cand_pre.detach().float()
                     print("\n[DBG-SCORES-PRE]")
@@ -2088,7 +2088,7 @@ class OppTrainer:
             scale = self.logit_scale_tensor()
             scores_cand = scores_cand * scale
 
-            if self._global_step % 200 == 0:
+            if self._global_step % 1000 == 0:
                 with torch.no_grad():
                     post = scores_cand.detach().float()
                     print("\n[DBG-SCORES-POST]")
@@ -2103,7 +2103,7 @@ class OppTrainer:
 
             #TODO: Erase debug
             # DEBUG TARGET, use meta pos_mask, not batch["labels"]
-            if self._global_step % 200 == 0:
+            if self._global_step % 1000 == 0:
                 with torch.no_grad():
                     print("\n[DBG-TARGET]")
                     print("scores_cand:", tuple(scores_cand.shape), scores_cand.dtype)

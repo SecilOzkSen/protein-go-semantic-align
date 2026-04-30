@@ -363,17 +363,17 @@ def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout:GoT
         neg_k=args.neg_k,
         go_dropout=None # dropout off
     )
-    train_weights = build_dataset_sample_weights(datasets["train"])
-    train_sampler = WeightedRandomSampler(
-        weights=train_weights,
-        num_samples=len(train_weights),
-        replacement=True,
-    )
+#    train_weights = build_dataset_sample_weights(datasets["train"])
+#    train_sampler = WeightedRandomSampler(
+#        weights=train_weights,
+#        num_samples=len(train_weights),
+#        replacement=True,
+#    )
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=False,
-        sampler=train_sampler,
+        shuffle=True,
+        sampler=None,
         num_workers=args.num_workers,
         persistent_workers=(args.num_workers > 0),
         pin_memory=True,

@@ -35,7 +35,7 @@ training:
   output_dir: /workspace/protein-go-align-outputs-A2
   save_every: 10000
   keep_last_n: 3
-  resume: /workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt #null
+  resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
   eval_only: false
   log_every: 500
   log_level: INFO

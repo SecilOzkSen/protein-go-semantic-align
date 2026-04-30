@@ -60,36 +60,57 @@ def save_checkpoint(out_dir: str,
 def load_checkpoint(trainer, path: str, map_location="cuda"):
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
 
-    # -----------------
-    # MODEL
-    # -----------------
     if "model" not in ckpt:
         raise RuntimeError(f"No 'model' key in checkpoint. Keys: {ckpt.keys()}")
 
-    trainer.model.load_state_dict(ckpt["model"], strict=False)
+    missing, unexpected = trainer.model.load_state_dict(ckpt["model"], strict=False)
+    print(f"[checkpoint] Model loaded. missing={len(missing)} unexpected={len(unexpected)}")
+    if missing:
+        print("[checkpoint][WARN] missing model keys example:", missing[:10])
+    if unexpected:
+        print("[checkpoint][WARN] unexpected model keys example:", unexpected[:10])
 
-    # -----------------
-    # EMA
-    # -----------------
     ema_state = ckpt.get("ema", {})
     if "go_encoder_k" in ema_state and getattr(trainer, "go_encoder_k", None) is not None:
-        trainer.go_encoder_k.load_state_dict(ema_state["go_encoder_k"], strict=False)
+        missing_ema, unexpected_ema = trainer.go_encoder_k.load_state_dict(
+            ema_state["go_encoder_k"],
+            strict=False,
+        )
+        print(f"[checkpoint] EMA go_encoder_k loaded. missing={len(missing_ema)} unexpected={len(unexpected_ema)}")
 
-    # -----------------
-    # OPTIMIZER
-    # -----------------
-    if "optimizer" in ckpt and hasattr(trainer, "opt"):
-        trainer.opt.load_state_dict(ckpt["optimizer"])
+    opt_blob = ckpt.get("optimizer", None)
+    if opt_blob is not None and hasattr(trainer, "opt"):
+        try:
+            if isinstance(opt_blob, dict) and "param_groups" in opt_blob:
+                trainer.opt.load_state_dict(opt_blob)
+                print("[checkpoint] Optimizer loaded.")
 
-    # -----------------
-    # META (CRITICAL)
-    # -----------------
+            elif isinstance(opt_blob, dict) and "optimizer" in opt_blob:
+                trainer.opt.load_state_dict(opt_blob["optimizer"])
+                print("[checkpoint] Optimizer loaded from nested key.")
+
+            else:
+                keys = list(opt_blob.keys()) if isinstance(opt_blob, dict) else None
+                print(f"[checkpoint][WARN] Optimizer skipped. type={type(opt_blob)} keys={keys}")
+
+        except Exception as e:
+            print(f"[checkpoint][WARN] Optimizer load failed, continuing with fresh optimizer: {repr(e)}")
+
+    else:
+        print("[checkpoint][WARN] No optimizer found in checkpoint, continuing with fresh optimizer.")
+
     meta = ckpt.get("meta", {})
 
     trainer._global_step = int(meta.get("global_step", meta.get("step", 0)))
     start_epoch = int(meta.get("epoch", -1)) + 1
 
+    if trainer._global_step <= 0:
+        print("[checkpoint][WARN] global_step is 0 after loading.")
+    if start_epoch < 0:
+        raise RuntimeError(f"Invalid start_epoch={start_epoch}")
+
     print(f"[checkpoint] Loaded from {path}")
+    print(f"[checkpoint] meta keys={list(meta.keys())}")
     print(f"[checkpoint] Resume from epoch={start_epoch}, step={trainer._global_step}")
 
     return start_epoch
