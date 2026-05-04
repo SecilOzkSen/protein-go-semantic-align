@@ -2225,7 +2225,7 @@ class OppTrainer:
             )
 
 
-        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent + 0.01*l_slot_div
+        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent + 0.05*l_slot_div
 
         self._global_step += 1
 

@@ -1039,27 +1039,27 @@ def run_training(args):
                 seen_go_ids_prev = set()
 
             # ---- Partial MemoryBank refresh ----
-            if getattr(args, "ablation_id", None) != "A0":
-                ids_eval = list(map(int, training_context.eval_id_list))
-                ids_seen = sorted(set(int(i) for i in seen_go_ids_prev)) if len(seen_go_ids_prev) > 0 else []
+        #    if getattr(args, "ablation_id", None) != "A0":
+        #        ids_eval = list(map(int, training_context.eval_id_list))
+        #        ids_seen = sorted(set(int(i) for i in seen_go_ids_prev)) if len(seen_go_ids_prev) > 0 else []
 
                 # eval ids are mandatory
-                ids_to_update = ids_eval + [i for i in ids_seen if i not in set(ids_eval)]
+        #        ids_to_update = ids_eval + [i for i in ids_seen if i not in set(ids_eval)]
 
                 # enforce budget
-                max_r = int(getattr(args, "max_refresh_go", 5000))
-                if max_r > 0 and len(ids_to_update) > max_r:
-                    ids_to_update = ids_to_update[:max_r]
+        #        max_r = int(getattr(args, "max_refresh_go", 5000))
+        #        if max_r > 0 and len(ids_to_update) > max_r:
+        #            ids_to_update = ids_to_update[:max_r]
 
-                if len(ids_to_update) > 0:
-                    refresh_go_cache_chunked(
-                        ids_to_update=ids_to_update,
-                        go_text_store=go_text_store,
-                        go_encoder=go_encoder,
-                        go_cache=training_context.go_cache,
-                        device=device,
-                        chunk_size=128
-                    )
+        #        if len(ids_to_update) > 0:
+        #            refresh_go_cache_chunked(
+        #                ids_to_update=ids_to_update,
+        #                go_text_store=go_text_store,
+        #                go_encoder=go_encoder,
+        #                go_cache=training_context.go_cache,
+        #                device=device,
+        #                chunk_size=128
+        #            )
 
         except Exception as _e:
             logging.getLogger("bank").warning("Partial refresh failed: %r", _e)
@@ -1123,7 +1123,7 @@ def run_training(args):
                 if k in losses and losses[k] is not None:
                     running[k] += float(losses[k].item() if hasattr(losses[k], "item") else float(losses[k]))
 
-            global_step += 1
+            global_step = int(trainer._global_step)
 
             # per-step logging
             if (global_step % max(1, args.log_every)) == 0:

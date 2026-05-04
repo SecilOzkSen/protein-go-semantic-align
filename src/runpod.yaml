@@ -8,7 +8,7 @@ data:
 
 general: #Ablation Purposes
   phase: -2
-  ablation_id: "A2" #A0 sanity check
+  ablation_id: "A3" #A0 sanity check
   use_queue_miner: True #CHECKED
   go_pooling_strategy: "none" #CHECKED -> Go attention strategy "attn" or "mean" or "none"
   use_lora: True #CHECKED
@@ -17,8 +17,8 @@ general: #Ablation Purposes
   return_slot_attn: True
   protein_pooling_strategy: "slots" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots"
   protein_n_slots: 4
-  go_pool_type: "mean" #token_align
-  go_encoder_output_mode: "pooled" # "pooled" | "tokens" | "both"
+  go_pool_type: "token_align" # mean
+  go_encoder_output_mode: "tokens" # "pooled" | "tokens" | "both"
 
 training:
   epochs: 15
@@ -32,10 +32,10 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-A2
+  output_dir: /workspace/protein-go-align-outputs-A3
   save_every: 10000
   keep_last_n: 3
-  resume: /workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt # null
+  resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
   eval_only: false
   log_every: 500
   log_level: INFO
@@ -44,7 +44,7 @@ training:
   early_stop_patience: 8        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
-  max_refresh_go: 2000 #7500 # max go queue refresh per epoch - bc we do lora training!
+  max_refresh_go: 0 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
   eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 128 # TODO: 512 batch size for storing go text embeddings
   is_logit_scale_constant: true #false = trainable logit scale
@@ -120,7 +120,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-a2minmax"
+  wandb_run_name: "protein-go-semantic-align-ablation-a3tokens"
   mode: online
 
 stores:
@@ -143,5 +143,5 @@ stores:
 
   seq_len_lookup: /workspace/data/seq_len_lookup.pkl
 
-  logs: /workspace/protein-go-align-logs-a1
+  logs: /workspace/protein-go-align-logs-a3
 
