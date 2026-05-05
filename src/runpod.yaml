@@ -18,7 +18,7 @@ general: #Ablation Purposes
   protein_pooling_strategy: "slots" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots"
   protein_n_slots: 4
   go_pool_type: "token_align" # mean
-  go_encoder_output_mode: "tokens" # "pooled" | "tokens" | "both"
+  go_encoder_output_mode: "both" # "pooled" | "tokens" | "both"
 
 training:
   epochs: 15
@@ -44,7 +44,7 @@ training:
   early_stop_patience: 8        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
-  max_refresh_go: 0 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
+  max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
   eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 128 # TODO: 512 batch size for storing go text embeddings
   is_logit_scale_constant: true #false = trainable logit scale

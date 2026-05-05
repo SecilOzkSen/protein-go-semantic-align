@@ -301,7 +301,6 @@ class ProteinGoAligner(nn.Module):
         if G.dim() == 4:
             if Zp.dim() != 3:
                 raise RuntimeError("Token-align scoring requires slot protein representation [B,S,Dz].")
-            B, K, L, Dg = G.shape
 
             Gz = self.go_ln(G)
             Gz = self.proj_g(Gz)
@@ -311,22 +310,22 @@ class ProteinGoAligner(nn.Module):
 
             sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
 
+            # sim: [B,S,K,L]
             if go_mask is not None:
                 if go_mask.dtype != torch.bool:
                     go_mask = go_mask != 0
-
                 fill_value = -1e4 if sim.dtype == torch.float16 else -1e9
                 sim = sim.masked_fill(~go_mask.unsqueeze(1), fill_value)
 
-            sim_bksl = sim.permute(0, 2, 1, 3).contiguous()
-            B, K, S, L = sim_bksl.shape
-            sim_flat = sim_bksl.view(B, K, S * L)
-            sim_flat = torch.nan_to_num(sim_flat, nan=-1e4, posinf=1e4, neginf=-1e4)
+            # 1) slot başına GO token max
+            slot_scores = sim.max(dim=-1).values  # [B,S,K]
 
-            tau = 0.07
-            weights = torch.softmax(sim_flat.float() / tau, dim=-1).to(sim_flat.dtype)
+            # 2) slotlar arası mean değil, max değil, top-2 mean daha stabil
+            slot_scores = slot_scores.permute(0, 2, 1)  # [B,K,S]
 
-            scores = (weights * sim_flat).sum(dim=-1)
+            topk = min(2, slot_scores.size(-1))
+            scores = slot_scores.topk(k=topk, dim=-1).values.mean(dim=-1)  # [B,K]
+
             return scores
 
         # pooled GO case: G = [B,K,Dg]

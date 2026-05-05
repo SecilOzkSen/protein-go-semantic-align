@@ -442,6 +442,8 @@ class OppTrainer:
             if ("pooler" in name or "proj_p" in name) and p.requires_grad:
                 in_opt = (id(p) in opt_params)
                 print("[OPTCHK]", name, "in_opt=", in_opt, "shape=", tuple(p.shape))
+
+        print("[GO-ENCODER-OUTPUT-MODE] Go encoder output mode:", self.ctx.go_encoder_output_mode)
     def _queue_active(self) -> bool:
         return self.use_moco_miner and (self._global_step >= self.queue_cfg.queue_start_step)
 
@@ -2825,6 +2827,7 @@ class OppTrainer:
     @torch.no_grad()
     def eval_epoch(self, loader, epoch_idx: int):
         if self._use_token_align:
+            print("[EVAL] token-align exhaustive eval path")
             return self.eval_epoch_token_align_exhaustive(loader, epoch_idx)
         self.model.eval()
         device = self.device
