@@ -2067,7 +2067,7 @@ class OppTrainer:
             if G_cand_mask is not None:
                 print("G_cand_mask shape:", tuple(G_cand_mask.shape))
                 print("G_cand_mask valid mean:", float(G_cand_mask.float().mean().item()))
-            raise SystemExit("A3 debug stop before expensive run")
+         #   raise SystemExit("A3 debug stop before expensive run")
 
         with amp_ctx:
             scores_cand = self.forward_scores(

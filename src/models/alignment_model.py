@@ -317,14 +317,11 @@ class ProteinGoAligner(nn.Module):
                 fill_value = -1e4 if sim.dtype == torch.float16 else -1e9
                 sim = sim.masked_fill(~go_mask.unsqueeze(1), fill_value)
 
-            # 1) slot başına GO token max
+            # token-level evidence per slot
             slot_scores = sim.max(dim=-1).values  # [B,S,K]
 
-            # 2) slotlar arası mean değil, max değil, top-2 mean daha stabil
-            slot_scores = slot_scores.permute(0, 2, 1)  # [B,K,S]
-
-            topk = min(2, slot_scores.size(-1))
-            scores = slot_scores.topk(k=topk, dim=-1).values.mean(dim=-1)  # [B,K]
+            # candidate score = best slot evidence
+            scores = slot_scores.max(dim=1).values  # [B,K]
 
             return scores
 
