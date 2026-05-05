@@ -2052,6 +2052,22 @@ class OppTrainer:
                 neg_raw_from_queue=neg_raw_from_queue,
             )
             G_cand_mask = None
+        # TODO: Erase:
+        if self._global_step == 0:
+            print("\n[A3-CHECK]")
+            print("_use_token_align:", self._use_token_align)
+            print("protein_pool_type:", self.model.protein_pool_type)
+            print("go_pool_type:", self.model.go_pool_type)
+            print("ctx.go_encoder_output_mode:", self.ctx.go_encoder_output_mode)
+            print("pooled_go is None:", pooled_go is None)
+            print("token_go is None:", token_go is None)
+            print("token_go_mask is None:", token_go_mask is None)
+            print("G_cand dim:", G_cand.dim())
+            print("G_cand shape:", tuple(G_cand.shape))
+            if G_cand_mask is not None:
+                print("G_cand_mask shape:", tuple(G_cand_mask.shape))
+                print("G_cand_mask valid mean:", float(G_cand_mask.float().mean().item()))
+            raise SystemExit("A3 debug stop before expensive run")
 
         with amp_ctx:
             scores_cand = self.forward_scores(
