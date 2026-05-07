@@ -10,15 +10,15 @@ general: #Ablation Purposes
   phase: -2
   ablation_id: "A3" #A0 sanity check
   use_queue_miner: True #CHECKED
-  go_pooling_strategy: "none" #CHECKED -> Go attention strategy "attn" or "mean" or "none"
+  go_pooling_strategy: "mean" #CHECKED -> Go attention strategy "attn" or "mean" or "none"
   use_lora: True #CHECKED
   use_attribution_loss: False #CHECKED
   return_alpha: False
   return_slot_attn: True
-  protein_pooling_strategy: "slots" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots"
-  protein_n_slots: 4
-  go_pool_type: "token_align" # mean
-  go_encoder_output_mode: "both" # "pooled" | "tokens" | "both"
+  protein_pooling_strategy: "mean_attn_gate" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots" or "mean_attn_gate"
+  protein_n_slots: 0
+  go_pool_type: "mean" # mean #pooled
+  go_encoder_output_mode: "pooled" # "pooled" | "tokens" | "both"
 
 training:
   epochs: 15

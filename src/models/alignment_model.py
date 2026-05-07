@@ -47,23 +47,85 @@ import torch.nn.functional as F
 class AttentionPool1D(nn.Module):
     def __init__(self, d_in: int, dropout: float = 0.0):
         super().__init__()
+        self.ln = nn.LayerNorm(d_in)
         self.score = nn.Linear(d_in, 1)
         self.dropout = nn.Dropout(dropout)
 
     def forward(
-            self,
-            x: torch.Tensor,  # [B, T, D]
-            mask: Optional[torch.Tensor] = None  # [B, T] bool, True=valid
+        self,
+        x: torch.Tensor,                       # [B,T,D]
+        mask: Optional[torch.Tensor] = None    # [B,T] bool, True=valid
     ):
-        s = self.score(self.dropout(x)).squeeze(-1)  # [B, T]
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask != 0
+        if mask is not None:
+            valid_counts = mask.sum(dim=1)
+            if (valid_counts == 0).any():
+                raise RuntimeError("AttentionPool1D received a row with zero valid residues.")
+
+        x_score = self.ln(x)
+        s = self.score(self.dropout(x_score)).squeeze(-1)  # [B,T]
 
         if mask is not None:
-            neg_inf = torch.finfo(s.dtype).min
-            s = s.masked_fill(~mask, neg_inf)
+            s = s.masked_fill(~mask, -1e4)
 
-        a = torch.softmax(s, dim=1)  # [B, T]
-        pooled = torch.sum(x * a.unsqueeze(-1), dim=1)  # [B, D]
+        a = torch.softmax(s.float(), dim=1).to(dtype=x.dtype)  # [B,T]
+        pooled = torch.sum(x * a.unsqueeze(-1), dim=1)         # [B,D]
+
         return pooled, a
+
+class GatedMeanAttnPool1D(nn.Module):
+    def __init__(self, d_in: int, dropout: float = 0.05):
+        super().__init__()
+
+        self.attn_pool = AttentionPool1D(d_in=d_in, dropout=dropout)
+
+        self.gate = nn.Sequential(
+            nn.LayerNorm(2 * d_in),
+            nn.Linear(2 * d_in, d_in // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_in // 4, 1),
+        )
+
+        # Start close to mean pooling.
+        # sigmoid(-2) ≈ 0.12, so attention initially contributes weakly.
+        nn.init.constant_(self.gate[-1].bias, -2.0)
+
+    @staticmethod
+    def masked_mean(
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        if mask is None:
+            return x.mean(dim=1)
+
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+
+        w = mask.to(dtype=x.dtype).unsqueeze(-1)
+        return (x * w).sum(dim=1) / w.sum(dim=1).clamp_min(eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,                       # [B,T,D]
+        mask: Optional[torch.Tensor] = None,
+    ):
+        h_mean = self.masked_mean(x, mask)     # [B,D]
+        h_attn, alpha = self.attn_pool(x, mask)
+
+        gate_in = torch.cat([h_mean, h_attn], dim=-1)  # [B,2D]
+        gate = torch.sigmoid(self.gate(gate_in))       # [B,1]
+
+        h = (1.0 - gate) * h_mean + gate * h_attn      # [B,D]
+
+        info = {
+            "protein_attn_alpha": alpha,
+            "protein_attn_gate": gate,
+        }
+
+        return h, info
 
 
 class ProteinSlotExtractor(nn.Module):
@@ -169,8 +231,18 @@ class ProteinGoAligner(nn.Module):
     ):
         super().__init__()
 
-        if protein_pool_type not in {"mean", "attn", "go_align", "slots"}:
+        if protein_pool_type not in {"mean", "attn", "mean_attn_gate", "slots"}:
             raise ValueError(f"Unsupported protein_pool_type: {protein_pool_type}")
+        if protein_pool_type == "go_align":
+            raise ValueError(
+                "protein_pool_type='go_align' is deprecated in the current retriever. "
+                "Use 'mean_attn_gate', 'mean', 'attn', or 'slots'."
+            )
+        if go_pool_type == "token_align" and protein_pool_type != "slots":
+            raise ValueError(
+                "go_pool_type='token_align' requires protein_pool_type='slots'. "
+                f"Got protein_pool_type={protein_pool_type}."
+            )
 
         if go_pool_type not in {"mean", "token_align"}:
             raise ValueError(f"Unsupported go_pool_type: {go_pool_type}")
@@ -197,6 +269,10 @@ class ProteinGoAligner(nn.Module):
             )
 
         self.protein_attn_pool = AttentionPool1D(d_h, dropout=0.05)
+        self.protein_mean_attn_gate_pool = GatedMeanAttnPool1D(
+            d_in=d_h,
+            dropout=0.05,
+        )
 
         self.slot_extractor = None
         if self.protein_pool_type == "slots":
@@ -258,6 +334,17 @@ class ProteinGoAligner(nn.Module):
 
         elif self.protein_pool_type == "attn":
             h_pool, _ = self.protein_attn_pool(H, mask)
+            Zp = self.protein_ln(h_pool)
+            Zp = self.proj_p(Zp)
+
+            if self.normalize:
+                Zp = self._norm(Zp, dim=-1)
+
+            return Zp
+
+        elif self.protein_pool_type == "mean_attn_gate":
+            h_pool, pool_info = self.protein_mean_attn_gate_pool(H, mask)
+
             Zp = self.protein_ln(h_pool)
             Zp = self.proj_p(Zp)
 

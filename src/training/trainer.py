@@ -107,17 +107,6 @@ def multi_positive_infonce_from_candidates_v2(
     # return 0 with correct dtype/device
     return denom.mean() * 0.0
 
-def slot_attention_diversity_loss(slot_attn: torch.Tensor) -> torch.Tensor:
-    # slot_attn: [B, S, T]
-    a = F.normalize(slot_attn.float(), dim=-1)
-    sim = torch.matmul(a, a.transpose(1, 2))  # [B,S,S]
-
-    S = sim.size(1)
-    eye = torch.eye(S, dtype=torch.bool, device=sim.device)
-    offdiag = sim[:, ~eye]
-
-    return offdiag.pow(2).mean()
-
 
 @torch.no_grad()
 def delta_y_from_occlusion_windows(
@@ -644,7 +633,7 @@ class OppTrainer:
         m = batch["prot_attn_mask"].to(self.device)
         if m.dim() == 3 and m.size(-1) == 1:
             m = m.squeeze(-1)
-        if m.dtype is not torch.bool:
+        if m.dtype != torch.bool:
             m = m != 0
         attn_valid = m
         pad_mask = ~attn_valid
@@ -1517,39 +1506,116 @@ class OppTrainer:
     def _get_prot_query(self, H: torch.Tensor, attn_valid: torch.Tensor, Dz: int) -> torch.Tensor:
         """
         GO-independent protein query for queue mining.
-        Returns [B, Dz]
+
+        Always returns:
+          q: [B, Dz]
+
+        Compatible with:
+          protein_pool_type = mean
+          protein_pool_type = attn
+          protein_pool_type = mean_attn_gate
+          protein_pool_type = slots
+          protein_pool_type = go_align
+
+        Notes:
+          - For slots, queue query is mean over slots, old behavior.
+          - For go_align, queue query falls back to masked mean, because queue mining must be GO-independent.
+          - For mean_attn_gate, this uses the same gated protein pool used by scoring.
         """
         if attn_valid is not None and attn_valid.dtype != torch.bool:
             attn_valid = attn_valid != 0
 
-        if self.model.protein_pool_type in {"mean", "go_align"}:
-            if attn_valid is not None:
-                w = attn_valid.to(H.dtype).unsqueeze(-1)
-                denom = w.sum(dim=1).clamp_min(1.0)
-                h_pool = (H * w).sum(dim=1) / denom
+        model = self.model
+        pool_type = getattr(model, "protein_pool_type", "mean")
+
+        was_training = model.training
+        model.eval()
+
+        try:
+            # --------------------------------------------------
+            # New clean path: gated mean + attention
+            # --------------------------------------------------
+            if pool_type == "mean_attn_gate":
+                if not hasattr(model, "protein_mean_attn_gate_pool"):
+                    raise RuntimeError(
+                        "protein_pool_type='mean_attn_gate' but model.protein_mean_attn_gate_pool is missing."
+                    )
+
+                h_pool, _pool_info = model.protein_mean_attn_gate_pool(H, attn_valid)  # [B, Dh]
+                q = model.proj_p(model.protein_ln(h_pool))  # [B, Dz]
+
+            # --------------------------------------------------
+            # Old attention pooling path
+            # --------------------------------------------------
+            elif pool_type == "attn":
+                h_pool, _alpha = model.protein_attn_pool(H, attn_valid)  # [B, Dh]
+                q = model.proj_p(model.protein_ln(h_pool))  # [B, Dz]
+
+            # --------------------------------------------------
+            # Old mean path, also fallback for go_align
+            # Queue query must be GO-independent, so go_align cannot be used here.
+            # --------------------------------------------------
+            elif pool_type in {"mean", "go_align"}:
+                if attn_valid is not None:
+                    w = attn_valid.to(H.dtype).unsqueeze(-1)  # [B,T,1]
+                    denom = w.sum(dim=1).clamp_min(1.0)  # [B,1]
+                    h_pool = (H * w).sum(dim=1) / denom  # [B,Dh]
+                else:
+                    h_pool = H.mean(dim=1)
+
+                q = model.proj_p(model.protein_ln(h_pool))  # [B, Dz]
+
+            # --------------------------------------------------
+            # Old slots path
+            # Queue query uses mean over slots, same idea as old code.
+            # --------------------------------------------------
+            elif pool_type == "slots":
+                if not hasattr(model, "slot_extractor") or model.slot_extractor is None:
+                    raise RuntimeError(
+                        "protein_pool_type='slots' but model.slot_extractor is missing."
+                    )
+
+                slots, _slot_attn = model.slot_extractor(H, attn_valid)  # [B,S,Dh]
+                h_pool = slots.mean(dim=1)  # [B,Dh]
+                q = model.proj_p(model.protein_ln(h_pool))  # [B,Dz]
+
+            # --------------------------------------------------
+            # Safety fallback
+            # --------------------------------------------------
             else:
-                h_pool = H.mean(dim=1)
+                if not hasattr(model, "encode_protein_for_scoring"):
+                    raise ValueError(f"Unsupported protein_pool_type: {pool_type}")
 
-        elif self.model.protein_pool_type == "attn":
-            h_pool, _ = self.model.protein_attn_pool(H, attn_valid)
+                q = model.encode_protein_for_scoring(H, mask=attn_valid)
 
-        elif self.model.protein_pool_type == "slots":
-            slots, _ = self.model.slot_extractor(H, attn_valid)   # [B,S,Dh]
-            h_pool = slots.mean(dim=1)                            # GO-independent slot summary
+                if isinstance(q, tuple):
+                    q = q[0]
 
-        else:
-            raise ValueError(f"Unsupported protein_pool_type: {self.model.protein_pool_type}")
+                # If some future protein encoder returns slots, compress to one query.
+                if q.dim() == 3:
+                    q = q.mean(dim=1)
 
-        h_pool = self.model.protein_ln(h_pool)
-        q = self.model.proj_p(h_pool)
+                if q.dim() != 2:
+                    raise RuntimeError(
+                        f"encode_protein_for_scoring returned unsupported shape: {tuple(q.shape)}"
+                    )
 
-        if getattr(self.model, "normalize", False):
-            q = self.model._norm(q, dim=-1)
+            if getattr(model, "normalize", False):
+                q = model._norm(q, dim=-1)
+
+            q = torch.nan_to_num(q)
+
+        finally:
+            if was_training:
+                model.train()
+
+        if q.dim() != 2:
+            raise RuntimeError(f"Expected prot_query [B,Dz], got {tuple(q.shape)}")
 
         if q.size(1) != int(Dz):
             raise RuntimeError(f"prot_query dim mismatch: got {q.size(1)} expected {Dz}")
 
-        return q
+        return q.detach()
 
     def _build_candidates_meta(
             self,
@@ -1960,6 +2026,11 @@ class OppTrainer:
         token_go_mask = go_pack["token_mask"]           # [G,L] or None
 
         if self._global_step % 200 == 0:
+            print("[DBG-GO]")
+            print("pooled_go:", None if pooled_go is None else tuple(pooled_go.shape))
+            print("token_go:", None if token_go is None else tuple(token_go.shape))
+
+        if self._global_step % 200 == 0:
             if pooled_go is not None:
                 _tstats(pooled_go, "uniq_go_pooled(raw)")
             if token_go is not None:
@@ -2052,6 +2123,13 @@ class OppTrainer:
                 neg_raw_from_queue=neg_raw_from_queue,
             )
             G_cand_mask = None
+
+        if self.model.protein_pool_type == "mean_attn_gate":
+            assert not self._use_token_align
+            assert pooled_go is not None
+            assert G_cand.dim() == 3, f"A3 expects pooled G_cand [B,K,D], got {tuple(G_cand.shape)}"
+            assert G_cand_mask is None, "A3 pooled path should not have G_cand_mask."
+
         # TODO: Erase:
         if self._global_step == 0:
             print("\n[A3-CHECK]")
@@ -2243,7 +2321,7 @@ class OppTrainer:
             )
 
 
-        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent + 0.05*l_slot_div
+        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent #+ 0.05*l_slot_div
 
         self._global_step += 1
 
