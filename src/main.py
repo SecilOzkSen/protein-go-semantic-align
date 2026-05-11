@@ -832,7 +832,12 @@ def run_training(args):
         print("segment_names:", b["segment_names"])
         print("seg_present:", b["seg_present"])
 
-    print("GoTextStore size:", len(go_text_store.id2tok))
+    print("GoTextStore text size:", len(go_text_store.id2text))
+    print("GoTextStore token cache size:", len(go_text_store.id2tok))
+
+    if go_text_store.is_go_segmented:
+        print("GoTextStore segment text size:", len(go_text_store.id2segments))
+        print("GoTextStore segment token cache size:", len(go_text_store.id2seg_tok))
 
     eval_space = getattr(args, "eval_space", "observed")
     if eval_space == "seen":
