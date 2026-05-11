@@ -39,7 +39,7 @@ training:
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "align_MRR"   # "total" da olabilir
+  monitor_metric: "align_nDCG@10"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
   early_stop_patience: 8        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
