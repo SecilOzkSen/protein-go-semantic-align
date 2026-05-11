@@ -768,7 +768,7 @@ def run_training(args):
         model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
         device=device,
         max_length=512,
-        attention_pooling_strategy=args.go_pooling_strategy,
+        attention_pooling_strategy=args.go_encoder_inner_pooling,
         attn_hidden=128,
         attn_dropout=0.1,
         special_token_weights=None,
@@ -778,12 +778,59 @@ def run_training(args):
     )
 
     # GO text dict per phase
-    go_id_to_text: Dict[int, Dict[int, str]] = {}
-    go_id_to_text[args.phase] = load_go_texts_by_phase(args.go_text_folder, phase=args.phase)
+    is_segmented = (args.go_encoder_output_mode == "segment_pooled")
+
+    full_id2segments = None
+    full_id2seg_present = None
+
+    if is_segmented:
+        # segment_pooled için return_segments kesin True olmalı
+        id2text, id2segments, id2seg_present = load_go_texts_by_phase(
+            args.go_text_folder,
+            phase=args.phase,
+            return_segments=True,
+        )
+
+        go_id_to_text = {int(args.phase): id2text}
+        full_id2segments = {int(args.phase): id2segments}
+        full_id2seg_present = {int(args.phase): id2seg_present}
+
+    else:
+        id2text = load_go_texts_by_phase(
+            args.go_text_folder,
+            phase=args.phase,
+            return_segments=False,
+        )
+
+        go_id_to_text = {int(args.phase): id2text}
 
     # GoTextStore + dataloaders
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=args.phase, lazy=False,
-                                max_len=args.go_text_store_max_len)
+    go_text_store = GoTextStore(
+        go_id_to_text,
+        go_encoder.tokenizer,
+        phase=args.phase,
+        lazy=True,
+        max_len=args.go_text_store_max_len,
+        is_segmented=is_segmented,
+        segment_max_len=args.segment_max_len,
+        full_id2segments=full_id2segments,
+        full_id2seg_present=full_id2seg_present,
+    )
+
+    # TODO: Erase
+    if is_segmented:
+        # hard-code ids yerine store içinden gerçek id seçmek daha güvenli
+        ids = list(go_text_store.id2text.keys())[:2]
+
+        b = go_text_store.batch(ids)
+
+        print("input_ids:", b["input_ids"].shape)
+        print("attention_mask:", b["attention_mask"].shape)
+        print("seg_input_ids:", b["seg_input_ids"].shape)
+        print("seg_attention_mask:", b["seg_attention_mask"].shape)
+        print("seg_present:", b["seg_present"].shape)
+        print("segment_names:", b["segment_names"])
+        print("seg_present:", b["seg_present"])
 
     print("GoTextStore size:", len(go_text_store.id2tok))
 
@@ -1283,6 +1330,7 @@ def load_structured_cfg(path: str):
         return_alpha = bool(general.get("return_alpha", False)),
         return_slot_attn = bool(general.get("return_slot_attn", False)),
         protein_pooling_strategy = general.get("protein_pooling_strategy", "mean"),
+        go_encoder_inner_pooling=general.get("go_encoder_inner_pooling", "mean"),
         ablation_id = general.get("ablation_id", None),
         phase=general.get("phase", -2),
         protein_n_slots=int(general.get("protein_n_slots", 0)),
@@ -1339,6 +1387,7 @@ def load_structured_cfg(path: str):
         eval_space=str(training.get("eval_space", "seen")),
         max_inbatch=int(training.get("max_inbatch", 64)),
         eval_cand_chunk_k=int(training.get("eval_cand_chunk_k", 8)),
+        go_segment_max_len=int(training.get("go_segment_max_len", 64)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

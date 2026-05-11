@@ -8,9 +8,10 @@ data:
 
 general: #Ablation Purposes
   phase: -2
-  ablation_id: "A3" #A0 sanity check
+  ablation_id: "B1_segment_aware_go" #A0 sanity check
   use_queue_miner: True #CHECKED
-  go_pooling_strategy: "mean" #CHECKED -> Go attention strategy "attn" or "mean" or "none"
+  go_pooling_strategy: "segment_aware" #CHECKED -> Go attention strategy "attn" or "mean" or "segment_aware"
+  go_encoder_inner_pooling: "mean" #inside biomedbertencoder pooling
   use_lora: True #CHECKED
   use_attribution_loss: False #CHECKED
   return_alpha: False
@@ -18,7 +19,7 @@ general: #Ablation Purposes
   protein_pooling_strategy: "mean_attn_gate" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots" or "mean_attn_gate"
   protein_n_slots: 0
   go_pool_type: "mean" # mean #pooled
-  go_encoder_output_mode: "pooled" # "pooled" | "tokens" | "both"
+  go_encoder_output_mode: "segment_pooled" # "pooled" | "tokens" | "both" | "segment_pooled" # inside go_encoder_output_mode pooling
 
 training:
   epochs: 15
@@ -32,7 +33,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-A3
+  output_dir: /workspace/protein-go-align-outputs-B1
   save_every: 10000
   keep_last_n: 3
   resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
@@ -47,6 +48,7 @@ training:
   max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
   eval_go_bs: 256 # eval go batch size for go embedding extraction
   go_text_store_max_len: 128 # TODO: 512 batch size for storing go text embeddings
+  go_segment_max_len: 64
   is_logit_scale_constant: true #false = trainable logit scale
   go_token_dropout: false
   go_pooling: "none" # cls, mean, masked_mean -> NO NEED
@@ -120,7 +122,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-a3tokens"
+  wandb_run_name: "protein-go-semantic-align-ablation-b1-segment-aware"
   mode: online
 
 stores:

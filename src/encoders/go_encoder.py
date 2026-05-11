@@ -116,11 +116,20 @@ class BioMedBERTEncoder(nn.Module):
     ):
         super().__init__()
 
-    #    if attention_pooling_strategy not in {"attn", "mean", "none"}:
-    #        raise ValueError(
-    #            f"Unsupported attention_pooling_strategy: {attention_pooling_strategy}. "
-    #            f"Use 'attn' or 'mean'."
-    #        )
+        if attention_pooling_strategy == "segment_aware":
+            raise ValueError(
+                "BioMedBERTEncoder does not support attention_pooling_strategy='segment_aware'. "
+                "Use output_mode='segment_pooled' in trainer/model, and set BioMedBERT pooling to 'mean' or 'attn'."
+            )
+
+        if attention_pooling_strategy not in {"attn", "mean", "none"}:
+            raise ValueError(
+                f"Unsupported attention_pooling_strategy: {attention_pooling_strategy}. "
+                f"Use 'attn', 'mean', or 'none'."
+            )
+
+        if attention_pooling_strategy == "none":
+            attention_pooling_strategy = "mean"
 
         self.device = torch.device(device) if isinstance(device, str) else device
         self.max_length = max_length

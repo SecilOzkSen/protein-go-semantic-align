@@ -1302,6 +1302,31 @@ class OppTrainer:
 
         mode = self.ctx.go_encoder_output_mode
 
+        if mode == "segment_pooled":
+            toks = batch["pos_go_tokens"]
+
+            seg_input_ids = toks["seg_input_ids"].to(device, non_blocking=True)
+            seg_attention_mask = toks["seg_attention_mask"].to(device, non_blocking=True)
+            seg_present = toks["seg_present"].to(device, non_blocking=True)
+
+            out = self.model.encode_go_segment_aware(
+                seg_input_ids=seg_input_ids,
+                seg_attention_mask=seg_attention_mask,
+                seg_present=seg_present,
+            )
+
+            pooled_embs = out["pooled"]
+            pooled_embs = torch.nan_to_num(pooled_embs)
+
+            ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
+
+            return {
+                "pooled_embs": pooled_embs,
+                "token_embs": None,
+                "token_mask": None,
+                "ids": ids,
+            }
+
         out = self.model.go_encoder(
             input_ids=input_ids,
             attention_mask=attn,

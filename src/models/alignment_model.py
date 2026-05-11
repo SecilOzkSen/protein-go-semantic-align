@@ -258,16 +258,6 @@ class ProteinGoAligner(nn.Module):
         if d_g is None:
             raise ValueError("d_g must be provided if go_encoder is None.")
 
-        # Existing go-align pooler, only for protein_pool_type == "go_align"
-        self.go_token_align_pooler = None
-        if self.protein_pool_type == "go_align":
-            self.go_token_align_pooler = GoTokenAlignPooler(
-                d_h=d_h,
-                d_g=d_g,
-                d_att=256,
-                dropout=0.05,
-            )
-
         self.protein_attn_pool = AttentionPool1D(d_h, dropout=0.05)
         self.protein_mean_attn_gate_pool = GatedMeanAttnPool1D(
             d_in=d_h,
@@ -290,6 +280,25 @@ class ProteinGoAligner(nn.Module):
 
         self.protein_ln = nn.LayerNorm(d_h)
         self.go_ln = nn.LayerNorm(d_g)
+
+        self.go_segment_names = ["name", "namespace", "definition", "is_a", "part_of"]
+        self.n_go_segments = len(self.go_segment_names)
+
+        self.go_segment_gate = nn.Sequential(
+            nn.LayerNorm(d_g),
+            nn.Linear(d_g, 128),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(128, 1),
+        )
+
+        # Start uniform over present segments.
+        # This avoids the gate randomly preferring one segment at step 0.
+        nn.init.zeros_(self.go_segment_gate[-1].weight)
+        nn.init.zeros_(self.go_segment_gate[-1].bias)
+
+        self.last_go_segment_info = {}
+        self.last_pool_info = {}
 
     @staticmethod
     def _norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -344,7 +353,7 @@ class ProteinGoAligner(nn.Module):
 
         elif self.protein_pool_type == "mean_attn_gate":
             h_pool, pool_info = self.protein_mean_attn_gate_pool(H, mask)
-
+            self.last_pool_info = pool_info
             Zp = self.protein_ln(h_pool)
             Zp = self.proj_p(Zp)
 
@@ -367,8 +376,6 @@ class ProteinGoAligner(nn.Module):
                 Zp = self._norm(Zp, dim=-1)
 
             return Zp
-        elif self.protein_pool_type == "go_align":
-            raise RuntimeError("go_align is not supported in the unified scoring path. Use mean, attn, or slots.")
 
         else:
             raise ValueError(f"Unsupported protein_pool_type: {self.protein_pool_type}")
@@ -461,3 +468,116 @@ class ProteinGoAligner(nn.Module):
         scores = self.score_from_encoded_protein(Zp, G, go_mask=go_mask)
 
         return scores
+
+    def encode_go_segment_aware(
+            self,
+            seg_input_ids: torch.Tensor,  # [G, S, L]
+            seg_attention_mask: torch.Tensor,  # [G, S, L]
+            seg_present: torch.Tensor,  # [G, S] bool
+    ):
+        """
+        Segment-aware GO encoder for B1.
+
+        Input:
+          seg_input_ids:      [G, S, L]
+          seg_attention_mask: [G, S, L]
+          seg_present:        [G, S]
+
+        Output dict:
+          pooled:          [G, Dg] raw GO encoder space
+          segment_embs:    [G, S, Dg]
+          segment_weights: [G, S]
+          segment_present: [G, S]
+
+        Important:
+          This returns RAW GO embeddings.
+          Do NOT apply go_ln/proj_g/normalize here.
+          score_from_encoded_protein() will handle projection.
+        """
+        if self.go_encoder is None:
+            raise RuntimeError("encode_go_segment_aware requires self.go_encoder.")
+
+        if seg_input_ids.dim() != 3:
+            raise RuntimeError(f"seg_input_ids must be [G,S,L], got {tuple(seg_input_ids.shape)}")
+        if seg_attention_mask.dim() != 3:
+            raise RuntimeError(f"seg_attention_mask must be [G,S,L], got {tuple(seg_attention_mask.shape)}")
+        if seg_present.dim() != 2:
+            raise RuntimeError(f"seg_present must be [G,S], got {tuple(seg_present.shape)}")
+
+        G, S, L = seg_input_ids.shape
+
+        if S != self.n_go_segments:
+            raise RuntimeError(
+                f"Expected {self.n_go_segments} GO segments {self.go_segment_names}, got S={S}"
+            )
+
+        if seg_attention_mask.shape != seg_input_ids.shape:
+            raise RuntimeError(
+                f"seg_attention_mask shape {tuple(seg_attention_mask.shape)} "
+                f"does not match seg_input_ids {tuple(seg_input_ids.shape)}"
+            )
+
+        if seg_present.shape != (G, S):
+            raise RuntimeError(
+                f"seg_present shape {tuple(seg_present.shape)} expected {(G, S)}"
+            )
+
+        if seg_present.dtype != torch.bool:
+            seg_present = seg_present != 0
+
+        seg_present = seg_present.to(device=seg_input_ids.device)
+
+        if (seg_present.sum(dim=1) == 0).any():
+            bad = torch.nonzero(seg_present.sum(dim=1) == 0, as_tuple=False).flatten()[:5]
+            raise RuntimeError(f"Some GO rows have zero present segments. Example rows: {bad.tolist()}")
+
+        flat_ids = seg_input_ids.reshape(G * S, L)
+        flat_mask = seg_attention_mask.reshape(G * S, L)
+
+        out = self.go_encoder(
+            input_ids=flat_ids,
+            attention_mask=flat_mask,
+            output_mode="pooled",
+        )
+
+        if isinstance(out, tuple):
+            out = out[0]
+        elif isinstance(out, dict):
+            if "pooled" in out:
+                out = out["pooled"]
+            elif "pooler_output" in out:
+                out = out["pooler_output"]
+            else:
+                raise RuntimeError("go_encoder dict output missing 'pooled' or 'pooler_output'.")
+
+        if not torch.is_tensor(out):
+            raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
+
+        if out.dim() != 2:
+            raise RuntimeError(f"Expected flat segment embeddings [G*S,D], got {tuple(out.shape)}")
+
+        Dg = out.size(-1)
+
+        segment_embs = torch.nan_to_num(out).view(G, S, Dg).contiguous()  # [G,S,Dg]
+
+        # Segment gate in raw GO encoder space.
+        seg_logits = self.go_segment_gate(segment_embs).squeeze(-1)  # [G,S]
+        seg_logits = seg_logits.float().masked_fill(~seg_present, -1e9)
+
+        segment_weights = torch.softmax(seg_logits, dim=-1).to(dtype=segment_embs.dtype)  # [G,S]
+
+        pooled = torch.einsum("gs,gsd->gd", segment_weights, segment_embs)  # [G,Dg]
+        pooled = torch.nan_to_num(pooled).contiguous()
+
+        self.last_go_segment_info = {
+            "segment_weights": segment_weights.detach(),
+            "segment_present": seg_present.detach(),
+            "segment_names": self.go_segment_names,
+        }
+
+        return {
+            "pooled": pooled,
+            "segment_embs": segment_embs,
+            "segment_weights": segment_weights,
+            "segment_present": seg_present,
+        }
