@@ -812,7 +812,7 @@ def run_training(args):
         lazy=True,
         max_len=args.go_text_store_max_len,
         is_segmented=is_segmented,
-        segment_max_len=args.segment_max_len,
+        segment_max_len=args.go_segment_max_len,
         full_id2segments=full_id2segments,
         full_id2seg_present=full_id2seg_present,
     )
