@@ -327,9 +327,14 @@ class OppTrainer:
         ).to(self.device)
 
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))
-        self.go_encoder_k = None
+        self.go_segment_gate_k = None
+
         if getattr(self.model, "go_encoder", None) is not None:
             self.go_encoder_k = clone_as_target(self.model.go_encoder).to(self.device)
+            if hasattr(self.model, "go_segment_gate"):
+                self.go_segment_gate_k = clone_as_target(self.model.go_segment_gate).to(self.device)
+        else:
+            self.go_encoder_k = None
 
         init_ln = math.log(10)  # 1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
@@ -1116,25 +1121,34 @@ class OppTrainer:
         input_ids = toks["input_ids"]
         attention_mask = toks["attention_mask"]
 
+        mode = getattr(self.ctx, "go_encoder_output_mode", "pooled")
         out_cpu = []
         for s in range(0, input_ids.size(0), chunk):
             e = min(input_ids.size(0), s + chunk)
-            embs = enc(
-                input_ids=input_ids[s:e].to(device, non_blocking=True),
-                attention_mask=attention_mask[s:e].to(device, non_blocking=True),
-                output_mode="pooled", #pooled olmalı!
-            )
 
-            # unwrap just in case
-            if isinstance(embs, tuple):
-                embs = embs[0]
-            elif isinstance(embs, dict):
-                embs = embs["pooled"]
+            cur_ids = torch.as_tensor(eval_ids[s:e], dtype=torch.long, device=device)
+
+            if mode == "segment_pooled":
+                embs = self._encode_go_ids_as_pooled_current(
+                    cur_ids,
+                    dtype=torch.float32,
+                    use_ema=False,
+                )
+            else:
+                embs = enc(
+                    input_ids=input_ids[s:e].to(device, non_blocking=True),
+                    attention_mask=attention_mask[s:e].to(device, non_blocking=True),
+                    output_mode="pooled",
+                )
+
+                if isinstance(embs, tuple):
+                    embs = embs[0]
+                elif isinstance(embs, dict):
+                    embs = embs["pooled"]
+
             if embs.dim() != 2:
                 raise RuntimeError(f"go_encoder must return [G,D], got {tuple(embs.shape)}")
 
-            # IMPORTANT: go_cache should store RAW encoder space, not projected
-            # normalize here only if you decided go_cache is normalized-space
             embs = torch.nan_to_num(embs).float().cpu().contiguous()
             out_cpu.append(embs)
 
@@ -1475,6 +1489,130 @@ class OppTrainer:
         }
 
     @torch.no_grad()
+    def _encode_go_ids_as_pooled_current(
+            self,
+            go_ids_1d: torch.Tensor,
+            dtype: torch.dtype,
+            *,
+            use_ema: bool = False,
+    ) -> torch.Tensor:
+        """
+        Encode GO ids with the correct current GO representation.
+
+        Backward compatible:
+          - segment_pooled: uses segment-aware encoder path
+          - pooled / old modes: uses full-text pooled encoder path
+
+        Returns:
+          embs: [N, Dg] on self.device, RAW GO encoder space
+        """
+        device = self.device
+
+        if go_ids_1d is None:
+            return torch.empty(0, 0, device=self.device, dtype=dtype)
+
+        if not torch.is_tensor(go_ids_1d):
+            go_ids_1d = torch.as_tensor(go_ids_1d, dtype=torch.long)
+
+        if int(go_ids_1d.numel()) == 0:
+            return torch.empty(0, 0, device=self.device, dtype=dtype)
+
+        go_ids = [int(x) for x in go_ids_1d.detach().cpu().long().flatten().tolist()]
+
+        if not hasattr(self.ctx, "go_text_store") or self.ctx.go_text_store is None:
+            raise RuntimeError("ctx.go_text_store is required for current GO encoding.")
+
+        mode = getattr(self.ctx, "go_encoder_output_mode", "pooled")
+
+        toks = self.ctx.go_text_store.batch(go_ids)
+
+        was_training = self.model.training
+        self.model.eval()
+
+        try:
+            if mode == "segment_pooled":
+                if "seg_input_ids" not in toks:
+                    raise RuntimeError("segment_pooled mode requires seg_input_ids in go_text_store.batch().")
+
+                seg_input_ids = toks["seg_input_ids"].to(device, non_blocking=True)
+                seg_attention_mask = toks["seg_attention_mask"].to(device, non_blocking=True)
+                seg_present = toks["seg_present"].to(device, non_blocking=True)
+
+                # Use EMA encoder/gate for queue enqueue if available.
+                if use_ema and self.go_encoder_k is not None:
+                    encoder = self.go_encoder_k
+                    segment_gate = self.go_segment_gate_k if self.go_segment_gate_k is not None else self.model.go_segment_gate
+                else:
+                    encoder = self.model.go_encoder
+                    segment_gate = self.model.go_segment_gate
+
+                G, S, L = seg_input_ids.shape
+                flat_ids = seg_input_ids.reshape(G * S, L)
+                flat_mask = seg_attention_mask.reshape(G * S, L)
+
+                out = encoder(
+                    input_ids=flat_ids,
+                    attention_mask=flat_mask,
+                    output_mode="pooled",
+                )
+
+                if isinstance(out, tuple):
+                    out = out[0]
+                elif isinstance(out, dict):
+                    out = out["pooled"]
+
+                if out.dim() != 2:
+                    raise RuntimeError(f"Expected segment pooled output [G*S,D], got {tuple(out.shape)}")
+
+                Dg = out.size(-1)
+                segment_embs = torch.nan_to_num(out).view(G, S, Dg).contiguous()
+
+                if seg_present.dtype != torch.bool:
+                    seg_present_bool = seg_present != 0
+                else:
+                    seg_present_bool = seg_present
+
+                if (seg_present_bool.sum(dim=1) == 0).any():
+                    raise RuntimeError("Some GO rows have zero present segments.")
+
+                seg_logits = segment_gate(segment_embs).squeeze(-1).float()
+                seg_logits = seg_logits.masked_fill(~seg_present_bool, -1e9)
+                seg_weights = torch.softmax(seg_logits, dim=-1).to(segment_embs.dtype)
+
+                embs = torch.einsum("gs,gsd->gd", seg_weights, segment_embs)
+                embs = torch.nan_to_num(embs)
+
+            else:
+                input_ids = toks["input_ids"].to(device, non_blocking=True)
+                attention_mask = toks["attention_mask"].to(device, non_blocking=True)
+
+                encoder = self.go_encoder_k if (use_ema and self.go_encoder_k is not None) else self.model.go_encoder
+
+                embs = encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_mode="pooled",
+                )
+
+                if isinstance(embs, tuple):
+                    embs = embs[0]
+                elif isinstance(embs, dict):
+                    embs = embs["pooled"]
+
+                embs = torch.nan_to_num(embs)
+
+            embs = embs.to(device=device, dtype=dtype).contiguous()
+
+        finally:
+            if was_training:
+                self.model.train()
+
+        if embs.dim() != 2:
+            raise RuntimeError(f"Expected current GO embeddings [N,D], got {tuple(embs.shape)}")
+
+        return embs
+
+    @torch.no_grad()
     def _encode_go_ids_as_tokens(self, go_ids_2d: torch.Tensor):
         """
         go_ids_2d: [B, K] global GO ids
@@ -1805,22 +1943,57 @@ class OppTrainer:
         G_cand[:, :U] = inbatch_embs.unsqueeze(0).expand(B, U, Dg)
 
         # extra negatives from go_cache / go_cache current bank
+        # extra negatives
         if extra_n > 0:
             extra_global_ids = meta["extra_global_ids"]
-            rows = []
-            for gid in extra_global_ids.detach().cpu().tolist():
-                row = self.ctx.go_cache.id2row.get(int(gid), None)
-                if row is not None:
-                    rows.append(int(row))
-            if len(rows) != extra_n:
-                raise RuntimeError("Some extra_global_ids are missing in go_cache.id2row.")
-            rows_t = torch.tensor(rows, dtype=torch.long, device=self.ctx.go_cache.embs.device)
-            extra_raw = self.ctx.go_cache.embs.index_select(0, rows_t).to(
-                device=device,
-                dtype=pooled_go.dtype,
-                non_blocking=True,
-            ).contiguous()
+
+            if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+                # B1 path: extra negatives must use the same segment-aware GO representation.
+                extra_raw = self._encode_go_ids_as_pooled_current(
+                    extra_global_ids,
+                    dtype=pooled_go.dtype,
+                    use_ema=False,
+                )
+
+                if extra_raw.size(0) != extra_n:
+                    raise RuntimeError(
+                        f"extra_raw size mismatch: got {extra_raw.size(0)}, expected {extra_n}"
+                    )
+                if extra_raw.size(1) != Dg:
+                    raise RuntimeError(
+                        f"extra_raw dim mismatch: got {extra_raw.size(1)}, expected {Dg}"
+                    )
+
+                extra_source = "current_segment_encoder"
+
+            else:
+                # A3 / old pooled path: keep old cache behavior.
+                rows = []
+                for gid in extra_global_ids.detach().cpu().tolist():
+                    row = self.ctx.go_cache.id2row.get(int(gid), None)
+                    if row is not None:
+                        rows.append(int(row))
+
+                if len(rows) != extra_n:
+                    raise RuntimeError("Some extra_global_ids are missing in go_cache.id2row.")
+
+                rows_t = torch.tensor(rows, dtype=torch.long, device=self.ctx.go_cache.embs.device)
+                extra_raw = self.ctx.go_cache.embs.index_select(0, rows_t).to(
+                    device=device,
+                    dtype=pooled_go.dtype,
+                    non_blocking=True,
+                ).contiguous()
+
+                extra_source = "go_cache"
+
             G_cand[:, U:U + extra_n] = extra_raw.unsqueeze(0).expand(B, extra_n, Dg)
+
+            if getattr(self, "_global_step", 0) == 0:
+                print("[DBG-EXTRA]")
+                print("mode:", getattr(self.ctx, "go_encoder_output_mode", None))
+                print("extra_n:", extra_n)
+                print("extra_source:", extra_source)
+                print("extra_raw:", tuple(extra_raw.shape), extra_raw.dtype, extra_raw.device)
 
         # queue negatives
         if kq > 0:
@@ -2098,7 +2271,7 @@ class OppTrainer:
                         dtype=pooled_go.dtype,
                     )
 
-            if self._global_step % 200 == 0:
+            if self._global_step % 1000 == 0:
                 dbg_go = pooled_go if pooled_go is not None else None
                 self._dbg_norms(prot_query=prot_query, uniq_go_embs=dbg_go, tag="[pre-enq]")
                 if neg_ids_from_queue is not None:
@@ -2152,25 +2325,8 @@ class OppTrainer:
         if self.model.protein_pool_type == "mean_attn_gate":
             assert not self._use_token_align
             assert pooled_go is not None
-            assert G_cand.dim() == 3, f"A3 expects pooled G_cand [B,K,D], got {tuple(G_cand.shape)}"
-            assert G_cand_mask is None, "A3 pooled path should not have G_cand_mask."
-
-        # TODO: Erase:
-        if self._global_step == 0:
-            print("\n[A3-CHECK]")
-            print("_use_token_align:", self._use_token_align)
-            print("protein_pool_type:", self.model.protein_pool_type)
-            print("go_pool_type:", self.model.go_pool_type)
-            print("ctx.go_encoder_output_mode:", self.ctx.go_encoder_output_mode)
-            print("pooled_go is None:", pooled_go is None)
-            print("token_go is None:", token_go is None)
-            print("token_go_mask is None:", token_go_mask is None)
-            print("G_cand dim:", G_cand.dim())
-            print("G_cand shape:", tuple(G_cand.shape))
-            if G_cand_mask is not None:
-                print("G_cand_mask shape:", tuple(G_cand_mask.shape))
-                print("G_cand_mask valid mean:", float(G_cand_mask.float().mean().item()))
-         #   raise SystemExit("A3 debug stop before expensive run")
+            assert G_cand.dim() == 3, f"Pooled retriever expects G_cand [B,K,D], got {tuple(G_cand.shape)}"
+            assert G_cand_mask is None, "Pooled retriever path should not have G_cand_mask."
 
         with amp_ctx:
             scores_cand = self.forward_scores(
@@ -2185,7 +2341,7 @@ class OppTrainer:
             if slot_extractor is not None and getattr(slot_extractor, "last_slot_div_loss", None) is not None:
                 l_slot_div = slot_extractor.last_slot_div_loss
 
-            if self._global_step % 200 == 0:
+            if self._global_step % 1000 == 0:
                 _tstats(scores_cand, "scores_cand(pre_scale)")
                 grad = self.logit_scale.grad.item() if self.logit_scale.grad is not None else None
                 print(
@@ -2222,7 +2378,7 @@ class OppTrainer:
                 queue_w = self._queue_weight_schedule(self._global_step)
                 scores_cand[:, q_start:q_start + kq] *= queue_w
 
-            #TODO: Erase debug
+            # TODO: Erase debug
             # DEBUG TARGET, use meta pos_mask, not batch["labels"]
             if self._global_step % 1000 == 0:
                 with torch.no_grad():
@@ -2353,6 +2509,9 @@ class OppTrainer:
         if self.go_encoder_k is not None:
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
+        if getattr(self, "go_segment_gate_k", None) is not None:
+            ema_update(self.model.go_segment_gate, self.go_segment_gate_k, m=self.m_ema)
+
         # enqueue always pooled/raw representations
         if self._queue_active() and self.queue_miner is not None:
             with torch.no_grad():
@@ -2360,25 +2519,36 @@ class OppTrainer:
                 if local_idx_list:
                     local_cat = torch.unique(torch.cat(local_idx_list, dim=0))
 
-                    if ("pos_go_tokens" in batch) and (self.go_encoder_k is not None):
-                        toks = batch["pos_go_tokens"]
-                        assert toks["input_ids"].size(0) == uniq_go_ids.size(0)
-
-                        pos_vecs_raw = self.go_encoder_k(
-                            input_ids=toks["input_ids"].to(device, non_blocking=True),
-                            attention_mask=toks["attention_mask"].to(device, non_blocking=True),
-                            output_mode="pooled",
+                    pos_ids = uniq_go_ids.index_select(0, local_cat).detach()
+                    if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+                        # B1 path: queue raw vectors must be segment-aware too.
+                        pos_vecs_raw = self._encode_go_ids_as_pooled_current(
+                            pos_ids,
+                            dtype=pooled_go.dtype,
+                            use_ema=True,
                         )
-                        if isinstance(pos_vecs_raw, tuple):
-                            pos_vecs_raw = pos_vecs_raw[0]
-                        elif isinstance(pos_vecs_raw, dict):
-                            pos_vecs_raw = pos_vecs_raw["pooled"]
-
-                        pos_vecs_raw = pos_vecs_raw.index_select(0, local_cat)
                     else:
-                        if pooled_go is None:
-                            raise RuntimeError("Queue enqueue requires pooled_go or EMA pooled encoding.")
-                        pos_vecs_raw = pooled_go.index_select(0, local_cat)
+                        # old path: preserve old EMA full-text pooled behavior.
+                        if ("pos_go_tokens" in batch) and (self.go_encoder_k is not None):
+                            toks = batch["pos_go_tokens"]
+                            assert toks["input_ids"].size(0) == uniq_go_ids.size(0)
+
+                            pos_vecs_raw = self.go_encoder_k(
+                                input_ids=toks["input_ids"].to(device, non_blocking=True),
+                                attention_mask=toks["attention_mask"].to(device, non_blocking=True),
+                                output_mode="pooled",
+                            )
+
+                            if isinstance(pos_vecs_raw, tuple):
+                                pos_vecs_raw = pos_vecs_raw[0]
+                            elif isinstance(pos_vecs_raw, dict):
+                                pos_vecs_raw = pos_vecs_raw["pooled"]
+
+                            pos_vecs_raw = pos_vecs_raw.index_select(0, local_cat)
+                        else:
+                            if pooled_go is None:
+                                raise RuntimeError("Queue enqueue requires pooled_go or EMA pooled encoding.")
+                            pos_vecs_raw = pooled_go.index_select(0, local_cat)
 
                     if self._global_step % 1000 == 0:
                         self._dbg_norms(pos_vecs=pos_vecs_raw, tag="[enq-raw]")
@@ -2397,6 +2567,12 @@ class OppTrainer:
                     if self._global_step % 1000 == 0:
                         self.debug_queue()
                         self._dbg_norms(pos_vecs=pos_vecs_proj, tag="[enq-proj]")
+
+                    if self._global_step % 1000 == 0:
+                        print("[DBG-QUEUE-ENQ]")
+                        print("mode:", getattr(self.ctx, "go_encoder_output_mode", None))
+                        print("pos_vecs_raw:", tuple(pos_vecs_raw.shape), pos_vecs_raw.dtype, pos_vecs_raw.device)
+                        print("pos_ids:", tuple(pos_ids.shape))
 
         try:
             self.wandb_run.log(
