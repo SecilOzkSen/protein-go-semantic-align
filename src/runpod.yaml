@@ -33,7 +33,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-B1
+  output_dir: /workspace/protein-go-align-outputs-B1v1
   save_every: 10000
   keep_last_n: 3
   resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
@@ -122,7 +122,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-b1-segment-aware"
+  wandb_run_name: "protein-go-semantic-align-ablation-b1v1-segment-aware"
   mode: online
 
 stores:

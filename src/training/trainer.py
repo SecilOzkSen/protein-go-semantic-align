@@ -1327,6 +1327,8 @@ class OppTrainer:
                 seg_input_ids=seg_input_ids,
                 seg_attention_mask=seg_attention_mask,
                 seg_present=seg_present,
+                input_ids=input_ids,
+                attention_mask=attn,
             )
 
             pooled_embs = out["pooled"]
@@ -1525,6 +1527,8 @@ class OppTrainer:
         mode = getattr(self.ctx, "go_encoder_output_mode", "pooled")
 
         toks = self.ctx.go_text_store.batch(go_ids)
+        input_ids = toks["input_ids"].to(device, non_blocking=True)
+        attention_mask = toks["attention_mask"].to(device, non_blocking=True)
 
         was_training = self.model.training
         self.model.eval()
@@ -1575,11 +1579,47 @@ class OppTrainer:
                 if (seg_present_bool.sum(dim=1) == 0).any():
                     raise RuntimeError("Some GO rows have zero present segments.")
 
+                # Segment logits and weights
                 seg_logits = segment_gate(segment_embs).squeeze(-1).float()
                 seg_logits = seg_logits.masked_fill(~seg_present_bool, -1e9)
                 seg_weights = torch.softmax(seg_logits, dim=-1).to(segment_embs.dtype)
 
-                embs = torch.einsum("gs,gsd->gd", seg_weights, segment_embs)
+                # 1) Segment-aware pooled GO embedding
+                # segment_embs: [G, S, Dg]
+                # seg_weights:  [G, S]
+                # seg_pooled:   [G, Dg]
+                seg_pooled = torch.einsum("gs,gsd->gd", seg_weights, segment_embs)
+                seg_pooled = torch.nan_to_num(seg_pooled)
+
+                # 2) Full-text GO embedding, A3 anchor
+                full_out = encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_mode="pooled",
+                )
+
+                if isinstance(full_out, tuple):
+                    full_out = full_out[0]
+                elif isinstance(full_out, dict):
+                    full_out = full_out["pooled"]
+
+                full_out = torch.nan_to_num(full_out)
+
+                if full_out.dim() != 2:
+                    raise RuntimeError(f"Expected full-text pooled output [G,D], got {tuple(full_out.shape)}")
+
+                if full_out.shape != seg_pooled.shape:
+                    raise RuntimeError(
+                        f"full_out shape {tuple(full_out.shape)} does not match "
+                        f"seg_pooled shape {tuple(seg_pooled.shape)}"
+                    )
+
+                # 3) Hybrid B1.1 embedding
+                # alpha=0.2 means:
+                #   80% full-text A3-style GO embedding
+                #   20% segment-aware refinement
+                alpha = float(getattr(self.model, "go_segment_mix_alpha", 0.2))
+                embs = (1.0 - alpha) * full_out + alpha * seg_pooled
                 embs = torch.nan_to_num(embs)
 
             else:
@@ -2423,6 +2463,48 @@ class OppTrainer:
                         neg_scores.std().item() if neg_scores.numel() > 1 else None,
                         neg_scores.numel(),
                     )
+
+            if self._global_step % 1000 == 0 and getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+                info = getattr(self.model, "last_go_segment_info", {})
+                w = info.get("segment_weights", None)
+                present = info.get("segment_present", None)
+                names = info.get("segment_names", None)
+
+                if w is not None:
+                    print("\n[DBG-GO-SEG]")
+                    print("segment_names:", names)
+                    print("weights shape:", tuple(w.shape))
+                    print("weights mean:", w.float().mean(dim=0).detach().cpu().tolist())
+                    print("weights min/max:", float(w.float().min()), float(w.float().max()))
+
+                if present is not None:
+                    print("present mean:", present.float().mean(dim=0).detach().cpu().tolist())
+
+            if self._global_step % 1000 == 0:
+                with torch.no_grad():
+                    Zp = self.model.encode_protein_for_scoring(H, attn_valid)
+                    Gz = self.model.go_ln(G_cand)
+                    Gz = self.model.proj_g(Gz)
+                    Gz = self.model._norm(Gz, dim=-1)
+
+                    print("\n[DBG-PROJ-SPACE]")
+                    print("Zp norm:", Zp.float().norm(dim=-1).mean().item())
+                    print("Gz norm:", Gz.float().norm(dim=-1).mean().item())
+
+                    # GO candidate pairwise similarity, sample one batch row
+                    g0 = Gz[0].float()  # [K,D]
+                    sim = g0 @ g0.T
+                    K0 = sim.size(0)
+                    eye = torch.eye(K0, device=sim.device, dtype=torch.bool)
+                    off = sim[~eye]
+
+                    print("Gz pairwise offdiag mean/std/min/max:",
+                          off.mean().item(), off.std().item(), off.min().item(), off.max().item())
+
+                    # Protein to GO scores pre-scale
+                    sc_pre = torch.einsum("bd,bkd->bk", Zp.float(), Gz.float())
+                    print("recomputed score pre mean/std/min/max:",
+                          sc_pre.mean().item(), sc_pre.std().item(), sc_pre.min().item(), sc_pre.max().item())
 
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,

@@ -252,6 +252,7 @@ class ProteinGoAligner(nn.Module):
         self.protein_pool_type = protein_pool_type
         self.protein_n_slots = int(protein_n_slots)
         self.go_pool_type = go_pool_type
+        self.go_segment_mix_alpha = 0.2
 
         if self.go_encoder is not None and d_g is None:
             d_g = int(self.go_encoder.model.config.hidden_size)
@@ -471,9 +472,11 @@ class ProteinGoAligner(nn.Module):
 
     def encode_go_segment_aware(
             self,
-            seg_input_ids: torch.Tensor,  # [G, S, L]
-            seg_attention_mask: torch.Tensor,  # [G, S, L]
-            seg_present: torch.Tensor,  # [G, S] bool
+            seg_input_ids: torch.Tensor,  # [G,S,Ls]
+            seg_attention_mask: torch.Tensor,  # [G,S,Ls]
+            seg_present: torch.Tensor,  # [G,S]
+            input_ids: Optional[torch.Tensor] = None,  # [G,L]
+            attention_mask: Optional[torch.Tensor] = None,  # [G,L]
     ):
         """
         Segment-aware GO encoder for B1.
@@ -566,13 +569,33 @@ class ProteinGoAligner(nn.Module):
 
         segment_weights = torch.softmax(seg_logits, dim=-1).to(dtype=segment_embs.dtype)  # [G,S]
 
-        pooled = torch.einsum("gs,gsd->gd", segment_weights, segment_embs)  # [G,Dg]
-        pooled = torch.nan_to_num(pooled).contiguous()
+        seg_pooled = torch.einsum("gs,gsd->gd", segment_weights, segment_embs)  # [G,Dg]
+        seg_pooled = torch.nan_to_num(seg_pooled).contiguous()
+
+        if input_ids is not None and attention_mask is not None:
+            full_out = self.go_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_mode="pooled",
+            )
+
+            if isinstance(full_out, tuple):
+                full_out = full_out[0]
+            elif isinstance(full_out, dict):
+                full_out = full_out["pooled"]
+
+            full_out = torch.nan_to_num(full_out)
+
+            alpha = float(getattr(self, "go_segment_mix_alpha", 0.2))
+            pooled = (1.0 - alpha) * full_out + alpha * seg_pooled
+        else:
+            pooled = seg_pooled
 
         self.last_go_segment_info = {
             "segment_weights": segment_weights.detach(),
             "segment_present": seg_present.detach(),
             "segment_names": self.go_segment_names,
+            "mix_alpha": float(getattr(self, "go_segment_mix_alpha", 0.2)),
         }
 
         return {
