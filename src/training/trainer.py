@@ -471,116 +471,117 @@ class OppTrainer:
 
         print("[WARMSTART] top-level keys:", list(ckpt.keys())[:30])
 
-        # Same logic as your resume loader.
-        if "model" in ckpt:
-            state = ckpt["model"]
-            print("[WARMSTART] using ckpt['model']")
-        elif "model_state_dict" in ckpt:
-            state = ckpt["model_state_dict"]
-            print("[WARMSTART] using ckpt['model_state_dict']")
-        elif "state_dict" in ckpt:
-            state = ckpt["state_dict"]
-            print("[WARMSTART] using ckpt['state_dict']")
-        else:
-            raise RuntimeError(f"[WARMSTART] no model-like key found. Keys={list(ckpt.keys())}")
+        # --------------------------------------------------
+        # 1) Find actual state_dict recursively
+        # --------------------------------------------------
+        def looks_like_state_dict(d):
+            if not isinstance(d, dict):
+                return False
+            n_tensor = 0
+            for _, v in d.items():
+                if torch.is_tensor(v):
+                    n_tensor += 1
+                    if n_tensor >= 5:
+                        return True
+            return False
 
-        if not isinstance(state, dict):
-            raise RuntimeError(f"[WARMSTART] model state is not dict, got {type(state)}")
+        state = ckpt
+
+        unwrap_keys = ["model", "model_state_dict", "state_dict", "net", "module"]
+
+        for depth in range(10):
+            if looks_like_state_dict(state):
+                print(f"[WARMSTART] found tensor state_dict at depth={depth}")
+                break
+
+            if not isinstance(state, dict):
+                raise RuntimeError(f"[WARMSTART] state became non-dict at depth={depth}: {type(state)}")
+
+            found = False
+            for key in unwrap_keys:
+                if key in state and isinstance(state[key], dict):
+                    print(f"[WARMSTART] unwrap depth={depth}: state = state['{key}']")
+                    state = state[key]
+                    found = True
+                    break
+
+            if not found:
+                raise RuntimeError(
+                    f"[WARMSTART] Could not find tensor state_dict. Current keys={list(state.keys())[:30]}"
+                )
+        else:
+            raise RuntimeError("[WARMSTART] exceeded max unwrap depth")
 
         raw_keys = list(state.keys())
-        cur_state = self.model.state_dict()
-        cur_keys = list(cur_state.keys())
+        print("[WARMSTART] raw state key example:", raw_keys[:20])
 
-        print("[WARMSTART] raw model key example:", raw_keys[:20])
+        # --------------------------------------------------
+        # 2) Clean / transform checkpoint keys
+        # --------------------------------------------------
+        current = self.model.state_dict()
+        cur_keys = list(current.keys())
         print("[WARMSTART] current model key example:", cur_keys[:20])
 
-        def strip_prefix(k: str, prefix: str) -> str:
+        def strip_once(k: str, prefix: str) -> str:
             return k[len(prefix):] if k.startswith(prefix) else k
 
-        def transform_key(k: str, mode: str) -> str:
-            if mode == "identity":
-                return k
-            if mode == "strip_module":
-                return strip_prefix(k, "module.")
-            if mode == "strip_model":
-                return strip_prefix(k, "model.")
-            if mode == "strip_module_model":
-                k = strip_prefix(k, "module.")
-                k = strip_prefix(k, "model.")
-                return k
-            if mode == "strip_model_module":
-                k = strip_prefix(k, "model.")
-                k = strip_prefix(k, "module.")
-                return k
-            if mode == "strip_trainer_model":
-                return strip_prefix(k, "trainer.model.")
+        def clean_key(k: str) -> str:
+            # repeat because some checkpoints can be model.module.model.xxx
+            for _ in range(5):
+                old = k
+                k = strip_once(k, "module.")
+                k = strip_once(k, "model.")
+                k = strip_once(k, "trainer.model.")
+                if k == old:
+                    break
             return k
 
-        modes = [
-            "identity",
-            "strip_module",
-            "strip_model",
-            "strip_module_model",
-            "strip_model_module",
-            "strip_trainer_model",
-        ]
+        clean_state = {}
+        for k, v in state.items():
+            if not torch.is_tensor(v):
+                continue
+            clean_state[clean_key(k)] = v
 
-        best_mode = None
-        best_loadable = {}
-        best_skipped_shape = []
-        best_skipped_missing = []
+        # --------------------------------------------------
+        # 3) Match compatible tensors only
+        # --------------------------------------------------
+        loadable = {}
+        skipped_missing = []
+        skipped_shape = []
 
-        for mode in modes:
-            loadable = {}
-            skipped_shape = []
-            skipped_missing = []
+        for k, v in clean_state.items():
+            if k not in current:
+                skipped_missing.append(k)
+                continue
 
-            for raw_k, v in state.items():
-                if not torch.is_tensor(v):
-                    continue
+            if tuple(current[k].shape) != tuple(v.shape):
+                skipped_shape.append((k, tuple(v.shape), tuple(current[k].shape)))
+                continue
 
-                k = transform_key(raw_k, mode)
+            loadable[k] = v
 
-                if k not in cur_state:
-                    skipped_missing.append((raw_k, k))
-                    continue
-
-                if tuple(cur_state[k].shape) != tuple(v.shape):
-                    skipped_shape.append((raw_k, k, tuple(v.shape), tuple(cur_state[k].shape)))
-                    continue
-
-                loadable[k] = v
-
-            print(f"[WARMSTART-TRY] mode={mode} loadable={len(loadable)} "
-                  f"missing={len(skipped_missing)} shape_mismatch={len(skipped_shape)}")
-
-            if len(loadable) > len(best_loadable):
-                best_mode = mode
-                best_loadable = loadable
-                best_skipped_shape = skipped_shape
-                best_skipped_missing = skipped_missing
-
-        print(f"[WARMSTART] best_mode={best_mode}")
-        print(f"[WARMSTART] best_loadable={len(best_loadable)}")
-
-        if len(best_loadable) == 0:
+        if len(loadable) == 0:
             print("[WARMSTART][DEBUG] raw key sample:", raw_keys[:50])
+            print("[WARMSTART][DEBUG] clean key sample:", list(clean_state.keys())[:50])
             print("[WARMSTART][DEBUG] current key sample:", cur_keys[:50])
-            print("[WARMSTART][DEBUG] skipped_missing sample:", best_skipped_missing[:20])
-            print("[WARMSTART][DEBUG] skipped_shape sample:", best_skipped_shape[:10])
+            print("[WARMSTART][DEBUG] skipped_missing sample:", skipped_missing[:30])
+            print("[WARMSTART][DEBUG] skipped_shape sample:", skipped_shape[:10])
             raise RuntimeError(
                 "[WARMSTART] loaded 0 compatible keys. "
-                "Checkpoint model keys do not match current model keys."
+                "Checkpoint structure/key names do not match current model."
             )
 
-        missing, unexpected = self.model.load_state_dict(best_loadable, strict=False)
+        missing, unexpected = self.model.load_state_dict(loadable, strict=False)
 
-        print(f"[WARMSTART] loaded compatible keys: {len(best_loadable)}")
+        print(f"[WARMSTART] loaded compatible keys: {len(loadable)}")
         print(f"[WARMSTART] missing n={len(missing)} example={missing[:30]}")
         print(f"[WARMSTART] unexpected n={len(unexpected)} example={unexpected[:30]}")
-        print(f"[WARMSTART] skipped_missing n={len(best_skipped_missing)} example={best_skipped_missing[:20]}")
-        print(f"[WARMSTART] skipped_shape n={len(best_skipped_shape)} example={best_skipped_shape[:10]}")
+        print(f"[WARMSTART] skipped_missing n={len(skipped_missing)} example={skipped_missing[:30]}")
+        print(f"[WARMSTART] skipped_shape n={len(skipped_shape)} example={skipped_shape[:10]}")
 
+        # --------------------------------------------------
+        # 4) Important sanity checks
+        # --------------------------------------------------
         important_prefixes = [
             "proj_p.",
             "proj_g.",
@@ -590,18 +591,19 @@ class OppTrainer:
         ]
 
         for pref in important_prefixes:
-            n_loaded = sum(k.startswith(pref) for k in best_loadable)
+            n_loaded = sum(k.startswith(pref) for k in loadable)
             print(f"[WARMSTART-CHECK] {pref} loaded={n_loaded}")
 
-        n_lora = sum("lora_" in k for k in best_loadable)
+        n_lora = sum("lora_" in k for k in loadable)
         print(f"[WARMSTART-CHECK] lora loaded={n_lora}")
 
-        if sum(k.startswith("proj_g.") for k in best_loadable) == 0:
-            print("[WARMSTART][WARN] proj_g was not loaded.")
-        if sum(k.startswith("proj_p.") for k in best_loadable) == 0:
-            print("[WARMSTART][WARN] proj_p was not loaded.")
-        if n_lora == 0:
-            print("[WARMSTART][WARN] no LoRA params were loaded.")
+        # Expected missing in B1/B1.1 because A3 did not have these
+        expected_new = [
+            k for k in missing
+            if k.startswith("go_segment_gate")
+               or k.startswith("go_segment_type_bias")
+        ]
+        print(f"[WARMSTART-CHECK] expected new B1 params missing={len(expected_new)} example={expected_new[:20]}")
 
     @torch.no_grad()
     def _maybe_activate_queue(self):
