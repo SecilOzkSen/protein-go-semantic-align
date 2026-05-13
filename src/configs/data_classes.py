@@ -263,6 +263,9 @@ class TrainerConfig:
     eval_go_bs: int = 256
     max_inbatch: int = 64
     eval_cand_chunk_k: int = 64
+    warmstart_path: str = None
+    go_segment_alpha: float = 0.0
+    go_segment_alpha_warmup_steps: int = 10000
 
 @dataclass
 class QueueConfig:

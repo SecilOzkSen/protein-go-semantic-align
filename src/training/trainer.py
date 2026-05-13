@@ -326,6 +326,11 @@ class OppTrainer:
             go_pool_type=ctx.go_pool_type,
         ).to(self.device)
 
+        # warmstart configs
+        warmstart_path = getattr(cfg, "warmstart_path", None)
+        if warmstart_path:
+            self._load_warmstart(warmstart_path)
+
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))
         self.go_segment_gate_k = None
 
@@ -440,6 +445,59 @@ class OppTrainer:
         print("[GO-ENCODER-OUTPUT-MODE] Go encoder output mode:", self.ctx.go_encoder_output_mode)
     def _queue_active(self) -> bool:
         return self.use_moco_miner and (self._global_step >= self.queue_cfg.queue_start_step)
+
+    def _segment_alpha_schedule(self, step: int):
+        alpha_max = float(getattr(self.cfg, "go_segment_alpha", 0.2))
+        warmup = int(getattr(self.cfg, "go_segment_alpha_warmup_steps", 10000))
+
+        if warmup <= 0:
+            return alpha_max
+
+        return alpha_max * min(1.0, float(step) / float(warmup))
+
+    def _load_warmstart(self, ckpt_path: str):
+        print(f"[WARMSTART] loading from {ckpt_path}")
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            state = ckpt["model"]
+        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            state = ckpt["model_state_dict"]
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+        else:
+            state = ckpt
+
+        clean_state = {}
+        for k, v in state.items():
+            if k.startswith("module."):
+                k = k[len("module."):]
+            if k.startswith("model."):
+                k = k[len("model."):]
+            clean_state[k] = v
+
+        model_state = self.model.state_dict()
+        loadable = {}
+        skipped_shape = []
+        skipped_new = []
+
+        for k, v in clean_state.items():
+            if k not in model_state:
+                skipped_new.append(k)
+                continue
+            if tuple(model_state[k].shape) != tuple(v.shape):
+                skipped_shape.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+                continue
+            loadable[k] = v
+
+        missing, unexpected = self.model.load_state_dict(loadable, strict=False)
+
+        print(f"[WARMSTART] loaded keys: {len(loadable)}")
+        print(f"[WARMSTART] missing n={len(missing)} example={missing[:20]}")
+        print(f"[WARMSTART] unexpected n={len(unexpected)} example={unexpected[:20]}")
+        print(f"[WARMSTART] skipped_new n={len(skipped_new)} example={skipped_new[:20]}")
+        print(f"[WARMSTART] skipped_shape n={len(skipped_shape)} example={skipped_shape[:10]}")
 
     @torch.no_grad()
     def _maybe_activate_queue(self):
@@ -1155,6 +1213,60 @@ class OppTrainer:
         new_embs_cpu = torch.cat(out_cpu, dim=0).contiguous()
         self.ctx.go_cache.update(eval_ids, new_embs_cpu)
 
+        # TODO: Debug. Erasae Later.
+        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+            with torch.no_grad():
+                rows = torch.as_tensor(
+                    [self.ctx.go_cache.id2row[int(g)] for g in eval_ids],
+                    dtype=torch.long,
+                    device=self.ctx.go_cache.embs.device,
+                )
+
+                cached = self.ctx.go_cache.embs.index_select(0, rows).float().cpu().contiguous()
+
+                cos = F.cosine_similarity(
+                    new_embs_cpu.float(),
+                    cached.float(),
+                    dim=-1,
+                )
+
+                print("\n[DBG-EVAL-CACHE-UPDATE]")
+                print("new_embs:", tuple(new_embs_cpu.shape), new_embs_cpu.dtype)
+                print("cached:", tuple(cached.shape), cached.dtype)
+                print(
+                    "cos new/cached mean/min/max:",
+                    float(cos.mean().item()),
+                    float(cos.min().item()),
+                    float(cos.max().item()),
+                )
+                print(
+                    "max abs diff:",
+                    float((new_embs_cpu.float() - cached.float()).abs().max().item()),
+                )
+        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+            with torch.no_grad():
+                G_once = self._eval_G_once_cpu.to(self.device, non_blocking=True)
+
+                G_proj = self.model.go_ln(G_once)
+                G_proj = self.model.proj_g(G_proj)
+                G_proj = F.normalize(G_proj.float(), dim=-1)
+
+                n = min(512, G_proj.size(0))
+                g = G_proj[:n]
+                sim = g @ g.T
+                eye = torch.eye(n, device=sim.device, dtype=torch.bool)
+                off = sim[~eye]
+
+                print("\n[DBG-EVAL-GO-PROJ]")
+                print("G_once norm mean/std:",
+                      float(G_once.float().norm(dim=-1).mean().item()),
+                      float(G_once.float().norm(dim=-1).std().item()))
+                print("G_proj offdiag mean/std/min/max:",
+                      float(off.mean().item()),
+                      float(off.std().item()),
+                      float(off.min().item()),
+                      float(off.max().item()))
+
         if was_training:
             enc.train()
     @torch.no_grad()
@@ -1542,86 +1654,77 @@ class OppTrainer:
                 seg_attention_mask = toks["seg_attention_mask"].to(device, non_blocking=True)
                 seg_present = toks["seg_present"].to(device, non_blocking=True)
 
-                # Use EMA encoder/gate for queue enqueue if available.
-                if use_ema and self.go_encoder_k is not None:
+                if not use_ema:
+                    out = self.model.encode_go_segment_aware(
+                        seg_input_ids=seg_input_ids,
+                        seg_attention_mask=seg_attention_mask,
+                        seg_present=seg_present,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
+                    embs = out["pooled"]
+                    embs = torch.nan_to_num(embs)
+
+                else:
+                    # EMA path, queue enqueue için manuel kalabilir
                     encoder = self.go_encoder_k
                     segment_gate = self.go_segment_gate_k if self.go_segment_gate_k is not None else self.model.go_segment_gate
-                else:
-                    encoder = self.model.go_encoder
-                    segment_gate = self.model.go_segment_gate
 
-                G, S, L = seg_input_ids.shape
-                flat_ids = seg_input_ids.reshape(G * S, L)
-                flat_mask = seg_attention_mask.reshape(G * S, L)
+                    G, S, L = seg_input_ids.shape
+                    flat_ids = seg_input_ids.reshape(G * S, L)
+                    flat_mask = seg_attention_mask.reshape(G * S, L)
 
-                out = encoder(
-                    input_ids=flat_ids,
-                    attention_mask=flat_mask,
-                    output_mode="pooled",
-                )
-
-                if isinstance(out, tuple):
-                    out = out[0]
-                elif isinstance(out, dict):
-                    out = out["pooled"]
-
-                if out.dim() != 2:
-                    raise RuntimeError(f"Expected segment pooled output [G*S,D], got {tuple(out.shape)}")
-
-                Dg = out.size(-1)
-                segment_embs = torch.nan_to_num(out).view(G, S, Dg).contiguous()
-
-                if seg_present.dtype != torch.bool:
-                    seg_present_bool = seg_present != 0
-                else:
-                    seg_present_bool = seg_present
-
-                if (seg_present_bool.sum(dim=1) == 0).any():
-                    raise RuntimeError("Some GO rows have zero present segments.")
-
-                # Segment logits and weights
-                seg_logits = segment_gate(segment_embs).squeeze(-1).float()
-                seg_logits = seg_logits.masked_fill(~seg_present_bool, -1e9)
-                seg_weights = torch.softmax(seg_logits, dim=-1).to(segment_embs.dtype)
-
-                # 1) Segment-aware pooled GO embedding
-                # segment_embs: [G, S, Dg]
-                # seg_weights:  [G, S]
-                # seg_pooled:   [G, Dg]
-                seg_pooled = torch.einsum("gs,gsd->gd", seg_weights, segment_embs)
-                seg_pooled = torch.nan_to_num(seg_pooled)
-
-                # 2) Full-text GO embedding, A3 anchor
-                full_out = encoder(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    output_mode="pooled",
-                )
-
-                if isinstance(full_out, tuple):
-                    full_out = full_out[0]
-                elif isinstance(full_out, dict):
-                    full_out = full_out["pooled"]
-
-                full_out = torch.nan_to_num(full_out)
-
-                if full_out.dim() != 2:
-                    raise RuntimeError(f"Expected full-text pooled output [G,D], got {tuple(full_out.shape)}")
-
-                if full_out.shape != seg_pooled.shape:
-                    raise RuntimeError(
-                        f"full_out shape {tuple(full_out.shape)} does not match "
-                        f"seg_pooled shape {tuple(seg_pooled.shape)}"
+                    out = encoder(
+                        input_ids=flat_ids,
+                        attention_mask=flat_mask,
+                        output_mode="pooled",
                     )
 
-                # 3) Hybrid B1.1 embedding
-                # alpha=0.2 means:
-                #   80% full-text A3-style GO embedding
-                #   20% segment-aware refinement
-                alpha = float(getattr(self.model, "go_segment_mix_alpha", 0.2))
-                embs = (1.0 - alpha) * full_out + alpha * seg_pooled
-                embs = torch.nan_to_num(embs)
+                    if isinstance(out, tuple):
+                        out = out[0]
+                    elif isinstance(out, dict):
+                        out = out["pooled"]
 
+                    Dg = out.size(-1)
+                    segment_embs = torch.nan_to_num(out).view(G, S, Dg).contiguous()
+
+                    if seg_present.dtype != torch.bool:
+                        seg_present_bool = seg_present != 0
+                    else:
+                        seg_present_bool = seg_present
+
+                    if (seg_present_bool.sum(dim=1) == 0).any():
+                        raise RuntimeError("Some GO rows have zero present segments.")
+
+                    seg_logits = segment_gate(segment_embs).squeeze(-1).float()
+                    seg_logits = seg_logits.masked_fill(~seg_present_bool, -1e9)
+                    seg_weights = torch.softmax(seg_logits, dim=-1).to(segment_embs.dtype)
+
+                    seg_pooled = torch.einsum("gs,gsd->gd", seg_weights, segment_embs)
+                    seg_pooled = torch.nan_to_num(seg_pooled)
+
+                    full_out = encoder(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_mode="pooled",
+                    )
+
+                    if isinstance(full_out, tuple):
+                        full_out = full_out[0]
+                    elif isinstance(full_out, dict):
+                        full_out = full_out["pooled"]
+
+                    full_out = torch.nan_to_num(full_out)
+
+                    if full_out.shape != seg_pooled.shape:
+                        raise RuntimeError(
+                            f"full_out shape {tuple(full_out.shape)} does not match "
+                            f"seg_pooled shape {tuple(seg_pooled.shape)}"
+                        )
+
+                    alpha = float(getattr(self.model, "go_segment_mix_alpha", 0.2))
+                    embs = (1.0 - alpha) * full_out + alpha * seg_pooled
+                    embs = torch.nan_to_num(embs)
             else:
                 input_ids = toks["input_ids"].to(device, non_blocking=True)
                 attention_mask = toks["attention_mask"].to(device, non_blocking=True)
@@ -2239,6 +2342,12 @@ class OppTrainer:
 
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
         self.model.train()
+        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+            if hasattr(self.model, "go_segment_mix_alpha"):
+                self.model.go_segment_mix_alpha = self._segment_alpha_schedule(self._global_step)
+
+            if self._global_step % 1000 == 0:
+                print("[DBG-SEG-ALPHA]", self.model.go_segment_mix_alpha)
         device = self.device
 
         if self.model.go_encoder is not None:

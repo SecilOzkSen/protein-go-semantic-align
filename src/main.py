@@ -993,6 +993,7 @@ def run_training(args):
         d_z=d_z,
         device=str(device),
         lr=args.lr,
+        lr_lora=args.lr_lora,
         max_epochs=args.epochs,
         cand_chunk_k=args.cand_chunk_k,
         pos_chunk_t=args.pos_chunk_t,
@@ -1001,6 +1002,10 @@ def run_training(args):
         eval_go_bs=args.eval_go_bs,
         max_inbatch=args.max_inbatch,
         eval_cand_chunk_k=args.eval_cand_chunk_k,
+        warmstart_path=args.warmstart_path,
+        go_segment_alpha_warmup_steps=args.go_segment_alpha_warmup_steps,
+        go_segment_alpha=args.go_segment_alpha,
+
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1374,6 +1379,7 @@ def load_structured_cfg(path: str):
         save_every=int(training.get("save_every", 1000)),
         keep_last_n=int(training.get("keep_last_n", 3)),
         resume=training.get("resume"),
+        warmstart_path=training.get("warmstart_path"),
         eval_only=bool(training.get("eval_only", False)),
         log_every=int(training.get("log_every", 50)),
         log_level=training.get("log_level", "INFO"),
@@ -1393,11 +1399,14 @@ def load_structured_cfg(path: str):
         max_inbatch=int(training.get("max_inbatch", 64)),
         eval_cand_chunk_k=int(training.get("eval_cand_chunk_k", 8)),
         go_segment_max_len=int(training.get("go_segment_max_len", 64)),
+        go_segment_alpha=float(training.get("go_segment_alpha", 0.5)),
+        go_segment_alpha_warmup_steps=int(training.get("go_segment_alpha_warmup_steps", 10000)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
         weight_decay=float(optim.get("weight_decay", 0.01)),
         grad_clip=float(optim.get("grad_clip", 1.0)),
+        lr_lora=float(optim.get("lr_lora", 0.0001)),
 
         # queue params
         queue_K=int(queue.get("queue_K", 16384)),

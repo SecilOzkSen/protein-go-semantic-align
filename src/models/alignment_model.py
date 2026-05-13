@@ -586,8 +586,18 @@ class ProteinGoAligner(nn.Module):
 
             full_out = torch.nan_to_num(full_out)
 
+            if full_out.dim() != 2:
+                raise RuntimeError(f"Expected full_out [G,D], got {tuple(full_out.shape)}")
+
+            if full_out.shape != seg_pooled.shape:
+                raise RuntimeError(
+                    f"full_out shape {tuple(full_out.shape)} does not match "
+                    f"seg_pooled shape {tuple(seg_pooled.shape)}"
+                )
+
             alpha = float(getattr(self, "go_segment_mix_alpha", 0.2))
             pooled = (1.0 - alpha) * full_out + alpha * seg_pooled
+            pooled = torch.nan_to_num(pooled).contiguous()
         else:
             pooled = seg_pooled
 

@@ -33,10 +33,11 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-B1v1
+  output_dir: /workspace/protein-go-align-outputs-B1v1-warmstart
   save_every: 10000
   keep_last_n: 3
   resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
+  warmstart_path: /workspace/warmstart-checkpoints/checkpoint_step251835.pt
   eval_only: false
   log_every: 500
   log_level: INFO
@@ -56,6 +57,8 @@ training:
   # eval space: observed = observed go ids. train+val+test seen once.
   max_inbatch: 160
   eval_cand_chunk_k: 64
+  go_segment_alpha: 0.2
+  go_segment_alpha_warmup_steps: 10000
 
 queue: # queue params
   queue_K: 16384  #8192 #2048 #8192
@@ -71,7 +74,8 @@ queue: # queue params
   k_hard_queue_warmup_steps: 6000
 
 optim:
-  lr: 0.0001
+  lr: 0.00005
+  lr_lora: 0.000025
   weight_decay: 0.01
   grad_clip: 1.0
 
