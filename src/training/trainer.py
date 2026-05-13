@@ -458,7 +458,11 @@ class OppTrainer:
     def _load_warmstart(self, ckpt_path: str):
         print(f"[WARMSTART] loading from {ckpt_path}")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(
+            ckpt_path,
+            map_location="cpu",
+            weights_only=False,  # kendi checkpoint'in ise OK
+        )
 
         if isinstance(ckpt, dict) and "model" in ckpt:
             state = ckpt["model"]
@@ -479,12 +483,12 @@ class OppTrainer:
 
         model_state = self.model.state_dict()
         loadable = {}
+        skipped_missing = []
         skipped_shape = []
-        skipped_new = []
 
         for k, v in clean_state.items():
             if k not in model_state:
-                skipped_new.append(k)
+                skipped_missing.append(k)
                 continue
             if tuple(model_state[k].shape) != tuple(v.shape):
                 skipped_shape.append((k, tuple(v.shape), tuple(model_state[k].shape)))
@@ -494,9 +498,9 @@ class OppTrainer:
         missing, unexpected = self.model.load_state_dict(loadable, strict=False)
 
         print(f"[WARMSTART] loaded keys: {len(loadable)}")
-        print(f"[WARMSTART] missing n={len(missing)} example={missing[:20]}")
-        print(f"[WARMSTART] unexpected n={len(unexpected)} example={unexpected[:20]}")
-        print(f"[WARMSTART] skipped_new n={len(skipped_new)} example={skipped_new[:20]}")
+        print(f"[WARMSTART] missing n={len(missing)} example={missing[:30]}")
+        print(f"[WARMSTART] unexpected n={len(unexpected)} example={unexpected[:30]}")
+        print(f"[WARMSTART] skipped_missing n={len(skipped_missing)} example={skipped_missing[:30]}")
         print(f"[WARMSTART] skipped_shape n={len(skipped_shape)} example={skipped_shape[:10]}")
 
     @torch.no_grad()
