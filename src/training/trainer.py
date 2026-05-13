@@ -457,87 +457,130 @@ class OppTrainer:
 
     def _load_warmstart(self, path: str):
         """
-        Warm-start from an old checkpoint.
+        Warm-start only model weights from a previous checkpoint.
 
-        Loads:
-          - model weights only
-
-        Does NOT load:
-          - optimizer
-          - epoch
-          - global_step
-          - queue
-          - EMA
-
-        Intended use:
-          A3 checkpoint -> B1/B2 model.
-          New B1 params such as go_segment_gate are allowed to stay randomly initialized.
+        Loads model-compatible tensors only.
+        Does NOT load optimizer, epoch, step, queue, or EMA.
         """
         print(f"[WARMSTART] loading from {path}")
 
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
 
         if not isinstance(ckpt, dict):
-            raise RuntimeError(f"[WARMSTART] checkpoint is not a dict: {type(ckpt)}")
+            raise RuntimeError(f"[WARMSTART] checkpoint is not dict, got {type(ckpt)}")
 
-        print("[WARMSTART] checkpoint top-level keys:", list(ckpt.keys())[:30])
+        print("[WARMSTART] top-level keys:", list(ckpt.keys())[:30])
 
-        if "model" not in ckpt:
-            raise RuntimeError(f"[WARMSTART] No 'model' key in checkpoint. Keys: {list(ckpt.keys())}")
-
-        state = ckpt["model"]
+        # Same logic as your resume loader.
+        if "model" in ckpt:
+            state = ckpt["model"]
+            print("[WARMSTART] using ckpt['model']")
+        elif "model_state_dict" in ckpt:
+            state = ckpt["model_state_dict"]
+            print("[WARMSTART] using ckpt['model_state_dict']")
+        elif "state_dict" in ckpt:
+            state = ckpt["state_dict"]
+            print("[WARMSTART] using ckpt['state_dict']")
+        else:
+            raise RuntimeError(f"[WARMSTART] no model-like key found. Keys={list(ckpt.keys())}")
 
         if not isinstance(state, dict):
-            raise RuntimeError(f"[WARMSTART] ckpt['model'] is not a dict: {type(state)}")
+            raise RuntimeError(f"[WARMSTART] model state is not dict, got {type(state)}")
 
-        print("[WARMSTART] raw model keys example:", list(state.keys())[:20])
+        raw_keys = list(state.keys())
+        cur_state = self.model.state_dict()
+        cur_keys = list(cur_state.keys())
 
-        # Clean possible prefixes and ignore non-tensors.
-        clean_state = {}
-        for k, v in state.items():
-            if not torch.is_tensor(v):
-                continue
+        print("[WARMSTART] raw model key example:", raw_keys[:20])
+        print("[WARMSTART] current model key example:", cur_keys[:20])
 
-            kk = k
-            if kk.startswith("module."):
-                kk = kk[len("module."):]
-            if kk.startswith("model."):
-                kk = kk[len("model."):]
+        def strip_prefix(k: str, prefix: str) -> str:
+            return k[len(prefix):] if k.startswith(prefix) else k
 
-            clean_state[kk] = v
+        def transform_key(k: str, mode: str) -> str:
+            if mode == "identity":
+                return k
+            if mode == "strip_module":
+                return strip_prefix(k, "module.")
+            if mode == "strip_model":
+                return strip_prefix(k, "model.")
+            if mode == "strip_module_model":
+                k = strip_prefix(k, "module.")
+                k = strip_prefix(k, "model.")
+                return k
+            if mode == "strip_model_module":
+                k = strip_prefix(k, "model.")
+                k = strip_prefix(k, "module.")
+                return k
+            if mode == "strip_trainer_model":
+                return strip_prefix(k, "trainer.model.")
+            return k
 
-        current = self.model.state_dict()
+        modes = [
+            "identity",
+            "strip_module",
+            "strip_model",
+            "strip_module_model",
+            "strip_model_module",
+            "strip_trainer_model",
+        ]
 
-        loadable = {}
-        skipped_missing = []
-        skipped_shape = []
+        best_mode = None
+        best_loadable = {}
+        best_skipped_shape = []
+        best_skipped_missing = []
 
-        for k, v in clean_state.items():
-            if k not in current:
-                skipped_missing.append(k)
-                continue
+        for mode in modes:
+            loadable = {}
+            skipped_shape = []
+            skipped_missing = []
 
-            if tuple(current[k].shape) != tuple(v.shape):
-                skipped_shape.append((k, tuple(v.shape), tuple(current[k].shape)))
-                continue
+            for raw_k, v in state.items():
+                if not torch.is_tensor(v):
+                    continue
 
-            loadable[k] = v
+                k = transform_key(raw_k, mode)
 
-        if len(loadable) == 0:
+                if k not in cur_state:
+                    skipped_missing.append((raw_k, k))
+                    continue
+
+                if tuple(cur_state[k].shape) != tuple(v.shape):
+                    skipped_shape.append((raw_k, k, tuple(v.shape), tuple(cur_state[k].shape)))
+                    continue
+
+                loadable[k] = v
+
+            print(f"[WARMSTART-TRY] mode={mode} loadable={len(loadable)} "
+                  f"missing={len(skipped_missing)} shape_mismatch={len(skipped_shape)}")
+
+            if len(loadable) > len(best_loadable):
+                best_mode = mode
+                best_loadable = loadable
+                best_skipped_shape = skipped_shape
+                best_skipped_missing = skipped_missing
+
+        print(f"[WARMSTART] best_mode={best_mode}")
+        print(f"[WARMSTART] best_loadable={len(best_loadable)}")
+
+        if len(best_loadable) == 0:
+            print("[WARMSTART][DEBUG] raw key sample:", raw_keys[:50])
+            print("[WARMSTART][DEBUG] current key sample:", cur_keys[:50])
+            print("[WARMSTART][DEBUG] skipped_missing sample:", best_skipped_missing[:20])
+            print("[WARMSTART][DEBUG] skipped_shape sample:", best_skipped_shape[:10])
             raise RuntimeError(
                 "[WARMSTART] loaded 0 compatible keys. "
-                "Checkpoint structure/key names do not match current model."
+                "Checkpoint model keys do not match current model keys."
             )
 
-        missing, unexpected = self.model.load_state_dict(loadable, strict=False)
+        missing, unexpected = self.model.load_state_dict(best_loadable, strict=False)
 
-        print(f"[WARMSTART] loaded compatible keys: {len(loadable)}")
+        print(f"[WARMSTART] loaded compatible keys: {len(best_loadable)}")
         print(f"[WARMSTART] missing n={len(missing)} example={missing[:30]}")
         print(f"[WARMSTART] unexpected n={len(unexpected)} example={unexpected[:30]}")
-        print(f"[WARMSTART] skipped_missing n={len(skipped_missing)} example={skipped_missing[:30]}")
-        print(f"[WARMSTART] skipped_shape n={len(skipped_shape)} example={skipped_shape[:10]}")
+        print(f"[WARMSTART] skipped_missing n={len(best_skipped_missing)} example={best_skipped_missing[:20]}")
+        print(f"[WARMSTART] skipped_shape n={len(best_skipped_shape)} example={best_skipped_shape[:10]}")
 
-        # Important checks
         important_prefixes = [
             "proj_p.",
             "proj_g.",
@@ -547,19 +590,18 @@ class OppTrainer:
         ]
 
         for pref in important_prefixes:
-            n_loaded = sum(k.startswith(pref) for k in loadable)
+            n_loaded = sum(k.startswith(pref) for k in best_loadable)
             print(f"[WARMSTART-CHECK] {pref} loaded={n_loaded}")
 
-        n_lora = sum("lora_" in k for k in loadable)
+        n_lora = sum("lora_" in k for k in best_loadable)
         print(f"[WARMSTART-CHECK] lora loaded={n_lora}")
 
-        # These are expected to be missing if A3 did not have segment-aware params.
-        expected_new = [
-            k for k in missing
-            if k.startswith("go_segment_gate")
-               or k.startswith("go_segment_type_bias")
-        ]
-        print(f"[WARMSTART-CHECK] expected new B1 params missing={len(expected_new)} example={expected_new[:20]}")
+        if sum(k.startswith("proj_g.") for k in best_loadable) == 0:
+            print("[WARMSTART][WARN] proj_g was not loaded.")
+        if sum(k.startswith("proj_p.") for k in best_loadable) == 0:
+            print("[WARMSTART][WARN] proj_p was not loaded.")
+        if n_lora == 0:
+            print("[WARMSTART][WARN] no LoRA params were loaded.")
 
     @torch.no_grad()
     def _maybe_activate_queue(self):
