@@ -1351,7 +1351,7 @@ class OppTrainer:
                 )
         if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
             with torch.no_grad():
-                G_once = self._eval_G_once_cpu.to(self.device, non_blocking=True)
+                G_once = new_embs_cpu.to(self.device, non_blocking=True)
 
                 G_proj = self.model.go_ln(G_once)
                 G_proj = self.model.proj_g(G_proj)
@@ -1364,14 +1364,18 @@ class OppTrainer:
                 off = sim[~eye]
 
                 print("\n[DBG-EVAL-GO-PROJ]")
-                print("G_once norm mean/std:",
-                      float(G_once.float().norm(dim=-1).mean().item()),
-                      float(G_once.float().norm(dim=-1).std().item()))
-                print("G_proj offdiag mean/std/min/max:",
-                      float(off.mean().item()),
-                      float(off.std().item()),
-                      float(off.min().item()),
-                      float(off.max().item()))
+                print(
+                    "G_once norm mean/std:",
+                    float(G_once.float().norm(dim=-1).mean().item()),
+                    float(G_once.float().norm(dim=-1).std().item()),
+                )
+                print(
+                    "G_proj offdiag mean/std/min/max:",
+                    float(off.mean().item()),
+                    float(off.std().item()),
+                    float(off.min().item()),
+                    float(off.max().item()),
+                )
 
         if was_training:
             enc.train()
