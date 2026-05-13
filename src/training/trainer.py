@@ -455,53 +455,111 @@ class OppTrainer:
 
         return alpha_max * min(1.0, float(step) / float(warmup))
 
-    def _load_warmstart(self, ckpt_path: str):
-        print(f"[WARMSTART] loading from {ckpt_path}")
+    def _load_warmstart(self, path: str):
+        """
+        Warm-start from an old checkpoint.
 
-        ckpt = torch.load(
-            ckpt_path,
-            map_location="cpu",
-            weights_only=False,  # kendi checkpoint'in ise OK
-        )
+        Loads:
+          - model weights only
 
-        if isinstance(ckpt, dict) and "model" in ckpt:
-            state = ckpt["model"]
-        elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-            state = ckpt["model_state_dict"]
-        elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-            state = ckpt["state_dict"]
-        else:
-            state = ckpt
+        Does NOT load:
+          - optimizer
+          - epoch
+          - global_step
+          - queue
+          - EMA
 
+        Intended use:
+          A3 checkpoint -> B1/B2 model.
+          New B1 params such as go_segment_gate are allowed to stay randomly initialized.
+        """
+        print(f"[WARMSTART] loading from {path}")
+
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+        if not isinstance(ckpt, dict):
+            raise RuntimeError(f"[WARMSTART] checkpoint is not a dict: {type(ckpt)}")
+
+        print("[WARMSTART] checkpoint top-level keys:", list(ckpt.keys())[:30])
+
+        if "model" not in ckpt:
+            raise RuntimeError(f"[WARMSTART] No 'model' key in checkpoint. Keys: {list(ckpt.keys())}")
+
+        state = ckpt["model"]
+
+        if not isinstance(state, dict):
+            raise RuntimeError(f"[WARMSTART] ckpt['model'] is not a dict: {type(state)}")
+
+        print("[WARMSTART] raw model keys example:", list(state.keys())[:20])
+
+        # Clean possible prefixes and ignore non-tensors.
         clean_state = {}
         for k, v in state.items():
-            if k.startswith("module."):
-                k = k[len("module."):]
-            if k.startswith("model."):
-                k = k[len("model."):]
-            clean_state[k] = v
+            if not torch.is_tensor(v):
+                continue
 
-        model_state = self.model.state_dict()
+            kk = k
+            if kk.startswith("module."):
+                kk = kk[len("module."):]
+            if kk.startswith("model."):
+                kk = kk[len("model."):]
+
+            clean_state[kk] = v
+
+        current = self.model.state_dict()
+
         loadable = {}
         skipped_missing = []
         skipped_shape = []
 
         for k, v in clean_state.items():
-            if k not in model_state:
+            if k not in current:
                 skipped_missing.append(k)
                 continue
-            if tuple(model_state[k].shape) != tuple(v.shape):
-                skipped_shape.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+
+            if tuple(current[k].shape) != tuple(v.shape):
+                skipped_shape.append((k, tuple(v.shape), tuple(current[k].shape)))
                 continue
+
             loadable[k] = v
+
+        if len(loadable) == 0:
+            raise RuntimeError(
+                "[WARMSTART] loaded 0 compatible keys. "
+                "Checkpoint structure/key names do not match current model."
+            )
 
         missing, unexpected = self.model.load_state_dict(loadable, strict=False)
 
-        print(f"[WARMSTART] loaded keys: {len(loadable)}")
+        print(f"[WARMSTART] loaded compatible keys: {len(loadable)}")
         print(f"[WARMSTART] missing n={len(missing)} example={missing[:30]}")
         print(f"[WARMSTART] unexpected n={len(unexpected)} example={unexpected[:30]}")
         print(f"[WARMSTART] skipped_missing n={len(skipped_missing)} example={skipped_missing[:30]}")
         print(f"[WARMSTART] skipped_shape n={len(skipped_shape)} example={skipped_shape[:10]}")
+
+        # Important checks
+        important_prefixes = [
+            "proj_p.",
+            "proj_g.",
+            "protein_ln.",
+            "go_ln.",
+            "protein_mean_attn_gate_pool.",
+        ]
+
+        for pref in important_prefixes:
+            n_loaded = sum(k.startswith(pref) for k in loadable)
+            print(f"[WARMSTART-CHECK] {pref} loaded={n_loaded}")
+
+        n_lora = sum("lora_" in k for k in loadable)
+        print(f"[WARMSTART-CHECK] lora loaded={n_lora}")
+
+        # These are expected to be missing if A3 did not have segment-aware params.
+        expected_new = [
+            k for k in missing
+            if k.startswith("go_segment_gate")
+               or k.startswith("go_segment_type_bias")
+        ]
+        print(f"[WARMSTART-CHECK] expected new B1 params missing={len(expected_new)} example={expected_new[:20]}")
 
     @torch.no_grad()
     def _maybe_activate_queue(self):
