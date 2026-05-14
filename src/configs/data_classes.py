@@ -266,6 +266,7 @@ class TrainerConfig:
     warmstart_path: str = None
     go_segment_alpha: float = 0.0
     go_segment_alpha_warmup_steps: int = 10000
+    trainable_mode: str = "none"
 
 @dataclass
 class QueueConfig:

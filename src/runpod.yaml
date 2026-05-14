@@ -43,7 +43,7 @@ training:
   log_level: INFO
   monitor_metric: "align_nDCG@10"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 8        # 0 veya negatif => kapalı
+  early_stop_patience: 1        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
   max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
@@ -58,7 +58,8 @@ training:
   max_inbatch: 160
   eval_cand_chunk_k: 64
   go_segment_alpha: 0.2
-  go_segment_alpha_warmup_steps: 10000
+  go_segment_alpha_warmup_steps: 5000
+  trainable_mode: "segment_gate_only"
 
 queue: # queue params
   queue_K: 16384  #8192 #2048 #8192
@@ -74,9 +75,9 @@ queue: # queue params
   k_hard_queue_warmup_steps: 6000
 
 optim:
-  lr: 0.00005
-  lr_lora: 0.000025
-  weight_decay: 0.01
+  lr: 0.0001
+  lr_lora: 0.0
+  weight_decay: 0.0
   grad_clip: 1.0
 
 model:

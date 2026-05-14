@@ -315,6 +315,7 @@ class OppTrainer:
         self.return_slot_attn = ctx.return_slot_attn
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
+        self.gate_only = getattr(cfg, "trainable_mode", "full") == "segment_gate_only"
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
@@ -331,6 +332,21 @@ class OppTrainer:
         if warmstart_path:
             self._load_warmstart(warmstart_path)
 
+        if self.gate_only:
+            self.set_trainable_segment_gate_only()
+
+        init_ln = math.log(10)  # 1.0 / 0.07
+        self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
+        if self.gate_only:
+            self.logit_scale.requires_grad_(False)
+        elif getattr(cfg, "is_logit_scale_constant", None) is not None and cfg.is_logit_scale_constant is True:
+            with torch.no_grad():
+                self.logit_scale.fill_(init_ln)
+            self.logit_scale.requires_grad_(False)
+            assert not self.logit_scale.requires_grad
+        else:
+            self.logit_scale.requires_grad_(True)
+
         self.m_ema = float(getattr(cfg, "m_ema", 0.999))
         self.go_segment_gate_k = None
 
@@ -340,16 +356,6 @@ class OppTrainer:
                 self.go_segment_gate_k = clone_as_target(self.model.go_segment_gate).to(self.device)
         else:
             self.go_encoder_k = None
-
-        init_ln = math.log(10)  # 1.0 / 0.07
-        self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
-        if getattr(cfg, "is_logit_scale_constant", None) is not None and cfg.is_logit_scale_constant is True:
-            with torch.no_grad():
-                self.logit_scale.fill_(init_ln)
-            self.logit_scale.requires_grad_(False)
-            assert not self.logit_scale.requires_grad
-        else:
-            self.logit_scale.requires_grad_(True)
 
         # self.opt = torch.optim.AdamW(list(self.model.parameters()) + [self.logit_scale], lr=cfg.lr)
         # -------- Optimizer: main + GO encoder param groups --------
@@ -367,18 +373,29 @@ class OppTrainer:
                 continue
             main_params.append(p)
 
-        param_groups = [
-            {"params": main_params, "lr": lr_main, "weight_decay": wd},
-            {"params": [self.logit_scale], "lr": 1e-3, "weight_decay": 0.0},
-        ]
+        param_groups = []
+
+        if len(main_params) > 0:
+            param_groups.append({
+                "params": main_params,
+                "lr": lr_main,
+                "weight_decay": wd,
+                "name": "main",
+            })
+
+        if self.logit_scale.requires_grad:
+            param_groups.append({
+                "params": [self.logit_scale],
+                "lr": 1e-3,
+                "weight_decay": 0.0,
+                "name": "logit_scale",
+            })
 
         # Add GO encoder groups (LoRA + embeddings + attn head), if present
-        if self.model.go_encoder is not None:
-            lr_lora = float(getattr(cfg, "lr_lora", lr_main * 0.1))
-            #   lr_emb = float(getattr(cfg, "lr_go_emb", lr_main * 0.5))
-            #   lr_attn = float(getattr(cfg, "lr_go_attn", lr_main * 0.1))
+        if self.model.go_encoder is not None and not self.gate_only:
+            lr_lora_raw = getattr(cfg, "lr_lora", None)
+            lr_lora = lr_main * 0.1 if lr_lora_raw is None else float(lr_lora_raw)
 
-            # BioMedBERTEncoder implements this
             ge_groups = self.model.go_encoder.param_groups_for_optimizer(
                 lr_emb=None,
                 lr_lora=lr_lora,
@@ -390,12 +407,10 @@ class OppTrainer:
                 g["name"] = "go_lora"
             param_groups.extend(ge_groups)
 
-        if self.model.go_encoder is not None:
-            lr_lora = float(getattr(cfg, "lr_lora", lr_main * 0.1))
             self._lora_lr_target = lr_lora
         else:
-            lr_lora = 0.0
             self._lora_lr_target = 0.0
+
         self._lora_warmup_steps = int(getattr(cfg, "lora_warmup_steps", 2000))
         self._lora_lr_start = float(getattr(cfg, "lora_lr_start", self._lora_lr_target * 0.2))
 
@@ -443,6 +458,22 @@ class OppTrainer:
                 print("[OPTCHK]", name, "in_opt=", in_opt, "shape=", tuple(p.shape))
 
         print("[GO-ENCODER-OUTPUT-MODE] Go encoder output mode:", self.ctx.go_encoder_output_mode)
+        for i, g in enumerate(self.opt.param_groups):
+            n_tensors = len(g["params"])
+            n_params = sum(p.numel() for p in g["params"])
+            n_trainable = sum(p.numel() for p in g["params"] if p.requires_grad)
+
+            print(
+                "[OPT-GROUP]",
+                i,
+                "name=", g.get("name"),
+                "lr=", g.get("lr"),
+                "weight_decay=", g.get("weight_decay"),
+                "n_tensors=", n_tensors,
+                "n_params=", n_params,
+                "n_trainable=", n_trainable,
+            )
+
     def _queue_active(self) -> bool:
         return self.use_moco_miner and (self._global_step >= self.queue_cfg.queue_start_step)
 
@@ -628,6 +659,37 @@ class OppTrainer:
                 print(f"[Trainer] MoCo Queue reset at activation step {self._global_step}.")
 
             self._queue_was_active = True
+
+    def set_trainable_segment_gate_only(self):
+        for name, p in self.model.named_parameters():
+            p.requires_grad_(False)
+
+        for name, p in self.model.named_parameters():
+            if name.startswith("go_segment_gate."):
+                p.requires_grad_(True)
+
+        trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        print("[TRAINABLE] mode=segment_gate_only")
+        print("[TRAINABLE] n=", len(trainable))
+        print("[TRAINABLE] example:", trainable[:30])
+
+        expected = [
+            "go_segment_gate.0.weight",
+            "go_segment_gate.0.bias",
+            "go_segment_gate.1.weight",
+            "go_segment_gate.1.bias",
+            "go_segment_gate.4.weight",
+            "go_segment_gate.4.bias",
+        ]
+
+        missing_expected = [x for x in expected if x not in trainable]
+        if missing_expected:
+            print("[TRAINABLE][WARN] expected gate params missing:", missing_expected)
+
+        bad = [n for n in trainable if not n.startswith("go_segment_gate.")]
+        if bad:
+            raise RuntimeError(f"segment_gate_only has unexpected trainables: {bad[:20]}")
     # ----------------- debug -----------------
     @torch.no_grad()
     def _debug_pos_neg_cosines(
@@ -2451,16 +2513,18 @@ class OppTrainer:
         return sc
 
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
-        self.model.train()
-        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
-            if hasattr(self.model, "go_segment_mix_alpha"):
-                self.model.go_segment_mix_alpha = self._segment_alpha_schedule(self._global_step)
-
-            if self._global_step % 1000 == 0:
-                print("[DBG-SEG-ALPHA]", self.model.go_segment_mix_alpha)
+        if self.gate_only:
+            # Disable dropout everywhere. Gradients still flow to trainable gate params.
+            self.model.eval()
+            # Safety: make sure gate params remain trainable.
+            for name, p in self.model.named_parameters():
+                if name.startswith("go_segment_gate."):
+                    p.requires_grad_(True)
+        else:
+            self.model.train()
         device = self.device
 
-        if self.model.go_encoder is not None:
+        if self.model.go_encoder is not None and not self.gate_only:
             self._set_group_lr("go_lora", self._lora_lr_schedule(self._global_step))
 
         if debug:
@@ -2475,6 +2539,13 @@ class OppTrainer:
             H = self.to_f32(H)
 
         pos_local = batch["pos_go_local"]
+
+        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+            if hasattr(self.model, "go_segment_mix_alpha"):
+                self.model.go_segment_mix_alpha = self._segment_alpha_schedule(self._global_step)
+
+            if self._global_step % 1000 == 0:
+                print("[DBG-SEG-ALPHA]", self.model.go_segment_mix_alpha)
 
         go_pack = self._get_uniq_go_embs(batch)
         uniq_go_ids = go_pack["ids"]                     # [G]
@@ -2807,7 +2878,7 @@ class OppTrainer:
 
         self._global_step += 1
 
-        if self.go_encoder_k is not None:
+        if self.go_encoder_k is not None and not self.gate_only:
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
         if getattr(self, "go_segment_gate_k", None) is not None:

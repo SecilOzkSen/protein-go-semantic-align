@@ -252,7 +252,7 @@ class ProteinGoAligner(nn.Module):
         self.protein_pool_type = protein_pool_type
         self.protein_n_slots = int(protein_n_slots)
         self.go_pool_type = go_pool_type
-        self.go_segment_mix_alpha = 0.2
+        self.go_segment_mix_alpha = 0.0
 
         if self.go_encoder is not None and d_g is None:
             d_g = int(self.go_encoder.model.config.hidden_size)

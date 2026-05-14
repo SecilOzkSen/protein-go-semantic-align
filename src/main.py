@@ -993,7 +993,7 @@ def run_training(args):
         d_z=d_z,
         device=str(device),
         lr=args.lr,
-        lr_lora=args.lr_lora,
+        lr_lora=None if args.lr_lora is None else float(args.lr_lora),
         max_epochs=args.epochs,
         cand_chunk_k=args.cand_chunk_k,
         pos_chunk_t=args.pos_chunk_t,
@@ -1005,7 +1005,8 @@ def run_training(args):
         warmstart_path=args.warmstart_path,
         go_segment_alpha_warmup_steps=args.go_segment_alpha_warmup_steps,
         go_segment_alpha=args.go_segment_alpha,
-
+        trainable_mode=args.trainable_mode,
+        weight_decay=args.weight_decay,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1170,7 +1171,45 @@ def run_training(args):
 
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
-                torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), gc)
+                clip_params = [p for p in trainer.model.parameters() if p.requires_grad]
+
+                if getattr(trainer, "logit_scale", None) is not None:
+                    if getattr(trainer.logit_scale, "requires_grad", False):
+                        clip_params.append(trainer.logit_scale)
+
+                if clip_params:
+                    torch.nn.utils.clip_grad_norm_(clip_params, gc)
+
+            if global_step % 1000 == 0:
+                # go_segment_gate grad
+                s = 0.0
+                c = 0
+                if hasattr(trainer.model, "go_segment_gate"):
+                    for n, p in trainer.model.go_segment_gate.named_parameters():
+                        if p.grad is not None:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                print(f"[DBG] go_segment_gate grad_norm_sum={s:.4g} over {c}")
+
+                # proj_g grad
+                pg = trainer.model.proj_g
+                gnorm = 0.0
+                cnt = 0
+                for n, p in pg.named_parameters():
+                    if p.grad is not None:
+                        gnorm += float(p.grad.detach().float().norm().item())
+                        cnt += 1
+                print(f"[DBG] proj_g grad_norm_sum={gnorm:.4g} over {cnt}")
+
+                # go_encoder LoRA grad
+                if getattr(trainer.model, "go_encoder", None) is not None:
+                    s = 0.0
+                    c = 0
+                    for n, p in trainer.model.go_encoder.named_parameters():
+                        if p.requires_grad and p.grad is not None and "lora_" in n:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                    print(f"[DBG] go_lora grad_norm_sum={s:.4g} over {c}")
 
             trainer.opt.step()
 
@@ -1406,7 +1445,8 @@ def load_structured_cfg(path: str):
         lr=float(optim.get("lr", 3e-4)),
         weight_decay=float(optim.get("weight_decay", 0.01)),
         grad_clip=float(optim.get("grad_clip", 1.0)),
-        lr_lora=float(optim.get("lr_lora", 0.0001)),
+        lr_lora=optim.get("lr_lora", None),
+        trainable_mode=str(training.get("trainable_mode", "full")),
 
         # queue params
         queue_K=int(queue.get("queue_K", 16384)),
