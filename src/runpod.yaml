@@ -150,5 +150,5 @@ stores:
 
   seq_len_lookup: /workspace/data/seq_len_lookup.pkl
 
-  logs: /workspace/protein-go-align-logs-a3
+  logs: /workspace/protein-go-align-logs-b1v1
 
