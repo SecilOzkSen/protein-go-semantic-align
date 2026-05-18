@@ -216,6 +216,130 @@ class ProteinSlotExtractor(nn.Module):
         slots = self.out_ln(slots)
         return slots, attn
 
+class LocalEvidencePool1D(nn.Module):
+    """
+    Local window evidence branch for protein pooling.
+
+    It does NOT replace the existing mean-attn pooled protein vector.
+    It adds a small residual local-evidence correction:
+
+        h_final = (1 - lambda) * h_base + lambda * h_local
+
+    where h_local is computed from overlapping residue windows.
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        window_size: int = 64,
+        stride: int = 32,
+        dropout: float = 0.05,
+        init_gate_bias: float = -4.0,
+    ):
+        super().__init__()
+
+        self.d_in = int(d_in)
+        self.window_size = int(window_size)
+        self.stride = int(stride)
+
+        self.window_score = nn.Sequential(
+            nn.LayerNorm(d_in),
+            nn.Linear(d_in, d_in // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_in // 4, 1),
+        )
+
+        self.residual_gate = nn.Sequential(
+            nn.LayerNorm(2 * d_in),
+            nn.Linear(2 * d_in, d_in // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_in // 4, 1),
+        )
+
+        # Start very close to h_base.
+        # sigmoid(-4) ≈ 0.018
+        nn.init.zeros_(self.residual_gate[-1].weight)
+        nn.init.constant_(self.residual_gate[-1].bias, init_gate_bias)
+
+    @staticmethod
+    def _window_starts(T: int, window_size: int, stride: int):
+        if T <= window_size:
+            return [0]
+
+        starts = list(range(0, T - window_size + 1, stride))
+        last = T - window_size
+        if starts[-1] != last:
+            starts.append(last)
+        return starts
+
+    def forward(
+        self,
+        H: torch.Tensor,                      # [B,T,D]
+        h_base: torch.Tensor,                 # [B,D]
+        mask: Optional[torch.Tensor] = None,  # [B,T] bool
+    ):
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask != 0
+
+        B, T, D = H.shape
+        if D != self.d_in:
+            raise RuntimeError(f"LocalEvidencePool1D expected D={self.d_in}, got D={D}")
+
+        starts = self._window_starts(
+            T=T,
+            window_size=self.window_size,
+            stride=self.stride,
+        )
+
+        win_vecs = []
+        win_valids = []
+
+        for s in starts:
+            e = min(T, s + self.window_size)
+
+            H_w = H[:, s:e, :]  # [B,L,D]
+
+            if mask is None:
+                h_w = H_w.mean(dim=1)
+                valid_w = torch.ones(B, device=H.device, dtype=torch.bool)
+            else:
+                m_w = mask[:, s:e]  # [B,L]
+                valid_w = m_w.any(dim=1)
+
+                w = m_w.to(dtype=H.dtype).unsqueeze(-1)
+                denom = w.sum(dim=1).clamp_min(1.0)
+                h_w = (H_w * w).sum(dim=1) / denom
+
+            win_vecs.append(h_w)
+            win_valids.append(valid_w)
+
+        W = len(win_vecs)
+
+        win_vecs = torch.stack(win_vecs, dim=1).contiguous()      # [B,W,D]
+        win_valids = torch.stack(win_valids, dim=1).contiguous()  # [B,W]
+
+        scores = self.window_score(win_vecs).squeeze(-1).float()  # [B,W]
+        scores = scores.masked_fill(~win_valids, -1e9)
+
+        weights = torch.softmax(scores, dim=-1).to(dtype=H.dtype)  # [B,W]
+        h_local = torch.einsum("bw,bwd->bd", weights, win_vecs)    # [B,D]
+
+        gate_in = torch.cat([h_base, h_local], dim=-1)             # [B,2D]
+        local_gate = torch.sigmoid(self.residual_gate(gate_in))    # [B,1]
+
+        h = (1.0 - local_gate) * h_base + local_gate * h_local
+
+        info = {
+            "local_window_weights": weights.detach(),
+            "local_window_valid": win_valids.detach(),
+            "local_evidence_gate": local_gate.detach(),
+            "local_window_scores": scores.detach(),
+        }
+
+        return h, info
+
 
 class ProteinGoAligner(nn.Module):
     def __init__(
@@ -228,10 +352,12 @@ class ProteinGoAligner(nn.Module):
             protein_pool_type: str = "mean",  # "mean" | "attn" | "go_align" | "slots"
             protein_n_slots: int = 4,
             go_pool_type: str = "mean",  # used when protein_pool_type == "slots": "mean" | "token_align"
+            local_window_size: int = 64,
+            local_window_stride: int = 32,
     ):
         super().__init__()
 
-        if protein_pool_type not in {"mean", "attn", "mean_attn_gate", "slots"}:
+        if protein_pool_type not in {"mean", "attn", "mean_attn_gate", "local_evidence_gate", "slots"}:
             raise ValueError(f"Unsupported protein_pool_type: {protein_pool_type}")
         if protein_pool_type == "go_align":
             raise ValueError(
@@ -264,6 +390,15 @@ class ProteinGoAligner(nn.Module):
             d_in=d_h,
             dropout=0.05,
         )
+        self.protein_local_evidence_pool = None
+        if self.protein_pool_type == "local_evidence_gate":
+            self.protein_local_evidence_pool = LocalEvidencePool1D(
+                d_in=d_h,
+                window_size=local_window_size,
+                stride=local_window_stride,
+                dropout=0.05,
+                init_gate_bias=-4.0,
+            )
 
         self.slot_extractor = None
         if self.protein_pool_type == "slots":
@@ -355,6 +490,37 @@ class ProteinGoAligner(nn.Module):
         elif self.protein_pool_type == "mean_attn_gate":
             h_pool, pool_info = self.protein_mean_attn_gate_pool(H, mask)
             self.last_pool_info = pool_info
+            Zp = self.protein_ln(h_pool)
+            Zp = self.proj_p(Zp)
+
+            if self.normalize:
+                Zp = self._norm(Zp, dim=-1)
+
+            return Zp
+        elif self.protein_pool_type == "local_evidence_gate":
+            if self.protein_local_evidence_pool is None:
+                raise RuntimeError(
+                    "protein_pool_type='local_evidence_gate' but protein_local_evidence_pool is missing."
+                )
+
+            # Existing warm-started base protein representation.
+            h_base, base_info = self.protein_mean_attn_gate_pool(H, mask)  # [B,Dh]
+
+            # New local evidence residual branch.
+            h_pool, local_info = self.protein_local_evidence_pool(
+                H=H,
+                h_base=h_base,
+                mask=mask,
+            )  # [B,Dh]
+
+            pool_info = {}
+            if base_info is not None:
+                pool_info.update(base_info)
+            if local_info is not None:
+                pool_info.update(local_info)
+
+            self.last_pool_info = pool_info
+
             Zp = self.protein_ln(h_pool)
             Zp = self.proj_p(Zp)
 

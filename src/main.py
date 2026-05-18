@@ -1007,6 +1007,8 @@ def run_training(args):
         go_segment_alpha=args.go_segment_alpha,
         trainable_mode=args.trainable_mode,
         weight_decay=args.weight_decay,
+        local_window_size=args.local_window_size,
+        local_window_stride=args.local_window_stride
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1440,6 +1442,8 @@ def load_structured_cfg(path: str):
         go_segment_max_len=int(training.get("go_segment_max_len", 64)),
         go_segment_alpha=float(training.get("go_segment_alpha", 0.5)),
         go_segment_alpha_warmup_steps=int(training.get("go_segment_alpha_warmup_steps", 10000)),
+        local_window_size=int(training.get("local_window_size", 64)),
+        local_window_stride=int(training.get("local_window_stride", 32)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

@@ -316,6 +316,8 @@ class OppTrainer:
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
         self.gate_only = getattr(cfg, "trainable_mode", "full") == "segment_gate_only"
+        self.local_evidence_only = getattr(cfg, "trainable_mode", "full") == "local_evidence_only"
+        self.local_evidence_query = getattr(cfg, "trainable_mode", "full") == "local_evidence_query"
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
@@ -325,6 +327,8 @@ class OppTrainer:
             protein_pool_type=ctx.protein_pooling_strategy,
             protein_n_slots=ctx.protein_n_slots,
             go_pool_type=ctx.go_pool_type,
+            local_window_size=int(getattr(cfg, "local_window_size", 64)),
+            local_window_stride=int(getattr(cfg, "local_window_stride", 32)),
         ).to(self.device)
 
         # warmstart configs
@@ -334,6 +338,12 @@ class OppTrainer:
 
         if self.gate_only:
             self.set_trainable_segment_gate_only()
+
+        if self.local_evidence_only:
+            self.set_trainable_local_evidence_only()
+
+        if self.local_evidence_query:
+            self.set_trainable_local_evidence_query()
 
         init_ln = math.log(10)  # 1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
@@ -690,6 +700,50 @@ class OppTrainer:
         bad = [n for n in trainable if not n.startswith("go_segment_gate.")]
         if bad:
             raise RuntimeError(f"segment_gate_only has unexpected trainables: {bad[:20]}")
+
+    def set_trainable_local_evidence_only(self):
+        for name, p in self.model.named_parameters():
+            p.requires_grad_(False)
+
+        allow = ("protein_local_evidence_pool.",)
+
+        for name, p in self.model.named_parameters():
+            if name.startswith(allow):
+                p.requires_grad_(True)
+
+        trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        print("[TRAINABLE] mode=local_evidence_only")
+        print("[TRAINABLE] n=", len(trainable))
+        print("[TRAINABLE] example:", trainable[:30])
+
+        bad = [n for n in trainable if not n.startswith(allow)]
+        if bad:
+            raise RuntimeError(f"local_evidence_only has unexpected trainables: {bad[:20]}")
+
+    def set_trainable_local_evidence_query(self):
+        for name, p in self.model.named_parameters():
+            p.requires_grad_(False)
+
+        allow = (
+            "protein_local_evidence_pool.",
+            "protein_ln.",
+            "proj_p.",
+        )
+
+        for name, p in self.model.named_parameters():
+            if name.startswith(allow):
+                p.requires_grad_(True)
+
+        trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        print("[TRAINABLE] mode=local_evidence_query")
+        print("[TRAINABLE] n=", len(trainable))
+        print("[TRAINABLE] example:", trainable[:30])
+
+        bad = [n for n in trainable if not n.startswith(allow)]
+        if bad:
+            raise RuntimeError(f"local_evidence_query has unexpected trainables: {bad[:20]}")
     # ----------------- debug -----------------
     @torch.no_grad()
     def _debug_pos_neg_cosines(
@@ -2019,8 +2073,26 @@ class OppTrainer:
                         "protein_pool_type='mean_attn_gate' but model.protein_mean_attn_gate_pool is missing."
                     )
 
-                h_pool, _pool_info = model.protein_mean_attn_gate_pool(H, attn_valid)  # [B, Dh]
-                q = model.proj_p(model.protein_ln(h_pool))  # [B, Dz]
+                h_pool, _pool_info = model.protein_mean_attn_gate_pool(H, attn_valid)
+                q = model.proj_p(model.protein_ln(h_pool))
+
+            elif pool_type == "local_evidence_gate":
+                if not hasattr(model, "protein_mean_attn_gate_pool"):
+                    raise RuntimeError(
+                        "protein_pool_type='local_evidence_gate' but model.protein_mean_attn_gate_pool is missing."
+                    )
+                if getattr(model, "protein_local_evidence_pool", None) is None:
+                    raise RuntimeError(
+                        "protein_pool_type='local_evidence_gate' but model.protein_local_evidence_pool is missing."
+                    )
+
+                h_base, _base_info = model.protein_mean_attn_gate_pool(H, attn_valid)
+                h_pool, _local_info = model.protein_local_evidence_pool(
+                    H=H,
+                    h_base=h_base,
+                    mask=attn_valid,
+                )
+                q = model.proj_p(model.protein_ln(h_pool))
 
             # --------------------------------------------------
             # Old attention pooling path
@@ -2514,17 +2586,35 @@ class OppTrainer:
 
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
         if self.gate_only:
-            # Disable dropout everywhere. Gradients still flow to trainable gate params.
             self.model.eval()
-            # Safety: make sure gate params remain trainable.
             for name, p in self.model.named_parameters():
                 if name.startswith("go_segment_gate."):
                     p.requires_grad_(True)
+        elif self.local_evidence_only or self.local_evidence_query:
+            # New local evidence branch trains.
+            self.model.train()
+            # Keep frozen modules deterministic.
+            if getattr(self.model, "go_encoder", None) is not None:
+                self.model.go_encoder.eval()
+
+            if hasattr(self.model, "protein_mean_attn_gate_pool"):
+                # Base A3 protein pool is frozen and deterministic.
+                self.model.protein_mean_attn_gate_pool.eval()
+
+            if hasattr(self.model, "go_segment_gate"):
+                self.model.go_segment_gate.eval()
+
+            if hasattr(self.model, "go_ln"):
+                self.model.go_ln.eval()
+
+            if hasattr(self.model, "proj_g"):
+                self.model.proj_g.eval()
         else:
             self.model.train()
         device = self.device
 
-        if self.model.go_encoder is not None and not self.gate_only:
+        if self.model.go_encoder is not None and not (
+                self.gate_only or self.local_evidence_only or self.local_evidence_query):
             self._set_group_lr("go_lora", self._lora_lr_schedule(self._global_step))
 
         if debug:
@@ -2878,7 +2968,7 @@ class OppTrainer:
 
         self._global_step += 1
 
-        if self.go_encoder_k is not None and not self.gate_only:
+        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query):
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
         if getattr(self, "go_segment_gate_k", None) is not None:

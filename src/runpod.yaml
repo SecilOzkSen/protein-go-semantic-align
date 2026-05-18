@@ -6,23 +6,28 @@ data:
   # Few/Zero-shot
   fs_target_ratio: 0.3
 
-general: #Ablation Purposes
+general:
   phase: -2
-  ablation_id: "B1_segment_aware_go" #A0 sanity check
-  use_queue_miner: True #CHECKED
-  go_pooling_strategy: "segment_aware" #CHECKED -> Go attention strategy "attn" or "mean" or "segment_aware"
-  go_encoder_inner_pooling: "mean" #inside biomedbertencoder pooling
-  use_lora: True #CHECKED
-  use_attribution_loss: False #CHECKED
-  return_alpha: False
-  return_slot_attn: True
-  protein_pooling_strategy: "mean_attn_gate" #  Protein pooling strategy "attn" or "mean" or "go_align" or "slots" or "mean_attn_gate"
+  ablation_id: "P1_local_evidence"
+  use_queue_miner: true
+
+  # GO side clean A3/full-text anchor
+  go_pooling_strategy: "mean"
+  go_encoder_inner_pooling: "mean"
+  go_pool_type: "mean"
+  go_encoder_output_mode: "pooled"
+
+  # Protein side new branch
+  protein_pooling_strategy: "local_evidence_gate"
   protein_n_slots: 0
-  go_pool_type: "mean" # mean #pooled
-  go_encoder_output_mode: "segment_pooled" # "pooled" | "tokens" | "both" | "segment_pooled" # inside go_encoder_output_mode pooling
+
+  use_lora: true
+  use_attribution_loss: false
+  return_alpha: false
+  return_slot_attn: false
 
 training:
-  epochs: 15
+  epochs: 4  #15
   batch_size: 4
   eval_batch_size: 4
   num_workers: 0
@@ -33,7 +38,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-B1v1-warmstart-refined
+  output_dir: /workspace/protein-go-align-outputs-P1-LEP64-A3warm-localOnly-pooledGO
   save_every: 10000
   keep_last_n: 3
   resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
@@ -43,7 +48,7 @@ training:
   log_level: INFO
   monitor_metric: "align_nDCG@10"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 1        # 0 veya negatif => kapalı
+  early_stop_patience: 3        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
   max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
@@ -59,7 +64,9 @@ training:
   eval_cand_chunk_k: 64
   go_segment_alpha: 0.2
   go_segment_alpha_warmup_steps: 5000
-  trainable_mode: "segment_gate_only"
+  trainable_mode: "local_evidence_only" #"segment_gate_only"
+  local_window_size: 64
+  local_window_stride: 32
 
 queue: # queue params
   queue_K: 16384  #8192 #2048 #8192
@@ -127,7 +134,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-b1v1-segment-aware-refined"
+  wandb_run_name: "protein-go-semantic-align-ablation-P1-LEP64-A3warm-localOnly-pooledGO"
   mode: online
 
 stores:
@@ -150,5 +157,5 @@ stores:
 
   seq_len_lookup: /workspace/data/seq_len_lookup.pkl
 
-  logs: /workspace/protein-go-align-logs-b1v1
+  logs: /workspace/protein-go-align-logs-p1v0
 

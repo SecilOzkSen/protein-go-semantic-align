@@ -267,6 +267,8 @@ class TrainerConfig:
     go_segment_alpha: float = 0.0
     go_segment_alpha_warmup_steps: int = 10000
     trainable_mode: str = "none"
+    local_window_size: int = 64
+    local_window_stride: int = 32
 
 @dataclass
 class QueueConfig:
