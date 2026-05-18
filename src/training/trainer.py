@@ -345,6 +345,9 @@ class OppTrainer:
         if self.local_evidence_query:
             self.set_trainable_local_evidence_query()
 
+        if self.protein_query_only:
+            self.set_trainable_protein_query_only()
+
         init_ln = math.log(10)  # 1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
         if self.gate_only:
@@ -402,7 +405,14 @@ class OppTrainer:
             })
 
         # Add GO encoder groups (LoRA + embeddings + attn head), if present
-        if self.model.go_encoder is not None and not self.gate_only:
+        frozen_go_modes = (
+                self.gate_only
+                or self.local_evidence_only
+                or self.local_evidence_query
+                or self.protein_query_only
+        )
+
+        if self.model.go_encoder is not None and not frozen_go_modes:
             lr_lora_raw = getattr(cfg, "lr_lora", None)
             lr_lora = lr_main * 0.1 if lr_lora_raw is None else float(lr_lora_raw)
 
@@ -2034,6 +2044,30 @@ class OppTrainer:
 
         return tok, msk
 
+    def set_trainable_protein_query_only(self):
+        for name, p in self.model.named_parameters():
+            p.requires_grad_(False)
+
+        allow = (
+            "protein_mean_attn_gate_pool.",
+            "protein_ln.",
+            "proj_p.",
+        )
+
+        for name, p in self.model.named_parameters():
+            if name.startswith(allow):
+                p.requires_grad_(True)
+
+        trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        print("[TRAINABLE] mode=protein_query_only")
+        print("[TRAINABLE] n=", len(trainable))
+        print("[TRAINABLE] example:", trainable[:30])
+
+        bad = [n for n in trainable if not n.startswith(allow)]
+        if bad:
+            raise RuntimeError(f"protein_query_only has unexpected trainables: {bad[:20]}")
+
     @torch.no_grad()
     def _get_prot_query(self, H: torch.Tensor, attn_valid: torch.Tensor, Dz: int) -> torch.Tensor:
         """
@@ -2585,36 +2619,75 @@ class OppTrainer:
         return sc
 
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
+        if self._global_step % 1000 == 0:
+            info = getattr(self.model, "last_pool_info", {})
+            lg = info.get("local_evidence_gate", None)
+            ww = info.get("local_window_weights", None)
+
+            if lg is not None:
+                print("\n[DBG-LOCAL-EVIDENCE]")
+                print(
+                    "local_gate mean/std/min/max:",
+                    float(lg.float().mean()),
+                    float(lg.float().std()),
+                    float(lg.float().min()),
+                    float(lg.float().max()),
+                )
+
+            if ww is not None:
+                w = ww.float().clamp_min(1e-8)
+                ent = -(w * w.log()).sum(dim=-1)
+
+                print(
+                    "window_weight entropy mean/std:",
+                    float(ent.mean()),
+                    float(ent.std()),
+                )
+                print(
+                    "window_weight max mean/std:",
+                    float(ww.float().max(dim=-1).values.mean()),
+                    float(ww.float().max(dim=-1).values.std()),
+                )
         if self.gate_only:
             self.model.eval()
             for name, p in self.model.named_parameters():
                 if name.startswith("go_segment_gate."):
                     p.requires_grad_(True)
         elif self.local_evidence_only or self.local_evidence_query:
-            # New local evidence branch trains.
             self.model.train()
-            # Keep frozen modules deterministic.
+            # Frozen modules deterministic.
             if getattr(self.model, "go_encoder", None) is not None:
                 self.model.go_encoder.eval()
-
+            # Base A3 protein pool frozen.
             if hasattr(self.model, "protein_mean_attn_gate_pool"):
-                # Base A3 protein pool is frozen and deterministic.
                 self.model.protein_mean_attn_gate_pool.eval()
-
+            # GO side frozen.
+            if hasattr(self.model, "go_ln"):
+                self.model.go_ln.eval()
+            if hasattr(self.model, "proj_g"):
+                self.model.proj_g.eval()
             if hasattr(self.model, "go_segment_gate"):
                 self.model.go_segment_gate.eval()
+        elif self.protein_query_only:
+            self.model.train()
+
+            if getattr(self.model, "go_encoder", None) is not None:
+                self.model.go_encoder.eval()
 
             if hasattr(self.model, "go_ln"):
                 self.model.go_ln.eval()
 
             if hasattr(self.model, "proj_g"):
                 self.model.proj_g.eval()
+
+            if hasattr(self.model, "go_segment_gate"):
+                self.model.go_segment_gate.eval()
         else:
             self.model.train()
         device = self.device
 
         if self.model.go_encoder is not None and not (
-                self.gate_only or self.local_evidence_only or self.local_evidence_query):
+                self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only):
             self._set_group_lr("go_lora", self._lora_lr_schedule(self._global_step))
 
         if debug:
@@ -2968,7 +3041,7 @@ class OppTrainer:
 
         self._global_step += 1
 
-        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query):
+        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only):
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
         if getattr(self, "go_segment_gate_k", None) is not None:

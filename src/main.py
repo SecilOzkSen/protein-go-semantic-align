@@ -1151,6 +1151,49 @@ def run_training(args):
             loss.backward()
 
             if global_step % 200 == 0:
+                # LocalEvidencePool grad
+                s = 0.0
+                c = 0
+                lep = getattr(trainer.model, "protein_local_evidence_pool", None)
+
+                if lep is not None:
+                    for n, p in lep.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+
+                print(f"[DBG] local_evidence grad_norm_sum={s:.4g} over {c}")
+
+                # protein projection grad
+                s = 0.0
+                c = 0
+                for n, p in trainer.model.proj_p.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] proj_p grad_norm_sum={s:.4g} over {c}")
+
+                # GO projection should stay frozen
+                pg = trainer.model.proj_g
+                s = 0.0
+                c = 0
+                for n, p in pg.named_parameters():
+                    if p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] proj_g grad_norm_sum={s:.4g} over {c}")
+
+                # LoRA should stay frozen
+                if getattr(trainer.model, "go_encoder", None) is not None:
+                    s = 0.0
+                    c = 0
+                    for n, p in trainer.model.go_encoder.named_parameters():
+                        if p.requires_grad and p.grad is not None and "lora_" in n:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                    print(f"[DBG] go_lora grad_norm_sum={s:.4g} over {c}")
+
+            if global_step % 200 == 0:
                 # proj_g grad
                 pg = trainer.model.proj_g
                 gnorm = 0.0

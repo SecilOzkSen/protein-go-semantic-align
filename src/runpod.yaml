@@ -8,7 +8,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "P1_local_evidence"
+  ablation_id: "P2a_protein_query_only"
   use_queue_miner: true
 
   # GO side clean A3/full-text anchor
@@ -18,7 +18,7 @@ general:
   go_encoder_output_mode: "pooled"
 
   # Protein side new branch
-  protein_pooling_strategy: "local_evidence_gate"
+  protein_pooling_strategy: "local_evidence_gate" # "mean_attn_gate" #local_evidence_gate
   protein_n_slots: 0
 
   use_lora: true
@@ -38,7 +38,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-P1-LEP64-A3warm-localOnly-pooledGO
+  output_dir: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO
   save_every: 10000
   keep_last_n: 3
   resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
@@ -64,7 +64,7 @@ training:
   eval_cand_chunk_k: 64
   go_segment_alpha: 0.2
   go_segment_alpha_warmup_steps: 5000
-  trainable_mode: "local_evidence_only" #"segment_gate_only"
+  trainable_mode: "local_evidence_query" #"protein_query_only" #"segment_gate_only" #local_evidence_only
   local_window_size: 64
   local_window_stride: 32
 
@@ -82,7 +82,7 @@ queue: # queue params
   k_hard_queue_warmup_steps: 6000
 
 optim:
-  lr: 0.0001
+  lr: 0.00005
   lr_lora: 0.0
   weight_decay: 0.0
   grad_clip: 1.0
@@ -134,7 +134,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-P1-LEP64-A3warm-localOnly-pooledGO"
+  wandb_run_name: "protein-go-semantic-align-ablation-P2b-LEP64-A3warm-localQuery-pooledGO"
   mode: online
 
 stores:
