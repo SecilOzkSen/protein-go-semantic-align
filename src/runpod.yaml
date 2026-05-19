@@ -38,7 +38,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO
+  output_dir: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO_resume
   save_every: 10000
   keep_last_n: 3
   resume: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO/checkpoint_step67156.pt #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
