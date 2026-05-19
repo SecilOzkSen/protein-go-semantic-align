@@ -318,6 +318,7 @@ class OppTrainer:
         self.gate_only = getattr(cfg, "trainable_mode", "full") == "segment_gate_only"
         self.local_evidence_only = getattr(cfg, "trainable_mode", "full") == "local_evidence_only"
         self.local_evidence_query = getattr(cfg, "trainable_mode", "full") == "local_evidence_query"
+        self.protein_query_only = getattr(cfg, "trainable_mode", "full") == "protein_query_only"
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
