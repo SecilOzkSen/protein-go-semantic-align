@@ -8,7 +8,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "P2a_protein_query_only"
+  ablation_id: "P2b_local_evidence_query_resume"
   use_queue_miner: true
 
   # GO side clean A3/full-text anchor
