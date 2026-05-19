@@ -27,7 +27,7 @@ general:
   return_slot_attn: false
 
 training:
-  epochs: 4  #15
+  epochs: 10  #15
   batch_size: 4
   eval_batch_size: 4
   num_workers: 0
@@ -41,14 +41,14 @@ training:
   output_dir: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO
   save_every: 10000
   keep_last_n: 3
-  resume: null #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
-  warmstart_path: /workspace/warmstart-checkpoints/checkpoint_step251835.pt
+  resume: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO/checkpoint_step67156.pt #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
+  warmstart_path: null #/workspace/warmstart-checkpoints/checkpoint_step251835.pt
   eval_only: false
   log_every: 500
   log_level: INFO
   monitor_metric: "align_nDCG@10"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 3        # 0 veya negatif => kapalı
+  early_stop_patience: 4        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
   max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
