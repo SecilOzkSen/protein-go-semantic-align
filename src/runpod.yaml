@@ -8,7 +8,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "P2b_local_evidence_query_resume"
+  ablation_id: "P2c_projection_only"
   use_queue_miner: true
 
   # GO side clean A3/full-text anchor
@@ -18,7 +18,7 @@ general:
   go_encoder_output_mode: "pooled"
 
   # Protein side new branch
-  protein_pooling_strategy: "local_evidence_gate" # "mean_attn_gate" #local_evidence_gate
+  protein_pooling_strategy: "mean_attn_gate" # "mean_attn_gate" #local_evidence_gate
   protein_n_slots: 0
 
   use_lora: true
@@ -38,17 +38,17 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO_resume
+  output_dir: /workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go
   save_every: 10000
   keep_last_n: 3
-  resume: /workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO/checkpoint_step67156.pt #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
-  warmstart_path: null #/workspace/warmstart-checkpoints/checkpoint_step251835.pt
+  resume: null #/workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO/checkpoint_step67156.pt #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
+  warmstart_path: /workspace/warmstart-checkpoints/checkpoint_step251835.pt
   eval_only: false
   log_every: 500
   log_level: INFO
   monitor_metric: "align_nDCG@10"   # "total" da olabilir
   monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 4        # 0 veya negatif => kapalı
+  early_stop_patience: 1        # 0 veya negatif => kapalı
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
   max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
@@ -64,7 +64,7 @@ training:
   eval_cand_chunk_k: 64
   go_segment_alpha: 0.2
   go_segment_alpha_warmup_steps: 5000
-  trainable_mode: "local_evidence_query" #"protein_query_only" #"segment_gate_only" #local_evidence_only
+  trainable_mode: "protein_projection_only" #"protein_query_only" #"segment_gate_only" #local_evidence_only #local_evidence_query
   local_window_size: 64
   local_window_stride: 32
 
@@ -108,7 +108,7 @@ loss:
   lambda_bce: 0.0
 
 curriculum:
-  epochs: 4
+  epochs: 10
   warmup_frac: 0.1
   mode: cosine
   hard_frac: [0.2, 0.5]

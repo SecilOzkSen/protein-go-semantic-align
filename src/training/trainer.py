@@ -315,10 +315,13 @@ class OppTrainer:
         self.return_slot_attn = ctx.return_slot_attn
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
         self.dag_anc = load_go_parents()
-        self.gate_only = getattr(cfg, "trainable_mode", "full") == "segment_gate_only"
-        self.local_evidence_only = getattr(cfg, "trainable_mode", "full") == "local_evidence_only"
-        self.local_evidence_query = getattr(cfg, "trainable_mode", "full") == "local_evidence_query"
-        self.protein_query_only = getattr(cfg, "trainable_mode", "full") == "protein_query_only"
+
+        mode = getattr(cfg, "trainable_mode", "full")
+        self.gate_only = mode == "segment_gate_only"
+        self.local_evidence_only = mode == "local_evidence_only"
+        self.local_evidence_query = mode == "local_evidence_query"
+        self.protein_projection_only = mode == "protein_projection_only"
+
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
             d_g=ctx.go_cache.embs.size(1) if go_encoder is None else None,
@@ -348,6 +351,9 @@ class OppTrainer:
 
         if self.protein_query_only:
             self.set_trainable_protein_query_only()
+
+        if self.protein_projection_only:
+            self.set_trainable_protein_projection_only()
 
         init_ln = math.log(10)  # 1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
@@ -411,6 +417,7 @@ class OppTrainer:
                 or self.local_evidence_only
                 or self.local_evidence_query
                 or self.protein_query_only
+                or self.protein_projection_only
         )
 
         if self.model.go_encoder is not None and not frozen_go_modes:
@@ -731,6 +738,51 @@ class OppTrainer:
         bad = [n for n in trainable if not n.startswith(allow)]
         if bad:
             raise RuntimeError(f"local_evidence_only has unexpected trainables: {bad[:20]}")
+
+    def set_trainable_protein_projection_only(self):
+        """
+        P2c control.
+
+        Train only the protein projection path:
+          - protein_ln
+          - proj_p
+
+        Freeze:
+          - protein_mean_attn_gate_pool
+          - protein_local_evidence_pool, if exists
+          - all GO-side modules
+          - logit scale
+        """
+        for name, p in self.model.named_parameters():
+            p.requires_grad_(False)
+
+        allow = (
+            "protein_ln.",
+            "proj_p.",
+        )
+
+        for name, p in self.model.named_parameters():
+            if name.startswith(allow):
+                p.requires_grad_(True)
+
+        trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        print("[TRAINABLE] mode=protein_projection_only")
+        print("[TRAINABLE] n=", len(trainable))
+        print("[TRAINABLE] example:", trainable[:30])
+
+        bad = [n for n in trainable if not n.startswith(allow)]
+        if bad:
+            raise RuntimeError(
+                f"protein_projection_only has unexpected trainables: {bad[:20]}"
+            )
+
+        # P2c should use the original A3 protein path.
+        if getattr(self.model, "protein_pool_type", None) != "mean_attn_gate":
+            raise RuntimeError(
+                "protein_projection_only expects protein_pool_type='mean_attn_gate'. "
+                f"Got {getattr(self.model, 'protein_pool_type', None)}"
+            )
 
     def set_trainable_local_evidence_query(self):
         for name, p in self.model.named_parameters():
@@ -2669,6 +2721,29 @@ class OppTrainer:
                 self.model.proj_g.eval()
             if hasattr(self.model, "go_segment_gate"):
                 self.model.go_segment_gate.eval()
+        elif self.protein_projection_only:
+            self.model.train()
+
+            # Frozen protein pooling should be deterministic.
+            if hasattr(self.model, "protein_mean_attn_gate_pool"):
+                self.model.protein_mean_attn_gate_pool.eval()
+
+            # Local evidence should not exist in this run, but freeze/eval if present.
+            if getattr(self.model, "protein_local_evidence_pool", None) is not None:
+                self.model.protein_local_evidence_pool.eval()
+
+            # GO side frozen and deterministic.
+            if getattr(self.model, "go_encoder", None) is not None:
+                self.model.go_encoder.eval()
+
+            if hasattr(self.model, "go_ln"):
+                self.model.go_ln.eval()
+
+            if hasattr(self.model, "proj_g"):
+                self.model.proj_g.eval()
+
+            if hasattr(self.model, "go_segment_gate"):
+                self.model.go_segment_gate.eval()
         elif self.protein_query_only:
             self.model.train()
 
@@ -2688,7 +2763,7 @@ class OppTrainer:
         device = self.device
 
         if self.model.go_encoder is not None and not (
-                self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only):
+                self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only):
             self._set_group_lr("go_lora", self._lora_lr_schedule(self._global_step))
 
         if debug:
@@ -3042,7 +3117,7 @@ class OppTrainer:
 
         self._global_step += 1
 
-        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only):
+        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only):
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
         if getattr(self, "go_segment_gate_k", None) is not None:
