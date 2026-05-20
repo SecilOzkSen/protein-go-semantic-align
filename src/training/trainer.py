@@ -321,6 +321,7 @@ class OppTrainer:
         self.local_evidence_only = mode == "local_evidence_only"
         self.local_evidence_query = mode == "local_evidence_query"
         self.protein_projection_only = mode == "protein_projection_only"
+        self.protein_query_only = mode == "protein_query_only"
 
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
