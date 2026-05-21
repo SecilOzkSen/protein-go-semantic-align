@@ -3869,7 +3869,7 @@ class OppTrainer:
             scores_rank = scores_raw * scale
 
             # retrieval over observed space
-            m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200))
+            m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200, 500, 1000))
             if m["num"] > 0:
                 sum_num += m["num"]
                 sum_R1 += m["R@1"] * m["num"]
