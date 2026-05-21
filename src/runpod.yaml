@@ -41,7 +41,7 @@ training:
   output_dir: /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly
   save_every: 10000
   keep_last_n: 3
-  resume: /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt
+  resume: /workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go/checkpoint_step83945.pt
   warmstart_path: null #/workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go/checkpoint_step83945.pt
   eval_only: true
   log_every: 500
