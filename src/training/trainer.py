@@ -3821,6 +3821,8 @@ class OppTrainer:
             "align_R@50": 0.0,
             "align_R@100": 0.0,
             "align_R@200": 0.0,
+            "align_R@500": 0.0,
+            "align_R@1000": 0.0,
             "align_MRR": 0.0,
             "align_nDCG@10": 0.0,
             "anc_R@10": 0.0,
