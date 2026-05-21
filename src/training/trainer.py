@@ -3850,6 +3850,23 @@ class OppTrainer:
         sum_anc_R50 = 0.0
         sum_anc_num = 0
 
+        # Candidate-ceiling metrics for reranker analysis.
+        # These quantify how much of the true label set is even present in top-K.
+        # oracle_microF@K assumes a perfect reranker that selects only true labels
+        # among the top-K candidates, so FP=0 and only missing labels count as FN.
+        candidate_ks = (50, 100, 200, 500, 1000)
+
+        cand_stats = {
+            int(k): {
+                "coverage_sum": 0.0,   # mean per-protein recall over true labels
+                "any_hit_sum": 0.0,    # fraction of proteins with at least one hit
+                "num_valid": 0,        # proteins with >=1 true label
+                "tp": 0.0,             # micro true positives inside top-K
+                "fn": 0.0,             # micro false negatives outside top-K
+            }
+            for k in candidate_ks
+        }
+
         scale = self.logit_scale_tensor()
 
         seen_cols_cpu = self._eval_cols_seen if self._eval_cols_seen is not None else torch.empty(0, dtype=torch.long)
@@ -3869,6 +3886,50 @@ class OppTrainer:
 
             scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
             scores_rank = scores_raw * scale
+
+            # ------------------------------------------------------------
+            # Candidate ceiling metrics for reranker.
+            # This is separate from retrieval_metrics_from_scores.
+            # It directly measures how many true labels are present in top-K.
+            # ------------------------------------------------------------
+            with torch.no_grad():
+                max_k = min(max(candidate_ks), int(scores_rank.size(1)))
+
+                # [B, max_k]
+                top_idx_full = torch.topk(
+                    scores_rank,
+                    k=max_k,
+                    dim=1,
+                ).indices
+
+                # [B, G], float so gather + sum is safe
+                y_float = (y_true > 0).float()
+                true_counts = y_float.sum(dim=1)  # [B]
+                valid = true_counts > 0
+
+                if valid.any():
+                    valid_n = int(valid.sum().item())
+
+                    for k in candidate_ks:
+                        kk = min(int(k), max_k)
+
+                        idx_k = top_idx_full[:, :kk]  # [B, kk]
+
+                        # Number of true labels retrieved in top-K per protein
+                        hits_k = torch.gather(y_float, 1, idx_k).sum(dim=1)  # [B]
+
+                        hits_valid = hits_k[valid]
+                        true_valid = true_counts[valid].float().clamp_min(1.0)
+
+                        coverage_k = hits_valid / true_valid
+
+                        cand_stats[int(k)]["coverage_sum"] += float(coverage_k.sum().item())
+                        cand_stats[int(k)]["any_hit_sum"] += float((hits_valid > 0).float().sum().item())
+                        cand_stats[int(k)]["num_valid"] += valid_n
+
+                        # Micro oracle counts
+                        cand_stats[int(k)]["tp"] += float(hits_valid.sum().item())
+                        cand_stats[int(k)]["fn"] += float((true_valid - hits_valid).sum().item())
 
             # retrieval over observed space
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200, 500, 1000))
@@ -3969,6 +4030,35 @@ class OppTrainer:
             logs["align_R@1000"] = sum_R1000 / sum_num
             logs["align_MRR"] = sum_MRR / sum_num
             logs["align_nDCG@10"] = sum_nDCG / sum_num
+
+        # ------------------------------------------------------------
+        # Candidate-ceiling logs.
+        # cand_coverage@K:
+        #   mean per-protein fraction of true labels present in top-K.
+        #
+        # cand_any_hit@K:
+        #   fraction of proteins with at least one true label in top-K.
+        #
+        # oracle_microF@K:
+        #   upper-bound micro-F if a perfect reranker selected only true
+        #   labels from top-K candidates, with FP=0.
+        # ------------------------------------------------------------
+        for k in candidate_ks:
+            k = int(k)
+            st = cand_stats[k]
+            n = max(1, int(st["num_valid"]))
+
+            coverage = st["coverage_sum"] / n
+            any_hit = st["any_hit_sum"] / n
+
+            tp = float(st["tp"])
+            fn = float(st["fn"])
+
+            oracle_micro_f = (2.0 * tp) / max(1e-12, (2.0 * tp + fn))
+
+            logs[f"cand_coverage@{k}"] = float(coverage)
+            logs[f"cand_any_hit@{k}"] = float(any_hit)
+            logs[f"oracle_microF@{k}"] = float(oracle_micro_f)
 
         if sum_unseen_num > 0:
             logs["unseen_R@10"] = sum_unseen_R10 / sum_unseen_num
