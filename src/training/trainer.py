@@ -3839,7 +3839,7 @@ class OppTrainer:
         preds_rare, trues_rare = [], []
 
         sum_num = 0
-        sum_R1 = sum_R5 = sum_R10 = sum_R50 = sum_R100 = sum_R200 = 0.0
+        sum_R1 = sum_R5 = sum_R10 = sum_R50 = sum_R100 = sum_R200 = sum_R500 = sum_R1000 = 0.0
         sum_MRR = sum_nDCG = 0.0
 
         sum_unseen_R10 = 0.0
@@ -3880,6 +3880,8 @@ class OppTrainer:
                 sum_R50 += m["R@50"] * m["num"]
                 sum_R100 += m["R@100"] * m["num"]
                 sum_R200 += m["R@200"] * m["num"]
+                sum_R500 += m["R@500"] * m["num"]
+                sum_R1000 += m["R@1000"] * m["num"]
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
@@ -3963,6 +3965,8 @@ class OppTrainer:
             logs["align_R@50"] = sum_R50 / sum_num
             logs["align_R@100"] = sum_R100 / sum_num
             logs["align_R@200"] = sum_R200 / sum_num
+            logs["align_R@500"] = sum_R500 / sum_num
+            logs["align_R@1000"] = sum_R1000 / sum_num
             logs["align_MRR"] = sum_MRR / sum_num
             logs["align_nDCG@10"] = sum_nDCG / sum_num
 
