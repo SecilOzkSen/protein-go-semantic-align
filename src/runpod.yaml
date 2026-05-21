@@ -8,14 +8,14 @@ data:
 
 general:
   phase: -2
-  ablation_id: "P2c_projection_only"
+  ablation_id: "P3a_seg_proj_only"
   use_queue_miner: true
 
   # GO side clean A3/full-text anchor
   go_pooling_strategy: "mean"
   go_encoder_inner_pooling: "mean"
   go_pool_type: "mean"
-  go_encoder_output_mode: "pooled"
+  go_encoder_output_mode: "segment_pooled" #"pooled"
 
   # Protein side new branch
   protein_pooling_strategy: "mean_attn_gate" # "mean_attn_gate" #local_evidence_gate
@@ -38,11 +38,11 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go
+  output_dir: /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly
   save_every: 10000
   keep_last_n: 3
-  resume: null #/workspace/protein-go-align-outputs-P2b-LEP64-A3warm-localQuery-pooledGO/checkpoint_step67156.pt #/workspace/protein-go-align-outputs-A2/checkpoint_step83945.pt
-  warmstart_path: /workspace/warmstart-checkpoints/checkpoint_step251835.pt
+  resume: null
+  warmstart_path: /workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go/checkpoint_step83945.pt
   eval_only: false
   log_every: 500
   log_level: INFO
@@ -62,9 +62,9 @@ training:
   # eval space: observed = observed go ids. train+val+test seen once.
   max_inbatch: 160
   eval_cand_chunk_k: 64
-  go_segment_alpha: 0.2
+  go_segment_alpha: 0.05
   go_segment_alpha_warmup_steps: 5000
-  trainable_mode: "protein_projection_only" #"protein_query_only" #"segment_gate_only" #local_evidence_only #local_evidence_query
+  trainable_mode: "segment_projection_only" #"protein_projection_only" #"protein_query_only" #"segment_gate_only" #local_evidence_only #local_evidence_query
   local_window_size: 64
   local_window_stride: 32
 
@@ -82,7 +82,7 @@ queue: # queue params
   k_hard_queue_warmup_steps: 6000
 
 optim:
-  lr: 0.00005
+  lr: 0.00001
   lr_lora: 0.0
   weight_decay: 0.0
   grad_clip: 1.0
@@ -108,7 +108,7 @@ loss:
   lambda_bce: 0.0
 
 curriculum:
-  epochs: 10
+  epochs: 5
   warmup_frac: 0.1
   mode: cosine
   hard_frac: [0.2, 0.5]

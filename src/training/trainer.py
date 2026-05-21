@@ -322,6 +322,7 @@ class OppTrainer:
         self.local_evidence_query = mode == "local_evidence_query"
         self.protein_projection_only = mode == "protein_projection_only"
         self.protein_query_only = mode == "protein_query_only"
+        self.segment_projection_only = mode == "segment_projection_only"
 
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
@@ -355,6 +356,9 @@ class OppTrainer:
 
         if self.protein_projection_only:
             self.set_trainable_protein_projection_only()
+
+        if self.segment_projection_only:
+            self.set_trainable_segment_projection_only()
 
         init_ln = math.log(10)  # 1.0 / 0.07
         self.logit_scale = torch.nn.Parameter(torch.tensor(init_ln, dtype=torch.float32, device=self.device))
@@ -419,6 +423,7 @@ class OppTrainer:
                 or self.local_evidence_query
                 or self.protein_query_only
                 or self.protein_projection_only
+                or self.segment_projection_only
         )
 
         if self.model.go_encoder is not None and not frozen_go_modes:
@@ -2098,6 +2103,48 @@ class OppTrainer:
 
         return tok, msk
 
+    def set_trainable_segment_projection_only(self):
+        """
+        P3a control.
+
+        Train only GO segment projection side:
+          - go_segment_gate
+          - go_ln
+          - proj_g
+
+        Freeze protein query and GO encoder.
+        """
+        for name, p in self.model.named_parameters():
+            p.requires_grad_(False)
+
+        allow = (
+            "go_segment_gate.",
+            "go_ln.",
+            "proj_g.",
+        )
+
+        for name, p in self.model.named_parameters():
+            if name.startswith(allow):
+                p.requires_grad_(True)
+
+        trainable = [n for n, p in self.model.named_parameters() if p.requires_grad]
+
+        print("[TRAINABLE] mode=segment_projection_only")
+        print("[TRAINABLE] n=", len(trainable))
+        print("[TRAINABLE] example:", trainable[:40])
+
+        bad = [n for n in trainable if not n.startswith(allow)]
+        if bad:
+            raise RuntimeError(
+                f"segment_projection_only has unexpected trainables: {bad[:20]}"
+            )
+
+        if getattr(self.model, "protein_pool_type", None) != "mean_attn_gate":
+            raise RuntimeError(
+                "segment_projection_only expects protein_pool_type='mean_attn_gate'. "
+                f"Got {getattr(self.model, 'protein_pool_type', None)}"
+            )
+
     def set_trainable_protein_query_only(self):
         for name, p in self.model.named_parameters():
             p.requires_grad_(False)
@@ -2722,6 +2769,22 @@ class OppTrainer:
                 self.model.proj_g.eval()
             if hasattr(self.model, "go_segment_gate"):
                 self.model.go_segment_gate.eval()
+        elif self.segment_projection_only:
+            self.model.train()
+
+            # Protein side frozen and deterministic.
+            if hasattr(self.model, "protein_mean_attn_gate_pool"):
+                self.model.protein_mean_attn_gate_pool.eval()
+
+            if hasattr(self.model, "protein_ln"):
+                self.model.protein_ln.eval()
+
+            if hasattr(self.model, "proj_p"):
+                self.model.proj_p.eval()
+
+            # GO encoder frozen.
+            if getattr(self.model, "go_encoder", None) is not None:
+                self.model.go_encoder.eval()
         elif self.protein_projection_only:
             self.model.train()
 
@@ -2764,7 +2827,7 @@ class OppTrainer:
         device = self.device
 
         if self.model.go_encoder is not None and not (
-                self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only):
+                self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only or self.segment_projection_only):
             self._set_group_lr("go_lora", self._lora_lr_schedule(self._global_step))
 
         if debug:
@@ -3118,7 +3181,7 @@ class OppTrainer:
 
         self._global_step += 1
 
-        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only):
+        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only or self.segment_projection_only):
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
         if getattr(self, "go_segment_gate_k", None) is not None:
