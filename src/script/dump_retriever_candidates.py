@@ -1,4 +1,30 @@
 '''
+# Train
+
+python scripts/dump_retriever_candidates.py \
+  --config src/runpod.yaml \
+  --checkpoint /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt \
+  --split train \
+  --topk 1000 \
+  --batch_size 4 \
+  --num_workers 0 \
+  --out_dir /workspace/candidate_dumps/P3a_train_top1000 \
+  --strict_exact
+
+# Validation
+
+python scripts/dump_retriever_candidates.py \
+  --config src/runpod.yaml \
+  --checkpoint /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt \
+  --split val \
+  --topk 1000 \
+  --batch_size 4 \
+  --num_workers 0 \
+  --out_dir /workspace/candidate_dumps/P3a_val_top1000 \
+  --strict_exact
+
+#Test
+
 python script/dump_retriever_candidates.py \
   --config src/runpod.yaml \
   --checkpoint /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt \

@@ -1,0 +1,22 @@
+
+reranker:
+  train_dump: /workspace/candidate_dumps/P3a_train_top1000
+  val_dump: /workspace/candidate_dumps/P3a_val_top1000
+  test_dump: null
+  out_dir: /workspace/reranker_outputs/P3a_top500_interaction_mlp
+
+  topk: 500
+  model_kind: interaction_mlp   # interaction_mlp | score_only | embedding_only
+  hidden_dim: 512
+  dropout: 0.10
+
+  batch_size: 8
+  num_workers: 0
+  lr: 0.0001
+  weight_decay: 0.0001
+  epochs: 10
+  patience: 2
+  grad_clip: 1.0
+  pos_weight_max: 50.0
+  monitor: fmax                # fmax | aupr
+  device: cuda:0
