@@ -181,9 +181,13 @@ def collate_candidate_batch(items: List[Dict]) -> Dict[str, torch.Tensor | List[
         "label",
         "top_cols",
         "top_ids",
+        "true_go_ids",
     ]
+
     for k in tensor_keys:
-        out[k] = torch.stack([x[k] for x in items], dim=0)
+        if k in items[0]:
+            out[k] = torch.stack([x[k] for x in items], dim=0)
+
     return out
 
 
@@ -291,6 +295,13 @@ def evaluate_reranker(
         )
         all_logits.append(logits.detach().cpu().float().numpy())
         all_cols.append(batch["top_cols"].detach().cpu().numpy())
+        if "true_go_ids" not in batch:
+            raise RuntimeError(
+                "Batch is missing true_go_ids. "
+                "Check that true_go_ids.npy exists in the dump directory and "
+                "collate_candidate_batch includes 'true_go_ids'."
+            )
+
         all_true.append(batch["true_go_ids"].detach().cpu().numpy())
 
     cand_logits = np.concatenate(all_logits, axis=0).astype(np.float32)
