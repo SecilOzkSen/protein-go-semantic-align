@@ -26,10 +26,22 @@ class DumpMetadata:
 
 class CandidateDumpDataset(Dataset):
     """
-    Protein-level dataset backed by candidate dump files.
+    Protein-level dataset backed by clean candidate dump files.
 
-    Each item contains one protein and its first K GO candidates.
-    This keeps batches shaped as [B, K] for direct candidate-level reranking.
+    Required files:
+      eval_go_ids.npy
+      go_z.float16.npy
+      protein_z.float16.npy
+      top_go_cols.int32.npy
+      top_scores.float32.npy
+      top_labels.int8.npy
+
+    Optional but recommended:
+      protein_ids.json
+      true_go_ids.npy
+
+    top_go_ids.int64.npy is NOT required.
+    GO ids are reconstructed as eval_go_ids[top_go_cols].
     """
 
     def __init__(
@@ -42,31 +54,61 @@ class CandidateDumpDataset(Dataset):
         self.dump_dir = Path(dump_dir)
         self.topk = int(topk)
 
-        with open(self.dump_dir / "protein_ids.json", "r", encoding="utf-8") as f:
-            self.protein_ids = json.load(f)
-
         self.eval_go_ids = np.load(self.dump_dir / "eval_go_ids.npy", mmap_mode="r")
         self.go_z = np.load(self.dump_dir / "go_z.float16.npy", mmap_mode="r")
         self.protein_z = np.load(self.dump_dir / "protein_z.float16.npy", mmap_mode="r")
         self.top_cols = np.load(self.dump_dir / "top_go_cols.int32.npy", mmap_mode="r")
-        self.top_ids = np.load(self.dump_dir / "top_go_ids.int64.npy", mmap_mode="r")
         self.top_scores = np.load(self.dump_dir / "top_scores.float32.npy", mmap_mode="r")
         self.top_labels = np.load(self.dump_dir / "top_labels.int8.npy", mmap_mode="r")
-        self.true_go_ids = np.load(self.dump_dir / "true_go_ids.npy", mmap_mode="r")
+
+        protein_ids_path = self.dump_dir / "protein_ids.json"
+        if protein_ids_path.exists():
+            with protein_ids_path.open("r", encoding="utf-8") as f:
+                self.protein_ids = json.load(f)
+        else:
+            self.protein_ids = [f"row_{i}" for i in range(int(self.top_scores.shape[0]))]
+
+        true_path = self.dump_dir / "true_go_ids.npy"
+        if true_path.exists():
+            self.true_go_ids = np.load(true_path, mmap_mode="r")
+        else:
+            self.true_go_ids = None
 
         if self.topk > self.top_scores.shape[1]:
             raise ValueError(
                 f"Requested topk={self.topk}, but dump has only {self.top_scores.shape[1]} candidates."
             )
 
+        if self.top_cols.shape != self.top_scores.shape:
+            raise RuntimeError(
+                f"top_go_cols shape {self.top_cols.shape} != top_scores shape {self.top_scores.shape}"
+            )
+
+        if self.top_labels.shape != self.top_scores.shape:
+            raise RuntimeError(
+                f"top_labels shape {self.top_labels.shape} != top_scores shape {self.top_scores.shape}"
+            )
+
+        if self.protein_z.shape[0] != self.top_scores.shape[0]:
+            raise RuntimeError(
+                f"protein_z rows {self.protein_z.shape[0]} != top_scores rows {self.top_scores.shape[0]}"
+            )
+
+        if len(self.protein_ids) != self.top_scores.shape[0]:
+            raise RuntimeError(
+                f"protein_ids length {len(self.protein_ids)} != top_scores rows {self.top_scores.shape[0]}"
+            )
+
         self.score_mean = float(score_mean) if score_mean is not None else 0.0
         self.score_std = float(score_std) if score_std is not None and score_std > 0 else 1.0
 
-        self.rank_feature = (np.log1p(np.arange(1, self.topk + 1, dtype=np.float32)) /
-                             np.log1p(float(self.topk))).astype(np.float32)
+        self.rank_feature = (
+            np.log1p(np.arange(1, self.topk + 1, dtype=np.float32))
+            / np.log1p(float(self.topk))
+        ).astype(np.float32)
 
     def __len__(self) -> int:
-        return len(self.protein_ids)
+        return int(self.top_scores.shape[0])
 
     @property
     def dim(self) -> int:
@@ -79,23 +121,34 @@ class CandidateDumpDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor | str]:
         cols = np.asarray(self.top_cols[idx, : self.topk], dtype=np.int64)
 
+        # Reconstruct global GO ids from eval_go_ids and top columns.
+        top_ids = np.asarray(self.eval_go_ids[cols], dtype=np.int64)
+
         pz = np.asarray(self.protein_z[idx], dtype=np.float32)
         gz = np.asarray(self.go_z[cols], dtype=np.float32)
+
         scores = np.asarray(self.top_scores[idx, : self.topk], dtype=np.float32)
         labels = np.asarray(self.top_labels[idx, : self.topk], dtype=np.float32)
 
         scores = (scores - self.score_mean) / max(self.score_std, 1e-6)
 
-        return {
+        item: Dict[str, torch.Tensor | str] = {
             "protein_id": str(self.protein_ids[idx]),
-            "protein_z": torch.from_numpy(pz),
-            "go_z": torch.from_numpy(gz),
-            "retriever_score": torch.from_numpy(scores),
+            "protein_z": torch.from_numpy(pz.copy()),
+            "go_z": torch.from_numpy(gz.copy()),
+            "retriever_score": torch.from_numpy(scores.copy()),
             "rank_feature": torch.from_numpy(self.rank_feature.copy()),
-            "label": torch.from_numpy(labels),
+            "label": torch.from_numpy(labels.copy()),
             "top_cols": torch.from_numpy(cols.astype(np.int64)),
-            "true_go_ids": torch.from_numpy(np.asarray(self.true_go_ids[idx], dtype=np.int64)),
+            "top_ids": torch.from_numpy(top_ids.astype(np.int64)),
         }
+
+        if self.true_go_ids is not None:
+            item["true_go_ids"] = torch.from_numpy(
+                np.asarray(self.true_go_ids[idx], dtype=np.int64).copy()
+            )
+
+        return item
 
 
 def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int] = None) -> Tuple[float, float]:
@@ -127,7 +180,7 @@ def collate_candidate_batch(items: List[Dict]) -> Dict[str, torch.Tensor | List[
         "rank_feature",
         "label",
         "top_cols",
-        "true_go_ids",
+        "top_ids",
     ]
     for k in tensor_keys:
         out[k] = torch.stack([x[k] for x in items], dim=0)
