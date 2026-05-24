@@ -575,11 +575,62 @@ def dump_candidates(
     topk: int,
     go_project_chunk: int,
     empty_cache_every: int = 50,
+    overwrite: bool = False,
+    save_top_go_ids: bool = False,
 ):
+    out_dir = Path(out_dir)
+
+    done_path = out_dir / "DONE"
+    metadata_path = out_dir / "metadata.json"
+
+    if out_dir.exists():
+        if done_path.exists() and not overwrite:
+            raise RuntimeError(
+                f"[dump] Output dir already has DONE marker: {out_dir}. "
+                "Use --overwrite or choose a new out_dir."
+            )
+
+        if not overwrite and any(out_dir.iterdir()):
+            raise RuntimeError(
+                f"[dump] Output dir exists and is not empty: {out_dir}. "
+                "Use --overwrite or choose a new out_dir."
+            )
+
+        if overwrite:
+            import shutil
+            logging.warning("[dump] removing existing output dir: %s", str(out_dir))
+            shutil.rmtree(out_dir)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = trainer.device
     trainer.model.eval()
+
+    # Important for segment_pooled checkpoints.
+    # In training, this may be scheduled inside step_losses.
+    # During dump, step_losses is never called, so set it explicitly.
+    if getattr(trainer.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+        alpha = float(getattr(trainer.cfg, "go_segment_alpha", 0.05))
+
+        if hasattr(trainer.model, "go_segment_mix_alpha"):
+            trainer.model.go_segment_mix_alpha = alpha
+            print("[dump] set go_segment_mix_alpha =", trainer.model.go_segment_mix_alpha)
+
+        if hasattr(trainer.model, "go_segment_alpha"):
+            trainer.model.go_segment_alpha = alpha
+            print("[dump] set go_segment_alpha =", trainer.model.go_segment_alpha)
+
+    # Write initial metadata as incomplete.
+    initial_metadata = {
+        "status": "incomplete",
+        "split": split_name,
+        "checkpoint": str(checkpoint_path),
+        "config": str(config_path),
+        "topk_requested": int(topk),
+        "save_top_go_ids": bool(save_top_go_ids),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(initial_metadata, f, indent=2)
 
     logging.info("[dump] refreshing eval GO cache")
     trainer._refresh_eval_go_cache(chunk=trainer.cfg.eval_go_bs)
@@ -598,7 +649,13 @@ def dump_candidates(
     np.save(out_dir / "go_z.float16.npy", go_z)
 
     n_samples = len(loader.dataset)
-    logging.info("[dump] n_samples=%d n_go=%d topk=%d dz=%d", n_samples, n_go, k_eff, dz)
+    logging.info(
+        "[dump] n_samples=%d n_go=%d topk=%d dz=%d",
+        n_samples,
+        n_go,
+        k_eff,
+        dz,
+    )
 
     top_cols_mm = np.lib.format.open_memmap(
         out_dir / "top_go_cols.int32.npy",
@@ -606,30 +663,36 @@ def dump_candidates(
         dtype=np.int32,
         shape=(n_samples, k_eff),
     )
-    top_ids_mm = np.lib.format.open_memmap(
-        out_dir / "top_go_ids.int64.npy",
-        mode="w+",
-        dtype=np.int64,
-        shape=(n_samples, k_eff),
-    )
+
     top_scores_mm = np.lib.format.open_memmap(
         out_dir / "top_scores.float32.npy",
         mode="w+",
         dtype=np.float32,
         shape=(n_samples, k_eff),
     )
+
     top_labels_mm = np.lib.format.open_memmap(
         out_dir / "top_labels.int8.npy",
         mode="w+",
         dtype=np.int8,
         shape=(n_samples, k_eff),
     )
+
     protein_z_mm = np.lib.format.open_memmap(
         out_dir / "protein_z.float16.npy",
         mode="w+",
         dtype=np.float16,
         shape=(n_samples, dz),
     )
+
+    top_ids_mm = None
+    if save_top_go_ids:
+        top_ids_mm = np.lib.format.open_memmap(
+            out_dir / "top_go_ids.int64.npy",
+            mode="w+",
+            dtype=np.int64,
+            shape=(n_samples, k_eff),
+        )
 
     protein_ids: List[str] = []
     true_ids_all: List[List[int]] = []
@@ -669,18 +732,13 @@ def dump_candidates(
         idxs_cpu = idxs.detach().cpu().to(torch.int64)
         vals_cpu = vals.detach().cpu().float()
 
-        top_ids = trainer._eval_ids_cpu.index_select(
-            0,
-            idxs_cpu.reshape(-1),
-        ).view(B, k_eff)
-
         labels = torch.gather(
             (y_true > 0).to(torch.int8),
             1,
             idxs,
         ).detach().cpu()
 
-        # Protein query embedding from the frozen retriever.
+        # Frozen retriever protein query embedding.
         Zp = trainer.model.encode_protein_for_scoring(H, attn_valid)
 
         if isinstance(Zp, tuple):
@@ -691,11 +749,18 @@ def dump_candidates(
 
         Zp = F.normalize(Zp.float(), dim=-1)
 
-        top_cols_mm[s:e, :] = idxs_cpu.numpy().astype(np.int32)
-        top_ids_mm[s:e, :] = top_ids.numpy().astype(np.int64)
+        top_cols_np = idxs_cpu.numpy().astype(np.int32)
+        top_cols_mm[s:e, :] = top_cols_np
         top_scores_mm[s:e, :] = vals_cpu.numpy().astype(np.float32)
         top_labels_mm[s:e, :] = labels.numpy().astype(np.int8)
         protein_z_mm[s:e, :] = Zp.detach().cpu().half().numpy()
+
+        if top_ids_mm is not None:
+            top_ids = trainer._eval_ids_cpu.index_select(
+                0,
+                idxs_cpu.reshape(-1),
+            ).view(B, k_eff)
+            top_ids_mm[s:e, :] = top_ids.numpy().astype(np.int64)
 
         pids = batch.get("protein_ids", None)
         if pids is None:
@@ -709,11 +774,26 @@ def dump_candidates(
         offset = e
 
         if empty_cache_every > 0 and (step + 1) % empty_cache_every == 0:
+            top_cols_mm.flush()
+            top_scores_mm.flush()
+            top_labels_mm.flush()
+            protein_z_mm.flush()
+            if top_ids_mm is not None:
+                top_ids_mm.flush()
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
     if offset != n_samples:
         raise RuntimeError(f"[dump] wrote offset={offset}, expected n_samples={n_samples}")
+
+    # Flush large memmaps.
+    top_cols_mm.flush()
+    top_scores_mm.flush()
+    top_labels_mm.flush()
+    protein_z_mm.flush()
+    if top_ids_mm is not None:
+        top_ids_mm.flush()
 
     true_padded = pad_true_ids(true_ids_all, pad_value=-1)
     np.save(out_dir / "true_go_ids.npy", true_padded)
@@ -724,7 +804,23 @@ def dump_candidates(
     with open(out_dir / "true_go_ids.json", "w", encoding="utf-8") as f:
         json.dump(true_ids_all, f)
 
+    files = {
+        "protein_ids": "protein_ids.json",
+        "true_go_ids_json": "true_go_ids.json",
+        "true_go_ids_padded": "true_go_ids.npy",
+        "eval_go_ids": "eval_go_ids.npy",
+        "go_z": "go_z.float16.npy",
+        "protein_z": "protein_z.float16.npy",
+        "top_go_cols": "top_go_cols.int32.npy",
+        "top_scores": "top_scores.float32.npy",
+        "top_labels": "top_labels.int8.npy",
+    }
+
+    if save_top_go_ids:
+        files["top_go_ids"] = "top_go_ids.int64.npy"
+
     metadata = {
+        "status": "complete",
         "split": split_name,
         "checkpoint": str(checkpoint_path),
         "config": str(config_path),
@@ -732,31 +828,25 @@ def dump_candidates(
         "n_go": int(n_go),
         "topk": int(k_eff),
         "dz": int(dz),
-        "files": {
-            "protein_ids": "protein_ids.json",
-            "true_go_ids_json": "true_go_ids.json",
-            "true_go_ids_padded": "true_go_ids.npy",
-            "eval_go_ids": "eval_go_ids.npy",
-            "go_z": "go_z.float16.npy",
-            "protein_z": "protein_z.float16.npy",
-            "top_go_cols": "top_go_cols.int32.npy",
-            "top_go_ids": "top_go_ids.int64.npy",
-            "top_scores": "top_scores.float32.npy",
-            "top_labels": "top_labels.int8.npy",
-        },
+        "save_top_go_ids": bool(save_top_go_ids),
+        "files": files,
         "schema": {
             "row_alignment": "All row-based files align by protein_ids order.",
             "top_go_cols": "Column indices into eval_go_ids and go_z.",
-            "top_go_ids": "Global GO integer ids.",
             "top_scores": "Post-logit-scale retriever scores.",
             "top_labels": "1 if candidate is a true GO label for that protein, else 0.",
             "protein_z": "Frozen retriever protein query embedding.",
             "go_z": "Frozen retriever projected GO embedding bank aligned with eval_go_ids.",
+            "true_go_ids": "All true GO ids per protein, padded with -1. Needed for full-space Fmax.",
+            "top_go_ids": "Optional. Can be reconstructed as eval_go_ids[top_go_cols].",
         },
     }
 
-    with open(out_dir / "metadata.json", "w", encoding="utf-8") as f:
+    with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+
+    with open(done_path, "w", encoding="utf-8") as f:
+        f.write("complete\n")
 
     logging.info("[dump] done: %s", str(out_dir))
 
@@ -780,6 +870,8 @@ def parse_args():
     p.add_argument("--go_project_chunk", type=int, default=2048)
     p.add_argument("--strict_exact", action="store_true", help="Require missing=0 and unexpected=0 when loading checkpoint.")
     p.add_argument("--empty_cache_every", type=int, default=50)
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--save_top_go_ids", action="store_true")
 
     return p.parse_args()
 
@@ -888,6 +980,8 @@ def main():
         topk=int(cli.topk),
         go_project_chunk=int(cli.go_project_chunk),
         empty_cache_every=int(cli.empty_cache_every),
+        overwrite=bool(cli.overwrite),
+        save_top_go_ids=bool(cli.save_top_go_ids),
     )
 
 
