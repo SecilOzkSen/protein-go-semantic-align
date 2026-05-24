@@ -768,8 +768,18 @@ def dump_candidates(
 
         protein_ids.extend([str(x) for x in pids])
 
-        for gids in batch["pos_go_global"]:
-            true_ids_all.append([int(x) for x in gids.detach().cpu().tolist()])
+        # Store true GO ids restricted to the observed eval space.
+        # This must match y_true, top_labels, and full-space Fmax/AUPR.
+        eval_ids_cpu = trainer._eval_ids_cpu  # CPU LongTensor [G]
+
+        for b in range(B):
+            true_cols = torch.nonzero(y_true[b] > 0, as_tuple=False).flatten().detach().cpu()
+
+            if true_cols.numel() > 0:
+                gids_eval = eval_ids_cpu.index_select(0, true_cols).tolist()
+                true_ids_all.append([int(x) for x in gids_eval])
+            else:
+                true_ids_all.append([])
 
         offset = e
 
