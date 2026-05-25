@@ -74,6 +74,12 @@ class CandidateDumpDataset(Dataset):
         else:
             self.true_go_ids = None
 
+        valid_path = self.dump_dir / "top_valid.int8.npy"
+        if valid_path.exists():
+            self.top_valid = np.load(valid_path, mmap_mode="r")
+        else:
+            self.top_valid = None
+
         if self.topk > self.top_scores.shape[1]:
             raise ValueError(
                 f"Requested topk={self.topk}, but dump has only {self.top_scores.shape[1]} candidates."
@@ -142,6 +148,12 @@ class CandidateDumpDataset(Dataset):
             "top_cols": torch.from_numpy(cols.astype(np.int64)),
             "top_ids": torch.from_numpy(top_ids.astype(np.int64)),
         }
+        if self.top_valid is not None:
+            valid = np.asarray(self.top_valid[idx, : self.topk], dtype=np.float32)
+        else:
+            valid = np.ones(self.topk, dtype=np.float32)
+
+        item["valid_mask"] = torch.from_numpy(valid.copy())
 
         if self.true_go_ids is not None:
             item["true_go_ids"] = torch.from_numpy(
@@ -152,10 +164,27 @@ class CandidateDumpDataset(Dataset):
 
 
 def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int] = None) -> Tuple[float, float]:
-    scores = np.load(Path(dump_dir) / "top_scores.float32.npy", mmap_mode="r")
+    dump_dir = Path(dump_dir)
+    scores = np.load(dump_dir / "top_scores.float32.npy", mmap_mode="r")
+
     n = scores.shape[0] if max_rows is None else min(int(max_rows), scores.shape[0])
     arr = np.asarray(scores[:n, :topk], dtype=np.float32)
-    return float(arr.mean()), float(arr.std() + 1e-6)
+
+    valid_path = dump_dir / "top_valid.int8.npy"
+    if valid_path.exists():
+        valid = np.asarray(np.load(valid_path, mmap_mode="r")[:n, :topk], dtype=bool)
+    else:
+        valid = np.ones_like(arr, dtype=bool)
+
+    finite = np.isfinite(arr)
+    not_filler = arr > -1e5
+    mask = valid & finite & not_filler
+
+    if not mask.any():
+        return float(arr.mean()), float(arr.std() + 1e-6)
+
+    vals = arr[mask]
+    return float(vals.mean()), float(vals.std() + 1e-6)
 
 
 def estimate_pos_weight(dump_dir: str | Path, topk: int, max_value: float = 50.0) -> float:
@@ -182,6 +211,7 @@ def collate_candidate_batch(items: List[Dict]) -> Dict[str, torch.Tensor | List[
         "top_cols",
         "top_ids",
         "true_go_ids",
+        "valid_mask",
     ]
 
     for k in tensor_keys:
@@ -293,6 +323,9 @@ def evaluate_reranker(
             retriever_score=batch["retriever_score"],
             rank_feature=batch["rank_feature"],
         )
+        if "valid_mask" in batch:
+            valid = batch["valid_mask"].bool()
+            logits = logits.masked_fill(~valid, -1e6)
         all_logits.append(logits.detach().cpu().float().numpy())
         all_cols.append(batch["top_cols"].detach().cpu().numpy())
         if "true_go_ids" not in batch:
@@ -371,7 +404,13 @@ def train_one_epoch(
         )
         labels = batch["label"].float()
 
-        loss = criterion(logits, labels)
+        loss_mat = criterion(logits, labels)
+
+        if "valid_mask" in batch:
+            valid = batch["valid_mask"].float()
+            loss = (loss_mat * valid).sum() / valid.sum().clamp_min(1.0)
+        else:
+            loss = loss_mat.mean()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -455,7 +494,10 @@ class RerankerTrainer:
 
         pos_weight = estimate_pos_weight(cfg.train_dump, cfg.topk, cfg.pos_weight_max)
         self.pos_weight = pos_weight
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=self.device))
+        self.criterion = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(pos_weight, device=self.device),
+            reduction="none",
+        )
 
         self.best_metric = -float("inf")
         self.best_epoch = -1
