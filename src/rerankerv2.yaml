@@ -3,10 +3,10 @@ reranker:
   train_dump: /workspace/candidate_dumps/P3a_train_top1000
   val_dump: /workspace/candidate_dumps/P3a_val_top1000
   test_dump: null
-  out_dir: /workspace/reranker_outputs/P3a_top1000_interaction_mlp
+  out_dir: /workspace/reranker_outputs/P3a_top500_score_only
 
-  topk: 1000
-  model_kind: interaction_mlp   # interaction_mlp | score_only | embedding_only
+  topk: 500
+  model_kind: score_only   # interaction_mlp | score_only | embedding_only
   hidden_dim: 512
   dropout: 0.10
 
