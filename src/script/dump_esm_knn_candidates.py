@@ -503,6 +503,16 @@ def main():
         use_fp16=not bool(cli.no_fp16_knn),
     )
 
+    # Save kNN neighbor debug arrays for leakage and homology checks.
+    np.save(out_dir / "knn_neighbor_idx.int64.npy", nn_idx.astype(np.int64))
+    np.save(out_dir / "knn_neighbor_sim.float32.npy", nn_sim.astype(np.float32))
+
+    with (out_dir / "knn_train_ids.json").open("w", encoding="utf-8") as f:
+        json.dump(train_ids, f)
+
+    with (out_dir / "knn_query_ids.json").open("w", encoding="utf-8") as f:
+        json.dump(query_ids, f)
+
     ref_top_cols = None
     if not bool(cli.no_ref_fill):
         ref_top_cols_path = ref_dump / "top_go_cols.int32.npy"
@@ -553,6 +563,10 @@ def main():
         "n_neighbors": int(cli.n_neighbors),
         "tau": float(cli.tau),
         "fill_from_ref": not bool(cli.no_ref_fill),
+        "knn_neighbor_idx": "knn_neighbor_idx.int64.npy",
+        "knn_neighbor_sim": "knn_neighbor_sim.float32.npy",
+        "knn_train_ids": "knn_train_ids.json",
+        "knn_query_ids": "knn_query_ids.json",
         "files": {
             "protein_ids": "protein_ids.json",
             "true_go_ids_json": "true_go_ids.json",
