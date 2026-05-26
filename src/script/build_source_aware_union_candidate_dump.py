@@ -1,3 +1,16 @@
+'''
+python -m src.script.build_source_aware_union_candidate_dump \
+  --dump_a /workspace/candidate_dumps/P3a_train_top1000 \
+  --dump_b /workspace/candidate_dumps/ESMknn_train_top500_nofill \
+  --topk_a 500 \
+  --topk_b 500 \
+  --max_out 1000 \
+  --a_name p3a \
+  --b_name esmknn \
+  --out_dir /workspace/candidate_dumps/P3a_ESMknn_sourceaware_union_train_top1000 \
+  --overwrite
+'''
+
 import argparse
 import json
 import shutil
