@@ -2,10 +2,10 @@ reranker:
   train_dump: /workspace/candidate_dumps/P3a_ESMknn_sourceaware_union_train_top1000
   val_dump: /workspace/candidate_dumps/P3a_ESMknn_sourceaware_union_val_top1000
   test_dump: null
-  out_dir: /workspace/reranker_outputs/P3a_ESMknn_sourceaware_union_top1000_interaction_mlp
+  out_dir: /workspace/reranker_outputs/P3a_ESMknn_sourceaware_union_top1000_moe #/workspace/reranker_outputs/P3a_ESMknn_sourceaware_union_top1000_interaction_mlp
 
   topk: 1000
-  model_kind: source_aware_interaction_mlp
+  model_kind: source_gated_moe #source_aware_interaction_mlp
   hidden_dim: 512
   dropout: 0.10
 

@@ -13,15 +13,17 @@ from src.metrics.cafa import compute_term_aupr
 from src.models.reranker_union_model import (
     SourceAwareCandidateInteractionMLP,
     SourceAwareScoreOnlyReranker,
+    SourceGatedMoEReranker
 )
 
 class SourceAwareUnionDataset(Dataset):
     def __init__(
-        self,
-        dump_dir: str | Path,
-        topk: int,
-        score_mean: Optional[float] = None,
-        score_std: Optional[float] = None,
+            self,
+            dump_dir: str | Path,
+            topk: int,
+            score_mean: Optional[float] = None,
+            score_std: Optional[float] = None,
+            source_stats: Optional[Dict[str, float]] = None,
     ):
         self.dump_dir = Path(dump_dir)
         self.topk = int(topk)
@@ -32,6 +34,12 @@ class SourceAwareUnionDataset(Dataset):
         self.top_cols = np.load(self.dump_dir / "top_go_cols.int32.npy", mmap_mode="r")
         self.top_scores = np.load(self.dump_dir / "top_scores.float32.npy", mmap_mode="r")
         self.top_labels = np.load(self.dump_dir / "top_labels.int8.npy", mmap_mode="r")
+        self.source_stats = source_stats or {
+            "source_a_mean": 0.0,
+            "source_a_std": 1.0,
+            "source_b_mean": 0.0,
+            "source_b_std": 1.0,
+        }
 
         required_source_files = [
             "source_in_a.int8.npy",
@@ -122,6 +130,23 @@ class SourceAwareUnionDataset(Dataset):
         else:
             valid = np.ones(self.topk, dtype=np.float32)
 
+        source_in_a = np.asarray(self.source_in_a[idx, : self.topk], dtype=np.float32)
+        source_in_b = np.asarray(self.source_in_b[idx, : self.topk], dtype=np.float32)
+
+        source_score_a = np.asarray(self.source_score_a[idx, : self.topk], dtype=np.float32)
+        source_score_b = np.asarray(self.source_score_b[idx, : self.topk], dtype=np.float32)
+
+        source_score_a = (source_score_a - self.source_stats["source_a_mean"]) / max(
+            self.source_stats["source_a_std"], 1e-6
+        )
+        source_score_b = (source_score_b - self.source_stats["source_b_mean"]) / max(
+            self.source_stats["source_b_std"], 1e-6
+        )
+
+        # Missing source score should be neutral. Source flags still tell the model what is missing.
+        source_score_a = np.where(source_in_a > 0, source_score_a, 0.0).astype(np.float32)
+        source_score_b = np.where(source_in_b > 0, source_score_b, 0.0).astype(np.float32)
+
         item = {
             "protein_id": str(self.protein_ids[idx]),
             "protein_z": torch.from_numpy(np.asarray(self.protein_z[idx], dtype=np.float32).copy()),
@@ -133,12 +158,12 @@ class SourceAwareUnionDataset(Dataset):
             "top_cols": torch.from_numpy(cols.astype(np.int64)),
             "top_ids": torch.from_numpy(top_ids.astype(np.int64)),
             "true_go_ids": torch.from_numpy(np.asarray(self.true_go_ids[idx], dtype=np.int64).copy()),
-            "source_in_a": torch.from_numpy(np.asarray(self.source_in_a[idx, : self.topk], dtype=np.float32).copy()),
-            "source_in_b": torch.from_numpy(np.asarray(self.source_in_b[idx, : self.topk], dtype=np.float32).copy()),
-            "source_score_a": torch.from_numpy(np.asarray(self.source_score_a[idx, : self.topk], dtype=np.float32).copy()),
-            "source_score_b": torch.from_numpy(np.asarray(self.source_score_b[idx, : self.topk], dtype=np.float32).copy()),
             "source_rank_a": torch.from_numpy(np.asarray(self.source_rank_a[idx, : self.topk], dtype=np.float32).copy()),
             "source_rank_b": torch.from_numpy(np.asarray(self.source_rank_b[idx, : self.topk], dtype=np.float32).copy()),
+            "source_in_a": torch.from_numpy(source_in_a.copy()),
+            "source_in_b": torch.from_numpy(source_in_b.copy()),
+            "source_score_a": torch.from_numpy(source_score_a.copy()),
+            "source_score_b": torch.from_numpy(source_score_b.copy()),
         }
         return item
 
@@ -159,6 +184,49 @@ def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int
         return 0.0, 1.0
     vals = arr[mask]
     return float(vals.mean()), float(vals.std() + 1e-6)
+
+def estimate_source_score_stats(
+    dump_dir: str | Path,
+    topk: int,
+    max_rows: Optional[int] = None,
+) -> Dict[str, float]:
+    dump_dir = Path(dump_dir)
+
+    score_a = np.load(dump_dir / "source_score_a.float32.npy", mmap_mode="r")
+    score_b = np.load(dump_dir / "source_score_b.float32.npy", mmap_mode="r")
+    in_a = np.load(dump_dir / "source_in_a.int8.npy", mmap_mode="r")
+    in_b = np.load(dump_dir / "source_in_b.int8.npy", mmap_mode="r")
+
+    n = score_a.shape[0] if max_rows is None else min(int(max_rows), score_a.shape[0])
+
+    a = np.asarray(score_a[:n, :topk], dtype=np.float32)
+    b = np.asarray(score_b[:n, :topk], dtype=np.float32)
+    ma = np.asarray(in_a[:n, :topk], dtype=bool)
+    mb = np.asarray(in_b[:n, :topk], dtype=bool)
+
+    ma = ma & np.isfinite(a) & (a > -1e5)
+    mb = mb & np.isfinite(b) & (b > -1e5)
+
+    if ma.any():
+        a_vals = a[ma]
+        a_mean = float(a_vals.mean())
+        a_std = float(a_vals.std() + 1e-6)
+    else:
+        a_mean, a_std = 0.0, 1.0
+
+    if mb.any():
+        b_vals = b[mb]
+        b_mean = float(b_vals.mean())
+        b_std = float(b_vals.std() + 1e-6)
+    else:
+        b_mean, b_std = 0.0, 1.0
+
+    return {
+        "source_a_mean": a_mean,
+        "source_a_std": a_std,
+        "source_b_mean": b_mean,
+        "source_b_std": b_std,
+    }
 
 
 def estimate_pos_weight(dump_dir: str | Path, topk: int, max_value: float = 50.0) -> float:
@@ -216,6 +284,12 @@ def build_model(kind: str, dim: int, hidden_dim: int, dropout: float) -> nn.Modu
             use_union_score=True,
             use_union_rank=True,
             use_source_features=True,
+        )
+    elif kind == "source_gated_moe":
+        return SourceGatedMoEReranker(
+            dim=dim,
+            hidden_dim=hidden_dim,
+            dropout=dropout,
         )
     raise ValueError(f"Unknown source-aware reranker kind: {kind}")
 
@@ -421,12 +495,39 @@ class SourceAwareRerankerTrainer:
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
         score_mean, score_std = estimate_score_stats(cfg.train_dump, cfg.topk)
+        source_stats = estimate_source_score_stats(cfg.train_dump, cfg.topk)
+
         self.score_mean = score_mean
         self.score_std = score_std
+        self.source_stats = source_stats
 
-        self.train_ds = SourceAwareUnionDataset(cfg.train_dump, cfg.topk, score_mean, score_std)
-        self.val_ds = SourceAwareUnionDataset(cfg.val_dump, cfg.topk, score_mean, score_std)
-        self.test_ds = SourceAwareUnionDataset(cfg.test_dump, cfg.topk, score_mean, score_std) if cfg.test_dump else None
+        self.train_ds = SourceAwareUnionDataset(
+            cfg.train_dump,
+            cfg.topk,
+            score_mean,
+            score_std,
+            source_stats=source_stats,
+        )
+
+        self.val_ds = SourceAwareUnionDataset(
+            cfg.val_dump,
+            cfg.topk,
+            score_mean,
+            score_std,
+            source_stats=source_stats,
+        )
+
+        self.test_ds = (
+            SourceAwareUnionDataset(
+                cfg.test_dump,
+                cfg.topk,
+                score_mean,
+                score_std,
+                source_stats=source_stats,
+            )
+            if cfg.test_dump
+            else None
+        )
 
         self.train_loader = DataLoader(
             self.train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers,
@@ -458,7 +559,7 @@ class SourceAwareRerankerTrainer:
 
         with open(self.out_dir / "config.json", "w", encoding="utf-8") as f:
             d = asdict(cfg)
-            d.update({"score_mean": score_mean, "score_std": score_std, "pos_weight": pos_weight})
+            d.update({"score_mean": score_mean, "score_std": score_std, "pos_weight": pos_weight, **source_stats})
             json.dump(d, f, indent=2)
 
     def save_checkpoint(self, path: Path, epoch: int, metrics: Dict[str, float]):

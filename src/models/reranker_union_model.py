@@ -4,6 +4,154 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class SourceGatedMoEReranker(nn.Module):
+    """
+    Candidate-level source-gated mixture-of-experts reranker.
+
+    Inputs:
+      protein_z:      [B, D]
+      go_z:           [B, K, D]
+      retriever_score:[B, K] union score
+      rank_feature:   [B, K] union rank feature
+
+      source_in_a:    [B, K] P3a flag
+      source_in_b:    [B, K] ESM-kNN flag
+      source_score_a: [B, K] P3a score
+      source_score_b: [B, K] ESM-kNN score
+      source_rank_a:  [B, K] P3a rank feature
+      source_rank_b:  [B, K] ESM-kNN rank feature
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int = 512,
+        dropout: float = 0.10,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.hidden_dim = int(hidden_dim)
+
+        self.prot_proj = nn.Linear(dim, hidden_dim)
+        self.go_proj = nn.Linear(dim, hidden_dim)
+
+        emb_feat_dim = hidden_dim * 4 + 1
+
+        self.emb_expert = nn.Sequential(
+            nn.Linear(emb_feat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # p3a_score, p3a_rank, in_p3a, both_sources
+        self.p3a_expert = nn.Sequential(
+            nn.LayerNorm(4),
+            nn.Linear(4, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+        # knn_score, knn_rank, in_knn, both_sources
+        self.knn_expert = nn.Sequential(
+            nn.LayerNorm(4),
+            nn.Linear(4, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+
+        # union_score, union_rank, p3a_score, knn_score,
+        # p3a_rank, knn_rank, in_p3a, in_knn, both_sources
+        self.mix_expert = nn.Sequential(
+            nn.LayerNorm(9),
+            nn.Linear(9, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 1),
+        )
+
+        # Gate sees source features plus cosine.
+        self.gate = nn.Sequential(
+            nn.LayerNorm(10),
+            nn.Linear(10, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 4),
+        )
+
+    def forward(
+        self,
+        protein_z: torch.Tensor,          # [B, D]
+        go_z: torch.Tensor,               # [B, K, D]
+        retriever_score: torch.Tensor,    # [B, K]
+        rank_feature: torch.Tensor,       # [B, K]
+        source_in_a: torch.Tensor,        # [B, K]
+        source_in_b: torch.Tensor,        # [B, K]
+        source_score_a: torch.Tensor,     # [B, K]
+        source_score_b: torch.Tensor,     # [B, K]
+        source_rank_a: torch.Tensor,      # [B, K]
+        source_rank_b: torch.Tensor,      # [B, K]
+    ) -> torch.Tensor:
+        B, K, D = go_z.shape
+
+        in_p3a = source_in_a.float()
+        in_knn = source_in_b.float()
+        both = (in_p3a * in_knn).float()
+
+        # Project protein and GO into scorer space.
+        p = self.prot_proj(protein_z)                  # [B, H]
+        g = self.go_proj(go_z)                         # [B, K, H]
+
+        p_rep = p.unsqueeze(1).expand(B, K, self.hidden_dim)
+
+        diff = torch.abs(p_rep - g)
+        prod = p_rep * g
+        cos = F.cosine_similarity(p_rep, g, dim=-1).unsqueeze(-1)
+
+        emb_feat = torch.cat([p_rep, g, diff, prod, cos], dim=-1)
+        emb_logit = self.emb_expert(emb_feat).squeeze(-1)  # [B, K]
+
+        p3a_feat = torch.stack(
+            [source_score_a, source_rank_a, in_p3a, both],
+            dim=-1,
+        )
+        p3a_logit = self.p3a_expert(p3a_feat).squeeze(-1)
+
+        knn_feat = torch.stack(
+            [source_score_b, source_rank_b, in_knn, both],
+            dim=-1,
+        )
+        knn_logit = self.knn_expert(knn_feat).squeeze(-1)
+
+        mix_feat = torch.stack(
+            [
+                retriever_score,
+                rank_feature,
+                source_score_a,
+                source_score_b,
+                source_rank_a,
+                source_rank_b,
+                in_p3a,
+                in_knn,
+                both,
+            ],
+            dim=-1,
+        )
+        mix_logit = self.mix_expert(mix_feat).squeeze(-1)
+
+        gate_feat = torch.cat([mix_feat, cos], dim=-1)     # [B, K, 10]
+        gate_w = torch.softmax(self.gate(gate_feat), dim=-1)
+
+        experts = torch.stack(
+            [emb_logit, p3a_logit, knn_logit, mix_logit],
+            dim=-1,
+        )                                                   # [B, K, 4]
+
+        out = (gate_w * experts).sum(dim=-1)
+        return out
+
 
 class SourceAwareCandidateInteractionMLP(nn.Module):
     """
