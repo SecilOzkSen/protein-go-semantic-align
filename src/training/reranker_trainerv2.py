@@ -188,13 +188,24 @@ def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int
 
 
 def estimate_pos_weight(dump_dir: str | Path, topk: int, max_value: float = 50.0) -> float:
-    labels = np.load(Path(dump_dir) / "top_labels.int8.npy", mmap_mode="r")
+    dump_dir = Path(dump_dir)
+    labels = np.load(dump_dir / "top_labels.int8.npy", mmap_mode="r")
     y = np.asarray(labels[:, :topk], dtype=np.int64)
-    pos = int(y.sum())
-    total = int(y.size)
+
+    valid_path = dump_dir / "top_valid.int8.npy"
+    if valid_path.exists():
+        valid = np.asarray(np.load(valid_path, mmap_mode="r")[:, :topk], dtype=bool)
+    else:
+        valid = np.ones_like(y, dtype=bool)
+
+    y_valid = y[valid]
+    pos = int(y_valid.sum())
+    total = int(y_valid.size)
     neg = max(1, total - pos)
+
     if pos <= 0:
         return 1.0
+
     return float(min(max_value, neg / max(1, pos)))
 
 
@@ -259,7 +270,7 @@ def compute_fmax_and_aupr(y_true: np.ndarray, y_score: np.ndarray, n_thresholds:
     y_true = y_true.astype(np.int32, copy=False)
     y_score = y_score.astype(np.float32, copy=False)
 
-    finite = np.isfinite(y_score)
+    finite = np.isfinite(y_score) & (y_score > -1e5)
     if not finite.any():
         return {"fmax": 0.0, "aupr": 0.0, "best_threshold": 0.0, "precision": 0.0, "recall": 0.0}
 
@@ -314,36 +325,51 @@ def evaluate_reranker(
     all_logits: List[np.ndarray] = []
     all_cols: List[np.ndarray] = []
     all_true: List[np.ndarray] = []
+    all_valid: List[np.ndarray] = []
 
     for batch in tqdm(loader, desc="eval", leave=False):
         batch = move_batch(batch, device)
+
         logits = model(
             protein_z=batch["protein_z"],
             go_z=batch["go_z"],
             retriever_score=batch["retriever_score"],
             rank_feature=batch["rank_feature"],
         )
+
+        logits_np = logits.detach().cpu().float().numpy()
+        cols_np = batch["top_cols"].detach().cpu().numpy()
+
         if "valid_mask" in batch:
-            valid = batch["valid_mask"].bool()
-            logits = logits.masked_fill(~valid, -1e6)
-        all_logits.append(logits.detach().cpu().float().numpy())
-        all_cols.append(batch["top_cols"].detach().cpu().numpy())
+            valid_np = batch["valid_mask"].detach().cpu().numpy().astype(bool)
+        else:
+            valid_np = np.ones_like(logits_np, dtype=bool)
+
+        all_logits.append(logits_np)
+        all_cols.append(cols_np)
+        all_valid.append(valid_np)
+
         if "true_go_ids" not in batch:
-            raise RuntimeError(
-                "Batch is missing true_go_ids. "
-                "Check that true_go_ids.npy exists in the dump directory and "
-                "collate_candidate_batch includes 'true_go_ids'."
-            )
+            raise RuntimeError("Batch is missing true_go_ids.")
 
         all_true.append(batch["true_go_ids"].detach().cpu().numpy())
 
     cand_logits = np.concatenate(all_logits, axis=0).astype(np.float32)
     top_cols = np.concatenate(all_cols, axis=0).astype(np.int64)
+    valid_mask = np.concatenate(all_valid, axis=0).astype(bool)
     true_ids = np.concatenate(all_true, axis=0).astype(np.int64)
 
     N = cand_logits.shape[0]
     G = dataset.n_go
-    fill_value = float(np.nanmin(cand_logits) - non_candidate_margin)
+
+    valid_scores = cand_logits[np.isfinite(cand_logits) & valid_mask]
+    if valid_scores.size == 0:
+        raise RuntimeError("No valid candidate scores found during evaluation.")
+
+    fill_value = float(valid_scores.min() - non_candidate_margin)
+
+    # Invalid/filler candidates get the same low score as non-candidates.
+    cand_logits = np.where(valid_mask & np.isfinite(cand_logits), cand_logits, fill_value)
 
     y_score = np.full((N, G), fill_value, dtype=np.float32)
     y_true = np.zeros((N, G), dtype=np.int8)
@@ -365,12 +391,21 @@ def evaluate_reranker(
 
     metrics = compute_fmax_and_aupr(y_true, y_score)
 
-    # Candidate-label diagnostics on the selected K.
     labels = np.asarray(dataset.top_labels[:, : dataset.topk], dtype=np.int8)
+
+    if getattr(dataset, "top_valid", None) is not None:
+        valid_diag = np.asarray(dataset.top_valid[:, : dataset.topk], dtype=np.int8)
+    else:
+        valid_diag = np.ones_like(labels, dtype=np.int8)
+
     true_counts = (np.asarray(dataset.true_go_ids) >= 0).sum(axis=1).clip(min=1)
-    hits = labels.sum(axis=1)
+    hits = (labels * valid_diag).sum(axis=1)
+
     coverage = float(np.mean(hits / true_counts))
-    oracle_micro_f = float((2.0 * hits.sum()) / max(1e-12, 2.0 * hits.sum() + (true_counts - hits).sum()))
+    oracle_micro_f = float(
+        (2.0 * hits.sum())
+        / max(1e-12, 2.0 * hits.sum() + (true_counts - hits).sum())
+    )
 
     metrics.update({
         "candidate_coverage": coverage,
