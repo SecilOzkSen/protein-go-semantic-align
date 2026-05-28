@@ -1,0 +1,32 @@
+p3a_reranker:
+  train_dump: /workspace/candidate_dumps/P3a_train_top1000
+  val_dump: /workspace/candidate_dumps/P3a_val_top1000
+  test_dump: null
+  out_dir: /workspace/reranker_outputs/P3a_top1000_branch_pairwise_interaction_mlp
+
+  go_basic_json: /workspace/data/go_vocab.json
+
+  topk: 1000
+  model_kind: branch_pairwise_interaction_mlp
+  hidden_dim: 512
+  dropout: 0.10
+
+  batch_size: 8
+  num_workers: 0
+  lr: 0.0001
+  weight_decay: 0.0001
+  epochs: 10
+  patience: 2
+  grad_clip: 1.0
+  pos_weight_max: 50.0
+
+  # Key upgrade over plain BCE reranker.
+  lambda_pair: 0.25
+  hard_neg_k: 64
+
+  # More stable Fmax sweep.
+  n_thresholds: 501
+
+  # Try monitor: branch_calibrated_fmax if global fmax under-selects a strong branch.
+  monitor: fmax
+  device: cuda:0
