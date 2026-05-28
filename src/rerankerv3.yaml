@@ -6,7 +6,7 @@ p3a_reranker:
 
   go_basic_json: /workspace/data/go_vocab.json
 
-  topk: 1000
+  topk: 500
   model_kind: branch_pairwise_interaction_mlp
   hidden_dim: 512
   dropout: 0.10
@@ -21,8 +21,8 @@ p3a_reranker:
   pos_weight_max: 50.0
 
   # Key upgrade over plain BCE reranker.
-  lambda_pair: 0.25
-  hard_neg_k: 64
+  lambda_pair: 0.10 #0.25
+  hard_neg_k: 32
 
   # More stable Fmax sweep.
   n_thresholds: 501
