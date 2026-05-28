@@ -38,7 +38,7 @@ def main():
     cfg_path = Path(args.config)
     if not cfg_path.exists():
         cfg_path = Path(__file__).resolve().parent / "rerankerv3.yaml"
-        raise FileNotFoundError(f"Config not found: {cfg_path}")
+        #raise FileNotFoundError(f"Config not found: {cfg_path}")
     print(f"[main] loading config: {cfg_path}")
     data = _load_yaml(cfg_path)
     cfg = P3aRerankerConfig(**_filter_dataclass_kwargs(P3aRerankerConfig, data))
