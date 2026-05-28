@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 import yaml
 
-from src.training.reranker_trainer_p3a import P3aRerankerConfig, P3aRerankerTrainer
+from src.training.reranker_trainerv3 import P3aRerankerConfig, P3aRerankerTrainer
 
 
 def _load_yaml(path: str | Path) -> Dict[str, Any]:

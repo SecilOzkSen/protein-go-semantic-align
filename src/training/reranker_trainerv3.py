@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
 from src.metrics.cafa import compute_term_aupr
-from src.models.reranker_model_p3a import BranchAwareInteractionMLP, BranchAwareScoreOnlyReranker
+from src.models.reranker_model_v3 import BranchAwareInteractionMLP, BranchAwareScoreOnlyReranker
 
 
 # -----------------------------
