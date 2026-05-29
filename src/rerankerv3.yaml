@@ -6,7 +6,7 @@ p3a_semexp_reranker:
 
   go_basic_json: /workspace/data/go_vocab.json
 
-  topk: 1000
+  topk: 500
   model_kind: semexp_interaction_mlp
   hidden_dim: 512
   dropout: 0.10

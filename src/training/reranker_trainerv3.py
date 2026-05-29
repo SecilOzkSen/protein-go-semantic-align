@@ -559,6 +559,9 @@ def evaluate_reranker(
 # -----------------------------
 
 def pairwise_ranking_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Tensor, hard_neg_k: int = 64) -> torch.Tensor:
+    if hard_neg_k is None or int(hard_neg_k) <= 0:
+        return logits.sum() * 0.0
+
     losses: List[torch.Tensor] = []
     B = logits.size(0)
     for i in range(B):
@@ -567,14 +570,27 @@ def pairwise_ranking_loss(logits: torch.Tensor, labels: torch.Tensor, valid: tor
         neg = logits[i][v & (labels[i] <= 0.5)]
         if pos.numel() == 0 or neg.numel() == 0:
             continue
-        if neg.numel() > hard_neg_k:
-            neg = torch.topk(neg, k=int(hard_neg_k), largest=True).values
+
+        k = min(int(hard_neg_k), int(neg.numel()))
+        if k <= 0:
+            continue
+
+        neg = torch.topk(neg, k=k, largest=True).values
+
         diff = pos.unsqueeze(1) - neg.unsqueeze(0)
+        if diff.numel() == 0:
+            continue
+
         losses.append(F.softplus(-diff).mean())
+
     if not losses:
         return logits.sum() * 0.0
-    return torch.stack(losses).mean()
 
+    out = torch.stack(losses).mean()
+    if not torch.isfinite(out):
+        return logits.sum() * 0.0
+
+    return out
 
 def train_one_epoch(
     model: nn.Module,
@@ -592,6 +608,8 @@ def train_one_epoch(
     total_pair = 0.0
     total_valid = 0.0
 
+    use_pair = (float(lambda_pair) > 0.0) and (int(hard_neg_k) > 0)
+
     for batch in tqdm(loader, desc="train", leave=False):
         batch = move_batch(batch, device)
         logits = model(
@@ -607,7 +625,22 @@ def train_one_epoch(
 
         bce_mat = criterion(logits, labels)
         bce = (bce_mat * valid).sum() / valid.sum().clamp_min(1.0)
-        pair = pairwise_ranking_loss(logits, labels, valid, hard_neg_k=hard_neg_k)
+
+        use_pair = (float(lambda_pair) > 0.0) and (int(hard_neg_k) > 0)
+
+        if use_pair:
+            pair = pairwise_ranking_loss(
+                logits,
+                labels,
+                valid,
+                hard_neg_k=hard_neg_k,
+            )
+
+            if not torch.isfinite(pair):
+                pair = logits.sum() * 0.0
+        else:
+            pair = logits.sum() * 0.0
+
         loss = bce + float(lambda_pair) * pair
 
         optimizer.zero_grad(set_to_none=True)
