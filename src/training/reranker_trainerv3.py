@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -11,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 
 from src.metrics.cafa import compute_term_aupr
-from src.models.reranker_model_v3 import BranchAwareInteractionMLP, BranchAwareScoreOnlyReranker
+from src.models.reranker_model_v3 import SemExpInteractionMLP, SemExpScoreOnlyReranker
 
 
 # -----------------------------
@@ -172,7 +174,7 @@ def build_go_meta_bank(
 # Dataset
 # -----------------------------
 
-class P3aCandidateDataset(Dataset):
+class P3aSemExpCandidateDataset(Dataset):
     def __init__(
         self,
         dump_dir: str | Path,
@@ -181,6 +183,7 @@ class P3aCandidateDataset(Dataset):
         score_std: float,
         go_meta_bank: np.ndarray,
         ns_id_bank: np.ndarray,
+        semexp_stats: Dict[str, float],
     ):
         self.dump_dir = Path(dump_dir)
         self.topk = int(topk)
@@ -197,6 +200,18 @@ class P3aCandidateDataset(Dataset):
 
         valid_path = self.dump_dir / "top_valid.int8.npy"
         self.top_valid = np.load(valid_path, mmap_mode="r") if valid_path.exists() else None
+
+        self.semexp_stats = semexp_stats or {"seed_score_mean": 0.0, "seed_score_std": 1.0}
+        arr_shape = self.top_scores.shape
+        self.direct_p3a = _load_optional_matrix(self.dump_dir, "direct_p3a.int8.npy", arr_shape, np.int8, 1)
+        self.parent_expansion = _load_optional_matrix(self.dump_dir, "parent_expansion.int8.npy", arr_shape, np.int8, 0)
+        self.child_expansion = _load_optional_matrix(self.dump_dir, "child_expansion.int8.npy", arr_shape, np.int8, 0)
+        self.sibling_expansion = _load_optional_matrix(self.dump_dir, "sibling_expansion.int8.npy", arr_shape, np.int8, 0)
+        self.text_neighbor_expansion = _load_optional_matrix(self.dump_dir, "text_neighbor_expansion.int8.npy", arr_shape, np.int8, 0)
+        self.seed_score = _load_optional_matrix(self.dump_dir, "seed_score.float32.npy", arr_shape, np.float32, 0.0)
+        self.seed_rank = _load_optional_matrix(self.dump_dir, "seed_rank.int32.npy", arr_shape, np.int32, -1)
+        self.relation_distance = _load_optional_matrix(self.dump_dir, "relation_distance.int16.npy", arr_shape, np.int16, -1)
+        self.text_neighbor_sim = _load_optional_matrix(self.dump_dir, "text_neighbor_sim.float32.npy", arr_shape, np.float32, 0.0)
 
         pids_path = self.dump_dir / "protein_ids.json"
         if pids_path.exists():
@@ -239,6 +254,34 @@ class P3aCandidateDataset(Dataset):
         scores = (scores - self.score_mean) / max(self.score_std, 1e-6)
         scores = np.where(valid > 0, scores, 0.0).astype(np.float32)
 
+        direct = np.asarray(self.direct_p3a[idx, : self.topk], dtype=np.float32) * valid
+        parent = np.asarray(self.parent_expansion[idx, : self.topk], dtype=np.float32) * valid
+        child = np.asarray(self.child_expansion[idx, : self.topk], dtype=np.float32) * valid
+        sibling = np.asarray(self.sibling_expansion[idx, : self.topk], dtype=np.float32) * valid
+        text_flag = np.asarray(self.text_neighbor_expansion[idx, : self.topk], dtype=np.float32) * valid
+        expanded = np.where((valid > 0) & (direct <= 0), 1.0, 0.0).astype(np.float32)
+
+        seed_score = np.asarray(self.seed_score[idx, : self.topk], dtype=np.float32)
+        seed_score = (seed_score - self.semexp_stats["seed_score_mean"]) / max(self.semexp_stats["seed_score_std"], 1e-6)
+        seed_score = np.where(valid > 0, seed_score, 0.0).astype(np.float32)
+
+        seed_rank = np.asarray(self.seed_rank[idx, : self.topk], dtype=np.float32)
+        seed_rank = np.where(seed_rank >= 0, seed_rank, float(self.topk))
+        seed_rank_feat = (np.log1p(seed_rank + 1.0) / np.log1p(float(self.topk + 1))).astype(np.float32)
+        seed_rank_feat = np.where(valid > 0, seed_rank_feat, 0.0).astype(np.float32)
+
+        rel_dist = np.asarray(self.relation_distance[idx, : self.topk], dtype=np.float32)
+        rel_dist = np.where(rel_dist >= 0, np.minimum(rel_dist, 5.0) / 5.0, 0.0).astype(np.float32)
+        rel_dist = np.where(valid > 0, rel_dist, 0.0).astype(np.float32)
+
+        text_sim = np.asarray(self.text_neighbor_sim[idx, : self.topk], dtype=np.float32)
+        text_sim = np.where(valid > 0, text_sim, 0.0).astype(np.float32)
+
+        semexp_feat = np.stack(
+            [direct, parent, child, sibling, text_flag, expanded, seed_score, seed_rank_feat, rel_dist, text_sim],
+            axis=-1,
+        ).astype(np.float32)
+
         item = {
             "protein_id": str(self.protein_ids[idx]),
             "protein_z": torch.from_numpy(np.asarray(self.protein_z[idx], dtype=np.float32).copy()),
@@ -246,6 +289,7 @@ class P3aCandidateDataset(Dataset):
             "retriever_score": torch.from_numpy(scores.copy()),
             "rank_feature": torch.from_numpy(self.rank_feature.copy()),
             "go_meta": torch.from_numpy(self.go_meta_bank[cols].copy()),
+            "semexp_feat": torch.from_numpy(semexp_feat.copy()),
             "label": torch.from_numpy(labels.copy()),
             "valid_mask": torch.from_numpy(valid.copy()),
             "top_cols": torch.from_numpy(cols.copy()),
@@ -275,6 +319,43 @@ def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int
     return float(vals.mean()), float(vals.std() + 1e-6)
 
 
+
+def _load_optional_matrix(dump_dir: Path, filename: str, shape: Tuple[int, int], dtype: Any, fill: float = 0.0) -> np.ndarray:
+    path = dump_dir / filename
+    if path.exists():
+        return np.load(path, mmap_mode="r")
+    # Returned arrays are only used through row slices. A dense fallback is okay for non-SemExp dumps.
+    return np.full(shape, fill, dtype=dtype)
+
+
+def estimate_semexp_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int] = None) -> Dict[str, float]:
+    """Stats for semantic-expansion seed scores, computed over valid candidates."""
+    dump_dir = Path(dump_dir)
+    scores = np.load(dump_dir / "top_scores.float32.npy", mmap_mode="r")
+    n = scores.shape[0] if max_rows is None else min(int(max_rows), scores.shape[0])
+    shape = (n, int(topk))
+
+    valid_path = dump_dir / "top_valid.int8.npy"
+    if valid_path.exists():
+        valid = np.asarray(np.load(valid_path, mmap_mode="r")[:n, :topk], dtype=bool)
+    else:
+        valid = np.ones(shape, dtype=bool)
+
+    seed_score_path = dump_dir / "seed_score.float32.npy"
+    if seed_score_path.exists():
+        seed = np.asarray(np.load(seed_score_path, mmap_mode="r")[:n, :topk], dtype=np.float32)
+        mask = valid & np.isfinite(seed) & (seed > -1e5)
+        if mask.any():
+            vals = seed[mask]
+            seed_mean = float(vals.mean())
+            seed_std = float(vals.std() + 1e-6)
+        else:
+            seed_mean, seed_std = 0.0, 1.0
+    else:
+        seed_mean, seed_std = 0.0, 1.0
+
+    return {"seed_score_mean": seed_mean, "seed_score_std": seed_std}
+
 def estimate_pos_weight(dump_dir: str | Path, topk: int, max_value: float = 50.0) -> float:
     dump_dir = Path(dump_dir)
     labels = np.load(dump_dir / "top_labels.int8.npy", mmap_mode="r")[:, :topk]
@@ -295,7 +376,7 @@ def estimate_pos_weight(dump_dir: str | Path, topk: int, max_value: float = 50.0
 def collate_candidate_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"protein_id": [x["protein_id"] for x in items]}
     tensor_keys = [
-        "protein_z", "go_z", "retriever_score", "rank_feature", "go_meta", "label",
+        "protein_z", "go_z", "retriever_score", "rank_feature", "go_meta", "semexp_feat", "label",
         "valid_mask", "top_cols", "top_ids", "true_go_ids", "ns_id",
     ]
     for k in tensor_keys:
@@ -314,10 +395,10 @@ def move_batch(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
 
 
 def build_model(kind: str, dim: int, hidden_dim: int, dropout: float) -> nn.Module:
-    if kind == "branch_pairwise_interaction_mlp":
-        return BranchAwareInteractionMLP(dim=dim, hidden_dim=hidden_dim, dropout=dropout)
-    if kind == "branch_score_only":
-        return BranchAwareScoreOnlyReranker(hidden_dim=max(32, hidden_dim // 4), dropout=dropout)
+    if kind in {"semexp_interaction_mlp", "branch_pairwise_interaction_mlp"}:
+        return SemExpInteractionMLP(dim=dim, hidden_dim=hidden_dim, dropout=dropout)
+    if kind in {"semexp_score_only", "branch_score_only"}:
+        return SemExpScoreOnlyReranker(hidden_dim=max(32, hidden_dim // 4), dropout=dropout)
     raise ValueError(f"Unknown model_kind: {kind}")
 
 
@@ -385,7 +466,7 @@ def branch_calibrated_fmax(
 def evaluate_reranker(
     model: nn.Module,
     loader: DataLoader,
-    dataset: P3aCandidateDataset,
+    dataset: P3aSemExpCandidateDataset,
     device: torch.device,
     ns_id_bank: np.ndarray,
     n_thresholds: int = 501,
@@ -405,6 +486,7 @@ def evaluate_reranker(
             retriever_score=batch["retriever_score"],
             rank_feature=batch["rank_feature"],
             go_meta=batch["go_meta"],
+            semexp_feat=batch["semexp_feat"],
         )
         all_logits.append(logits.detach().cpu().float().numpy())
         all_cols.append(batch["top_cols"].detach().cpu().numpy())
@@ -518,6 +600,7 @@ def train_one_epoch(
             retriever_score=batch["retriever_score"],
             rank_feature=batch["rank_feature"],
             go_meta=batch["go_meta"],
+            semexp_feat=batch["semexp_feat"],
         )
         labels = batch["label"].float()
         valid = batch["valid_mask"].float()
@@ -544,14 +627,14 @@ def train_one_epoch(
 
 
 @dataclass
-class P3aRerankerConfig:
+class P3aSemExpRerankerConfig:
     train_dump: str
     val_dump: str
     test_dump: Optional[str]
     out_dir: str
     go_basic_json: str = "/workspace/data/go_vocab.json"
     topk: int = 1000
-    model_kind: str = "branch_pairwise_interaction_mlp"
+    model_kind: str = "semexp_interaction_mlp"
     hidden_dim: int = 512
     dropout: float = 0.10
     batch_size: int = 8
@@ -569,14 +652,15 @@ class P3aRerankerConfig:
     device: str = "cuda:0"
 
 
-class P3aRerankerTrainer:
-    def __init__(self, cfg: P3aRerankerConfig):
+class P3aSemExpRerankerTrainer:
+    def __init__(self, cfg: P3aSemExpRerankerConfig):
         self.cfg = cfg
         self.out_dir = Path(cfg.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
         self.score_mean, self.score_std = estimate_score_stats(cfg.train_dump, cfg.topk)
+        self.semexp_stats = estimate_semexp_stats(cfg.train_dump, cfg.topk)
         eval_go_ids = np.load(Path(cfg.train_dump) / "eval_go_ids.npy", mmap_mode="r").astype(np.int64)
         self.go_meta_bank, self.ns_id_bank, self.meta_stats = build_go_meta_bank(
             eval_go_ids=eval_go_ids,
@@ -584,9 +668,9 @@ class P3aRerankerTrainer:
             go_basic_json=cfg.go_basic_json,
         )
 
-        self.train_ds = P3aCandidateDataset(cfg.train_dump, cfg.topk, self.score_mean, self.score_std, self.go_meta_bank, self.ns_id_bank)
-        self.val_ds = P3aCandidateDataset(cfg.val_dump, cfg.topk, self.score_mean, self.score_std, self.go_meta_bank, self.ns_id_bank)
-        self.test_ds = P3aCandidateDataset(cfg.test_dump, cfg.topk, self.score_mean, self.score_std, self.go_meta_bank, self.ns_id_bank) if cfg.test_dump else None
+        self.train_ds = P3aSemExpCandidateDataset(cfg.train_dump, cfg.topk, self.score_mean, self.score_std, self.go_meta_bank, self.ns_id_bank, self.semexp_stats)
+        self.val_ds = P3aSemExpCandidateDataset(cfg.val_dump, cfg.topk, self.score_mean, self.score_std, self.go_meta_bank, self.ns_id_bank, self.semexp_stats)
+        self.test_ds = P3aSemExpCandidateDataset(cfg.test_dump, cfg.topk, self.score_mean, self.score_std, self.go_meta_bank, self.ns_id_bank, self.semexp_stats) if cfg.test_dump else None
 
         self.train_loader = DataLoader(
             self.train_ds,
@@ -626,7 +710,7 @@ class P3aRerankerTrainer:
         self.history: List[Dict[str, float]] = []
 
         cfg_dump = asdict(cfg)
-        cfg_dump.update({"score_mean": self.score_mean, "score_std": self.score_std, "pos_weight": self.pos_weight, "meta_stats": self.meta_stats})
+        cfg_dump.update({"score_mean": self.score_mean, "score_std": self.score_std, "pos_weight": self.pos_weight, "meta_stats": self.meta_stats, "semexp_stats": self.semexp_stats})
         with (self.out_dir / "config.json").open("w", encoding="utf-8") as f:
             json.dump(cfg_dump, f, indent=2)
 
@@ -641,17 +725,19 @@ class P3aRerankerTrainer:
                 "score_std": self.score_std,
                 "pos_weight": self.pos_weight,
                 "meta_stats": self.meta_stats,
+                "semexp_stats": self.semexp_stats,
                 "config": asdict(self.cfg),
             },
             path,
         )
 
     def fit(self):
-        print(f"[p3a-reranker] device={self.device}")
-        print(f"[p3a-reranker] model={self.cfg.model_kind} topk={self.cfg.topk}")
-        print(f"[p3a-reranker] score_mean={self.score_mean:.4f} score_std={self.score_std:.4f} pos_weight={self.pos_weight:.2f}")
-        print(f"[p3a-reranker] lambda_pair={self.cfg.lambda_pair} hard_neg_k={self.cfg.hard_neg_k}")
-        print(f"[p3a-reranker] meta_stats={self.meta_stats}")
+        print(f"[p3a-semexp-reranker] device={self.device}")
+        print(f"[p3a-semexp-reranker] model={self.cfg.model_kind} topk={self.cfg.topk}")
+        print(f"[p3a-semexp-reranker] score_mean={self.score_mean:.4f} score_std={self.score_std:.4f} pos_weight={self.pos_weight:.2f}")
+        print(f"[p3a-semexp-reranker] lambda_pair={self.cfg.lambda_pair} hard_neg_k={self.cfg.hard_neg_k}")
+        print(f"[p3a-semexp-reranker] meta_stats={self.meta_stats}")
+        print(f"[p3a-semexp-reranker] semexp_stats={self.semexp_stats}")
 
         for epoch in range(self.cfg.epochs):
             train_metrics = train_one_epoch(
@@ -697,11 +783,11 @@ class P3aRerankerTrainer:
                 self.best_epoch = epoch
                 self.bad_epochs = 0
                 self.save_checkpoint(self.out_dir / "best.pt", epoch, val_metrics)
-                print(f"[p3a-reranker] new best {self.cfg.monitor}={monitor_value:.4f} at epoch={epoch}")
+                print(f"[p3a-semexp-reranker] new best {self.cfg.monitor}={monitor_value:.4f} at epoch={epoch}")
             else:
                 self.bad_epochs += 1
                 if self.bad_epochs >= self.cfg.patience:
-                    print(f"[p3a-reranker] early stop at epoch={epoch}, best_epoch={self.best_epoch}")
+                    print(f"[p3a-semexp-reranker] early stop at epoch={epoch}, best_epoch={self.best_epoch}")
                     break
 
             with (self.out_dir / "history.json").open("w", encoding="utf-8") as f:

@@ -7,17 +7,16 @@ from typing import Any, Dict
 
 import yaml
 
-from src.training.reranker_trainerv3 import P3aRerankerConfig, P3aRerankerTrainer
+from src.training.reranker_trainerv3 import P3aSemExpRerankerConfig, P3aSemExpRerankerTrainer
 
 
 def _load_yaml(path: str | Path) -> Dict[str, Any]:
     with Path(path).open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    # Accept either flat yaml or {p3a_reranker: {...}}.
-    if "p3a_reranker" in data and isinstance(data["p3a_reranker"], dict):
-        data = data["p3a_reranker"]
-    if "reranker" in data and isinstance(data["reranker"], dict):
-        data = data["reranker"]
+    # Accept flat yaml or nested keys.
+    for key in ["p3a_semexp_reranker", "p3a_reranker", "reranker"]:
+        if key in data and isinstance(data[key], dict):
+            return data[key]
     return data
 
 
@@ -27,8 +26,8 @@ def _filter_dataclass_kwargs(cls, data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Train P3a branch-aware pairwise candidate reranker.")
-    default_cfg = Path(__file__).resolve().parent / "reranker_p3a.yaml"
+    p = argparse.ArgumentParser("Train P3a semantic-expansion reranker.")
+    default_cfg = Path(__file__).resolve().parent / "reranker_p3a_semexp.yaml"
     p.add_argument("--config", type=str, default=str(default_cfg))
     return p.parse_args()
 
@@ -37,12 +36,11 @@ def main():
     args = parse_args()
     cfg_path = Path(args.config)
     if not cfg_path.exists():
-        cfg_path = Path(__file__).resolve().parent / "rerankerv3.yaml"
-        #raise FileNotFoundError(f"Config not found: {cfg_path}")
+        raise FileNotFoundError(f"Config not found: {cfg_path}")
     print(f"[main] loading config: {cfg_path}")
     data = _load_yaml(cfg_path)
-    cfg = P3aRerankerConfig(**_filter_dataclass_kwargs(P3aRerankerConfig, data))
-    trainer = P3aRerankerTrainer(cfg)
+    cfg = P3aSemExpRerankerConfig(**_filter_dataclass_kwargs(P3aSemExpRerankerConfig, data))
+    trainer = P3aSemExpRerankerTrainer(cfg)
     trainer.fit()
 
 
