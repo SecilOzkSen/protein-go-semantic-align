@@ -27,7 +27,7 @@ def _filter_dataclass_kwargs(cls, data: Dict[str, Any]) -> Dict[str, Any]:
 
 def parse_args():
     p = argparse.ArgumentParser("Train P3a semantic-expansion reranker.")
-    default_cfg = Path(__file__).resolve().parent / "reranker_p3a_semexp.yaml"
+    default_cfg = Path(__file__).resolve().parent / "rerankerv3.yaml"
     p.add_argument("--config", type=str, default=str(default_cfg))
     return p.parse_args()
 
