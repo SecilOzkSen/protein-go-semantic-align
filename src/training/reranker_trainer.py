@@ -28,6 +28,7 @@ class RerankerTrainer:
         lambda_dag: float = 0.1,
         dag_margin: float = 0.0,
         grad_clip_norm: Optional[float] = None,
+        pos_weight: float = 20.0,
     ):
         self.model = model.to(device)
         self.device = torch.device(device)
@@ -45,7 +46,8 @@ class RerankerTrainer:
             weight_decay=float(weight_decay),
         )
 
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.pos_weight = torch.tensor(float(pos_weight), device=self.device)
+        self.bce = nn.BCEWithLogitsLoss(reduction="none", pos_weight=self.pos_weight)
 
         self.global_step = 0
 
@@ -115,6 +117,8 @@ class RerankerTrainer:
         labels = batch["labels"]                    # [B,K]
         cand_valid = batch["cand_valid"]            # [B,K] bool
         K = int(batch["K"].item())
+        retriever_score = batch.get("retriever_score", None)
+        rank_feature = batch.get("rank_feature", None)
 
         dag_parent_mask = batch.get("dag_parent_mask", None)  # [B,K,K], optional
 
@@ -127,6 +131,8 @@ class RerankerTrainer:
                 go_input_ids=go_input_ids,
                 go_attention_mask=go_attention_mask,
                 K=K,
+                retriever_score=retriever_score,
+                rank_feature=rank_feature,
                 return_alpha=False,
             )                                       # [B,K]
 
@@ -181,6 +187,8 @@ class RerankerTrainer:
         labels = batch["labels"]
         cand_valid = batch["cand_valid"]
         K = int(batch["K"].item())
+        retriever_score = batch.get("retriever_score", None)
+        rank_feature = batch.get("rank_feature", None)
 
         dag_parent_mask = batch.get("dag_parent_mask", None)
 
@@ -190,6 +198,8 @@ class RerankerTrainer:
             go_input_ids=go_input_ids,
             go_attention_mask=go_attention_mask,
             K=K,
+            retriever_score=retriever_score,
+            rank_feature=rank_feature,
             return_alpha=False,
         )  # [B,K]
 

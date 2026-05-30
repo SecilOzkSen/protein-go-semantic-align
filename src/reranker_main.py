@@ -19,7 +19,7 @@ from src.encoders.go_encoder import BioMedBERTEncoder, LoRAParameters
 
 # Reranker
 from src.training.reranker_trainer import RerankerTrainer
-from src.models.reranker_model import RerankerMeanPoolConcatMLP
+from src.models.reranker_model import RerankerMeanPoolConcatMLP, ResidueGoCrossAttentionReranker
 from src.datasets.go_text_store import GoTextStore
 
 # dataset + collator
@@ -171,10 +171,11 @@ def retriever_topk_ids_chunked(
     topk: int,
     device: torch.device,
     chunk_k: int = 2048,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Returns:
       cand_ids: [B,K] global GO ids on CPU
+      cand_scores: [B,K] retriever scores on CPU, aligned with cand_ids
     """
     B = H.size(0)
     eval_ids_t = torch.as_tensor(eval_go_ids, dtype=torch.long)
@@ -208,7 +209,7 @@ def retriever_topk_ids_chunked(
         best_scores, best_idx = new_scores, new_idx
 
     cand_ids = eval_ids_t.index_select(0, best_idx.reshape(-1).cpu()).view(B, K)
-    return cand_ids
+    return cand_ids, best_scores.detach().cpu()
 
 
 # -----------------------------
@@ -459,6 +460,13 @@ def tokenize_candidates_flat(
     toks = go_text_store.batch(flat)
     return toks
 
+def make_rank_feature(B: int, K: int, device: torch.device) -> torch.Tensor:
+    """Log-normalized 1-based rank feature, shape [B,K]."""
+    r = torch.arange(1, K + 1, dtype=torch.float32, device=device)
+    r = torch.log1p(r) / torch.log1p(torch.tensor(float(K), dtype=torch.float32, device=device))
+    return r.unsqueeze(0).expand(B, K).contiguous()
+
+
 
 # -----------------------------
 # Eval
@@ -505,7 +513,7 @@ def evaluate_reranker(
         vm = valid_mask_from_attn(vbatch["prot_attn_mask"].to(device, non_blocking=True))
         pos2 = vbatch["pos_go_global"]
 
-        cand2 = retriever_topk_ids_chunked(
+        cand2, cand_scores2 = retriever_topk_ids_chunked(
             retriever=retriever,
             H=H2,
             valid_mask=vm,
@@ -514,7 +522,7 @@ def evaluate_reranker(
             topk=int(topk),
             device=device,
             chunk_k=2048,
-        )  # [B,K] CPU
+        )  # [B,K] CPU, [B,K] CPU
 
         toks2 = tokenize_candidates_flat(go_text_store, cand2)
         go_input_ids = toks2["input_ids"].to(device, non_blocking=True)
@@ -537,6 +545,8 @@ def evaluate_reranker(
             labels=lab2.to(device, non_blocking=True),
             cand_valid=cand_valid,
             dag_parent_mask=dag_parent_mask2.to(device, non_blocking=True),
+            retriever_score=cand_scores2.to(device, non_blocking=True),
+            rank_feature=make_rank_feature(B2, K2, device),
             K=torch.tensor(K2, dtype=torch.long, device=device),
         )
 
@@ -554,6 +564,8 @@ def evaluate_reranker(
             valid_mask=vm,
             go_input_ids=go_input_ids,
             go_attention_mask=go_attention_mask,
+            retriever_score=cand_scores2.to(device, non_blocking=True),
+            rank_feature=make_rank_feature(B2, K2, device),
         ).detach().float().cpu()  # [B,K]
 
         sc_np = logits.numpy()
@@ -710,6 +722,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
 
     args = types.SimpleNamespace(
         # model
+        model_kind=str(model.get("model_kind", "meanpool_mlp")),
         text_model_name=model.get(
             "text_model_name",
             "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
@@ -724,6 +737,12 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         go_align_attn_dim=model.get("go_align_attn_dim", None),
         go_align_dropout=float(model.get("go_align_dropout", 0.1)),
         use_go_residual=bool(model.get("use_go_residual", True)),
+        cross_dim=int(model.get("cross_dim", 256)),
+        cross_heads=int(model.get("cross_heads", 4)),
+        cross_dropout=float(model.get("cross_dropout", 0.1)),
+        candidate_chunk_size=int(model.get("candidate_chunk_size", 16)),
+        use_retriever_features=bool(model.get("use_retriever_features", True)),
+        use_cls_residual=bool(model.get("use_cls_residual", True)),
 
         # training
         retriever_ckpt=str(training.get("retriever_ckpt", "")),
@@ -742,6 +761,8 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         lambda_dag=float(training.get("lambda_dag", 0.1)),
         dag_margin=float(training.get("dag_margin", 0.0)),
         grad_clip_norm=training.get("grad_clip_norm", None),
+        pos_weight=float(training.get("pos_weight", 20.0)),
+        inject_true_positives=int(training.get("inject_true_positives", 0)),
 
         # stores
         train_ids_path=Path(stores.get("train_ids_path", "")),
@@ -884,19 +905,36 @@ def main(phase_id: int = -2):
 
     train_loader, val_loader = build_reranker_dataloaders(datasets=datasets, args=args, eval_go_ids=eval_go_ids, go_text_store=go_text_store)
 
-    reranker_model = RerankerMeanPoolConcatMLP(
-        text_model_name=args.text_model_name,
-        d_h=args.protein_dim,
-        hidden_dim=args.reranker_hidden_dim,
-        freeze_text_encoder=args.freeze_text_encoder,
-        dropout=args.reranker_dropout,
-        use_protein_ln=args.use_protein_ln,
-        use_go_ln=args.use_go_ln,
-        use_go_token_align_pooler=args.use_go_token_align_pooler,
-        go_align_attn_dim=args.go_align_attn_dim,
-        go_align_dropout=args.go_align_dropout,
-        use_go_residual=args.use_go_residual,
-    ).to(device)
+    if args.model_kind in {"hiercross", "residue_go_cross_attention", "p3a_hiercross"}:
+        reranker_model = ResidueGoCrossAttentionReranker(
+            text_model_name=args.text_model_name,
+            d_h=args.protein_dim,
+            hidden_dim=args.reranker_hidden_dim,
+            freeze_text_encoder=args.freeze_text_encoder,
+            dropout=args.reranker_dropout,
+            use_protein_ln=args.use_protein_ln,
+            use_go_ln=args.use_go_ln,
+            cross_dim=args.cross_dim,
+            cross_heads=args.cross_heads,
+            cross_dropout=args.cross_dropout,
+            candidate_chunk_size=args.candidate_chunk_size,
+            use_retriever_features=args.use_retriever_features,
+            use_cls_residual=args.use_cls_residual,
+        ).to(device)
+    else:
+        reranker_model = RerankerMeanPoolConcatMLP(
+            text_model_name=args.text_model_name,
+            d_h=args.protein_dim,
+            hidden_dim=args.reranker_hidden_dim,
+            freeze_text_encoder=args.freeze_text_encoder,
+            dropout=args.reranker_dropout,
+            use_protein_ln=args.use_protein_ln,
+            use_go_ln=args.use_go_ln,
+            use_go_token_align_pooler=args.use_go_token_align_pooler,
+            go_align_attn_dim=args.go_align_attn_dim,
+            go_align_dropout=args.go_align_dropout,
+            use_go_residual=args.use_go_residual,
+        ).to(device)
 
     rr_trainer = RerankerTrainer(
         model=reranker_model,
@@ -908,6 +946,7 @@ def main(phase_id: int = -2):
         lambda_dag=args.lambda_dag,
         dag_margin=args.dag_margin,
         grad_clip_norm=args.grad_clip_norm,
+        pos_weight=args.pos_weight,
     )
 
     out_dir = args.out_dir
@@ -925,7 +964,7 @@ def main(phase_id: int = -2):
             valid_mask = valid_mask_from_attn(batch["prot_attn_mask"].to(device, non_blocking=True))
             pos_go_global = batch["pos_go_global"]
 
-            cand_ids = retriever_topk_ids_chunked(
+            cand_ids, cand_scores = retriever_topk_ids_chunked(
                 retriever=retriever,
                 H=H,
                 valid_mask=valid_mask,
@@ -936,12 +975,14 @@ def main(phase_id: int = -2):
                 chunk_k=2048,
             )
 
-            # train-time positive injection
-            cand_ids = inject_true_positives_into_candidates(
-                cand_ids=cand_ids,
-                pos_go_global=pos_go_global,
-                inject_n=3,
-            )
+            # Optional train-time positive injection. Default is 0 for strict direct retrieval.
+            # If you enable this later, retriever scores for injected tail candidates are not exact.
+            if int(args.inject_true_positives) > 0:
+                cand_ids = inject_true_positives_into_candidates(
+                    cand_ids=cand_ids,
+                    pos_go_global=pos_go_global,
+                    inject_n=int(args.inject_true_positives),
+                )
 
             labels = make_labels_for_candidates(cand_ids, pos_go_global)
 
@@ -992,6 +1033,8 @@ def main(phase_id: int = -2):
                 labels=labels.to(device, non_blocking=True),
                 cand_valid=cand_valid,
                 dag_parent_mask=dag_parent_mask.to(device, non_blocking=True),
+                retriever_score=cand_scores.to(device, non_blocking=True),
+                rank_feature=make_rank_feature(B, K, device),
                 K=torch.tensor(K, dtype=torch.long, device=device),
             )
 
