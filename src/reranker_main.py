@@ -30,6 +30,54 @@ from src.main import build_datasets, build_stores, build_go_cache
 
 RETRIEVER_YAML_PATH = SRC_DIR / "reranker.yaml"
 
+class CandidateDumpLookup:
+    def __init__(self, dump_dir: str | Path, topk: int):
+        self.dump_dir = Path(dump_dir)
+        self.topk = int(topk)
+
+        self.eval_go_ids = np.load(self.dump_dir / "eval_go_ids.npy", mmap_mode="r").astype(np.int64)
+        self.top_cols = np.load(self.dump_dir / "top_go_cols.int32.npy", mmap_mode="r")
+        self.top_scores = np.load(self.dump_dir / "top_scores.float32.npy", mmap_mode="r")
+        self.top_labels = np.load(self.dump_dir / "top_labels.int8.npy", mmap_mode="r")
+
+        pids_path = self.dump_dir / "protein_ids.json"
+        with pids_path.open("r", encoding="utf-8") as f:
+            self.protein_ids = [str(x) for x in json.load(f)]
+
+        self.pid_to_row = {pid: i for i, pid in enumerate(self.protein_ids)}
+
+        if self.topk > self.top_cols.shape[1]:
+            raise ValueError(
+                f"Requested topk={self.topk}, but dump has only {self.top_cols.shape[1]}"
+            )
+
+    def get_batch(self, protein_ids: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = []
+        missing = []
+        for pid in protein_ids:
+            pid = str(pid)
+            if pid not in self.pid_to_row:
+                missing.append(pid)
+            else:
+                rows.append(self.pid_to_row[pid])
+
+        if missing:
+            raise KeyError(f"Missing protein IDs in candidate dump: {missing[:10]}")
+
+        rows_np = np.asarray(rows, dtype=np.int64)
+
+        cols = np.asarray(self.top_cols[rows_np, : self.topk], dtype=np.int64)
+        cand_ids = self.eval_go_ids[cols].astype(np.int64)
+
+        scores = np.asarray(self.top_scores[rows_np, : self.topk], dtype=np.float32)
+        labels = np.asarray(self.top_labels[rows_np, : self.topk], dtype=np.float32)
+
+        return (
+            torch.from_numpy(cand_ids.copy()).long(),
+            torch.from_numpy(scores.copy()).float(),
+            torch.from_numpy(labels.copy()).float(),
+        )
+
 # Helpers for checkpoint loading
 # -----------------------------
 def safe_torch_load(path: str, map_location="cpu"):
@@ -483,6 +531,7 @@ def evaluate_reranker(
     device: torch.device,
     topk: int,
     max_batches: int = 0,
+    candidate_lookup: CandidateDumpLookup | None = None,
 ) -> Dict[str, float]:
     rr_trainer.model.eval()
     retriever.eval()
@@ -513,16 +562,20 @@ def evaluate_reranker(
         vm = valid_mask_from_attn(vbatch["prot_attn_mask"].to(device, non_blocking=True))
         pos2 = vbatch["pos_go_global"]
 
-        cand2, cand_scores2 = retriever_topk_ids_chunked(
-            retriever=retriever,
-            H=H2,
-            valid_mask=vm,
-            G_once_cpu=G_once_cpu,
-            eval_go_ids=eval_go_ids,
-            topk=int(topk),
-            device=device,
-            chunk_k=2048,
-        )  # [B,K] CPU, [B,K] CPU
+        if candidate_lookup is not None:
+            cand2, cand_scores2, lab2 = candidate_lookup.get_batch(vbatch["protein_ids"])
+        else:
+            cand2, cand_scores2 = retriever_topk_ids_chunked(
+                retriever=retriever,
+                H=H2,
+                valid_mask=vm,
+                G_once_cpu=G_once_cpu,
+                eval_go_ids=eval_go_ids,
+                topk=int(topk),
+                device=device,
+                chunk_k=2048,
+            )
+            lab2 = make_labels_for_candidates(cand2, pos2)
 
         toks2 = tokenize_candidates_flat(go_text_store, cand2)
         go_input_ids = toks2["input_ids"].to(device, non_blocking=True)
@@ -531,7 +584,6 @@ def evaluate_reranker(
         B2, K2 = cand2.shape
         cand_valid = torch.ones((B2, K2), dtype=torch.bool, device=device)
 
-        lab2 = make_labels_for_candidates(cand2, pos2)  # CPU [B,K]
         dag_parent_mask2 = make_dag_parent_mask_for_candidates(
             cand_ids=cand2,
             go_child_to_parents=go_child_to_parents,
@@ -763,6 +815,9 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         grad_clip_norm=training.get("grad_clip_norm", None),
         pos_weight=float(training.get("pos_weight", 20.0)),
         inject_true_positives=int(training.get("inject_true_positives", 0)),
+        use_candidate_dump=bool(training.get("use_candidate_dump", False)),
+        train_candidate_dump=str(training.get("train_candidate_dump", "")),
+        val_candidate_dump=str(training.get("val_candidate_dump", "")),
 
         # stores
         train_ids_path=Path(stores.get("train_ids_path", "")),
@@ -905,6 +960,16 @@ def main(phase_id: int = -2):
 
     train_loader, val_loader = build_reranker_dataloaders(datasets=datasets, args=args, eval_go_ids=eval_go_ids, go_text_store=go_text_store)
 
+    train_candidate_lookup = None
+    val_candidate_lookup = None
+
+    if getattr(args, "use_candidate_dump", False):
+        train_candidate_lookup = CandidateDumpLookup(args.train_candidate_dump, topk=args.topk)
+        val_candidate_lookup = CandidateDumpLookup(args.val_candidate_dump, topk=args.topk)
+
+        logging.info("[candidate-dump] train=%s", args.train_candidate_dump)
+        logging.info("[candidate-dump] val=%s", args.val_candidate_dump)
+
     if args.model_kind in {"hiercross", "residue_go_cross_attention", "p3a_hiercross"}:
         reranker_model = ResidueGoCrossAttentionReranker(
             text_model_name=args.text_model_name,
@@ -964,27 +1029,29 @@ def main(phase_id: int = -2):
             valid_mask = valid_mask_from_attn(batch["prot_attn_mask"].to(device, non_blocking=True))
             pos_go_global = batch["pos_go_global"]
 
-            cand_ids, cand_scores = retriever_topk_ids_chunked(
-                retriever=retriever,
-                H=H,
-                valid_mask=valid_mask,
-                G_once_cpu=G_once_cpu,
-                eval_go_ids=eval_go_ids,
-                topk=int(args.topk),
-                device=device,
-                chunk_k=2048,
-            )
+            if train_candidate_lookup is not None:
+                cand_ids, cand_scores, labels = train_candidate_lookup.get_batch(batch["protein_ids"])
+            else:
+                cand_ids, cand_scores = retriever_topk_ids_chunked(
+                    retriever=retriever,
+                    H=H,
+                    valid_mask=valid_mask,
+                    G_once_cpu=G_once_cpu,
+                    eval_go_ids=eval_go_ids,
+                    topk=int(args.topk),
+                    device=device,
+                    chunk_k=2048,
+                )
+                labels = make_labels_for_candidates(cand_ids, pos_go_global)
 
             # Optional train-time positive injection. Default is 0 for strict direct retrieval.
             # If you enable this later, retriever scores for injected tail candidates are not exact.
-            if int(args.inject_true_positives) > 0:
+            if train_candidate_lookup is None and int(args.inject_true_positives) > 0:
                 cand_ids = inject_true_positives_into_candidates(
                     cand_ids=cand_ids,
                     pos_go_global=pos_go_global,
                     inject_n=int(args.inject_true_positives),
                 )
-
-            labels = make_labels_for_candidates(cand_ids, pos_go_global)
 
             dag_parent_mask = make_dag_parent_mask_for_candidates(
                 cand_ids=cand_ids,
@@ -1064,6 +1131,7 @@ def main(phase_id: int = -2):
             device=device,
             topk=int(args.topk),
             max_batches=0,
+            candidate_lookup=val_candidate_lookup
         )
 
         logging.info(

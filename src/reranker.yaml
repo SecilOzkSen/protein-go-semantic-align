@@ -54,6 +54,10 @@ training:
   dag_margin: 0.0
   grad_clip_norm: 1.0
 
+  use_candidate_dump: true
+  train_candidate_dump: /workspace/candidate_dumps/P3a_train_top1000
+  val_candidate_dump: /workspace/candidate_dumps/P3a_val_top1000
+
 stores:
   train_ids_path: /workspace/data/splits/train_ids.txt
   pid2pos_path: /workspace/data/pid_to_positives_canonical.json
@@ -66,5 +70,6 @@ stores:
   go_basic_json: /workspace/data/go_vocab.json
   zero_shot_path: /workspace/data/eval/buckets/count_based/go_eval_ids_zeroshot.pkl
   few_shot_path: /workspace/data/eval/buckets/count_based/go_eval_ids_rare_lt20.pkl
+  seq_len_lookup: /workspace/data/seq_len_lookup.pkl
   go_path_seen: /workspace/data/eval/go_eval_ids_seen.pkl
   go_path_observed: /workspace/data/eval/go_eval_ids_observed.pkl
