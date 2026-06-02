@@ -39,6 +39,10 @@ class CandidateDumpLookup:
         self.top_cols = np.load(self.dump_dir / "top_go_cols.int32.npy", mmap_mode="r")
         self.top_scores = np.load(self.dump_dir / "top_scores.float32.npy", mmap_mode="r")
         self.top_labels = np.load(self.dump_dir / "top_labels.int8.npy", mmap_mode="r")
+        self.true_go_ids = np.load(self.dump_dir / "true_go_ids.npy", mmap_mode="r")
+
+        valid_path = self.dump_dir / "top_valid.int8.npy"
+        self.top_valid = np.load(valid_path, mmap_mode="r") if valid_path.exists() else None
 
         pids_path = self.dump_dir / "protein_ids.json"
         with pids_path.open("r", encoding="utf-8") as f:
@@ -51,7 +55,7 @@ class CandidateDumpLookup:
                 f"Requested topk={self.topk}, but dump has only {self.top_cols.shape[1]}"
             )
 
-    def get_batch(self, protein_ids: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_batch(self, protein_ids: List[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = []
         missing = []
         for pid in protein_ids:
@@ -72,13 +76,22 @@ class CandidateDumpLookup:
         scores = np.asarray(self.top_scores[rows_np, : self.topk], dtype=np.float32)
         labels = np.asarray(self.top_labels[rows_np, : self.topk], dtype=np.float32)
 
+        true_ids = np.asarray(self.true_go_ids[rows_np], dtype=np.int64)
+
+        if self.top_valid is not None:
+            valid = np.asarray(self.top_valid[rows_np, : self.topk], dtype=np.int8)
+        else:
+            valid = np.ones_like(labels, dtype=np.int8)
+
         return (
             torch.from_numpy(cand_ids.copy()).long(),
             torch.from_numpy(scores.copy()).float(),
             torch.from_numpy(labels.copy()).float(),
+            torch.from_numpy(true_ids.copy()).long(),
+            torch.from_numpy(valid.copy()).bool(),
         )
 
-# Helpers for checkpoint loading
+        # Helpers for checkpoint loading
 # -----------------------------
 def safe_torch_load(path: str, map_location="cpu"):
     """
@@ -563,7 +576,7 @@ def evaluate_reranker(
         pos2 = vbatch["pos_go_global"]
 
         if candidate_lookup is not None:
-            cand2, cand_scores2, lab2 = candidate_lookup.get_batch(vbatch["protein_ids"])
+            cand2, cand_scores2, lab2,  true2, valid2 = candidate_lookup.get_batch(vbatch["protein_ids"])
         else:
             cand2, cand_scores2 = retriever_topk_ids_chunked(
                 retriever=retriever,
@@ -576,13 +589,15 @@ def evaluate_reranker(
                 chunk_k=2048,
             )
             lab2 = make_labels_for_candidates(cand2, pos2)
+            true2 = None
+            valid2 = torch.ones_like(lab2, dtype=torch.bool)
 
         toks2 = tokenize_candidates_flat(go_text_store, cand2)
         go_input_ids = toks2["input_ids"].to(device, non_blocking=True)
         go_attention_mask = toks2["attention_mask"].to(device, non_blocking=True)
 
         B2, K2 = cand2.shape
-        cand_valid = torch.ones((B2, K2), dtype=torch.bool, device=device)
+        cand_valid = valid2.to(device, non_blocking=True)
 
         dag_parent_mask2 = make_dag_parent_mask_for_candidates(
             cand_ids=cand2,
@@ -620,33 +635,47 @@ def evaluate_reranker(
             rank_feature=make_rank_feature(B2, K2, device),
         ).detach().float().cpu()  # [B,K]
 
-        sc_np = logits.numpy()
-        lab_np = lab2.numpy()
-        cand_np = cand2.numpy()
+        sc_np = logits.detach().float().cpu().numpy()
+        lab_np = lab2.detach().cpu().numpy()
+        cand_np = cand2.detach().cpu().numpy()
+        valid_np = cand_valid.detach().cpu().numpy().astype(bool)
+
+        eval_set = set(int(x) for x in eval_go_ids)
 
         for i in range(B2):
-            pos_set = set(int(x) for x in (
-                pos2[i].detach().cpu().tolist() if pos2[i] is not None else []
-            ))
+            if true2 is not None:
+                pos_set = set(
+                    int(x) for x in true2[i].detach().cpu().tolist()
+                    if int(x) >= 0
+                )
+            else:
+                row = pos2[i].detach().cpu().tolist() if pos2[i] is not None else []
+                pos_set = set(
+                    int(x) for x in row
+                    if int(x) >= 0 and int(x) in eval_set
+                )
+
             cand_row = [int(x) for x in cand_np[i].tolist()]
             cand_set = set(cand_row)
 
-            # Full denominator: all true labels
             n_true_full += len(pos_set)
 
-            # TopK denominator: only true labels that survived retrieval
-            n_true_candidate += len(pos_set & cand_set)
+            # Candidate denominator consistent with labels actually scored.
+            n_true_candidate += int(((lab_np[i] > 0) & valid_np[i]).sum())
 
-            # Candidate-space scored items only
             for j in range(K2):
+                if not valid_np[i, j]:
+                    continue
                 items_candidate.append((float(sc_np[i, j]), int(lab_np[i, j])))
 
-            # Protein-level hits
             order = np.argsort(-sc_np[i])
 
-            top1 = [int(cand_np[i, order[0]])] if K2 > 0 else []
-            top5 = [int(cand_np[i, j]) for j in order[: min(5, K2)]]
-            top10 = [int(cand_np[i, j]) for j in order[: min(10, K2)]]
+            # Only valid candidates for hit metrics.
+            order = [j for j in order if valid_np[i, j]]
+
+            top1 = [int(cand_np[i, order[0]])] if len(order) > 0 else []
+            top5 = [int(cand_np[i, j]) for j in order[: min(5, len(order))]]
+            top10 = [int(cand_np[i, j]) for j in order[: min(10, len(order))]]
 
             hit1 += 1 if any(g in pos_set for g in top1) else 0
             hit5 += 1 if any(g in pos_set for g in top5) else 0
@@ -682,6 +711,10 @@ def evaluate_reranker(
 
     # Useful retrieval ceiling diagnostic
     out["retrieval_recall@K"] = float(n_true_candidate) / max(1.0, float(n_true_full))
+    out["oracle_microF@K"] = float(
+        (2.0 * n_true_candidate)
+        / max(1e-12, 2.0 * n_true_candidate + (n_true_full - n_true_candidate))
+    )
 
     return out
 
@@ -818,6 +851,7 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         use_candidate_dump=bool(training.get("use_candidate_dump", False)),
         train_candidate_dump=str(training.get("train_candidate_dump", "")),
         val_candidate_dump=str(training.get("val_candidate_dump", "")),
+        eval_every_steps=int(training.get("eval_every_steps", 0)),
 
         # stores
         train_ids_path=Path(stores.get("train_ids_path", "")),
@@ -1119,6 +1153,25 @@ def main(phase_id: int = -2):
                     stats.pos_mean,
                     stats.neg_mean,
                 )
+            if getattr(args, "eval_every_steps", 0) and args.eval_every_steps > 0:
+                if step > 0 and step % int(args.eval_every_steps) == 0:
+                    logging.info("[mid-epoch-eval] step=%d", step)
+
+                    val_logs = evaluate_reranker(
+                            rr_trainer=rr_trainer,
+                            retriever=retriever,
+                            val_loader=val_loader,
+                            G_once_cpu=G_once_cpu,
+                            eval_go_ids=eval_go_ids,
+                            go_text_store=go_text_store,
+                            go_child_to_parents=go_child_to_parents,
+                            device=device,
+                            topk=int(args.topk),
+                            max_batches=0,
+                            candidate_lookup=val_candidate_lookup
+                    )
+
+                    logging.info("[val@step%d] %s", step, val_logs)
 
         metrics = evaluate_reranker(
             rr_trainer=rr_trainer,
