@@ -597,7 +597,7 @@ def evaluate_reranker(
         go_attention_mask = toks2["attention_mask"].to(device, non_blocking=True)
 
         B2, K2 = cand2.shape
-        cand_valid = valid2.to(device, non_blocking=True)
+        cand_valid = valid2.to(device, non_blocking=True).bool()
 
         dag_parent_mask2 = make_dag_parent_mask_for_candidates(
             cand_ids=cand2,
@@ -1064,7 +1064,9 @@ def main(phase_id: int = -2):
             pos_go_global = batch["pos_go_global"]
 
             if train_candidate_lookup is not None:
-                cand_ids, cand_scores, labels = train_candidate_lookup.get_batch(batch["protein_ids"])
+                cand_ids, cand_scores, labels, true_ids_batch, cand_valid_cpu = train_candidate_lookup.get_batch(
+                    batch["protein_ids"]
+                )
             else:
                 cand_ids, cand_scores = retriever_topk_ids_chunked(
                     retriever=retriever,
@@ -1096,7 +1098,10 @@ def main(phase_id: int = -2):
             go_attention_mask = toks["attention_mask"].to(device, non_blocking=True)
 
             B, K = cand_ids.shape
-            cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
+            if train_candidate_lookup is not None:
+                cand_valid = cand_valid_cpu.to(device, non_blocking=True).bool()
+            else:
+                cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
 
             if step == 0:
                 logging.info("[debug-batch-keys] %s", list(batch.keys()))
