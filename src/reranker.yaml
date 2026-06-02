@@ -32,7 +32,7 @@ training:
   device: cuda
   fp16: true
   # First sanity run: topk=200. If stable, move to 300/500.
-  topk: 200
+  topk: 500
   batch_size: 2
   epochs: 5
   lr: 1.0e-4
@@ -40,7 +40,7 @@ training:
   log_every: 100
   eval_every: 500
   save_metric: "fmax_full"
-  out_dir: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top200
+  out_dir: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000
   eval_every_steps: 5000
 
   # Strict direct retrieval first. Do not inject labels unless the run cannot learn.
@@ -56,8 +56,8 @@ training:
   grad_clip_norm: 1.0
 
   use_candidate_dump: true
-  train_candidate_dump: /workspace/candidate_dumps/P3a_train_top1000
-  val_candidate_dump: /workspace/candidate_dumps/P3a_val_top1000
+  train_candidate_dump: /workspace/candidate_dumps/P3a_SemExp_train_top1000 #/workspace/candidate_dumps/P3a_train_top1000
+  val_candidate_dump: /workspace/candidate_dumps/P3a_SemExp_val_top1000 #/workspace/candidate_dumps/P3a_val_top1000
 
 stores:
   train_ids_path: /workspace/data/splits/train_ids.txt
