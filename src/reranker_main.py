@@ -792,6 +792,19 @@ def inject_true_positives_into_candidates(
 
     return cand_cpu
 
+def feature_dropout(x: torch.Tensor, p: float, training: bool) -> torch.Tensor:
+    """
+    x: [B, K]
+    Drops an entire scalar feature channel per protein row.
+    Since features are normalized, zero is neutral.
+    """
+    if (not training) or p <= 0:
+        return x
+
+    B = x.size(0)
+    keep = (torch.rand(B, 1, device=x.device) > p).to(x.dtype)
+    return x * keep
+
 
 # -----------------------------
 # Config
@@ -852,6 +865,10 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         train_candidate_dump=str(training.get("train_candidate_dump", "")),
         val_candidate_dump=str(training.get("val_candidate_dump", "")),
         eval_every_steps=int(training.get("eval_every_steps", 0)),
+        score_feature_dropout=float(training.get("score_feature_dropout", 0.0)),
+        rank_feature_dropout = float(training.get("rank_feature_dropout", 0.0)),
+        save_mid_checkpoints = bool(training.get("save_mid_checkpoints", True)),
+        mid_checkpoint_metric = str(training.get("mid_checkpoint_metric", "fmax_full")),
 
         # stores
         train_ids_path=Path(stores.get("train_ids_path", "")),
@@ -1054,6 +1071,8 @@ def main(phase_id: int = -2):
     best = {"fmax_full": -1.0, "aupr": -1.0}
     step = 0
 
+    best_mid_metric = -float("inf")
+
     for epoch in range(int(args.epochs)):
         print(f"\n[main] epoch={epoch}")
         rr_trainer.model.train()
@@ -1131,6 +1150,23 @@ def main(phase_id: int = -2):
                     logging.info("[debug] first pos sample=%s", ex_pos[:10])
                     logging.info("[debug] first cand sample=%s", ex_cand[:10])
 
+            retriever_score = cand_scores.to(device, non_blocking=True)
+            rank_feature = make_rank_feature(B, K, device)
+            score_p = float(getattr(args, "score_feature_dropout", 0.0))
+            rank_p = float(getattr(args, "rank_feature_dropout", 0.0))
+
+            retriever_score_in = feature_dropout(
+                retriever_score,
+                p=score_p,
+                training=rr_trainer.model.training,
+            )
+
+            rank_feature_in = feature_dropout(
+                rank_feature,
+                p=rank_p,
+                training=rr_trainer.model.training,
+            )
+
             rr_batch = dict(
                 H=H,
                 valid_mask=valid_mask,
@@ -1139,8 +1175,8 @@ def main(phase_id: int = -2):
                 labels=labels.to(device, non_blocking=True),
                 cand_valid=cand_valid,
                 dag_parent_mask=dag_parent_mask.to(device, non_blocking=True),
-                retriever_score=cand_scores.to(device, non_blocking=True),
-                rank_feature=make_rank_feature(B, K, device),
+                retriever_score=retriever_score_in,
+                rank_feature=rank_feature_in,
                 K=torch.tensor(K, dtype=torch.long, device=device),
             )
 
@@ -1158,25 +1194,47 @@ def main(phase_id: int = -2):
                     stats.pos_mean,
                     stats.neg_mean,
                 )
-            if getattr(args, "eval_every_steps", 0) and args.eval_every_steps > 0:
+            if int(getattr(args, "eval_every_steps", 0)) > 0:
                 if step > 0 and step % int(args.eval_every_steps) == 0:
                     logging.info("[mid-epoch-eval] step=%d", step)
 
                     val_logs = evaluate_reranker(
-                            rr_trainer=rr_trainer,
-                            retriever=retriever,
-                            val_loader=val_loader,
-                            G_once_cpu=G_once_cpu,
-                            eval_go_ids=eval_go_ids,
-                            go_text_store=go_text_store,
-                            go_child_to_parents=go_child_to_parents,
-                            device=device,
-                            topk=int(args.topk),
-                            max_batches=0,
-                            candidate_lookup=val_candidate_lookup
+                        rr_trainer=rr_trainer,
+                        retriever=retriever,
+                        val_loader=val_loader,
+                        G_once_cpu=G_once_cpu,
+                        eval_go_ids=eval_go_ids,
+                        go_text_store=go_text_store,
+                        go_child_to_parents=go_child_to_parents,
+                        device=device,
+                        topk=int(args.topk),
+                        max_batches=int(getattr(args, "max_eval_batches", 0)),
+                        candidate_lookup=val_candidate_lookup,
                     )
 
                     logging.info("[val@step%d] %s", step, val_logs)
+
+                    metric_name = str(getattr(args, "mid_checkpoint_metric", "fmax_full"))
+                    metric_value = float(val_logs.get(metric_name, -float("inf")))
+
+                    if bool(getattr(args, "save_mid_checkpoints", True)) and metric_value > best_mid_metric:
+                        best_mid_metric = metric_value
+                        best_mid_path = save_checkpoint(
+                            out_dir=out_dir,
+                            step=step,
+                            epoch=epoch,
+                            optimizer=getattr(rr_trainer, "opt", None) or getattr(rr_trainer, "optimizer", None),
+                            model=rr_trainer.model,
+                            metrics=val_logs,
+                            tag=f"mid_epoch_{epoch}_step_{step}",
+                        )
+
+                        logging.info(
+                            "[checkpoint] saved mid best %s=%.4f -> %s",
+                            metric_name,
+                            metric_value,
+                            best_mid_path,
+                        )
 
         metrics = evaluate_reranker(
             rr_trainer=rr_trainer,

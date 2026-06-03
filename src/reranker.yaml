@@ -35,13 +35,15 @@ training:
   topk: 500
   batch_size: 2
   epochs: 5
-  lr: 1.0e-4
+  lr: 5e-5 #1.0e-4
   weight_decay: 0.01
   log_every: 100
   eval_every: 500
   save_metric: "fmax_full"
-  out_dir: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000
+  out_dir: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_semexp_top500_lr5e5_drop015 #/workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000
   eval_every_steps: 5000
+  save_mid_checkpoints: true
+  mid_checkpoint_metric: "fmax_full"
 
   # Strict direct retrieval first. Do not inject labels unless the run cannot learn.
   inject_true_positives: 0
@@ -54,6 +56,9 @@ training:
   lambda_dag: 0.02
   dag_margin: 0.0
   grad_clip_norm: 1.0
+
+  score_feature_dropout: 0.15
+  rank_feature_dropout: 0.15
 
   use_candidate_dump: true
   train_candidate_dump: /workspace/candidate_dumps/P3a_SemExp_train_top1000 #/workspace/candidate_dumps/P3a_train_top1000
