@@ -46,7 +46,7 @@ training:
   save_mid_checkpoints: true
   mid_checkpoint_metric: "fmax_full"
 
-  resume: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_semexp_top500_lr5e5_drop015/ckpt_best_fmax_full.pt
+  resume: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000/ckpt_best_fmax_full_step67156_epoch1.pt
   resume_optimizer: true
   reset_optimizer_lr: true
   resume_lr: 3e-5
