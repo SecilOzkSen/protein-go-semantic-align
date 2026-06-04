@@ -323,26 +323,192 @@ def count_true_total(pos_go_global: List[torch.Tensor]) -> int:
 # -----------------------------
 # Checkpoint save helper
 # -----------------------------
+def _get_optimizer(rr_trainer):
+    return getattr(rr_trainer, "opt", None) or getattr(rr_trainer, "optimizer", None)
+
+
+def _get_scaler(rr_trainer):
+    return getattr(rr_trainer, "scaler", None)
+
+
 def save_checkpoint(
     out_dir: str,
     step: int,
     epoch: int,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: torch.optim.Optimizer | None,
     metrics: Dict[str, float],
     tag: str,
+    scaler=None,
+    args=None,
+    path_override: str | Path | None = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
-    path = Path(out_dir) / f"ckpt_{tag}_step{step}_epoch{epoch}.pt"
+
+    if path_override is None:
+        path = Path(out_dir) / f"ckpt_{tag}_step{step}_epoch{epoch}.pt"
+    else:
+        path = Path(path_override)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
     payload = {
-        "step": step,
-        "epoch": epoch,
+        "step": int(step),
+        "global_step": int(step),
+        "epoch": int(epoch),
         "metrics": metrics,
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
     }
+
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+
+    if scaler is not None:
+        try:
+            payload["scaler"] = scaler.state_dict()
+        except Exception:
+            pass
+
+    if args is not None and hasattr(args, "__dict__"):
+        payload["config"] = dict(vars(args))
+
     torch.save(payload, str(path))
     return str(path)
+
+def _looks_like_state_dict(x) -> bool:
+    if not isinstance(x, dict):
+        return False
+    n = 0
+    for v in x.values():
+        if torch.is_tensor(v):
+            n += 1
+            if n >= 3:
+                return True
+    return False
+
+
+def _unwrap_model_state(ckpt: dict) -> dict:
+    if _looks_like_state_dict(ckpt):
+        return ckpt
+
+    for key in ["model", "state_dict", "model_state_dict", "module", "net"]:
+        if key in ckpt and isinstance(ckpt[key], dict):
+            state = ckpt[key]
+            if _looks_like_state_dict(state):
+                return state
+
+            for key2 in ["model", "state_dict", "model_state_dict", "module", "net"]:
+                if key2 in state and isinstance(state[key2], dict) and _looks_like_state_dict(state[key2]):
+                    return state[key2]
+
+    raise RuntimeError(f"Could not find model state_dict in checkpoint. keys={list(ckpt.keys())[:30]}")
+
+
+def _clean_state_keys(state: dict) -> dict:
+    out = {}
+    for k, v in state.items():
+        if not torch.is_tensor(v):
+            continue
+
+        kk = k
+        changed = True
+        while changed:
+            changed = False
+            for pref in ["module.", "model.", "rr_trainer.model."]:
+                if kk.startswith(pref):
+                    kk = kk[len(pref):]
+                    changed = True
+
+        out[kk] = v
+
+    return out
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+
+
+def load_reranker_resume(
+    *,
+    ckpt_path: str | Path,
+    rr_trainer: RerankerTrainer,
+    device: torch.device,
+    resume_optimizer: bool = True,
+    reset_optimizer_lr: bool = True,
+    resume_lr: float | None = None,
+) -> Dict[str, object]:
+    ckpt_path = Path(ckpt_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {ckpt_path}")
+
+    logging.info("[resume] loading checkpoint: %s", str(ckpt_path))
+
+    ckpt = safe_torch_load(str(ckpt_path), map_location=device)
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"Checkpoint must be dict, got {type(ckpt)}")
+
+    state = _unwrap_model_state(ckpt)
+    state = _clean_state_keys(state)
+
+    missing, unexpected = rr_trainer.model.load_state_dict(state, strict=False)
+
+    logging.info(
+        "[resume] model loaded: missing=%d unexpected=%d",
+        len(missing),
+        len(unexpected),
+    )
+
+    if missing:
+        logging.warning("[resume] missing sample: %s", missing[:20])
+    if unexpected:
+        logging.warning("[resume] unexpected sample: %s", unexpected[:20])
+
+    opt = _get_optimizer(rr_trainer)
+    loaded_optimizer = False
+
+    if resume_optimizer and opt is not None and "optimizer" in ckpt:
+        try:
+            opt.load_state_dict(ckpt["optimizer"])
+            loaded_optimizer = True
+            logging.info("[resume] optimizer state loaded")
+        except Exception as e:
+            logging.warning("[resume] optimizer load failed, continuing model-only: %s", repr(e))
+
+    scaler = _get_scaler(rr_trainer)
+    loaded_scaler = False
+
+    if scaler is not None and "scaler" in ckpt:
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+            loaded_scaler = True
+            logging.info("[resume] GradScaler state loaded")
+        except Exception as e:
+            logging.warning("[resume] scaler load failed: %s", repr(e))
+
+    if reset_optimizer_lr and opt is not None and resume_lr is not None:
+        set_optimizer_lr(opt, float(resume_lr))
+        logging.info("[resume] optimizer lr reset to %.8g", float(resume_lr))
+
+    epoch = int(ckpt.get("epoch", 0))
+    step = int(ckpt.get("global_step", ckpt.get("step", 0)))
+    metrics = ckpt.get("metrics", {})
+
+    logging.info(
+        "[resume] epoch=%d step=%d loaded_optimizer=%s loaded_scaler=%s metrics=%s",
+        epoch,
+        step,
+        loaded_optimizer,
+        loaded_scaler,
+        metrics,
+    )
+
+    return {
+        "epoch": epoch,
+        "step": step,
+        "metrics": metrics,
+        "loaded_optimizer": loaded_optimizer,
+        "loaded_scaler": loaded_scaler,
+    }
 
 
 # -----------------------------
@@ -869,6 +1035,13 @@ def load_structured_cfg(path: str = RETRIEVER_YAML_PATH):
         rank_feature_dropout = float(training.get("rank_feature_dropout", 0.0)),
         save_mid_checkpoints = bool(training.get("save_mid_checkpoints", True)),
         mid_checkpoint_metric = str(training.get("mid_checkpoint_metric", "fmax_full")),
+        # resume
+        resume=str(training.get("resume", "")),
+        resume_optimizer=bool(training.get("resume_optimizer", True)),
+        reset_optimizer_lr=bool(training.get("reset_optimizer_lr", True)),
+        resume_lr=float(training.get("resume_lr", training.get("lr", 5e-5))),
+        resume_start_next_epoch=bool(training.get("resume_start_next_epoch", True)),
+        max_eval_batches=int(training.get("max_eval_batches", 0)),
 
         # stores
         train_ids_path=Path(stores.get("train_ids_path", "")),
@@ -1068,12 +1241,63 @@ def main(phase_id: int = -2):
     out_dir = args.out_dir
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    best = {"fmax_full": -1.0, "aupr": -1.0}
-    step = 0
+    best = {
+        "fmax_full": -float("inf"),
+        "fmax_topk": -float("inf"),
+        "aupr_full": -float("inf"),
+        "aupr_topk": -float("inf"),
+    }
 
+    step = 0
+    start_epoch = 0
     best_mid_metric = -float("inf")
 
-    for epoch in range(int(args.epochs)):
+    resume_path = str(getattr(args, "resume", "") or "")
+    if resume_path:
+        resume_info = load_reranker_resume(
+            ckpt_path=resume_path,
+            rr_trainer=rr_trainer,
+            device=device,
+            resume_optimizer=bool(getattr(args, "resume_optimizer", True)),
+            reset_optimizer_lr=bool(getattr(args, "reset_optimizer_lr", True)),
+            resume_lr=float(getattr(args, "resume_lr", getattr(args, "lr", 5e-5))),
+        )
+
+        loaded_epoch = int(resume_info.get("epoch", 0))
+        loaded_step = int(resume_info.get("step", 0))
+        loaded_metrics = resume_info.get("metrics", {}) or {}
+
+        step = loaded_step
+
+        if bool(getattr(args, "resume_start_next_epoch", True)):
+            start_epoch = loaded_epoch + 1
+        else:
+            start_epoch = loaded_epoch
+
+        metric_name = str(getattr(args, "mid_checkpoint_metric", "fmax_full"))
+        if isinstance(loaded_metrics, dict) and metric_name in loaded_metrics:
+            best_mid_metric = float(loaded_metrics[metric_name])
+
+        if isinstance(loaded_metrics, dict):
+            for k in best:
+                if k in loaded_metrics:
+                    best[k] = float(loaded_metrics[k])
+
+        logging.info(
+            "[resume] start_epoch=%d step=%d best_mid_metric=%.6f",
+            start_epoch,
+            step,
+            best_mid_metric,
+        )
+
+    if start_epoch >= int(args.epochs):
+        logging.warning(
+            "[resume] start_epoch=%d >= epochs=%d. Increase epochs in YAML if you want to continue training.",
+            start_epoch,
+            int(args.epochs),
+        )
+
+    for epoch in range(start_epoch, int(args.epochs)):
         print(f"\n[main] epoch={epoch}")
         rr_trainer.model.train()
 
@@ -1219,14 +1443,33 @@ def main(phase_id: int = -2):
 
                     if bool(getattr(args, "save_mid_checkpoints", True)) and metric_value > best_mid_metric:
                         best_mid_metric = metric_value
+
+                        opt = _get_optimizer(rr_trainer)
+                        scaler = _get_scaler(rr_trainer)
+
                         best_mid_path = save_checkpoint(
                             out_dir=out_dir,
                             step=step,
                             epoch=epoch,
-                            optimizer=getattr(rr_trainer, "opt", None) or getattr(rr_trainer, "optimizer", None),
+                            optimizer=opt,
                             model=rr_trainer.model,
                             metrics=val_logs,
-                            tag=f"mid_epoch_{epoch}_step_{step}",
+                            tag=f"mid_best_{metric_name}",
+                            scaler=scaler,
+                            args=args,
+                        )
+
+                        stable_path = save_checkpoint(
+                            out_dir=out_dir,
+                            step=step,
+                            epoch=epoch,
+                            optimizer=opt,
+                            model=rr_trainer.model,
+                            metrics=val_logs,
+                            tag=f"best_{metric_name}",
+                            scaler=scaler,
+                            args=args,
+                            path_override=Path(out_dir) / f"ckpt_best_{metric_name}.pt",
                         )
 
                         logging.info(
@@ -1234,6 +1477,10 @@ def main(phase_id: int = -2):
                             metric_name,
                             metric_value,
                             best_mid_path,
+                        )
+                        logging.info(
+                            "[checkpoint] updated stable best -> %s",
+                            stable_path,
                         )
 
         metrics = evaluate_reranker(
@@ -1275,7 +1522,8 @@ def main(phase_id: int = -2):
 
         if metrics[key] > best[key]:
             best[key] = metrics[key]
-            opt = getattr(rr_trainer, "opt", None) or getattr(rr_trainer, "optimizer", None)
+            opt = _get_optimizer(rr_trainer)
+            scaler = _get_scaler(rr_trainer)
             best_path = save_checkpoint(
                 out_dir=out_dir,
                 step=step,
@@ -1284,6 +1532,8 @@ def main(phase_id: int = -2):
                 optimizer=opt,
                 metrics=metrics,
                 tag=f"best_{key}",
+                scaler=scaler,
+                args=args,
             )
             logging.info("[checkpoint] saved best_%s -> %s", key, best_path)
 
