@@ -335,6 +335,8 @@ class OppTrainer:
             go_pool_type=ctx.go_pool_type,
             local_window_size=int(getattr(cfg, "local_window_size", 64)),
             local_window_stride=int(getattr(cfg, "local_window_stride", 32)),
+            multivec_slot_lse_tau=float(getattr(cfg, "multivec_slot_lse_tau", 0.10)),
+            multivec_global_residual_init=float(getattr(cfg, "multivec_global_residual_init", 0.25)),
         ).to(self.device)
 
         # warmstart configs
@@ -473,7 +475,7 @@ class OppTrainer:
         self._eval_id2col = None
         self._use_token_align = (
                 getattr(self.model, "protein_pool_type", None) == "slots"
-                and getattr(self.model, "go_pool_type", None) == "token_align"
+                and getattr(self.model, "go_pool_type", None) in {"token_align", "multivec_token"}
         )
 
         if self.ctx.eval_seen_go_ids is not None:
@@ -3073,7 +3075,7 @@ class OppTrainer:
                 if present is not None:
                     print("present mean:", present.float().mean(dim=0).detach().cpu().tolist())
 
-            if self._global_step % 1000 == 0:
+            if self._global_step % 1000 == 0 and (not self._use_token_align):
                 with torch.no_grad():
                     Zp = self.model.encode_protein_for_scoring(H, attn_valid)
                     Gz = self.model.go_ln(G_cand)
@@ -3084,8 +3086,7 @@ class OppTrainer:
                     print("Zp norm:", Zp.float().norm(dim=-1).mean().item())
                     print("Gz norm:", Gz.float().norm(dim=-1).mean().item())
 
-                    # GO candidate pairwise similarity, sample one batch row
-                    g0 = Gz[0].float()  # [K,D]
+                    g0 = Gz[0].float()
                     sim = g0 @ g0.T
                     K0 = sim.size(0)
                     eye = torch.eye(K0, device=sim.device, dtype=torch.bool)
@@ -3094,7 +3095,6 @@ class OppTrainer:
                     print("Gz pairwise offdiag mean/std/min/max:",
                           off.mean().item(), off.std().item(), off.min().item(), off.max().item())
 
-                    # Protein to GO scores pre-scale
                     sc_pre = torch.einsum("bd,bkd->bk", Zp.float(), Gz.float())
                     print("recomputed score pre mean/std/min/max:",
                           sc_pre.mean().item(), sc_pre.std().item(), sc_pre.min().item(), sc_pre.max().item())
@@ -3176,8 +3176,15 @@ class OppTrainer:
                 scale=1.0
             )
 
+        lambda_slot_div = float(getattr(self.cfg, "lambda_slot_div", 0.0))
 
-        total = l_con + self.attr.lambda_dag * l_dag + self.attr.lambda_attr * l_attr + l_ent #+ 0.05*l_slot_div
+        total = (
+                l_con
+                + self.attr.lambda_dag * l_dag
+                + self.attr.lambda_attr * l_attr
+                + l_ent
+                + lambda_slot_div * l_slot_div
+        )
 
         self._global_step += 1
 
@@ -3266,6 +3273,8 @@ class OppTrainer:
                     "train/queue_weight_eff": float(self._queue_weight_schedule(self._global_step)),
                     "train/k_hard_queue_eff": int(self._k_hard_queue_schedule(self._global_step)),
                     "train/slot_div": float(l_slot_div.detach().item()),
+                    "train/slot_div_weighted": float(
+                        (float(getattr(self.cfg, "lambda_slot_div", 0.0)) * l_slot_div).detach().item()),
                 },
                 step=int(self._global_step),
             )

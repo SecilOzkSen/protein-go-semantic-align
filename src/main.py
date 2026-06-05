@@ -1008,7 +1008,10 @@ def run_training(args):
         trainable_mode=args.trainable_mode,
         weight_decay=args.weight_decay,
         local_window_size=args.local_window_size,
-        local_window_stride=args.local_window_stride
+        local_window_stride=args.local_window_stride,
+        lambda_slot_div = float(getattr(args, "lambda_slot_div", 0.0)),
+        multivec_slot_lse_tau = float(getattr(args, "multivec_slot_lse_tau", 0.10)),
+        multivec_global_residual_init = float(getattr(args, "multivec_global_residual_init", 0.25)),
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1565,6 +1568,8 @@ def load_structured_cfg(path: str):
         entropy_reg=float(model.get("entropy_reg", 0.01)),
         win_size=int(model.get("win_size", 1024)),
         win_stride=int(model.get("win_stride", 256)),
+        multivec_slot_lse_tau=float(model.get("multivec_slot_lse_tau", 0.10)),
+        multivec_global_residual_init=float(model.get("multivec_global_residual_init", 0.25)),
 
         # loss
         lambda_con=float(loss.get("lambda_con", 1.0)),
@@ -1576,6 +1581,7 @@ def load_structured_cfg(path: str):
         lambda_vtrue=float(loss.get("lambda_vtrue", 0.2)),
         tau_distill=float(loss.get("tau_distill", 1.5)),
         lambda_bce=float(loss.get("lambda_bce", 0.1)),
+        lambda_slot_div=float(loss.get("lambda_slot_div", 0.0)),
 
         # curriculum
         curriculum_epochs=int(curriculum.get("epochs", 4)),

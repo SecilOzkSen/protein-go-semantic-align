@@ -269,6 +269,9 @@ class TrainerConfig:
     trainable_mode: str = "none"
     local_window_size: int = 64
     local_window_stride: int = 32
+    lambda_slot_div: float = 0.0
+    multivec_slot_lse_tau: float = 0.00
+    multivec_global_residual_init: float = 0.0
 
 @dataclass
 class QueueConfig:

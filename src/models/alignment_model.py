@@ -216,6 +216,124 @@ class ProteinSlotExtractor(nn.Module):
         slots = self.out_ln(slots)
         return slots, attn
 
+class MultiVectorTokenScorer(nn.Module):
+    """
+    Multi-vector protein-GO token scorer.
+
+    Protein:
+      Zp: [B, S, Dz], S protein slots
+
+    GO:
+      Gz: [B, K, L, Dz], L GO text tokens
+
+    Score:
+      1. slot-token similarity
+      2. smooth max over protein slots
+      3. masked mean over GO tokens
+      4. optional global residual score
+    """
+
+    def __init__(
+        self,
+        slot_lse_tau: float = 0.10,
+        global_residual_init: float = 0.25,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.slot_lse_tau = float(slot_lse_tau)
+        self.eps = float(eps)
+
+        # Learnable residual weight in (0, 1).
+        # Initialized to global_residual_init.
+        w = float(global_residual_init)
+        w = min(max(w, 1e-4), 1.0 - 1e-4)
+        logit = math.log(w / (1.0 - w))
+        self.global_residual_logit = nn.Parameter(torch.tensor(logit, dtype=torch.float32))
+
+        self.last_info = {}
+
+    @staticmethod
+    def _masked_mean_tokens(x: torch.Tensor, mask: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
+        """
+        x:    [B,K,L]
+        mask: [B,K,L] bool
+        """
+        if mask is None:
+            return x.mean(dim=-1)
+
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+
+        w = mask.to(dtype=x.dtype)
+        return (x * w).sum(dim=-1) / w.sum(dim=-1).clamp_min(eps)
+
+    @staticmethod
+    def _masked_mean_vec(x: torch.Tensor, mask: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
+        """
+        x:    [B,K,L,D]
+        mask: [B,K,L] bool
+        returns [B,K,D]
+        """
+        if mask is None:
+            return x.mean(dim=2)
+
+        if mask.dtype != torch.bool:
+            mask = mask != 0
+
+        w = mask.to(dtype=x.dtype).unsqueeze(-1)
+        return (x * w).sum(dim=2) / w.sum(dim=2).clamp_min(eps)
+
+    def forward(
+        self,
+        Zp: torch.Tensor,                    # [B,S,D]
+        Gz: torch.Tensor,                    # [B,K,L,D]
+        go_mask: Optional[torch.Tensor] = None,  # [B,K,L]
+    ) -> torch.Tensor:
+        if Zp.dim() != 3:
+            raise RuntimeError(f"MultiVectorTokenScorer expects Zp [B,S,D], got {tuple(Zp.shape)}")
+        if Gz.dim() != 4:
+            raise RuntimeError(f"MultiVectorTokenScorer expects Gz [B,K,L,D], got {tuple(Gz.shape)}")
+
+        B, S, D = Zp.shape
+        Bg, K, L, Dg = Gz.shape
+        if Bg != B or Dg != D:
+            raise RuntimeError(f"Shape mismatch: Zp={tuple(Zp.shape)} Gz={tuple(Gz.shape)}")
+
+        # slot-token similarity: [B,S,K,L]
+        sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
+
+        if go_mask is not None:
+            if go_mask.dtype != torch.bool:
+                go_mask = go_mask != 0
+            fill_value = -1e4 if sim.dtype == torch.float16 else -1e9
+            sim = sim.masked_fill(~go_mask.unsqueeze(1), fill_value)
+
+        # smooth max over slots, [B,K,L]
+        tau = max(float(self.slot_lse_tau), 1e-4)
+        token_evidence = tau * torch.logsumexp(sim.float() / tau, dim=1)
+        token_evidence = token_evidence.to(dtype=Gz.dtype)
+
+        # aggregate GO tokens, [B,K]
+        token_score = self._masked_mean_tokens(token_evidence, go_mask, eps=self.eps)
+
+        # small global residual from mean slot vector and mean GO token vector
+        zp_global = F.normalize(Zp.float().mean(dim=1), dim=-1)                  # [B,D]
+        gz_global = self._masked_mean_vec(Gz.float(), go_mask, eps=self.eps)     # [B,K,D]
+        gz_global = F.normalize(gz_global, dim=-1)
+
+        global_score = torch.einsum("bd,bkd->bk", zp_global, gz_global)          # [B,K]
+
+        residual_w = torch.sigmoid(self.global_residual_logit)
+        scores = token_score.float() + residual_w * global_score.float()
+
+        self.last_info = {
+            "multivec_residual_w": residual_w.detach(),
+            "multivec_token_score_mean": token_score.detach().float().mean(),
+            "multivec_global_score_mean": global_score.detach().float().mean(),
+        }
+
+        return scores
+
 class LocalEvidencePool1D(nn.Module):
     """
     Local window evidence branch for protein pooling.
@@ -351,9 +469,11 @@ class ProteinGoAligner(nn.Module):
             normalize: bool = True,
             protein_pool_type: str = "mean",  # "mean" | "attn" | "go_align" | "slots"
             protein_n_slots: int = 4,
-            go_pool_type: str = "mean",  # used when protein_pool_type == "slots": "mean" | "token_align"
+            go_pool_type: str = "mean",  # "mean" | "token_align" | "multivec_token"
             local_window_size: int = 64,
             local_window_stride: int = 32,
+            multivec_slot_lse_tau: float = 0.10,
+            multivec_global_residual_init: float = 0.25,
     ):
         super().__init__()
 
@@ -364,13 +484,13 @@ class ProteinGoAligner(nn.Module):
                 "protein_pool_type='go_align' is deprecated in the current retriever. "
                 "Use 'mean_attn_gate', 'mean', 'attn', or 'slots'."
             )
-        if go_pool_type == "token_align" and protein_pool_type != "slots":
+        if go_pool_type in {"token_align", "multivec_token"} and protein_pool_type != "slots":
             raise ValueError(
-                "go_pool_type='token_align' requires protein_pool_type='slots'. "
+                f"go_pool_type='{go_pool_type}' requires protein_pool_type='slots'. "
                 f"Got protein_pool_type={protein_pool_type}."
             )
 
-        if go_pool_type not in {"mean", "token_align"}:
+        if go_pool_type not in {"mean", "token_align", "multivec_token"}:
             raise ValueError(f"Unsupported go_pool_type: {go_pool_type}")
 
         self.normalize = bool(normalize)
@@ -409,6 +529,13 @@ class ProteinGoAligner(nn.Module):
                 dropout=0.05,
                 use_residual=False,
                 use_output_ln=True,
+            )
+
+        self.multivec_scorer = None
+        if self.go_pool_type == "multivec_token":
+            self.multivec_scorer = MultiVectorTokenScorer(
+                slot_lse_tau=multivec_slot_lse_tau,
+                global_residual_init=multivec_global_residual_init,
             )
 
         self.proj_p = ProjectionHead(d_in=d_h, d_out=d_z)
@@ -559,9 +686,10 @@ class ProteinGoAligner(nn.Module):
         """
 
         # token-align case: G = [B,K,L,Dg]
+        # token candidate case: G = [B,K,L,Dg]
         if G.dim() == 4:
             if Zp.dim() != 3:
-                raise RuntimeError("Token-align scoring requires slot protein representation [B,S,Dz].")
+                raise RuntimeError("Token scoring requires slot protein representation [B,S,Dz].")
 
             Gz = self.go_ln(G)
             Gz = self.proj_g(Gz)
@@ -569,21 +697,25 @@ class ProteinGoAligner(nn.Module):
             if self.normalize:
                 Gz = self._norm(Gz, dim=-1)
 
+            # New smoother multi-vector scorer.
+            if self.go_pool_type == "multivec_token":
+                if self.multivec_scorer is None:
+                    raise RuntimeError("go_pool_type='multivec_token' but self.multivec_scorer is None.")
+                scores = self.multivec_scorer(Zp=Zp, Gz=Gz, go_mask=go_mask)
+                self.last_multivec_info = self.multivec_scorer.last_info
+                return scores
+
+            # Old hard token-align scorer, preserved.
             sim = torch.einsum("bsd,bkld->bskl", Zp, Gz)
 
-            # sim: [B,S,K,L]
             if go_mask is not None:
                 if go_mask.dtype != torch.bool:
                     go_mask = go_mask != 0
                 fill_value = -1e4 if sim.dtype == torch.float16 else -1e9
                 sim = sim.masked_fill(~go_mask.unsqueeze(1), fill_value)
 
-            # token-level evidence per slot
             slot_scores = sim.max(dim=-1).values  # [B,S,K]
-
-            # candidate score = best slot evidence
             scores = slot_scores.max(dim=1).values  # [B,K]
-
             return scores
 
         # pooled GO case: G = [B,K,Dg]
