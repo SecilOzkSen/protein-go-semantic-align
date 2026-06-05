@@ -8,7 +8,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "PP3a_MultiVec_scratch"
+  ablation_id: "P3a_MultiVec_scratch"
   use_queue_miner: true
 
   # GO side clean A3/full-text anchor
@@ -38,7 +38,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/protein-go-align-outputs-multivec
+  output_dir: /workspace/protein-go-align-outputs-P3a-MultiVec-scratch
   save_every: 10000
   keep_last_n: 3
   resume: null #/workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go/checkpoint_step83945.pt
@@ -137,7 +137,7 @@ wandb:
   enabled: true
   project: protein-go-align
   entity: null
-  wandb_run_name: "protein-go-semantic-align-ablation-P2b-LEP64-A3warm-localQuery-pooledGO"
+  wandb_run_name: "p3a-multivec-scratch"
   mode: online
 
 stores:
