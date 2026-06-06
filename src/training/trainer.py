@@ -428,7 +428,7 @@ class OppTrainer:
                 or self.segment_projection_only
         )
 
-        if self.model.go_encoder is not None and not frozen_go_modes:
+        if self.model.go_encoder is not None and not frozen_go_modes and cfg.use_lora:
             lr_lora_raw = getattr(cfg, "lr_lora", None)
             lr_lora = lr_main * 0.1 if lr_lora_raw is None else float(lr_lora_raw)
 
@@ -447,7 +447,7 @@ class OppTrainer:
         else:
             self._lora_lr_target = 0.0
 
-        self._lora_warmup_steps = int(getattr(cfg, "lora_warmup_steps", 2000))
+        self._lora_warmup_steps = int(getattr(cfg, "lora_warmup_steps", 0))
         self._lora_lr_start = float(getattr(cfg, "lora_lr_start", self._lora_lr_target * 0.2))
 
         # Optional: one-time sanity check that GO encoder is LoRA-only

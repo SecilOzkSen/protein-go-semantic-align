@@ -152,21 +152,6 @@ class LoRAParameters:
     bias: Literal["none", "all", "lora_only"] = "none"
     task_type: str = "FEATURE_EXTRACTION"
 
-
-@dataclass(frozen=True)
-class TrainingReadyDataPaths:
-    # Few/Zero/Common ID-only json
-    zero_shot_id_only_json: Path = ZERO_SHOT_TERMS_ID_ONLY_JSON
-    few_shot_id_only_json: Path = FEW_SHOT_IC_TERMS_ID_ONLY_JSON
-    common_id_only_json: Path = COMMON_IC_GO_TERMS_ID_ONLY_JSON
-
-    phases: List[Dict[str, Path]] = field(default_factory=lambda: [
-        dict(embeddings=GO_INDEX[1]["TEXT_EMB"], ip=GO_INDEX[1]["FAISS_IP"], meta=GO_INDEX[1]["META"]),
-        dict(embeddings=GO_INDEX[2]["TEXT_EMB"], ip=GO_INDEX[2]["FAISS_IP"], meta=GO_INDEX[2]["META"]),
-        dict(embeddings=GO_INDEX[3]["TEXT_EMB"], ip=GO_INDEX[3]["FAISS_IP"], meta=GO_INDEX[3]["META"]),
-        dict(embeddings=GO_INDEX[4]["TEXT_EMB"], ip=GO_INDEX[4]["FAISS_IP"], meta=GO_INDEX[4]["META"]),
-    ])
-
 @dataclass
 class LoggingConfig:
     log_every: int = 50
@@ -247,7 +232,8 @@ class TrainerConfig:
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
     lr_lora: float = 5e-5
-    lora_warmup_steps: int = 2000
+    use_lora: float = True
+    lora_warmup_steps: int = 0
     max_epochs: int = 20,
     cand_chunk_k: int = 8
     pos_chunk_t: int = 128

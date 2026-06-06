@@ -994,6 +994,7 @@ def run_training(args):
         device=str(device),
         lr=args.lr,
         lr_lora=None if args.lr_lora is None else float(args.lr_lora),
+        use_lora=args.use_lora,
         max_epochs=args.epochs,
         cand_chunk_k=args.cand_chunk_k,
         pos_chunk_t=args.pos_chunk_t,
