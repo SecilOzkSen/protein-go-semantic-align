@@ -21,7 +21,7 @@ general:
   protein_pooling_strategy: "slots" # "mean_attn_gate" #local_evidence_gate
   protein_n_slots: 8
 
-  use_lora: true
+  use_lora: false
   use_attribution_loss: false
   return_alpha: false
   return_slot_attn: false
@@ -52,7 +52,7 @@ training:
   cand_chunk_k: 4 #8
   pos_chunk_t: 128
   max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
-  eval_go_bs: 64 # eval go batch size for go embedding extraction
+  eval_go_bs: 32 #64 # eval go batch size for go embedding extraction
   go_text_store_max_len: 128 # TODO: 512 batch size for storing go text embeddings
   go_segment_max_len: 64
   is_logit_scale_constant: true #false = trainable logit scale
@@ -61,7 +61,7 @@ training:
   eval_space: "observed" #seen -> # observed: all go must be included to make evaluation reliable.
   # eval space: observed = observed go ids. train+val+test seen once.
   max_inbatch: 160
-  eval_cand_chunk_k: 8
+  eval_cand_chunk_k: 4
   go_segment_alpha: 0.05
   go_segment_alpha_warmup_steps: 5000
   trainable_mode: "full" #"segment_projection_only" #"protein_projection_only" #"protein_query_only" #"segment_gate_only" #local_evidence_only #local_evidence_query
@@ -69,17 +69,17 @@ training:
   local_window_stride: 32
 
 queue: # queue params
-  queue_K: 32768 #16384  #8192 #2048 #8192
-  queue_start_step: 1000
+  queue_K: 16384 #32768 #16384  #8192 #2048 #8192
+  queue_start_step: 3000
   queue_hard_frac_start: 0.0
-  queue_hard_frac_end: 0.5
-  queue_hard_frac_warmup_steps: 6000
+  queue_hard_frac_end: 0.3
+  queue_hard_frac_warmup_steps: 10000
   queue_weight_start: 0.2
   queue_weight_end: 1.0
-  queue_weight_warmup_steps: 6000
-  k_hard_queue_start: 4
-  k_hard_queue_end: 16
-  k_hard_queue_warmup_steps: 6000
+  queue_weight_warmup_steps: 10000
+  k_hard_queue_start: 2
+  k_hard_queue_end: 8
+  k_hard_queue_warmup_steps: 10000
 
 optim:
   lr: 2e-4
@@ -95,8 +95,8 @@ model:
   entropy_reg: 0.01
   win_size: 1024
   win_stride: 256
-  multivec_slot_lse_tau: 0.10
-  multivec_global_residual_init: 0.25
+  multivec_slot_lse_tau: 0.25
+  multivec_global_residual_init: 0.60 #0.25
 
 loss:
   lambda_con: 1.0
