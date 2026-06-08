@@ -35,21 +35,20 @@ training:
   topk: 500
   batch_size: 2
   epochs: 5
-  lr: 3e-5 #5e-5 #1.0e-4
+  lr: 2e-5 #5e-5 #1.0e-4
   weight_decay: 0.01
   log_every: 100
   eval_every: 500
   save_metric: "fmax_full"
-  out_dir: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_semexp_top500_resume_lr3e5_scoredrop010
-  #/workspace/protein-go-align/outputs/reranker/p3a_hiercross_semexp_top500_lr5e5_drop015 #/workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000
+  out_dir: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_np_p3asemexp200_esmknn300_top500 #/workspace/protein-go-align/outputs/reranker/p3a_hiercross_semexp_top500_lr5e5_drop015 #/workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000
   eval_every_steps: 5000
   save_mid_checkpoints: true
   mid_checkpoint_metric: "fmax_full"
 
-  resume: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000/ckpt_best_fmax_full_step67156_epoch1.pt
-  resume_optimizer: true
+  resume: /workspace/protein-go-align/outputs/reranker/p3a_hiercross_semexp_top500_resume_lr3e5_scoredrop010/ckpt_best_fmax_full_step167890_epoch4.pt #/workspace/protein-go-align/outputs/reranker/p3a_hiercross_direct_top1000/ckpt_best_fmax_full_step67156_epoch1.pt
+  resume_optimizer: false
   reset_optimizer_lr: true
-  resume_lr: 3e-5
+  resume_lr: 2e-5
   resume_start_next_epoch: true
 
   # Strict direct retrieval first. Do not inject labels unless the run cannot learn.
@@ -64,12 +63,12 @@ training:
   dag_margin: 0.0
   grad_clip_norm: 1.0
 
-  score_feature_dropout: 0.10
+  score_feature_dropout: 0.05
   rank_feature_dropout: 0.00
 
   use_candidate_dump: true
-  train_candidate_dump: /workspace/candidate_dumps/P3a_SemExp_train_top1000 #/workspace/candidate_dumps/P3a_train_top1000
-  val_candidate_dump: /workspace/candidate_dumps/P3a_SemExp_val_top1000 #/workspace/candidate_dumps/P3a_val_top1000
+  train_candidate_dump: /workspace/candidate_dumps/P3aSemExp200_ESMknn300_union_train_top500 #/workspace/candidate_dumps/P3a_SemExp_train_top1000 #/workspace/candidate_dumps/P3a_train_top1000
+  val_candidate_dump: /workspace/candidate_dumps/P3aSemExp200_ESMknn300_union_val_top500 #/workspace/candidate_dumps/P3a_SemExp_val_top1000 #/workspace/candidate_dumps/P3a_val_top1000
 
 stores:
   train_ids_path: /workspace/data/splits/train_ids.txt
