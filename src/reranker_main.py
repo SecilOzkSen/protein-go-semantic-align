@@ -83,6 +83,22 @@ class CandidateDumpLookup:
         else:
             valid = np.ones_like(labels, dtype=np.int8)
 
+        # Safety for union/no-fill dumps.
+        # Invalid/filler candidates often have sentinel scores such as -1e6.
+        # These can become -inf under fp16/AMP and later produce NaNs.
+        scores = np.nan_to_num(
+            scores,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).astype(np.float32)
+
+        scores = np.clip(scores, -20.0, 20.0).astype(np.float32)
+
+        # Invalid candidates should be neutral inputs and never positive labels.
+        scores[valid == 0] = 0.0
+        labels[valid == 0] = 0.0
+
         return (
             torch.from_numpy(cand_ids.copy()).long(),
             torch.from_numpy(scores.copy()).float(),
@@ -712,26 +728,45 @@ def evaluate_reranker(
     max_batches: int = 0,
     candidate_lookup: CandidateDumpLookup | None = None,
 ) -> Dict[str, float]:
+    """
+    Safe evaluator for dump-backed or live-retriever candidate evaluation.
+
+    Key fixes:
+      1. Invalid candidates are replaced with a safe GO id before tokenization.
+      2. Retriever score / rank features are sanitized and zeroed for invalid candidates.
+      3. Logits are nan/inf sanitized and invalid logits are forced to -1e9.
+      4. Metrics are computed only over valid candidates.
+      5. Full-space denominator keeps unretrieved true labels as false negatives.
+      6. Candidate-space denominator uses true labels that actually appear among valid candidates.
+    """
     rr_trainer.model.eval()
     retriever.eval()
 
-    # Only candidate-space scored items are stored
+    eval_set = set(int(x) for x in eval_go_ids)
+
+    # Candidate-space scored items only: (score, label)
     items_candidate: List[Tuple[float, int]] = []
 
     # Denominators
     n_true_full = 0
     n_true_candidate = 0
 
-    # Protein-level hits
+    # Protein-level hit metrics
     hit1 = 0
     hit5 = 0
     hit10 = 0
     n_prot = 0
 
-    # Optional loss tracking from eval_step
+    # Optional safe loss tracking, computed from the same forward pass
     bce_vals: List[float] = []
     dag_vals: List[float] = []
     loss_vals: List[float] = []
+
+    # Optional loss params
+    pos_weight_value = getattr(rr_trainer, "pos_weight", None)
+    use_dag_loss = bool(getattr(rr_trainer, "use_dag_loss", False))
+    lambda_dag = float(getattr(rr_trainer, "lambda_dag", 0.0))
+    dag_margin = float(getattr(rr_trainer, "dag_margin", 0.0))
 
     for vb, vbatch in enumerate(val_loader):
         if max_batches and vb >= max_batches:
@@ -741,8 +776,13 @@ def evaluate_reranker(
         vm = valid_mask_from_attn(vbatch["prot_attn_mask"].to(device, non_blocking=True))
         pos2 = vbatch["pos_go_global"]
 
+        # ------------------------------------------------------------------
+        # Candidate source
+        # ------------------------------------------------------------------
         if candidate_lookup is not None:
-            cand2, cand_scores2, lab2,  true2, valid2 = candidate_lookup.get_batch(vbatch["protein_ids"])
+            cand2, cand_scores2, lab2, true2, valid2 = candidate_lookup.get_batch(
+                vbatch["protein_ids"]
+            )
         else:
             cand2, cand_scores2 = retriever_topk_ids_chunked(
                 retriever=retriever,
@@ -758,85 +798,207 @@ def evaluate_reranker(
             true2 = None
             valid2 = torch.ones_like(lab2, dtype=torch.bool)
 
-        toks2 = tokenize_candidates_flat(go_text_store, cand2)
-        go_input_ids = toks2["input_ids"].to(device, non_blocking=True)
-        go_attention_mask = toks2["attention_mask"].to(device, non_blocking=True)
-
         B2, K2 = cand2.shape
         cand_valid = valid2.to(device, non_blocking=True).bool()
 
+        # ------------------------------------------------------------------
+        # IMPORTANT: invalid candidate IDs should not be tokenized as real GO.
+        # Replace invalid ids with a safe valid GO id before tokenization.
+        # The logits for invalid positions are later forced to -1e9.
+        # ------------------------------------------------------------------
+        cand2_safe = cand2.clone()
+        if candidate_lookup is not None:
+            safe_gid = int(candidate_lookup.eval_go_ids[0])
+        else:
+            safe_gid = int(eval_go_ids[0])
+
+        valid2_cpu = valid2.detach().cpu().bool()
+        cand2_safe[~valid2_cpu] = safe_gid
+
+        toks2 = tokenize_candidates_flat(go_text_store, cand2_safe)
+        go_input_ids = toks2["input_ids"].to(device, non_blocking=True)
+        go_attention_mask = toks2["attention_mask"].to(device, non_blocking=True)
+
+        # ------------------------------------------------------------------
+        # DAG mask, then restrict it to valid candidates only.
+        # dag_parent_mask[b, i, j] = candidate j is parent of candidate i.
+        # ------------------------------------------------------------------
         dag_parent_mask2 = make_dag_parent_mask_for_candidates(
             cand_ids=cand2,
             go_child_to_parents=go_child_to_parents,
-        )  # [B,K,K] CPU bool
+        ).to(device, non_blocking=True).bool()
 
-        rr_batch2 = dict(
-            H=H2,
-            valid_mask=vm,
-            go_input_ids=go_input_ids,
-            go_attention_mask=go_attention_mask,
-            labels=lab2.to(device, non_blocking=True),
-            cand_valid=cand_valid,
-            dag_parent_mask=dag_parent_mask2.to(device, non_blocking=True),
-            retriever_score=cand_scores2.to(device, non_blocking=True),
-            rank_feature=make_rank_feature(B2, K2, device),
-            K=torch.tensor(K2, dtype=torch.long, device=device),
+        valid_pair = cand_valid.unsqueeze(2) & cand_valid.unsqueeze(1)
+        dag_parent_mask2 = dag_parent_mask2 & valid_pair
+
+        # ------------------------------------------------------------------
+        # Retriever score / rank feature sanitization.
+        # This is crucial for union/no-fill dumps where invalid/filler scores
+        # may contain NaN, +/-inf, or large sentinel values.
+        # ------------------------------------------------------------------
+        retriever_score2 = cand_scores2.to(device, non_blocking=True)
+        rank_feature2 = make_rank_feature(B2, K2, device)
+
+        retriever_score2 = torch.nan_to_num(
+            retriever_score2,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        retriever_score2 = torch.clamp(retriever_score2, min=-20.0, max=20.0)
+
+        rank_feature2 = torch.nan_to_num(
+            rank_feature2,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
 
-        eval_out = rr_trainer.eval_step(rr_batch2)
-        if "bce" in eval_out:
-            bce_vals.append(float(eval_out["bce"]))
-        if "dag_loss" in eval_out:
-            dag_vals.append(float(eval_out["dag_loss"]))
-        if "loss" in eval_out:
-            loss_vals.append(float(eval_out["loss"]))
+        retriever_score2 = torch.where(
+            cand_valid,
+            retriever_score2,
+            torch.zeros_like(retriever_score2),
+        )
+        rank_feature2 = torch.where(
+            cand_valid,
+            rank_feature2,
+            torch.zeros_like(rank_feature2),
+        )
 
+        # ------------------------------------------------------------------
+        # Single forward pass.
+        # Do not call rr_trainer.eval_step here, because that causes a second
+        # forward and may report NaN loss from invalid candidates.
+        # ------------------------------------------------------------------
         logits = rr_trainer.model(
             H=H2,
             K=K2,
             valid_mask=vm,
             go_input_ids=go_input_ids,
             go_attention_mask=go_attention_mask,
-            retriever_score=cand_scores2.to(device, non_blocking=True),
-            rank_feature=make_rank_feature(B2, K2, device),
-        ).detach().float().cpu()  # [B,K]
+            retriever_score=retriever_score2,
+            rank_feature=rank_feature2,
+        )
 
+        # ------------------------------------------------------------------
+        # Logit safety.
+        # Invalid logits cannot affect ranking or metrics.
+        # ------------------------------------------------------------------
+        if not torch.isfinite(logits).all():
+            bad_total = int((~torch.isfinite(logits)).sum().detach().cpu().item())
+            bad_valid = int(((~torch.isfinite(logits)) & cand_valid).sum().detach().cpu().item())
+            logging.warning(
+                "[eval-nan-guard] non-finite logits detected: total=%d valid=%d",
+                bad_total,
+                bad_valid,
+            )
+
+        logits = torch.nan_to_num(
+            logits,
+            nan=-1e9,
+            posinf=1e9,
+            neginf=-1e9,
+        )
+
+        logits = torch.where(
+            cand_valid,
+            logits,
+            torch.full_like(logits, -1e9),
+        )
+
+        # ------------------------------------------------------------------
+        # Optional safe BCE / DAG loss tracking from the same sanitized logits.
+        # ------------------------------------------------------------------
+        labels_dev = lab2.to(device, non_blocking=True).float()
+        labels_dev = torch.where(cand_valid, labels_dev, torch.zeros_like(labels_dev))
+
+        valid_logits = logits[cand_valid]
+        valid_labels = labels_dev[cand_valid]
+
+        if valid_logits.numel() > 0:
+            if pos_weight_value is not None:
+                pos_weight_t = torch.as_tensor(
+                    float(pos_weight_value),
+                    device=device,
+                    dtype=valid_logits.dtype,
+                )
+                bce_eval = torch.nn.functional.binary_cross_entropy_with_logits(
+                    valid_logits,
+                    valid_labels,
+                    pos_weight=pos_weight_t,
+                    reduction="mean",
+                )
+            else:
+                bce_eval = torch.nn.functional.binary_cross_entropy_with_logits(
+                    valid_logits,
+                    valid_labels,
+                    reduction="mean",
+                )
+        else:
+            bce_eval = logits.sum() * 0.0
+
+        if use_dag_loss and dag_parent_mask2.any():
+            child_scores = logits.unsqueeze(2).expand(B2, K2, K2)
+            parent_scores = logits.unsqueeze(1).expand(B2, K2, K2)
+            diffs = child_scores[dag_parent_mask2] - parent_scores[dag_parent_mask2] - dag_margin
+            dag_eval = torch.nn.functional.softplus(diffs).mean()
+            if not torch.isfinite(dag_eval):
+                logging.warning("[eval-nan-guard] non-finite DAG loss, setting to zero")
+                dag_eval = logits.sum() * 0.0
+        else:
+            dag_eval = logits.sum() * 0.0
+
+        loss_eval = bce_eval + lambda_dag * dag_eval
+
+        if torch.isfinite(bce_eval):
+            bce_vals.append(float(bce_eval.detach().cpu().item()))
+        if torch.isfinite(dag_eval):
+            dag_vals.append(float(dag_eval.detach().cpu().item()))
+        if torch.isfinite(loss_eval):
+            loss_vals.append(float(loss_eval.detach().cpu().item()))
+
+        # ------------------------------------------------------------------
+        # Convert to numpy for metrics.
+        # ------------------------------------------------------------------
         sc_np = logits.detach().float().cpu().numpy()
         lab_np = lab2.detach().cpu().numpy()
         cand_np = cand2.detach().cpu().numpy()
         valid_np = cand_valid.detach().cpu().numpy().astype(bool)
 
-        eval_set = set(int(x) for x in eval_go_ids)
-
         for i in range(B2):
+            # Full denominator
             if true2 is not None:
                 pos_set = set(
-                    int(x) for x in true2[i].detach().cpu().tolist()
-                    if int(x) >= 0
+                    int(x)
+                    for x in true2[i].detach().cpu().tolist()
+                    if int(x) >= 0 and int(x) in eval_set
                 )
             else:
                 row = pos2[i].detach().cpu().tolist() if pos2[i] is not None else []
                 pos_set = set(
-                    int(x) for x in row
+                    int(x)
+                    for x in row
                     if int(x) >= 0 and int(x) in eval_set
                 )
 
-            cand_row = [int(x) for x in cand_np[i].tolist()]
-            cand_set = set(cand_row)
-
             n_true_full += len(pos_set)
 
-            # Candidate denominator consistent with labels actually scored.
+            # Candidate denominator: true labels that are actually valid scored candidates.
             n_true_candidate += int(((lab_np[i] > 0) & valid_np[i]).sum())
 
+            # Candidate-space scored items
             for j in range(K2):
                 if not valid_np[i, j]:
                     continue
-                items_candidate.append((float(sc_np[i, j]), int(lab_np[i, j])))
 
+                score_ij = float(sc_np[i, j])
+                if not np.isfinite(score_ij):
+                    score_ij = -1e9
+
+                items_candidate.append((score_ij, int(lab_np[i, j])))
+
+            # Protein-level hits, valid candidates only
             order = np.argsort(-sc_np[i])
-
-            # Only valid candidates for hit metrics.
             order = [j for j in order if valid_np[i, j]]
 
             top1 = [int(cand_np[i, order[0]])] if len(order) > 0 else []
@@ -848,10 +1010,15 @@ def evaluate_reranker(
             hit10 += 1 if any(g in pos_set for g in top10) else 0
             n_prot += 1
 
+    # ----------------------------------------------------------------------
     # Candidate-space reranker quality
+    # ----------------------------------------------------------------------
     pr_topk = compute_global_fmax_aupr_from_items(items_candidate, n_true_candidate)
 
-    # Full pipeline metric, candidate dışı GT'ler denominator'da kalır
+    # ----------------------------------------------------------------------
+    # Full pipeline metric:
+    # candidate-outside GT labels remain in denominator as false negatives.
+    # ----------------------------------------------------------------------
     pr_full = compute_global_fmax_aupr_from_items(items_candidate, n_true_full)
 
     out = {
@@ -875,7 +1042,6 @@ def evaluate_reranker(
     if loss_vals:
         out["loss"] = float(sum(loss_vals) / len(loss_vals))
 
-    # Useful retrieval ceiling diagnostic
     out["retrieval_recall@K"] = float(n_true_candidate) / max(1.0, float(n_true_full))
     out["oracle_microF@K"] = float(
         (2.0 * n_true_candidate)
@@ -1332,19 +1498,31 @@ def main(phase_id: int = -2):
                     inject_n=int(args.inject_true_positives),
                 )
 
-            dag_parent_mask = make_dag_parent_mask_for_candidates(
-                cand_ids=cand_ids,
-                go_child_to_parents=go_child_to_parents,
-            )
-            toks = tokenize_candidates_flat(go_text_store, cand_ids)
-            go_input_ids = toks["input_ids"].to(device, non_blocking=True)
-            go_attention_mask = toks["attention_mask"].to(device, non_blocking=True)
-
             B, K = cand_ids.shape
+
             if train_candidate_lookup is not None:
                 cand_valid = cand_valid_cpu.to(device, non_blocking=True).bool()
             else:
                 cand_valid = torch.ones((B, K), dtype=torch.bool, device=device)
+
+            # Replace invalid candidate IDs before tokenization.
+            # The logits for these positions will be masked out anyway.
+            cand_ids_safe = cand_ids.clone()
+            if train_candidate_lookup is not None:
+                safe_gid = int(train_candidate_lookup.eval_go_ids[0])
+            else:
+                safe_gid = int(eval_go_ids[0])
+
+            cand_ids_safe[~cand_valid.detach().cpu().bool()] = safe_gid
+
+            dag_parent_mask = make_dag_parent_mask_for_candidates(
+                cand_ids=cand_ids,
+                go_child_to_parents=go_child_to_parents,
+            )
+
+            toks = tokenize_candidates_flat(go_text_store, cand_ids_safe)
+            go_input_ids = toks["input_ids"].to(device, non_blocking=True)
+            go_attention_mask = toks["attention_mask"].to(device, non_blocking=True)
 
             if step == 0:
                 logging.info("[debug-batch-keys] %s", list(batch.keys()))
@@ -1376,6 +1554,28 @@ def main(phase_id: int = -2):
 
             retriever_score = cand_scores.to(device, non_blocking=True)
             rank_feature = make_rank_feature(B, K, device)
+            cand_valid = cand_valid.bool()
+
+            retriever_score = torch.nan_to_num(
+                retriever_score,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            # Large sentinel scores from invalid/filler candidates can break fp16.
+            retriever_score = torch.clamp(retriever_score, min=-20.0, max=20.0)
+
+            rank_feature = torch.nan_to_num(
+                rank_feature,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+            # Invalid candidates should be neutral model inputs.
+            retriever_score = torch.where(cand_valid, retriever_score, torch.zeros_like(retriever_score))
+            rank_feature = torch.where(cand_valid, rank_feature, torch.zeros_like(rank_feature))
             score_p = float(getattr(args, "score_feature_dropout", 0.0))
             rank_p = float(getattr(args, "rank_feature_dropout", 0.0))
 

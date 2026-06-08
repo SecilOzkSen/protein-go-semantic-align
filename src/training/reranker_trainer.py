@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
+import logging
 
 import torch
 import torch.nn as nn
@@ -58,53 +59,164 @@ class RerankerTrainer:
         }
 
     def _compute_bce_loss(
-        self,
-        logits: torch.Tensor,      # [B,K]
-        labels: torch.Tensor,      # [B,K]
-        cand_valid: torch.Tensor,  # [B,K] bool
-    ) -> torch.Tensor:
-        loss_mat = self.bce(logits, labels)                 # [B,K]
-        loss_mat = loss_mat * cand_valid.to(loss_mat.dtype)
-        denom = cand_valid.sum().clamp_min(1).to(loss_mat.dtype)
-        return loss_mat.sum() / denom
-
-    def _compute_dag_loss(
-        self,
-        logits: torch.Tensor,                     # [B,K]
-        cand_valid: torch.Tensor,                 # [B,K] bool
-        dag_parent_mask: Optional[torch.Tensor],  # [B,K,K], child->parent mask
+            self,
+            logits: torch.Tensor,  # [B,K]
+            labels: torch.Tensor,  # [B,K]
+            cand_valid: torch.Tensor,  # [B,K] bool
     ) -> torch.Tensor:
         """
-        dag_parent_mask[b, i, j] = 1 means:
+        BCE over valid candidate positions only.
+
+        Important:
+          - Do not use mask multiplication, because nan * 0 = nan.
+          - Select valid logits explicitly.
+          - Invalid candidates are excluded from the loss.
+        """
+        if cand_valid.dtype != torch.bool:
+            valid = cand_valid != 0
+        else:
+            valid = cand_valid
+
+        labels = labels.float()
+
+        # Safety: avoid non-finite logits contaminating loss.
+        # Valid non-finite logits should not normally happen, but this guard prevents
+        # a whole run from becoming NaN.
+        if not torch.isfinite(logits).all():
+            bad_total = int((~torch.isfinite(logits)).sum().detach().cpu().item())
+            bad_valid = int(((~torch.isfinite(logits)) & valid).sum().detach().cpu().item())
+            logging.warning(
+                "[nan-guard][bce] non-finite logits detected: total=%d valid=%d",
+                bad_total,
+                bad_valid,
+            )
+
+        logits = torch.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=30.0,
+            neginf=-30.0,
+        )
+
+        # Clamp for numerical safety. BCEWithLogits is stable, but this prevents
+        # extreme sentinel values from union/filler candidates from causing trouble.
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
+
+        # Invalid candidates should not contribute to loss.
+        valid_logits = logits[valid]
+        valid_labels = labels[valid]
+
+        if valid_logits.numel() == 0:
+            return logits.sum() * 0.0
+
+        if self.pos_weight is not None:
+            pos_weight = torch.as_tensor(
+                float(self.pos_weight),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                valid_logits,
+                valid_labels,
+                pos_weight=pos_weight,
+                reduction="mean",
+            )
+        else:
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                valid_logits,
+                valid_labels,
+                reduction="mean",
+            )
+
+        if not torch.isfinite(bce):
+            logging.warning("[nan-guard][bce] BCE became non-finite, returning zero loss")
+            return logits.sum() * 0.0
+
+        return bce
+
+    def _compute_dag_loss(
+            self,
+            logits: torch.Tensor,  # [B,K]
+            cand_valid: torch.Tensor,  # [B,K] bool
+            dag_parent_mask: Optional[torch.Tensor],  # [B,K,K], child->parent mask
+    ) -> torch.Tensor:
+        """
+        dag_parent_mask[b, i, j] = True means:
             candidate j is a parent of candidate i
             i = child, j = parent
 
         Penalize when child score exceeds parent score by more than margin:
-            relu(score_child - score_parent - margin)
+
+            softplus(score_child - score_parent - margin)
+
+        Only valid candidate pairs are used.
         """
         if (not self.use_dag_loss) or (dag_parent_mask is None):
-            return logits.new_zeros(())
+            return logits.sum() * 0.0
+
+        if cand_valid.dtype != torch.bool:
+            valid = cand_valid != 0
+        else:
+            valid = cand_valid
 
         if dag_parent_mask.dtype != torch.bool:
             dag_parent_mask = dag_parent_mask != 0
 
-        # valid pair mask: both child and parent candidates must be valid
-        pair_valid = cand_valid.unsqueeze(2) & cand_valid.unsqueeze(1)   # [B,K,K]
+        dag_parent_mask = dag_parent_mask.to(device=logits.device)
+        valid = valid.to(device=logits.device)
 
-        # keep only declared DAG edges among valid candidates
-        edge_mask = dag_parent_mask & pair_valid                         # [B,K,K]
+        # Safety for non-finite logits.
+        if not torch.isfinite(logits).all():
+            bad_total = int((~torch.isfinite(logits)).sum().detach().cpu().item())
+            bad_valid = int(((~torch.isfinite(logits)) & valid).sum().detach().cpu().item())
+            logging.warning(
+                "[nan-guard][dag] non-finite logits detected: total=%d valid=%d",
+                bad_total,
+                bad_valid,
+            )
+
+        logits = torch.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=30.0,
+            neginf=-30.0,
+        )
+        logits = torch.clamp(logits, min=-30.0, max=30.0)
+
+        # valid pair mask:
+        # child candidate must be valid and parent candidate must be valid.
+        pair_valid = valid.unsqueeze(2) & valid.unsqueeze(1)  # [B,K,K]
+
+        # candidate j is parent of candidate i
+        edge_mask = dag_parent_mask & pair_valid
 
         if not edge_mask.any():
-            return logits.new_zeros(())
+            return logits.sum() * 0.0
 
-        score_child = logits.unsqueeze(2)   # [B,K,1] -> child index on dim=1, broadcast over parent dim
-        score_parent = logits.unsqueeze(1)  # [B,1,K] -> parent index on dim=2, broadcast over child dim
+        # child_scores[b, i, j] = score of child i
+        child_scores = logits.unsqueeze(2).expand_as(edge_mask)
 
-        viol = torch.relu(score_child - score_parent - self.dag_margin)  # [B,K,K]
-        viol = viol * edge_mask.to(viol.dtype)
+        # parent_scores[b, i, j] = score of parent j
+        parent_scores = logits.unsqueeze(1).expand_as(edge_mask)
 
-        denom = edge_mask.sum().clamp_min(1).to(viol.dtype)
-        return viol.sum() / denom
+        diffs = child_scores[edge_mask] - parent_scores[edge_mask] - float(self.dag_margin)
+
+        # Extra safety in case extreme diffs appear.
+        diffs = torch.nan_to_num(
+            diffs,
+            nan=0.0,
+            posinf=30.0,
+            neginf=-30.0,
+        )
+        diffs = torch.clamp(diffs, min=-30.0, max=30.0)
+
+        dag_loss = torch.nn.functional.softplus(diffs).mean()
+
+        if not torch.isfinite(dag_loss):
+            logging.warning("[nan-guard][dag] DAG loss became non-finite, returning zero loss")
+            return logits.sum() * 0.0
+
+        return dag_loss
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> RerankerTrainStats:
         batch = self._to_device(batch)
