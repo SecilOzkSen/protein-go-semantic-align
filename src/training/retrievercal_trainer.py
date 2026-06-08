@@ -14,7 +14,15 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-from src.models.retrievercal_model import RetrieverCal, ScoreSetCal
+from src.models.retrievercal_model import RetrieverCal, ScoreSetCal, EmbCal, EmbSetCal
+
+
+def _first_existing(base: Path, names: List[str]) -> Optional[Path]:
+    for name in names:
+        p = base / name
+        if p.exists():
+            return p
+    return None
 
 
 class CandidateDumpDataset(Dataset):
@@ -24,11 +32,15 @@ class CandidateDumpDataset(Dataset):
         topk: int,
         score_mean: float,
         score_std: float,
+        embedding_dump: str | Path | None = None,
+        require_embeddings: bool = False,
     ):
         self.dump_dir = Path(dump_dir)
         self.topk = int(topk)
         self.score_mean = float(score_mean)
         self.score_std = float(score_std) if score_std > 0 else 1.0
+        self.embedding_dir = Path(embedding_dump) if embedding_dump else self.dump_dir
+        self.require_embeddings = bool(require_embeddings)
 
         self.eval_go_ids = np.load(self.dump_dir / "eval_go_ids.npy", mmap_mode="r").astype(np.int64)
         self.top_cols = np.load(self.dump_dir / "top_go_cols.int32.npy", mmap_mode="r")
@@ -41,7 +53,7 @@ class CandidateDumpDataset(Dataset):
         pids_path = self.dump_dir / "protein_ids.json"
         if pids_path.exists():
             with pids_path.open("r", encoding="utf-8") as f:
-                self.protein_ids = json.load(f)
+                self.protein_ids = [str(x) for x in json.load(f)]
         else:
             self.protein_ids = [f"row_{i}" for i in range(self.top_scores.shape[0])]
 
@@ -51,6 +63,69 @@ class CandidateDumpDataset(Dataset):
         self.rank_feature = (
             np.log1p(np.arange(1, self.topk + 1, dtype=np.float32)) / np.log1p(float(self.topk))
         ).astype(np.float32)
+
+        self.has_embeddings = False
+        self.protein_z = None
+        self.go_z = None
+        self.protein_row_map = None
+        self.go_col_map = None
+        self.emb_dim = None
+        self._setup_embeddings()
+
+    def _setup_embeddings(self) -> None:
+        prot_path = _first_existing(self.embedding_dir, ["protein_z.float16.npy", "protein_z.float32.npy", "protein_z.npy"])
+        go_path = _first_existing(self.embedding_dir, ["go_z.float16.npy", "go_z.float32.npy", "go_z.npy"])
+        if prot_path is None or go_path is None:
+            if self.require_embeddings:
+                raise FileNotFoundError(
+                    f"Embeddings required but missing protein_z/go_z in {self.embedding_dir}. "
+                    "Copy protein_z.float16.npy and go_z.float16.npy from the source dump or pass --*_embedding_dump."
+                )
+            return
+
+        self.protein_z = np.load(prot_path, mmap_mode="r")
+        self.go_z = np.load(go_path, mmap_mode="r")
+        self.emb_dim = int(self.go_z.shape[1])
+        self.has_embeddings = True
+
+        # GO id order may differ between candidate dump and embedding source dump.
+        src_eval_path = self.embedding_dir / "eval_go_ids.npy"
+        if src_eval_path.exists():
+            src_eval = np.load(src_eval_path, mmap_mode="r").astype(np.int64)
+            if len(src_eval) == len(self.eval_go_ids) and np.array_equal(src_eval, self.eval_go_ids):
+                self.go_col_map = None
+            else:
+                id2src = {int(g): i for i, g in enumerate(src_eval.tolist())}
+                missing = [int(g) for g in self.eval_go_ids.tolist() if int(g) not in id2src]
+                if missing:
+                    raise KeyError(f"{len(missing)} eval GO ids missing in embedding dump. Examples: {missing[:10]}")
+                self.go_col_map = np.asarray([id2src[int(g)] for g in self.eval_go_ids.tolist()], dtype=np.int64)
+        else:
+            if self.go_z.shape[0] != len(self.eval_go_ids):
+                raise RuntimeError(
+                    f"go_z rows={self.go_z.shape[0]} but candidate eval_go_ids={len(self.eval_go_ids)} and no source eval_go_ids.npy."
+                )
+            self.go_col_map = None
+
+        # Protein row order may differ too.
+        src_pids_path = self.embedding_dir / "protein_ids.json"
+        if src_pids_path.exists():
+            with src_pids_path.open("r", encoding="utf-8") as f:
+                src_pids = [str(x) for x in json.load(f)]
+            if src_pids == self.protein_ids:
+                self.protein_row_map = None
+            else:
+                pid2src = {p: i for i, p in enumerate(src_pids)}
+                missing = [p for p in self.protein_ids if p not in pid2src]
+                if missing:
+                    raise KeyError(f"{len(missing)} protein IDs missing in embedding dump. Examples: {missing[:10]}")
+                self.protein_row_map = np.asarray([pid2src[p] for p in self.protein_ids], dtype=np.int64)
+        else:
+            if self.protein_z.shape[0] != len(self.protein_ids):
+                raise RuntimeError(
+                    f"protein_z rows={self.protein_z.shape[0]} but proteins={len(self.protein_ids)} and no source protein_ids.json."
+                )
+            self.protein_row_map = None
 
     def __len__(self) -> int:
         return int(self.top_scores.shape[0])
@@ -73,7 +148,7 @@ class CandidateDumpDataset(Dataset):
         score_z = ((scores - self.score_mean) / max(self.score_std, 1e-6)).astype(np.float32)
         score_z[~valid] = 0.0
 
-        return {
+        item = {
             "protein_id": str(self.protein_ids[idx]),
             "cand_ids": torch.from_numpy(cand_ids.copy()).long(),
             "score_z": torch.from_numpy(score_z.copy()).float(),
@@ -83,10 +158,23 @@ class CandidateDumpDataset(Dataset):
             "true_go_ids": torch.from_numpy(np.asarray(self.true_go_ids[idx], dtype=np.int64).copy()).long(),
         }
 
+        if self.has_embeddings:
+            prot_row = int(idx if self.protein_row_map is None else self.protein_row_map[idx])
+            src_cols = cols if self.go_col_map is None else self.go_col_map[cols]
+            protein_z = np.asarray(self.protein_z[prot_row], dtype=np.float32)
+            go_z = np.asarray(self.go_z[src_cols], dtype=np.float32)
+            item["protein_z"] = torch.from_numpy(protein_z.copy()).float()
+            item["go_z"] = torch.from_numpy(go_z.copy()).float()
+
+        return item
+
 
 def collate_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"protein_id": [x["protein_id"] for x in items]}
-    for k in ["cand_ids", "score_z", "rank_feature", "labels", "valid", "true_go_ids"]:
+    tensor_keys = ["cand_ids", "score_z", "rank_feature", "labels", "valid", "true_go_ids"]
+    if "protein_z" in items[0]:
+        tensor_keys += ["protein_z", "go_z"]
+    for k in tensor_keys:
         out[k] = torch.stack([x[k] for x in items], dim=0)
     return out
 
@@ -111,13 +199,10 @@ def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int
 def compute_global_fmax_aupr_from_items(items: List[Tuple[float, int]], n_true_total: int) -> Dict[str, float]:
     if n_true_total <= 0 or len(items) == 0:
         return {"fmax": 0.0, "aupr": 0.0, "best_threshold": 0.0, "precision": 0.0, "recall": 0.0}
-
     items = [(float(s), int(y)) for s, y in items if math.isfinite(float(s))]
     if not items:
         return {"fmax": 0.0, "aupr": 0.0, "best_threshold": 0.0, "precision": 0.0, "recall": 0.0}
-
     items.sort(key=lambda x: x[0], reverse=True)
-
     tp = 0
     fp = 0
     best_f = 0.0
@@ -126,7 +211,6 @@ def compute_global_fmax_aupr_from_items(items: List[Tuple[float, int]], n_true_t
     best_r = 0.0
     aupr = 0.0
     prev_rec = 0.0
-
     for score, is_true in items:
         if is_true:
             tp += 1
@@ -145,14 +229,7 @@ def compute_global_fmax_aupr_from_items(items: List[Tuple[float, int]], n_true_t
         if dr > 0:
             aupr += prec * dr
             prev_rec = rec
-
-    return {
-        "fmax": float(best_f),
-        "aupr": float(aupr),
-        "best_threshold": float(best_t),
-        "precision": float(best_p),
-        "recall": float(best_r),
-    }
+    return {"fmax": float(best_f), "aupr": float(aupr), "best_threshold": float(best_t), "precision": float(best_p), "recall": float(best_r)}
 
 
 def soft_f1_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -173,6 +250,22 @@ def cardinality_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Te
     pred_count = p.sum(dim=1)
     true_count = y.sum(dim=1)
     return F.mse_loss(torch.log1p(pred_count), torch.log1p(true_count))
+
+
+def _go_to_int(x: Any) -> Optional[int]:
+    if x is None:
+        return None
+    if isinstance(x, (int, np.integer)):
+        return int(x)
+    s = str(x).strip()
+    if not s:
+        return None
+    if s.startswith("GO:"):
+        s = s.split(":", 1)[1]
+    try:
+        return int(s)
+    except Exception:
+        return None
 
 
 def load_child_to_parents_json(path: str | Path) -> Dict[int, List[int]]:
@@ -196,24 +289,7 @@ def load_child_to_parents_json(path: str | Path) -> Dict[int, List[int]]:
     return out
 
 
-def _go_to_int(x: Any) -> Optional[int]:
-    if x is None:
-        return None
-    if isinstance(x, (int, np.integer)):
-        return int(x)
-    s = str(x).strip()
-    if not s:
-        return None
-    if s.startswith("GO:"):
-        s = s.split(":", 1)[1]
-    try:
-        return int(s)
-    except Exception:
-        return None
-
-
 def make_dag_edge_mask(cand_ids: torch.Tensor, valid: torch.Tensor, child_to_parents: Dict[int, List[int]], device: torch.device) -> torch.Tensor:
-    # [B,K,K], child i -> parent j
     B, K = cand_ids.shape
     out = torch.zeros((B, K, K), dtype=torch.bool)
     cand_np = cand_ids.detach().cpu().numpy()
@@ -252,7 +328,7 @@ class CalibConfig:
     train_dump: str
     val_dump: str
     out_dir: str
-    model_kind: str = "retrievercal"  # retrievercal | scoresetcal
+    model_kind: str = "retrievercal"  # retrievercal | scoresetcal | embcal | embsetcal
     topk: int = 500
     batch_size: int = 512
     num_workers: int = 0
@@ -274,6 +350,9 @@ class CalibConfig:
     device: str = "cuda:0"
     score_stat_rows: int = 0
     monitor: str = "fmax_full"
+    train_embedding_dump: str = ""
+    val_embedding_dump: str = ""
+    proj_dim: int = 0
 
 
 class CalibTrainer:
@@ -284,33 +363,45 @@ class CalibTrainer:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         max_rows = None if cfg.score_stat_rows <= 0 else int(cfg.score_stat_rows)
         self.score_mean, self.score_std = estimate_score_stats(cfg.train_dump, cfg.topk, max_rows=max_rows)
-        self.train_ds = CandidateDumpDataset(cfg.train_dump, cfg.topk, self.score_mean, self.score_std)
-        self.val_ds = CandidateDumpDataset(cfg.val_dump, cfg.topk, self.score_mean, self.score_std)
-        self.train_loader = DataLoader(
-            self.train_ds,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            collate_fn=collate_batch,
-            pin_memory=True,
+        kind = cfg.model_kind.lower()
+        requires_emb = kind in {"embcal", "embsetcal", "embeddingcal", "embeddingsetcal", "step3"}
+        self.train_ds = CandidateDumpDataset(
+            cfg.train_dump,
+            cfg.topk,
+            self.score_mean,
+            self.score_std,
+            embedding_dump=cfg.train_embedding_dump or None,
+            require_embeddings=requires_emb,
         )
-        self.val_loader = DataLoader(
-            self.val_ds,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            collate_fn=collate_batch,
-            pin_memory=True,
+        self.val_ds = CandidateDumpDataset(
+            cfg.val_dump,
+            cfg.topk,
+            self.score_mean,
+            self.score_std,
+            embedding_dump=cfg.val_embedding_dump or None,
+            require_embeddings=requires_emb,
         )
-        if cfg.model_kind.lower() in {"retrievercal", "step1"}:
+        self.train_loader = DataLoader(self.train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
+        self.val_loader = DataLoader(self.val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
+        if kind in {"retrievercal", "step1"}:
             self.model: nn.Module = RetrieverCal(hidden_dim=cfg.hidden_dim, dropout=cfg.dropout)
-        elif cfg.model_kind.lower() in {"scoresetcal", "setcal", "step2"}:
-            self.model = ScoreSetCal(
+        elif kind in {"scoresetcal", "setcal", "step2"}:
+            self.model = ScoreSetCal(hidden_dim=cfg.hidden_dim, n_layers=cfg.n_layers, n_heads=cfg.n_heads, dropout=cfg.dropout, max_k=max(1024, cfg.topk))
+        elif kind in {"embcal", "embeddingcal"}:
+            if self.train_ds.emb_dim is None:
+                raise RuntimeError("EmbCal requires embeddings but emb_dim is None")
+            self.model = EmbCal(emb_dim=self.train_ds.emb_dim, hidden_dim=cfg.hidden_dim, dropout=cfg.dropout, proj_dim=(cfg.proj_dim or None))
+        elif kind in {"embsetcal", "embeddingsetcal", "step3"}:
+            if self.train_ds.emb_dim is None:
+                raise RuntimeError("EmbSetCal requires embeddings but emb_dim is None")
+            self.model = EmbSetCal(
+                emb_dim=self.train_ds.emb_dim,
                 hidden_dim=cfg.hidden_dim,
                 n_layers=cfg.n_layers,
                 n_heads=cfg.n_heads,
                 dropout=cfg.dropout,
                 max_k=max(1024, cfg.topk),
+                proj_dim=(cfg.proj_dim or None),
             )
         else:
             raise ValueError(f"Unknown model_kind: {cfg.model_kind}")
@@ -342,9 +433,17 @@ class CalibTrainer:
     def _move(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
+    def _forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        kind = self.cfg.model_kind.lower()
+        if kind in {"embcal", "embeddingcal", "embsetcal", "embeddingsetcal", "step3"}:
+            return self.model(batch["score_z"], batch["rank_feature"], batch["valid"], batch["protein_z"], batch["go_z"])
+        return self.model(batch["score_z"], batch["rank_feature"], batch["valid"])
+
     def _loss(self, logits: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         labels = batch["labels"].float()
         valid = batch["valid"].bool()
+        logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
+        logits = torch.where(valid, logits, torch.full_like(logits, -1e9))
         valid_logits = logits[valid]
         valid_labels = labels[valid]
         if valid_logits.numel() == 0:
@@ -365,12 +464,14 @@ class CalibTrainer:
     def train(self) -> None:
         logging.info("[calib] device=%s model=%s topk=%d", self.device, self.cfg.model_kind, self.cfg.topk)
         logging.info("[calib] score_mean=%.4f score_std=%.4f pos_weight=%.2f", self.score_mean, self.score_std, self.pos_weight)
+        if getattr(self.train_ds, "has_embeddings", False):
+            logging.info("[calib] embeddings enabled emb_dim=%s train_emb=%s val_emb=%s", self.train_ds.emb_dim, self.train_ds.embedding_dir, self.val_ds.embedding_dir)
         global_step = 0
         for epoch in range(self.cfg.epochs):
             self.model.train()
             for batch in tqdm(self.train_loader, desc=f"train e{epoch}", leave=False):
                 batch = self._move(batch)
-                logits = self.model(batch["score_z"], batch["rank_feature"], batch["valid"])
+                logits = self._forward(batch)
                 losses = self._loss(logits, batch)
                 loss = losses["loss"]
                 if not torch.isfinite(loss):
@@ -436,7 +537,7 @@ class CalibTrainer:
         dags: List[float] = []
         for batch in tqdm(self.val_loader, desc="eval", leave=False):
             batch = self._move(batch)
-            logits = self.model(batch["score_z"], batch["rank_feature"], batch["valid"])
+            logits = self._forward(batch)
             logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
             logits = torch.where(batch["valid"].bool(), logits, torch.full_like(logits, -1e9))
             loss_dict = self._loss(logits, batch)
@@ -445,7 +546,6 @@ class CalibTrainer:
             f1s.append(float(loss_dict["soft_f1"].detach().cpu()))
             cards.append(float(loss_dict["card"].detach().cpu()))
             dags.append(float(loss_dict["dag"].detach().cpu()))
-
             sc = logits.detach().cpu().numpy()
             y = batch["labels"].detach().cpu().numpy()
             valid = batch["valid"].detach().cpu().numpy().astype(bool)
@@ -471,7 +571,7 @@ class CalibTrainer:
                 n_prot += 1
         topk_m = compute_global_fmax_aupr_from_items(items, n_true_cand)
         full_m = compute_global_fmax_aupr_from_items(items, n_true_full)
-        out = {
+        return {
             "fmax_topk": topk_m["fmax"],
             "aupr_topk": topk_m["aupr"],
             "fmax_full": full_m["fmax"],
@@ -490,4 +590,3 @@ class CalibTrainer:
             "card_loss": float(np.mean(cards)) if cards else 0.0,
             "dag_loss": float(np.mean(dags)) if dags else 0.0,
         }
-        return out

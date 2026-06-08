@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MaskedStats(nn.Module):
@@ -31,7 +31,6 @@ class MaskedStats(nn.Module):
         var = (((x - mean[:, None]) ** 2) * w).sum(dim=1) / n
         std = torch.sqrt(var.clamp_min(0.0) + self.eps)
 
-        # Mask invalid candidates to a large negative value for maxima.
         neg_large = torch.full_like(x, -1e6)
         x_masked = torch.where(valid, x, neg_large)
         top1 = x_masked.max(dim=1).values
@@ -40,7 +39,6 @@ class MaskedStats(nn.Module):
         k10 = min(10, x.size(1))
         top10 = torch.topk(x_masked, k=k10, dim=1).values.mean(dim=1)
 
-        # Simple score gaps. If K is smaller, this gracefully falls back.
         sorted_top = torch.topk(x_masked, k=min(20, x.size(1)), dim=1).values
         gap_1_2 = sorted_top[:, 0] - sorted_top[:, 1] if sorted_top.size(1) >= 2 else torch.zeros_like(top1)
         gap_5_10 = (
@@ -59,18 +57,7 @@ class MaskedStats(nn.Module):
 
 
 class RetrieverCal(nn.Module):
-    """
-    Minimal retriever-score decoder.
-
-    Input per candidate:
-      normalized retriever score + normalized rank.
-
-    It learns:
-      candidate base logit
-      protein-specific threshold tau_p from score-distribution summary
-
-    final_logit_i = base_i - tau_p
-    """
+    """Minimal score/rank calibration decoder."""
 
     def __init__(self, hidden_dim: int = 64, dropout: float = 0.05):
         super().__init__()
@@ -90,14 +77,10 @@ class RetrieverCal(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-
-        # Start close to a simple score/rank calibrator, not too aggressive.
         nn.init.zeros_(self.candidate_mlp[-1].weight)
         nn.init.zeros_(self.candidate_mlp[-1].bias)
         nn.init.zeros_(self.threshold_head[-1].weight)
         nn.init.zeros_(self.threshold_head[-1].bias)
-
-        # Learnable affine base directly on score and rank so zero-init MLP is not dead.
         self.score_scale = nn.Parameter(torch.tensor(1.0))
         self.rank_scale = nn.Parameter(torch.tensor(-0.5))
         self.bias = nn.Parameter(torch.tensor(0.0))
@@ -108,26 +91,17 @@ class RetrieverCal(nn.Module):
         rank_feature = torch.nan_to_num(rank_feature, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.5)
         score_z = torch.where(valid, score_z, torch.zeros_like(score_z))
         rank_feature = torch.where(valid, rank_feature, torch.zeros_like(rank_feature))
-
-        x = torch.stack([score_z, rank_feature], dim=-1)  # [B,K,2]
+        x = torch.stack([score_z, rank_feature], dim=-1)
         residual = self.candidate_mlp(x).squeeze(-1)
         base = self.score_scale * score_z + self.rank_scale * rank_feature + self.bias + residual
         summary = self.stats(score_z, rank_feature, valid)
-        tau = self.threshold_head(summary).squeeze(-1)  # [B]
+        tau = self.threshold_head(summary).squeeze(-1)
         logits = base - tau[:, None]
-        logits = torch.where(valid, logits, torch.full_like(logits, -1e9))
-        return logits
+        return torch.where(valid, logits, torch.full_like(logits, -1e9))
 
 
 class ScoreSetCal(nn.Module):
-    """
-    Candidate-set calibration model.
-
-    This is still score/rank only, but lets candidates interact through a small
-    TransformerEncoder and learns a protein-specific threshold.
-
-    final_logit_i = base_i + delta_i - tau_p
-    """
+    """Small candidate-set calibration Transformer over score/rank only."""
 
     def __init__(
         self,
@@ -141,7 +115,6 @@ class ScoreSetCal(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.max_k = int(max_k)
         self.stats = MaskedStats()
-
         self.input_proj = nn.Sequential(
             nn.Linear(2, hidden_dim),
             nn.ReLU(),
@@ -149,7 +122,6 @@ class ScoreSetCal(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.pos_emb = nn.Embedding(max_k, hidden_dim)
-
         enc_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=n_heads,
@@ -160,7 +132,6 @@ class ScoreSetCal(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-
         self.delta_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -174,13 +145,10 @@ class ScoreSetCal(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-
-        # Stable start: SetCal initially behaves like affine score/rank model.
         nn.init.zeros_(self.delta_head[-1].weight)
         nn.init.zeros_(self.delta_head[-1].bias)
         nn.init.zeros_(self.threshold_head[-1].weight)
         nn.init.zeros_(self.threshold_head[-1].bias)
-
         self.score_scale = nn.Parameter(torch.tensor(1.0))
         self.rank_scale = nn.Parameter(torch.tensor(-0.5))
         self.bias = nn.Parameter(torch.tensor(0.0))
@@ -190,28 +158,203 @@ class ScoreSetCal(nn.Module):
         B, K = score_z.shape
         if K > self.max_k:
             raise ValueError(f"K={K} exceeds max_k={self.max_k}")
+        score_z = torch.nan_to_num(score_z, nan=0.0, posinf=0.0, neginf=0.0).clamp(-20.0, 20.0)
+        rank_feature = torch.nan_to_num(rank_feature, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.5)
+        score_z = torch.where(valid, score_z, torch.zeros_like(score_z))
+        rank_feature = torch.where(valid, rank_feature, torch.zeros_like(rank_feature))
+        inp = torch.stack([score_z, rank_feature], dim=-1)
+        h = self.input_proj(inp)
+        pos = torch.arange(K, device=score_z.device).unsqueeze(0).expand(B, K)
+        h = h + self.pos_emb(pos)
+        h = self.encoder(h, src_key_padding_mask=~valid)
+        delta = self.delta_head(h).squeeze(-1)
+        base = self.score_scale * score_z + self.rank_scale * rank_feature + self.bias
+        w = valid.to(h.dtype).unsqueeze(-1)
+        h_summary = (h * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
+        stats = self.stats(score_z, rank_feature, valid)
+        tau = self.threshold_head(torch.cat([stats, h_summary], dim=-1)).squeeze(-1)
+        logits = base + delta - tau[:, None]
+        return torch.where(valid, logits, torch.full_like(logits, -1e9))
 
+
+class EmbCal(nn.Module):
+    """
+    Candidate-independent embedding calibration model.
+
+    Uses score/rank plus pooled protein and GO embeddings, but no candidate-set Transformer.
+    This is the cheap diagnostic between ScoreSetCal and full HierCross.
+    """
+
+    def __init__(self, emb_dim: int, hidden_dim: int = 128, dropout: float = 0.10, proj_dim: Optional[int] = None):
+        super().__init__()
+        self.stats = MaskedStats()
+        self.emb_dim = int(emb_dim)
+        self.proj_dim = int(proj_dim or hidden_dim)
+        self.protein_proj = nn.Sequential(nn.LayerNorm(emb_dim), nn.Linear(emb_dim, self.proj_dim), nn.GELU())
+        self.go_proj = nn.Sequential(nn.LayerNorm(emb_dim), nn.Linear(emb_dim, self.proj_dim), nn.GELU())
+        feat_dim = 4 * self.proj_dim + 3  # p, g, |p-g|, p*g, score/rank/cos
+        self.candidate_mlp = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.threshold_head = nn.Sequential(
+            nn.Linear(10 + self.proj_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        # Do not zero candidate head, embeddings must be allowed to score immediately.
+        nn.init.zeros_(self.threshold_head[-1].weight)
+        nn.init.zeros_(self.threshold_head[-1].bias)
+        self.score_scale = nn.Parameter(torch.tensor(1.0))
+        self.rank_scale = nn.Parameter(torch.tensor(-0.5))
+        self.cos_scale = nn.Parameter(torch.tensor(0.5))
+        self.bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        score_z: torch.Tensor,
+        rank_feature: torch.Tensor,
+        valid: torch.Tensor,
+        protein_z: torch.Tensor,
+        go_z: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = valid.bool()
         score_z = torch.nan_to_num(score_z, nan=0.0, posinf=0.0, neginf=0.0).clamp(-20.0, 20.0)
         rank_feature = torch.nan_to_num(rank_feature, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.5)
         score_z = torch.where(valid, score_z, torch.zeros_like(score_z))
         rank_feature = torch.where(valid, rank_feature, torch.zeros_like(rank_feature))
 
-        inp = torch.stack([score_z, rank_feature], dim=-1)  # [B,K,2]
-        h = self.input_proj(inp)
-        pos = torch.arange(K, device=score_z.device).unsqueeze(0).expand(B, K)
-        h = h + self.pos_emb(pos)
+        p = self.protein_proj(protein_z.float())       # [B,H]
+        g = self.go_proj(go_z.float())                 # [B,K,H]
+        B, K, H = g.shape
+        p_rep = p.unsqueeze(1).expand(B, K, H)
+        cos = F.cosine_similarity(p_rep, g, dim=-1)
+        x = torch.cat(
+            [p_rep, g, torch.abs(p_rep - g), p_rep * g, score_z.unsqueeze(-1), rank_feature.unsqueeze(-1), cos.unsqueeze(-1)],
+            dim=-1,
+        )
+        residual = self.candidate_mlp(x).squeeze(-1)
+        base = self.score_scale * score_z + self.rank_scale * rank_feature + self.cos_scale * cos + self.bias
+        summary = self.stats(score_z, rank_feature, valid)
+        tau = self.threshold_head(torch.cat([summary, p], dim=-1)).squeeze(-1)
+        logits = base + residual - tau[:, None]
+        return torch.where(valid, logits, torch.full_like(logits, -1e9))
 
-        # Transformer key padding mask uses True for padding/invalid.
+
+class EmbSetCal(nn.Module):
+    """
+    Embedding-aware candidate-set calibrator.
+
+    Inputs:
+      - normalized retriever score
+      - rank feature
+      - pooled protein embedding
+      - candidate GO embedding bank vectors
+
+    It is much cheaper than HierCross because it does not use GO tokens or residues.
+    """
+
+    def __init__(
+        self,
+        emb_dim: int,
+        hidden_dim: int = 128,
+        n_layers: int = 1,
+        n_heads: int = 4,
+        dropout: float = 0.10,
+        max_k: int = 1024,
+        proj_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.emb_dim = int(emb_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.proj_dim = int(proj_dim or hidden_dim)
+        self.max_k = int(max_k)
+        self.stats = MaskedStats()
+
+        self.protein_proj = nn.Sequential(nn.LayerNorm(emb_dim), nn.Linear(emb_dim, self.proj_dim), nn.GELU())
+        self.go_proj = nn.Sequential(nn.LayerNorm(emb_dim), nn.Linear(emb_dim, self.proj_dim), nn.GELU())
+        token_feat_dim = 4 * self.proj_dim + 3
+        self.input_proj = nn.Sequential(
+            nn.Linear(token_feat_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.pos_emb = nn.Embedding(max_k, hidden_dim)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.delta_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.threshold_head = nn.Sequential(
+            nn.Linear(10 + hidden_dim + self.proj_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        nn.init.zeros_(self.delta_head[-1].weight)
+        nn.init.zeros_(self.delta_head[-1].bias)
+        nn.init.zeros_(self.threshold_head[-1].weight)
+        nn.init.zeros_(self.threshold_head[-1].bias)
+        self.score_scale = nn.Parameter(torch.tensor(1.0))
+        self.rank_scale = nn.Parameter(torch.tensor(-0.5))
+        self.cos_scale = nn.Parameter(torch.tensor(0.5))
+        self.bias = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        score_z: torch.Tensor,
+        rank_feature: torch.Tensor,
+        valid: torch.Tensor,
+        protein_z: torch.Tensor,
+        go_z: torch.Tensor,
+    ) -> torch.Tensor:
+        valid = valid.bool()
+        B, K = score_z.shape
+        if K > self.max_k:
+            raise ValueError(f"K={K} exceeds max_k={self.max_k}")
+        score_z = torch.nan_to_num(score_z, nan=0.0, posinf=0.0, neginf=0.0).clamp(-20.0, 20.0)
+        rank_feature = torch.nan_to_num(rank_feature, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.5)
+        score_z = torch.where(valid, score_z, torch.zeros_like(score_z))
+        rank_feature = torch.where(valid, rank_feature, torch.zeros_like(rank_feature))
+
+        p = self.protein_proj(protein_z.float())       # [B,P]
+        g = self.go_proj(go_z.float())                 # [B,K,P]
+        _, _, P = g.shape
+        p_rep = p.unsqueeze(1).expand(B, K, P)
+        cos = F.cosine_similarity(p_rep, g, dim=-1)
+        token_x = torch.cat(
+            [p_rep, g, torch.abs(p_rep - g), p_rep * g, score_z.unsqueeze(-1), rank_feature.unsqueeze(-1), cos.unsqueeze(-1)],
+            dim=-1,
+        )
+        h = self.input_proj(token_x)
+        pos_idx = torch.arange(K, device=score_z.device).unsqueeze(0).expand(B, K)
+        h = h + self.pos_emb(pos_idx)
         h = self.encoder(h, src_key_padding_mask=~valid)
         delta = self.delta_head(h).squeeze(-1)
-
-        base = self.score_scale * score_z + self.rank_scale * rank_feature + self.bias
+        base = self.score_scale * score_z + self.rank_scale * rank_feature + self.cos_scale * cos + self.bias
 
         w = valid.to(h.dtype).unsqueeze(-1)
         h_summary = (h * w).sum(dim=1) / w.sum(dim=1).clamp_min(1.0)
         stats = self.stats(score_z, rank_feature, valid)
-        tau = self.threshold_head(torch.cat([stats, h_summary], dim=-1)).squeeze(-1)
-
+        tau = self.threshold_head(torch.cat([stats, h_summary, p], dim=-1)).squeeze(-1)
         logits = base + delta - tau[:, None]
-        logits = torch.where(valid, logits, torch.full_like(logits, -1e9))
-        return logits
+        return torch.where(valid, logits, torch.full_like(logits, -1e9))

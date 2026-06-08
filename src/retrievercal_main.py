@@ -1,22 +1,26 @@
 '''
 python -m src.retrievercal_main \
-  --model_kind retrievercal \
+  --model_kind embcal \
   --train_dump /workspace/candidate_dumps/P3aSemExp500_ESMknn500_union_train_top500 \
   --val_dump /workspace/candidate_dumps/P3aSemExp500_ESMknn500_union_val_top500 \
+  --train_embedding_dump /workspace/candidate_dumps/P3a_SemExp_train_top1000 \
+  --val_embedding_dump /workspace/candidate_dumps/P3a_SemExp_val_top1000 \
   --topk 500 \
-  --batch_size 1024 \
+  --batch_size 512 \
   --epochs 20 \
-  --lr 1e-3 \
+  --lr 3e-4 \
   --weight_decay 1e-4 \
-  --hidden_dim 64 \
-  --dropout 0.05 \
-  --lambda_f1 0.25 \
-  --lambda_card 0.05 \
+  --hidden_dim 128 \
+  --proj_dim 128 \
+  --dropout 0.10 \
+  --pos_weight_max 20 \
+  --lambda_f1 0.10 \
+  --lambda_card 0.01 \
   --lambda_dag 0.0 \
   --eval_every_steps 500 \
-  --patience 8 \
+  --patience 6 \
   --monitor fmax_full \
-  --out_dir /workspace/protein-go-align/outputs/retrievercal/retrievercal_union_top500
+  --out_dir /workspace/protein-go-align/outputs/retrievercal/embcal_union_top500
 '''
 import argparse
 import logging
@@ -30,7 +34,7 @@ def parse_args() -> CalibConfig:
     p.add_argument("--train_dump", required=True)
     p.add_argument("--val_dump", required=True)
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--model_kind", default="retrievercal", choices=["retrievercal", "scoresetcal", "step1", "step2", "setcal"])
+    p.add_argument("--model_kind", default="retrievercal", choices=["retrievercal", "scoresetcal", "embcal", "embsetcal", "embeddingcal", "embeddingsetcal", "step1", "step2", "step3", "setcal"])
     p.add_argument("--topk", type=int, default=500)
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--num_workers", type=int, default=0)
@@ -52,6 +56,9 @@ def parse_args() -> CalibConfig:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--score_stat_rows", type=int, default=0)
     p.add_argument("--monitor", default="fmax_full")
+    p.add_argument("--train_embedding_dump", default="", help="Optional dump providing protein_z/go_z for train; defaults to train_dump")
+    p.add_argument("--val_embedding_dump", default="", help="Optional dump providing protein_z/go_z for val; defaults to val_dump")
+    p.add_argument("--proj_dim", type=int, default=0, help="Projection dim for embedding calibrators; 0 uses hidden_dim")
     a = p.parse_args()
     return CalibConfig(**vars(a))
 
