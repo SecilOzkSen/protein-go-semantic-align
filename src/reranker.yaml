@@ -34,7 +34,7 @@ training:
   # First sanity run: topk=200. If stable, move to 300/500.
   topk: 500
   batch_size: 2
-  epochs: 5
+  epochs: 10
   lr: 2e-5 #5e-5 #1.0e-4
   weight_decay: 0.01
   log_every: 100
