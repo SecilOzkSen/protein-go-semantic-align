@@ -21,6 +21,34 @@ python -m src.retrievercal_main \
   --patience 6 \
   --monitor fmax_full \
   --out_dir /workspace/protein-go-align/outputs/retrievercal/embcal_union_top500
+
+  ## embcalset:
+
+  python -m src.retrievercal_main \
+  --model_kind embsetcal \
+  --train_dump /workspace/candidate_dumps/P3aSemExp500_ESMknn500_union_train_top500 \
+  --val_dump /workspace/candidate_dumps/P3aSemExp500_ESMknn500_union_val_top500 \
+  --train_embedding_dump /workspace/candidate_dumps/P3a_SemExp_train_top1000 \
+  --val_embedding_dump /workspace/candidate_dumps/P3a_SemExp_val_top1000 \
+  --topk 500 \
+  --batch_size 256 \
+  --epochs 20 \
+  --lr 3e-4 \
+  --weight_decay 1e-4 \
+  --hidden_dim 128 \
+  --proj_dim 128 \
+  --n_layers 1 \
+  --n_heads 4 \
+  --dropout 0.10 \
+  --pos_weight_max 20 \
+  --lambda_f1 0.10 \
+  --lambda_card 0.01 \
+  --lambda_dag 0.0 \
+  --eval_every_steps 500 \
+  --patience 6 \
+  --monitor fmax_full \
+  --out_dir /workspace/protein-go-align/outputs/retrievercal/embsetcal_union_top500
+
 '''
 import argparse
 import logging
