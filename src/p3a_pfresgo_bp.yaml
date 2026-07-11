@@ -1,0 +1,188 @@
+data:
+  dataset_name: "pfresgo"
+  branch: "bp"
+  ontology_namespace: "biological_process"
+  ontology_release: "2020-06-01"
+  overlap: 256
+  max_len: 1024
+  # DAG & expansion
+  use_dag_in_ds: true
+  # Few/Zero-shot
+  fs_target_ratio: 0.0
+  # Branch annotation'ı olmayan train proteinleri
+  # contrastive training'e alınmayacak.
+  drop_empty_train_positives: true
+  # Validation ve test splitleri korunacak.
+  drop_empty_eval_positives: false
+
+general:
+  phase: -2
+  ablation_id: "P3a_PFresGO_BP"
+  use_queue_miner: true
+
+  # GO side clean A3/full-text anchor
+  go_pooling_strategy: "mean"
+  go_encoder_inner_pooling: "mean"
+  go_pool_type: "mean"
+  go_encoder_output_mode: "segment_pooled" #"pooled"
+
+  # Protein side new branch
+  protein_pooling_strategy: "mean_attn_gate" # "mean_attn_gate" #local_evidence_gate
+  protein_n_slots: 0
+
+  use_lora: false
+  use_attribution_loss: false
+  return_alpha: false
+  return_slot_attn: false
+
+training:
+  epochs: 15  #15
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+  val_num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  fp16: true
+  cpu: false
+  seed: 42
+  output_dir: /workspace/data_pfresgo/outputs/retriever/bp
+  save_every: 10000
+  keep_last_n: 3
+  resume: null
+  warmstart_path: null #/workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go/checkpoint_step83945.pt
+  eval_only: false
+  log_every: 500
+  log_level: INFO
+  monitor_metric: "oracle_Fmax@200" #"align_nDCG@10"   # "total" da olabilir
+  monitor_mode: "max"           # "min" (ör. total loss) için değiştir
+  early_stop_patience: 3        # 0 veya negatif => kapalı
+  cand_chunk_k: 4 #8
+  pos_chunk_t: 128
+  max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
+  eval_go_bs: 256 # eval go batch size for go embedding extraction
+  go_text_store_max_len: 128 # TODO: 512 batch size for storing go text embeddings
+  go_segment_max_len: 64
+  is_logit_scale_constant: true #false = trainable logit scale
+  go_token_dropout: false
+  go_pooling: "none" # cls, mean, masked_mean -> NO NEED
+  eval_space: "branch_full" #"observed" #seen -> # observed: all go must be included to make evaluation reliable.
+  # eval space: observed = observed go ids. train+val+test seen once.
+  max_inbatch: 160
+  eval_cand_chunk_k: 64
+  go_segment_alpha: 0.05
+  go_segment_alpha_warmup_steps: 5000
+  trainable_mode: "segment_projection_only" #"protein_projection_only" #"protein_query_only" #"segment_gate_only" #local_evidence_only #local_evidence_query
+  local_window_size: 64
+  local_window_stride: 32ü
+    # Validation sırasında tek Top-500 retrieval alınacak.
+    # Daha küçük K değerleri bunun slice'larından hesaplanacak.
+  candidate_k_grid:
+      - 100
+      - 200
+      - 300
+      - 500
+
+  checkpoint_candidate_k: 200
+
+queue: # queue params
+  queue_K: 16384  #8192 #2048 #8192
+  queue_start_step: 2000
+  queue_hard_frac_start: 0.0
+  queue_hard_frac_end: 0.5
+  queue_hard_frac_warmup_steps: 6000
+  queue_weight_start: 0.2
+  queue_weight_end: 1.0
+  queue_weight_warmup_steps: 6000
+  k_hard_queue_start: 4
+  k_hard_queue_end: 24
+  k_hard_queue_warmup_steps: 6000
+
+optim:
+  lr: 0.00001
+  lr_lora: 0.0
+  weight_decay: 0.0
+  grad_clip: 1.0
+
+model:
+  align_dim: 768
+  temperature: 0.07
+  attn_heads: 2
+  attn_dropout: 0.1
+  entropy_reg: 0.01
+  win_size: 1024
+  win_stride: 256
+
+loss:
+  lambda_con: 1.0
+  lambda_dag: 0.0
+  lambda_attr: 0.0
+  lambda_entropy_alpha: 0.0
+  dag_margin: 0.05
+  dag_scale: 10.0
+  lambda_vtrue: 0.0
+  tau_distill: 1.0
+  lambda_bce: 0.0
+
+curriculum:
+  epochs: 5
+  warmup_frac: 0.1
+  mode: cosine
+  hard_frac: [0.2, 0.5]
+  shortlist_M: [128, 64]
+  k_hard: [4, 1]
+  hier_up: [1, 0]
+  hier_dn: [0, 0]
+  random_k: [4, 0]
+  inbatch_easy: [1.0, 0.0]
+  neg_k: 8
+  curriculum_mode: cosine
+
+schedule:
+  phase_breaks: [5, 9, 12]
+  stageA_mix: [1.0, 0.0, 0.0]
+  stageB_mix: [0.7, 0.3, 0.0]
+  stageC_mix: [0.4, 0.4, 0.2]
+  stageD_mix: [0.4, 0.4, 0.2]
+  lambda_attr_start: 6
+  lambda_attr_max: 0.2
+
+wandb:
+  enabled: true
+  project: "protein-go-align-pfresgo"
+  entity: null
+  wandb_run_name: "P3a-PFresGO-BP"
+  mode: online
+
+stores:
+  train_ids_path: /workspace/stargo/datasets/pfresgo/train.txt
+  val_ids_path: /workspace/stargo/datasets/pfresgo/valid.txt
+  test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
+
+  annotation_path: /workspace/stargo/datasets/pfresgo/annot.tsv
+  fasta_path: /workspace/stargo/datasets/pfresgo/nrPDB-GO_2019.06.18_sequences.fasta
+
+  go_obo_path: /workspace/stargo/datasets/pfresgo/go.obo
+  go_basic_json: /workspace/data_pfresgo/processed/go_vocab.json
+  go_basic_pkl: /workspace/data_pfresgo/processed/go_vocab.pkl
+  go_alt_id_path: /workspace/data_pfresgo/processed/go_alt_id_to_primary.json
+
+  branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_bp.json
+  pid2pos_path: /workspace/data_pfresgo/processed/pid_to_positives_bp.json
+
+  embed_dir_res: /workspace/data_pfresgo/protein_embeddings/esm1b_residue
+
+  go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
+  go_text_folder: /workspace/data_pfresgo/processed
+
+  go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
+  go_cache_ids_path: /workspace/data_pfresgo/go_cache/all/ids.json
+  go_cache_meta_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy.meta.pt
+
+  seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
+
+  test_identity_path: /workspace/stargo/datasets/pfresgo/nrPDB-GO_2019.06.18_test.csv
+
+  logs: /workspace/data_pfresgo/logs/retriever/bp
+

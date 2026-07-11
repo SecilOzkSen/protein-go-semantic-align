@@ -3868,6 +3868,7 @@ class OppTrainer:
         cand_stats = {
             int(k): {
                 "coverage_sum": 0.0,   # mean per-protein recall over true labels
+                "protein_f_sum": 0.0,  # protein-centric perfect-reranker F
                 "any_hit_sum": 0.0,    # fraction of proteins with at least one hit
                 "num_valid": 0,        # proteins with >=1 true label
                 "tp": 0.0,             # micro true positives inside top-K
@@ -3931,8 +3932,10 @@ class OppTrainer:
                         true_valid = true_counts[valid].float().clamp_min(1.0)
 
                         coverage_k = hits_valid / true_valid
+                        protein_f_k = (2.0 * coverage_k) / (1.0 + coverage_k).clamp_min(1e-12)
 
                         cand_stats[int(k)]["coverage_sum"] += float(coverage_k.sum().item())
+                        cand_stats[int(k)]["protein_f_sum"] += float(protein_f_k.sum().item())
                         cand_stats[int(k)]["any_hit_sum"] += float((hits_valid > 0).float().sum().item())
                         cand_stats[int(k)]["num_valid"] += valid_n
 
@@ -4058,6 +4061,7 @@ class OppTrainer:
             n = max(1, int(st["num_valid"]))
 
             coverage = st["coverage_sum"] / n
+            oracle_protein_f = st["protein_f_sum"] / n
             any_hit = st["any_hit_sum"] / n
 
             tp = float(st["tp"])
@@ -4068,6 +4072,7 @@ class OppTrainer:
             logs[f"cand_coverage@{k}"] = float(coverage)
             logs[f"cand_any_hit@{k}"] = float(any_hit)
             logs[f"oracle_microF@{k}"] = float(oracle_micro_f)
+            logs[f"oracle_proteinF@{k}"] = float(oracle_protein_f)
 
         if sum_unseen_num > 0:
             logs["unseen_R@10"] = sum_unseen_R10 / sum_unseen_num
