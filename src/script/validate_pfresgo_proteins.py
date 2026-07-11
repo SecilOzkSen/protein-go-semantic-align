@@ -2,8 +2,6 @@ import hashlib
 from collections import Counter
 from pathlib import Path
 
-from Bio import SeqIO
-
 
 PFRESGO_DIR = Path(
     "/workspace/stargo/datasets/pfresgo"
@@ -49,13 +47,20 @@ def load_fasta(path: Path):
         "ACDEFGHIKLMNPQRSTVWYBXZJUO"
     )
 
-    for record in SeqIO.parse(path, "fasta"):
-        protein_id = record.id.strip()
-        sequence = str(record.seq).strip().upper()
+    current_id = None
+    current_sequence_parts = []
 
-        if protein_id in sequences:
-            duplicate_ids.append(protein_id)
-            continue
+    def save_current_sequence():
+        if current_id is None:
+            return
+
+        sequence = "".join(
+            current_sequence_parts
+        ).strip().upper()
+
+        if current_id in sequences:
+            duplicate_ids.append(current_id)
+            return
 
         invalid_chars = sorted(
             set(sequence) - valid_amino_acids
@@ -64,14 +69,42 @@ def load_fasta(path: Path):
         if invalid_chars:
             invalid_sequences.append(
                 {
-                    "protein_id": protein_id,
+                    "protein_id": current_id,
                     "invalid_chars": invalid_chars,
                 }
             )
 
-        sequences[protein_id] = sequence
+        sequences[current_id] = sequence
 
-    return sequences, duplicate_ids, invalid_sequences
+    with open(path, "r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                save_current_sequence()
+
+                header = line[1:].strip()
+                current_id = header.split()[0]
+                current_sequence_parts = []
+            else:
+                if current_id is None:
+                    raise ValueError(
+                        "FASTA sequence encountered before "
+                        f"a header in {path}"
+                    )
+
+                current_sequence_parts.append(line)
+
+    save_current_sequence()
+
+    return (
+        sequences,
+        duplicate_ids,
+        invalid_sequences,
+    )
 
 
 def load_annotation_ids(path: Path):
