@@ -392,7 +392,7 @@ class BioMedBERTEncoder(nn.Module):
         self,
         go_texts: List[str],
         batch_size: int = 16,
-        normalize: bool = True,
+        normalize: bool = False,
         return_attn: bool = False,
         output_mode: str = "pooled",   # "pooled" | "tokens" | "both"
     ):
