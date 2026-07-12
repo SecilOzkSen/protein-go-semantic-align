@@ -294,6 +294,62 @@ def compute_fmax_old(
     return fmax, best_t
 
 
+
+def compute_protein_centric_fmax(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    num_thresholds: int = 101,
+    eps: float = 1e-12,
+) -> Tuple[float, float]:
+    """CAFA-style protein-centric Fmax.
+
+    At each threshold, precision is averaged over proteins having at least one
+    prediction and recall is averaged over proteins having at least one true
+    label. Their harmonic mean is maximized over thresholds.
+
+    Raw logits are converted to sigmoid confidences. Inputs already in [0, 1]
+    are treated as confidences.
+    """
+    yt = np.asarray(y_true) > 0
+    score = np.asarray(y_score, dtype=np.float32)
+
+    if yt.ndim != 2 or score.ndim != 2 or yt.shape != score.shape:
+        raise ValueError(f"Expected matching [N,G] arrays, got {yt.shape} and {score.shape}")
+    if not np.isfinite(score).all():
+        raise ValueError("Non-finite prediction scores in protein-centric Fmax")
+    if yt.shape[0] == 0 or not np.any(yt):
+        return 0.0, 0.0
+
+    if float(score.min()) < 0.0 or float(score.max()) > 1.0:
+        # Stable sigmoid for raw similarity/logit scores.
+        score = np.clip(score, -50.0, 50.0)
+        score = 1.0 / (1.0 + np.exp(-score))
+
+    thresholds = np.linspace(0.0, 1.0, int(num_thresholds), dtype=np.float32)
+    true_count = yt.sum(axis=1).astype(np.float32)
+    has_true = true_count > 0
+
+    best_f = 0.0
+    best_t = 0.0
+    for threshold in thresholds:
+        pred = score >= threshold
+        tp = (pred & yt).sum(axis=1).astype(np.float32)
+        pred_count = pred.sum(axis=1).astype(np.float32)
+        has_pred = pred_count > 0
+
+        precision = (
+            float(np.mean(tp[has_pred] / np.maximum(pred_count[has_pred], 1.0)))
+            if np.any(has_pred) else 0.0
+        )
+        recall = float(np.mean(tp[has_true] / np.maximum(true_count[has_true], 1.0)))
+        f_value = (2.0 * precision * recall) / max(eps, precision + recall)
+
+        if f_value > best_f:
+            best_f = float(f_value)
+            best_t = float(threshold)
+
+    return best_f, best_t
+
 # -----------------------------
 # Term-centric AUPR
 # -----------------------------

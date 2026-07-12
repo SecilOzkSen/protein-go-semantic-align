@@ -9,7 +9,7 @@ from src.models.alignment_model import ProteinGoAligner
 from src.loss.attribution import attribution_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig, QueueConfig
 from src.miners.queue_miner import MoCoQueue
-from src.metrics.cafa import compute_fmax, compute_term_aupr
+from src.metrics.cafa import (compute_fmax, compute_term_aupr, compute_protein_centric_fmax)
 from src.metrics.retrieval import retrieval_metrics_from_scores
 from src.utils.helpers import go_str_to_int_any
 import numpy as np
@@ -3713,6 +3713,23 @@ class OppTrainer:
         logs["seen_fmax"], logs["seen_aupr"] = _finish_fmax_aupr(preds_seen, trues_seen)
         logs["rare_fmax"], logs["rare_aupr"] = _finish_fmax_aupr(preds_rare, trues_rare)
 
+        def _finish_protein_fmax(pred_list, true_list):
+            if not pred_list:
+                return 0.0, 0.0
+            y_score = torch.cat(pred_list, dim=0).numpy().astype(np.float32)
+            y_true_np = torch.cat(true_list, dim=0).numpy().astype(np.int32)
+            return compute_protein_centric_fmax(y_true_np, y_score, num_thresholds=101)
+
+        logs["obs_protein_fmax"], logs["obs_protein_fmax_threshold"] = _finish_protein_fmax(
+            preds_obs, trues_obs
+        )
+        logs["seen_protein_fmax"], logs["seen_protein_fmax_threshold"] = _finish_protein_fmax(
+            preds_seen, trues_seen
+        )
+        logs["rare_protein_fmax"], logs["rare_protein_fmax_threshold"] = _finish_protein_fmax(
+            preds_rare, trues_rare
+        )
+
         if sum_num > 0:
             logs["align_R@1"] = sum_R1 / sum_num
             logs["align_R@5"] = sum_R5 / sum_num
@@ -4030,6 +4047,23 @@ class OppTrainer:
         logs["obs_fmax"], logs["obs_aupr"] = _finish_fmax_aupr(preds_obs, trues_obs)
         logs["seen_fmax"], logs["seen_aupr"] = _finish_fmax_aupr(preds_seen, trues_seen)
         logs["rare_fmax"], logs["rare_aupr"] = _finish_fmax_aupr(preds_rare, trues_rare)
+
+        def _finish_protein_fmax(pred_list, true_list):
+            if not pred_list:
+                return 0.0, 0.0
+            y_score = torch.cat(pred_list, dim=0).numpy().astype(np.float32)
+            y_true_np = torch.cat(true_list, dim=0).numpy().astype(np.int32)
+            return compute_protein_centric_fmax(y_true_np, y_score, num_thresholds=101)
+
+        logs["obs_protein_fmax"], logs["obs_protein_fmax_threshold"] = _finish_protein_fmax(
+            preds_obs, trues_obs
+        )
+        logs["seen_protein_fmax"], logs["seen_protein_fmax_threshold"] = _finish_protein_fmax(
+            preds_seen, trues_seen
+        )
+        logs["rare_protein_fmax"], logs["rare_protein_fmax_threshold"] = _finish_protein_fmax(
+            preds_rare, trues_rare
+        )
 
         if sum_num > 0:
             logs["align_R@1"] = sum_R1 / sum_num

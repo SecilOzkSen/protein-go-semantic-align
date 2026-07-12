@@ -1,88 +1,73 @@
+# PFresGO MF retriever config for src/main_pfresgo.py
+pfresgo:
+  branch: MF
+  branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_mf.json
+  go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
+  test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
+  evaluation_split: valid
+  rare_lt: 20
+
 data:
-  dataset_name: "pfresgo"
-  branch: "mf"
-  ontology_namespace: "molecular_function"
-  ontology_release: "2020-06-01"
   overlap: 256
   max_len: 1024
-  # DAG & expansion
-  use_dag_in_ds: true
-  # Few/Zero-shot
+  # Keep benchmark labels exact. DAG is still available to the evaluator.
+  use_dag_in_ds: false
   fs_target_ratio: 0.0
-  # Branch annotation'ı olmayan train proteinleri
-  # contrastive training'e alınmayacak.
-  drop_empty_train_positives: true
-  # Validation ve test splitleri korunacak.
-  drop_empty_eval_positives: false
 
 general:
   phase: -2
-  ablation_id: "P3a_PFresGO_MF"
+  ablation_id: "PFresGO_MF_full"
   use_queue_miner: true
-
-  # GO side clean A3/full-text anchor
-  go_pooling_strategy: "mean"
-  go_encoder_inner_pooling: "mean"
-  go_pool_type: "mean"
-  go_encoder_output_mode: "segment_pooled" #"pooled"
-
-  # Protein side new branch
-  protein_pooling_strategy: "mean_attn_gate" # "mean_attn_gate" #local_evidence_gate
+  go_pooling_strategy: mean
+  go_encoder_inner_pooling: mean
+  go_pool_type: mean
+  go_encoder_output_mode: segment_pooled
+  protein_pooling_strategy: mean_attn_gate
   protein_n_slots: 0
-
   use_lora: false
   use_attribution_loss: false
   return_alpha: false
   return_slot_attn: false
 
 training:
-  epochs: 15  #15
+  epochs: 15
   batch_size: 4
   eval_batch_size: 4
-  num_workers: 4
-  val_num_workers: 2
-  pin_memory: true
-  persistent_workers: true
-  prefetch_factor: 2
+  num_workers: 0
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/retriever/mf
+  output_dir: /workspace/data_pfresgo/outputs/mf
   save_every: 10000
   keep_last_n: 3
   resume: null
-  warmstart_path: null #/workspace/protein-go-align-outputs-P2c-A3warm-projPOnly-pooled_go/checkpoint_step83945.pt
+  warmstart_path: null
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "oracle_Fmax@100" #"align_nDCG@10"   # "total" da olabilir
-  monitor_mode: "max"           # "min" (ör. total loss) için değiştir
-  early_stop_patience: 3        # 0 veya negatif => kapalı
-  cand_chunk_k: 4 #8
+  monitor_metric: "oracle_proteinF@100"
+  monitor_mode: max
+  early_stop_patience: 3
+  cand_chunk_k: 4
   pos_chunk_t: 128
-  max_refresh_go: 0 #27156 #2000 #7500 # max go queue refresh per epoch - bc we do lora training!
-  eval_go_bs: 256 # eval go batch size for go embedding extraction
-  go_text_store_max_len: 128 # TODO: 512 batch size for storing go text embeddings
+  max_refresh_go: 0
+  eval_go_bs: 256
+  go_text_store_max_len: 128
   go_segment_max_len: 64
-  is_logit_scale_constant: true #false = trainable logit scale
+  is_logit_scale_constant: true
   go_token_dropout: false
-  go_pooling: "none" # cls, mean, masked_mean -> NO NEED
-  eval_space: "branch_full" #"observed" #seen -> # observed: all go must be included to make evaluation reliable.
-  # eval space: observed = observed go ids. train+val+test seen once.
+  go_pooling: none
+  eval_space: observed
   max_inbatch: 160
   eval_cand_chunk_k: 64
   go_segment_alpha: 0.05
   go_segment_alpha_warmup_steps: 5000
-  trainable_mode: "segment_projection_only" #"protein_projection_only" #"protein_query_only" #"segment_gate_only" #local_evidence_only #local_evidence_query
+  trainable_mode: full
   local_window_size: 64
-  local_window_stride: 32ü
-    # Validation sırasında tek Top-500 retrieval alınacak.
-    # Daha küçük K değerleri bunun slice'larından hesaplanacak.
-  candidate_k_grid: [50, 100, 200, 300]
-  checkpoint_candidate_k: 100
+  local_window_stride: 32
 
-queue: # queue params
-  queue_K: 16384  #8192 #2048 #8192
+queue:
+  queue_K: 16384
   queue_start_step: 2000
   queue_hard_frac_start: 0.0
   queue_hard_frac_end: 0.5
@@ -108,6 +93,8 @@ model:
   entropy_reg: 0.01
   win_size: 1024
   win_stride: 256
+  multivec_slot_lse_tau: 0.10
+  multivec_global_residual_init: 0.25
 
 loss:
   lambda_con: 1.0
@@ -119,6 +106,7 @@ loss:
   lambda_vtrue: 0.0
   tau_distill: 1.0
   lambda_bce: 0.0
+  lambda_slot_div: 0.0
 
 curriculum:
   epochs: 5
@@ -127,57 +115,31 @@ curriculum:
   hard_frac: [0.2, 0.5]
   shortlist_M: [128, 64]
   k_hard: [4, 1]
-  hier_up: [1, 0]
+  hier_up: [0, 0]
   hier_dn: [0, 0]
   random_k: [4, 0]
   inbatch_easy: [1.0, 0.0]
   neg_k: 8
-  curriculum_mode: cosine
-
-schedule:
-  phase_breaks: [5, 9, 12]
-  stageA_mix: [1.0, 0.0, 0.0]
-  stageB_mix: [0.7, 0.3, 0.0]
-  stageC_mix: [0.4, 0.4, 0.2]
-  stageD_mix: [0.4, 0.4, 0.2]
-  lambda_attr_start: 6
-  lambda_attr_max: 0.2
 
 wandb:
   enabled: true
-  project: "protein-go-align-pfresgo"
+  project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "P3a-PFresGO-MF"
+  wandb_run_name: "PFresGO-MF-full"
   mode: online
 
 stores:
   train_ids_path: /workspace/stargo/datasets/pfresgo/train.txt
   val_ids_path: /workspace/stargo/datasets/pfresgo/valid.txt
-  test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
-
-  annotation_path: /workspace/stargo/datasets/pfresgo/annot.tsv
-  fasta_path: /workspace/stargo/datasets/pfresgo/nrPDB-GO_2019.06.18_sequences.fasta
-
-  go_obo_path: /workspace/stargo/datasets/pfresgo/go.obo
   go_basic_json: /workspace/data_pfresgo/processed/go_vocab.json
-  go_basic_pkl: /workspace/data_pfresgo/processed/go_vocab.pkl
-  go_alt_id_path: /workspace/data_pfresgo/processed/go_alt_id_to_primary.json
-
-  branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_mf.json
   pid2pos_path: /workspace/data_pfresgo/processed/pid_to_positives_mf.json
-
+  zero_shot_path: null
+  few_shot_path: null
+  go_path_seen: null
+  go_path_observed: null
   embed_dir_res: /workspace/data_pfresgo/protein_embeddings/esm1b_residue
-
-  go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
   go_text_folder: /workspace/data_pfresgo/processed
-
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
-  go_cache_ids_path: /workspace/data_pfresgo/go_cache/all/ids.json
-  go_cache_meta_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy.meta.pt
-
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-
-  test_identity_path: /workspace/stargo/datasets/pfresgo/nrPDB-GO_2019.06.18_test.csv
-
-  logs: /workspace/data_pfresgo/logs/retriever/mf
+  logs: /workspace/data_pfresgo/logs/mf
 
