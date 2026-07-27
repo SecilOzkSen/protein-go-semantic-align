@@ -132,69 +132,321 @@ def _validate(args, pf: dict, branch_ids: List[int]) -> None:
 
 def configure(config_path: str):
     cfg_path = Path(config_path).resolve()
-    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+
+    raw = yaml.safe_load(
+        cfg_path.read_text(encoding="utf-8")
+    ) or {}
+
     pf = raw.get("pfresgo", {})
     if not pf:
-        raise ValueError("Config is missing the top-level 'pfresgo' block")
+        raise ValueError(
+            "Config is missing the top-level 'pfresgo' block"
+        )
 
-    args = base.load_structured_cfg(str(cfg_path))
-    args.pfresgo_branch = str(pf.get("branch", "")).upper()
-    if args.pfresgo_branch not in {"BP", "MF", "CC"}:
-        raise ValueError("pfresgo.branch must be BP, MF, or CC")
+    # ---------------------------------------------------------
+    # PFresGO segment configuration
+    # ---------------------------------------------------------
+    allowed_segments = [
+        "name",
+        "namespace",
+        "definition",
+        "is_a",
+        "part_of",
+    ]
 
-    branch_ids_path = Path(pf["branch_go_ids_path"])
-    go_text_path = Path(pf["go_text_path"])
-    branch_ids = _read_ids(branch_ids_path)
-    seen, rare, zero = _training_buckets(
-        Path(args.train_ids_path), Path(args.pid2pos), branch_ids, int(pf.get("rare_lt", 20))
+    pf_enabled_segments = pf.get(
+        "enabled_segments",
+        ["name", "definition"],
     )
 
-    split = str(pf.get("evaluation_split", "valid")).lower()
-    if split == "test":
-        args.val_ids_path = Path(pf["test_ids_path"])
-    elif split != "valid":
-        raise ValueError("pfresgo.evaluation_split must be 'valid' or 'test'")
+    if not isinstance(pf_enabled_segments, list):
+        raise ValueError(
+            "pfresgo.enabled_segments must be a list"
+        )
 
+    pf_enabled_segments = [
+        str(segment).strip()
+        for segment in pf_enabled_segments
+        if str(segment).strip()
+    ]
+
+    if not pf_enabled_segments:
+        raise ValueError(
+            "At least one PFresGO segment must be enabled"
+        )
+
+    unknown_segments = (
+        set(pf_enabled_segments) - set(allowed_segments)
+    )
+    if unknown_segments:
+        raise ValueError(
+            f"Unknown PFresGO segments: "
+            f"{sorted(unknown_segments)}. "
+            f"Allowed segments: {allowed_segments}"
+        )
+
+    # Remove duplicates while preserving canonical segment order.
+    pf_enabled_segment_set = set(pf_enabled_segments)
+    pf_enabled_segments = [
+        segment
+        for segment in allowed_segments
+        if segment in pf_enabled_segment_set
+    ]
+
+    # ---------------------------------------------------------
+    # Load main structured config
+    # ---------------------------------------------------------
+    args = base.load_structured_cfg(str(cfg_path))
+
+    # Store explicitly so other code paths can access it.
+    args.enabled_segments = list(pf_enabled_segments)
+    args.pfresgo_enabled_segments = list(pf_enabled_segments)
+
+    # ---------------------------------------------------------
+    # Branch configuration
+    # ---------------------------------------------------------
+    args.pfresgo_branch = str(
+        pf.get("branch", "")
+    ).strip().upper()
+
+    if args.pfresgo_branch not in {"BP", "MF", "CC"}:
+        raise ValueError(
+            "pfresgo.branch must be BP, MF, or CC"
+        )
+
+    if "branch_go_ids_path" not in pf:
+        raise ValueError(
+            "pfresgo.branch_go_ids_path is required"
+        )
+
+    if "go_text_path" not in pf:
+        raise ValueError(
+            "pfresgo.go_text_path is required"
+        )
+
+    branch_ids_path = Path(
+        pf["branch_go_ids_path"]
+    ).expanduser().resolve()
+
+    go_text_path = Path(
+        pf["go_text_path"]
+    ).expanduser().resolve()
+
+    branch_ids = _read_ids(branch_ids_path)
+
+    seen, rare, zero = _training_buckets(
+        Path(args.train_ids_path),
+        Path(args.pid2pos),
+        branch_ids,
+        int(pf.get("rare_lt", 20)),
+    )
+
+    # ---------------------------------------------------------
+    # Evaluation split
+    # ---------------------------------------------------------
+    split = str(
+        pf.get("evaluation_split", "valid")
+    ).strip().lower()
+
+    if split == "test":
+        test_ids_path = pf.get("test_ids_path")
+        if not test_ids_path:
+            raise ValueError(
+                "pfresgo.test_ids_path is required when "
+                "pfresgo.evaluation_split=test"
+            )
+
+        args.val_ids_path = str(
+            Path(test_ids_path).expanduser().resolve()
+        )
+
+    elif split != "valid":
+        raise ValueError(
+            "pfresgo.evaluation_split must be 'valid' or 'test'"
+        )
+
+    # ---------------------------------------------------------
+    # Dynamic GO sets
+    # ---------------------------------------------------------
     sentinels = {
         "__PFRESGO_BRANCH__": branch_ids,
         "__PFRESGO_SEEN__": seen,
         "__PFRESGO_RARE__": rare,
         "__PFRESGO_ZERO__": zero,
     }
+
     args.eval_space = "observed"
     args.go_path_observed = "__PFRESGO_BRANCH__"
     args.go_path_seen = "__PFRESGO_SEEN__"
     args.few_shot_path = "__PFRESGO_RARE__"
     args.zero_shot_path = "__PFRESGO_ZERO__"
 
+    # ---------------------------------------------------------
+    # Patch ID loaders
+    # ---------------------------------------------------------
     original_pickle_loader = base.load_raw_pickle
 
     def load_ids_compat(path):
+        if path is None:
+            return []
+
         key = str(path)
+
         if key in sentinels:
             return list(sentinels[key])
-        p = Path(path)
-        return _read_ids(p) if p.suffix.lower() in {".json", ".txt"} else original_pickle_loader(path)
+
+        resolved_path = Path(path)
+
+        if resolved_path.suffix.lower() in {
+            ".json",
+            ".txt",
+            ".pkl",
+            ".pickle",
+        }:
+            return _read_ids(resolved_path)
+
+        return original_pickle_loader(path)
 
     base.load_raw_pickle = load_ids_compat
-    base.load_go_set = lambda path: set(load_ids_compat(path)) if path else set()
-    base.load_go_parents = lambda: _build_dag(Path(args.go_basic_json))[0]
-    base.load_go_children = lambda: _build_dag(Path(args.go_basic_json))[1]
-    base.load_go_namespaces = lambda: _namespace_map(Path(args.go_basic_json))
 
+    def load_go_set_compat(path):
+        if not path:
+            return set()
+        return set(load_ids_compat(path))
+
+    base.load_go_set = load_go_set_compat
+
+    # ---------------------------------------------------------
+    # Patch PFresGO ontology loaders
+    # ---------------------------------------------------------
+    dag_cache = None
+    namespace_cache = None
+
+    def load_pfresgo_parents():
+        nonlocal dag_cache
+        if dag_cache is None:
+            dag_cache = _build_dag(
+                Path(args.go_basic_json)
+            )
+        return dag_cache[0]
+
+    def load_pfresgo_children():
+        nonlocal dag_cache
+        if dag_cache is None:
+            dag_cache = _build_dag(
+                Path(args.go_basic_json)
+            )
+        return dag_cache[1]
+
+    def load_pfresgo_namespaces():
+        nonlocal namespace_cache
+        if namespace_cache is None:
+            namespace_cache = _namespace_map(
+                Path(args.go_basic_json)
+            )
+        return namespace_cache
+
+    base.load_go_parents = load_pfresgo_parents
+    base.load_go_children = load_pfresgo_children
+    base.load_go_namespaces = load_pfresgo_namespaces
+
+    # ---------------------------------------------------------
+    # Patch GO text loader
+    # ---------------------------------------------------------
     original_text_loader = base.load_go_texts_by_phase
 
-    def load_pfresgo_texts(_folder, phase=0, return_segments=False):
+    def load_pfresgo_texts(
+        folder,
+        phase=0,
+        return_segments=False,
+        enabled_segments=None,
+        **kwargs,
+    ):
+        """
+        PFresGO-compatible GO text loader.
+
+        Priority:
+        1. Explicit enabled_segments supplied by the caller.
+        2. pfresgo.enabled_segments from YAML.
+        """
+
+        effective_segments = (
+            list(enabled_segments)
+            if enabled_segments is not None
+            else list(pf_enabled_segments)
+        )
+
+        unknown = (
+            set(effective_segments) - set(allowed_segments)
+        )
+        if unknown:
+            raise ValueError(
+                f"Unknown GO segments passed to loader: "
+                f"{sorted(unknown)}"
+            )
+
+        # Preserve canonical ordering.
+        effective_set = set(effective_segments)
+        effective_segments = [
+            segment
+            for segment in allowed_segments
+            if segment in effective_set
+        ]
+
+        if not effective_segments:
+            raise ValueError(
+                "GO text loader received no enabled segments"
+            )
+
+        # PFresGO uses its canonical JSONL for negative phases.
         if int(phase) < 0:
-            return load_go_texts_canonical(str(go_text_path), phase=phase, return_segments=return_segments)
-        return original_text_loader(_folder, phase=phase, return_segments=return_segments)
+            return load_go_texts_canonical(
+                str(go_text_path),
+                phase=phase,
+                return_segments=return_segments,
+                enabled_segments=effective_segments,
+            )
+
+        # Preserve the original loader for non-canonical phases.
+        # Some older loader versions may not yet accept
+        # enabled_segments, so support both signatures.
+        try:
+            return original_text_loader(
+                folder,
+                phase=phase,
+                return_segments=return_segments,
+                enabled_segments=effective_segments,
+                **kwargs,
+            )
+        except TypeError as exc:
+            if "enabled_segments" not in str(exc):
+                raise
+
+            return original_text_loader(
+                folder,
+                phase=phase,
+                return_segments=return_segments,
+                **kwargs,
+            )
 
     base.load_go_texts_by_phase = load_pfresgo_texts
+
+    # ---------------------------------------------------------
+    # Validation and diagnostics
+    # ---------------------------------------------------------
     _validate(args, pf, branch_ids)
+
     print(
-        f"[PFresGO] branch={args.pfresgo_branch} split={split} "
-        f"candidates={len(branch_ids)} seen={len(seen)} rare={len(rare)} zero={len(zero)}"
+        f"[PFresGO] "
+        f"branch={args.pfresgo_branch} "
+        f"split={split} "
+        f"segments={pf_enabled_segments} "
+        f"candidates={len(branch_ids)} "
+        f"seen={len(seen)} "
+        f"rare={len(rare)} "
+        f"zero={len(zero)}"
     )
+
     return args
 
 

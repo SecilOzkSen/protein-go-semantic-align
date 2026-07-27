@@ -5,7 +5,13 @@ from pathlib import Path
 import pickle
 
 from configs.paths import GO_VOCAB
-SEGMENT_NAMES = ["name", "namespace", "definition", "is_a", "part_of"]
+ALL_SEGMENT_NAMES = [
+    "name",
+    "namespace",
+    "definition",
+    "is_a",
+    "part_of",
+]
 
 SEGMENT_DEFAULT_TEXT = {
     "name": "Name: none.",
@@ -76,29 +82,64 @@ def _segment_is_present(text: str) -> bool:
         return False
     return True
 
+from typing import Dict, Iterable, Optional, Set, Tuple
 
-def load_go_texts_canonical(go_text_path: str, phase=-2, return_segments: bool = False):
+
+def load_go_texts_canonical(
+    go_text_path: str,
+    phase: int = -2,
+    return_segments: bool = False,
+    enabled_segments: Optional[Iterable[str]] = None,
+):
     """
-    Backward-compatible loader.
+    Canonical GO text loader with automatic segment ablation.
 
-    If return_segments=False:
-        returns:
-            id2text: Dict[int, str]
+    enabled_segments örnekleri:
+        ["name", "definition"]
+        ["name", "definition", "is_a"]
+        ["name", "definition", "is_a", "part_of"]
 
-    If return_segments=True:
-        returns:
-            id2text: Dict[int, str]
-            id2segments: Dict[int, Dict[str, str]]
-            id2seg_present: Dict[int, Dict[str, bool]]
+    return_segments=False:
+        id2text
+
+    return_segments=True:
+        id2text
+        id2segments
+        id2seg_present
     """
-    import os, json
+    import json
+    import os
 
     if not os.path.exists(go_text_path):
-        raise FileNotFoundError(f"Canonical GO text file not found: {go_text_path}")
+        raise FileNotFoundError(
+            f"Canonical GO text file not found: {go_text_path}"
+        )
 
-    id2text = {}
-    id2segments = {}
-    id2seg_present = {}
+    if enabled_segments is None:
+        enabled: Set[str] = set(ALL_SEGMENT_NAMES)
+    else:
+        enabled = {str(x).strip() for x in enabled_segments}
+
+    unknown = enabled.difference(ALL_SEGMENT_NAMES)
+    if unknown:
+        raise ValueError(
+            f"Unknown GO segments: {sorted(unknown)}. "
+            f"Allowed segments: {ALL_SEGMENT_NAMES}"
+        )
+
+    if not enabled:
+        raise ValueError("At least one GO text segment must be enabled.")
+
+    # Çıktı segment ekseni yalnızca aktif segmentlerden oluşur.
+    segment_names = [
+        segment_name
+        for segment_name in ALL_SEGMENT_NAMES
+        if segment_name in enabled
+    ]
+
+    id2text: Dict[int, str] = {}
+    id2segments: Dict[int, Dict[str, str]] = {}
+    id2seg_present: Dict[int, Dict[str, bool]] = {}
 
     n_lines = 0
     n_ok = 0
@@ -116,11 +157,7 @@ def load_go_texts_canonical(go_text_path: str, phase=-2, return_segments: bool =
             except json.JSONDecodeError:
                 continue
 
-            # --- GO ID ---
-            if "go_id" not in el:
-                continue
-
-            gid_raw = el["go_id"]
+            gid_raw = el.get("go_id")
             if not isinstance(gid_raw, str):
                 continue
 
@@ -133,77 +170,123 @@ def load_go_texts_canonical(go_text_path: str, phase=-2, return_segments: bool =
             except ValueError:
                 continue
 
-            # --- core fields ---
+            # --------------------------------------------------
+            # Raw fields
+            # --------------------------------------------------
             name = _clean_text(el.get("name", ""))
             definition = _clean_text(el.get("definition", ""))
-            namespace = _clean_text(el.get("namespace", "")) or _clean_text(el.get("domain", ""))
+            namespace = (
+                _clean_text(el.get("namespace", ""))
+                or _clean_text(el.get("domain", ""))
+            )
 
-            # --- full text ---
-            if phase == -2:
-                text = _clean_text(el.get("text", ""))
-                if not text:
-                    # fallback for older files
-                    if name and definition:
-                        text = f"Name: {_ensure_period(name)}\nDefinition: {_ensure_period(definition)}"
-                    elif name:
-                        text = f"Name: {_ensure_period(name)}"
-                    elif definition:
-                        text = f"Definition: {_ensure_period(definition)}"
-                    else:
-                        continue
-            elif name and definition:
-                text = f"{name}. {definition}"
-            elif name:
-                text = name
-            elif definition:
-                text = definition
-            else:
-                continue
-
-            # --- segments ---
-            raw_segments = el.get("segments", None)
-
-            if isinstance(raw_segments, dict):
-                segments = {}
-                for s in SEGMENT_NAMES:
-                    seg_text = _clean_text(raw_segments.get(s, ""))
-                    segments[s] = seg_text if seg_text else SEGMENT_DEFAULT_TEXT[s]
-            else:
-                # fallback for older files without segments
-                is_a_parents = el.get("is_a_parents", []) or []
-                part_of_parents = el.get("part_of_parents", []) or []
-
-                if isinstance(is_a_parents, str):
-                    is_a_parents = [is_a_parents]
-                if isinstance(part_of_parents, str):
-                    part_of_parents = [part_of_parents]
-
-                is_a_txt = "; ".join(_clean_text(x) for x in is_a_parents if _clean_text(x))
-                part_of_txt = "; ".join(_clean_text(x) for x in part_of_parents if _clean_text(x))
-
-                segments = {
-                    "name": f"Name: {_ensure_period(name)}" if name else "Name: none.",
-                    "namespace": f"Namespace: {_ensure_period(namespace)}" if namespace else "Namespace: none.",
-                    "definition": f"Definition: {_ensure_period(definition)}" if definition else "Definition: none.",
-                    "is_a": f"Is-a parents: {_ensure_period(is_a_txt)}" if is_a_txt else "Is-a parents: none.",
-                    "part_of": f"Part-of parents: {_ensure_period(part_of_txt)}" if part_of_txt else "Part-of parents: none.",
-                }
-
-            # --- segment presence ---
             is_a_parents = el.get("is_a_parents", []) or []
             part_of_parents = el.get("part_of_parents", []) or []
 
-            present = {
-                "name": bool(name) or _segment_is_present(segments["name"]),
-                "namespace": bool(namespace) or _segment_is_present(segments["namespace"]),
-                "definition": bool(definition) or _segment_is_present(segments["definition"]),
-                "is_a": bool(is_a_parents) and _segment_is_present(segments["is_a"]),
-                "part_of": bool(part_of_parents) and _segment_is_present(segments["part_of"]),
+            if isinstance(is_a_parents, str):
+                is_a_parents = [is_a_parents]
+
+            if isinstance(part_of_parents, str):
+                part_of_parents = [part_of_parents]
+
+            is_a_txt = "; ".join(
+                cleaned
+                for parent in is_a_parents
+                if (cleaned := _clean_text(parent))
+            )
+
+            part_of_txt = "; ".join(
+                cleaned
+                for parent in part_of_parents
+                if (cleaned := _clean_text(parent))
+            )
+
+            # --------------------------------------------------
+            # Build canonical value for every possible segment
+            # --------------------------------------------------
+            generated_segments = {
+                "name": (
+                    f"Name: {_ensure_period(name)}"
+                    if name
+                    else SEGMENT_DEFAULT_TEXT["name"]
+                ),
+                "namespace": (
+                    f"Namespace: {_ensure_period(namespace)}"
+                    if namespace
+                    else SEGMENT_DEFAULT_TEXT["namespace"]
+                ),
+                "definition": (
+                    f"Definition: {_ensure_period(definition)}"
+                    if definition
+                    else SEGMENT_DEFAULT_TEXT["definition"]
+                ),
+                "is_a": (
+                    f"Is-a parents: {_ensure_period(is_a_txt)}"
+                    if is_a_txt
+                    else SEGMENT_DEFAULT_TEXT["is_a"]
+                ),
+                "part_of": (
+                    f"Part-of parents: {_ensure_period(part_of_txt)}"
+                    if part_of_txt
+                    else SEGMENT_DEFAULT_TEXT["part_of"]
+                ),
             }
 
-            # Safety: at least name/full text should be usable
+            raw_segments = el.get("segments")
+
+            segments: Dict[str, str] = {}
+
+            for segment_name in segment_names:
+                # Önce JSONL içindeki segmenti kullan.
+                if isinstance(raw_segments, dict):
+                    segment_text = _clean_text(
+                        raw_segments.get(segment_name, "")
+                    )
+                else:
+                    segment_text = ""
+
+                # JSONL'de yoksa canonical field'lardan üret.
+                if not segment_text:
+                    segment_text = generated_segments[segment_name]
+
+                segments[segment_name] = segment_text
+
+            # --------------------------------------------------
+            # Presence: yalnızca enabled segmentler için hesaplanır
+            # --------------------------------------------------
+            raw_presence = {
+                "name": bool(name),
+                "namespace": bool(namespace),
+                "definition": bool(definition),
+                "is_a": bool(is_a_txt),
+                "part_of": bool(part_of_txt),
+            }
+
+            present = {
+                segment_name: (
+                    raw_presence[segment_name]
+                    and _segment_is_present(segments[segment_name])
+                )
+                for segment_name in segment_names
+            }
+
+            # En az bir aktif segment kullanılabilir olmalı.
             if not any(present.values()):
-                present["name"] = True
+                continue
+
+            # --------------------------------------------------
+            # Full text: eski el["text"] alanını kullanmıyoruz.
+            # Ablation'a göre aktif segmentlerden yeniden kuruyoruz.
+            # --------------------------------------------------
+            text_parts = [
+                segments[segment_name]
+                for segment_name in segment_names
+                if present[segment_name]
+            ]
+
+            text = "\n".join(text_parts).strip()
+            if not text:
+                continue
 
             id2text[go_int] = text
             id2segments[go_int] = segments
@@ -211,18 +294,23 @@ def load_go_texts_canonical(go_text_path: str, phase=-2, return_segments: bool =
 
             n_ok += 1
 
-    print(f"[load_go_texts_canonical] Loaded {n_ok} GO terms out of {n_lines} lines")
+    print(
+        "[load_go_texts_canonical] "
+        f"enabled_segments={segment_names} | "
+        f"loaded={n_ok}/{n_lines}"
+    )
 
     if return_segments:
         return id2text, id2segments, id2seg_present
 
     return id2text
 
-def load_go_texts_by_phase(go_text_folder: str, phase: int = 0, return_segments:bool = False) -> Dict[int, str]:
+
+def load_go_texts_by_phase(go_text_folder: str, phase: int = 0, return_segments:bool = False, enabled_segments=None) -> Dict[int, str]:
     if phase < 0: #ablation 1
         fname = "go_texts_canonical.jsonl"
         path = os.path.join(go_text_folder, fname)
-        return load_go_texts_canonical(path, phase=phase, return_segments=return_segments)
+        return load_go_texts_canonical(path, phase=phase, return_segments=return_segments, enabled_segments=enabled_segments)
     else:
         fname = f"go_texts_phase_{phase+1}.jsonl"
         path = os.path.join(go_text_folder, fname)
