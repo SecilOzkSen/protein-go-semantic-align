@@ -141,5 +141,5 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/bp
+  logs: /workspace/data_pfresgo/logs/bp_name_def-
 
