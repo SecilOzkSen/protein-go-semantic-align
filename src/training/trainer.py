@@ -314,7 +314,7 @@ class OppTrainer:
         self.return_alpha = ctx.return_alpha
         self.return_slot_attn = ctx.return_slot_attn
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
-        self.dag_anc = load_go_parents()
+        self.dag_anc = None #load_go_parents()
 
         mode = getattr(cfg, "trainable_mode", "full")
         self.gate_only = mode == "segment_gate_only"
