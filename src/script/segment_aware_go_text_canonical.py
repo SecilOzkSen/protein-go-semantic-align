@@ -283,6 +283,7 @@ def build_text_entry(
     max_part_of_parents: int = 3,
     include_synonyms: bool = False,
     max_synonyms: int = 3,
+    segment_order: List[str] = None # Leave empty if you need full text.
 ) -> Dict[str, Any]:
     go_id_norm = _as_go_id(go_id) or str(go_id)
 
@@ -338,9 +339,13 @@ def build_text_entry(
     if include_synonyms:
         segments["synonyms"] = f"Synonyms: {format_list_inline(synonyms)}."
 
-    segment_order = ["name", "namespace", "definition", "is_a", "part_of"]
+    if segment_order is None:
+        # Full text
+        segment_order = ["name", "namespace", "definition", "is_a", "part_of"]
+
     if include_synonyms:
         segment_order.append("synonyms")
+
 
     text = "\n".join(segments[k] for k in segment_order)
 
@@ -382,6 +387,7 @@ def main(
     include_synonyms: bool = False,
     max_synonyms: int = 3,
     include_obsolete: bool = False,
+    segment_order: Optional[List[str]] = None,
 ) -> None:
     terms = load_terms(input_path)
 
@@ -509,8 +515,7 @@ if __name__ == "__main__":
             "processed/go_vocab.pkl"
         ),
         out_path=(
-            "/workspace/data_pfresgo/"
-            "processed/"
+            "/workspace/"
             "go_texts_canonical_segmented.jsonl"
         ),
 
@@ -526,4 +531,5 @@ if __name__ == "__main__":
 
         # Obsolete terms candidate vocabulary'ye alınmayacak.
         include_obsolete=False,
+        segment_order=["name", "definition"]
     )
