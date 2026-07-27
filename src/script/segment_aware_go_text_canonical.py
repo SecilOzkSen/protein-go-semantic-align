@@ -456,6 +456,7 @@ def main(
             max_part_of_parents=max_part_of_parents,
             include_synonyms=include_synonyms,
             max_synonyms=max_synonyms,
+            segment_order=segment_order,
         )
 
         examples.append(example)
