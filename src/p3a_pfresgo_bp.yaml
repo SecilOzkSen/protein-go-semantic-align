@@ -7,7 +7,6 @@ pfresgo:
   evaluation_split: valid
   rare_lt: 20
   enabled_segments:
-    - name
     - definition
 
 data:
@@ -40,7 +39,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp
+  output_dir: /workspace/data_pfresgo/outputs/bp/defonly
   save_every: 10000
   keep_last_n: 3
   resume: null

@@ -532,5 +532,5 @@ if __name__ == "__main__":
 
         # Obsolete terms candidate vocabulary'ye alınmayacak.
         include_obsolete=False,
-        segment_order=["name", "definition"]
+        segment_order=["definition"]
     )
