@@ -337,7 +337,7 @@ class OppTrainer:
             local_window_stride=int(getattr(cfg, "local_window_stride", 32)),
             multivec_slot_lse_tau=float(getattr(cfg, "multivec_slot_lse_tau", 0.10)),
             multivec_global_residual_init=float(getattr(cfg, "multivec_global_residual_init", 0.25)),
-            go_segment_representation_mode=str(getattr(cfg, "go_segment_representation_mode", "mixed")),
+            go_segment_representation_mode=str(getattr(ctx, "go_segment_representation_mode", "mixed")),
         ).to(self.device)
 
         # warmstart configs

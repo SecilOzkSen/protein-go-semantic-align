@@ -219,12 +219,12 @@ class GoTextStore:
             txt = segs.get(s, "")
             if not txt:
                 txt = {
-                    "name": "Name: none.",
-                    "namespace": "Namespace: none.",
-                    "definition": "Definition: none.",
-                    "is_a": "Is-a parents: none.",
-                    "part_of": "Part-of parents: none.",
-                }.get(s, f"{s}: none.")
+                    "name": "none.",
+                    "namespace": "none.",
+                    "definition": "none.",
+                    "is_a": "none.",
+                    "part_of": "none.",
+                }.get(s, "none.")
             texts.append(txt)
             pres.append(bool(present.get(s, False)))
 
