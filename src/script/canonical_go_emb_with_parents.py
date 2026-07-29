@@ -263,7 +263,7 @@ def main(
 if __name__ == "__main__":
     main(
         go_path=(
-            "/workspace/data_pfresgo/processed"
+            "/workspace/data_pfresgo/processed/"
             "go_texts_canonical_segmented.jsonl"
         ),
         output_prefix=(
