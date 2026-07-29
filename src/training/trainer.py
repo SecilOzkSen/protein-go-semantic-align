@@ -337,6 +337,7 @@ class OppTrainer:
             local_window_stride=int(getattr(cfg, "local_window_stride", 32)),
             multivec_slot_lse_tau=float(getattr(cfg, "multivec_slot_lse_tau", 0.10)),
             multivec_global_residual_init=float(getattr(cfg, "multivec_global_residual_init", 0.25)),
+            go_segment_representation_mode=str(getattr(cfg, "go_segment_representation_mode", "mixed")),
         ).to(self.device)
 
         # warmstart configs
@@ -2000,28 +2001,40 @@ class OppTrainer:
                     seg_pooled = torch.einsum("gs,gsd->gd", seg_weights, segment_embs)
                     seg_pooled = torch.nan_to_num(seg_pooled)
 
-                    full_out = encoder(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_mode="pooled",
-                    )
+                    full_out = None
 
-                    if isinstance(full_out, tuple):
-                        full_out = full_out[0]
-                    elif isinstance(full_out, dict):
-                        full_out = full_out["pooled"]
-
-                    full_out = torch.nan_to_num(full_out)
-
-                    if full_out.shape != seg_pooled.shape:
-                        raise RuntimeError(
-                            f"full_out shape {tuple(full_out.shape)} does not match "
-                            f"seg_pooled shape {tuple(seg_pooled.shape)}"
+                    if self.model.go_segment_representation_mode == "mixed":
+                        full_out = encoder(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            output_mode="pooled",
                         )
 
-                    alpha = float(getattr(self.model, "go_segment_mix_alpha", 0.2))
-                    embs = (1.0 - alpha) * full_out + alpha * seg_pooled
-                    embs = torch.nan_to_num(embs)
+                        if isinstance(full_out, tuple):
+                            full_out = full_out[0]
+
+                        elif isinstance(full_out, dict):
+                            if "pooled" in full_out:
+                                full_out = full_out["pooled"]
+                            elif "pooler_output" in full_out:
+                                full_out = full_out["pooler_output"]
+                            else:
+                                raise RuntimeError(
+                                    "EMA full-text GO encoder output missing "
+                                    "'pooled' or 'pooler_output'."
+                                )
+
+                        if not torch.is_tensor(full_out):
+                            raise RuntimeError(
+                                f"Unsupported EMA full_out type: {type(full_out)}"
+                            )
+
+                        full_out = torch.nan_to_num(full_out)
+
+                    embs = self.model._combine_go_representations(
+                        seg_pooled=seg_pooled,
+                        full_out=full_out,
+                    )
             else:
                 input_ids = toks["input_ids"].to(device, non_blocking=True)
                 attention_mask = toks["attention_mask"].to(device, non_blocking=True)
@@ -2845,7 +2858,7 @@ class OppTrainer:
 
         pos_local = batch["pos_go_local"]
 
-        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled":
+        if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled" and getattr(self.ctx, "go_segment_representation_mode", None) == "mixed":
             if hasattr(self.model, "go_segment_mix_alpha"):
                 self.model.go_segment_mix_alpha = self._segment_alpha_schedule(self._global_step)
 

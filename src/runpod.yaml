@@ -16,6 +16,7 @@ general:
   go_encoder_inner_pooling: "mean"
   go_pool_type: "mean"
   go_encoder_output_mode: "segment_pooled" #"pooled"
+  go_segment_representation_mode: "segments_only" #mixed
 
   # Protein side new branch
   protein_pooling_strategy: "mean_attn_gate" # "mean_attn_gate" #local_evidence_gate

@@ -474,6 +474,7 @@ class ProteinGoAligner(nn.Module):
             local_window_stride: int = 32,
             multivec_slot_lse_tau: float = 0.10,
             multivec_global_residual_init: float = 0.25,
+            go_segment_representation_mode: str = "mixed", #segments_only
     ):
         super().__init__()
 
@@ -499,6 +500,7 @@ class ProteinGoAligner(nn.Module):
         self.protein_n_slots = int(protein_n_slots)
         self.go_pool_type = go_pool_type
         self.go_segment_mix_alpha = 0.0
+        self.go_segment_representation_mode = go_segment_representation_mode
 
         if self.go_encoder is not None and d_g is None:
             d_g = int(self.go_encoder.model.config.hidden_size)
@@ -768,6 +770,43 @@ class ProteinGoAligner(nn.Module):
 
         return scores
 
+    def _combine_go_representations(
+            self,
+            *,
+            seg_pooled: torch.Tensor,
+            full_out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        mode = self.go_segment_representation_mode
+
+        if mode == "segments_only":
+            pooled = seg_pooled
+
+        elif mode == "mixed":
+            if full_out is None:
+                raise RuntimeError(
+                    "mixed mode requires a full-text GO embedding."
+                )
+
+            if full_out.shape != seg_pooled.shape:
+                raise RuntimeError(
+                    f"full_out shape {tuple(full_out.shape)} does not match "
+                    f"seg_pooled shape {tuple(seg_pooled.shape)}"
+                )
+
+            alpha = self.go_segment_mix_alpha
+
+            pooled = (
+                    (1.0 - alpha) * full_out
+                    + alpha * seg_pooled
+            )
+
+        else:
+            raise RuntimeError(
+                f"Unknown GO representation mode: {mode!r}"
+            )
+
+        return torch.nan_to_num(pooled).contiguous()
+
     def encode_go_segment_aware(
             self,
             seg_input_ids: torch.Tensor,  # [G,S,Ls]
@@ -870,7 +909,14 @@ class ProteinGoAligner(nn.Module):
         seg_pooled = torch.einsum("gs,gsd->gd", segment_weights, segment_embs)  # [G,Dg]
         seg_pooled = torch.nan_to_num(seg_pooled).contiguous()
 
-        if input_ids is not None and attention_mask is not None:
+        full_out = None
+
+        if self.go_segment_representation_mode == "mixed":
+            if input_ids is None or attention_mask is None:
+                raise RuntimeError(
+                    "mixed mode requires input_ids and attention_mask."
+                )
+
             full_out = self.go_encoder(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -879,31 +925,45 @@ class ProteinGoAligner(nn.Module):
 
             if isinstance(full_out, tuple):
                 full_out = full_out[0]
+
             elif isinstance(full_out, dict):
-                full_out = full_out["pooled"]
+                if "pooled" in full_out:
+                    full_out = full_out["pooled"]
+                elif "pooler_output" in full_out:
+                    full_out = full_out["pooler_output"]
+                else:
+                    raise RuntimeError(
+                        "Full-text GO encoder output missing "
+                        "'pooled' or 'pooler_output'."
+                    )
+
+            if not torch.is_tensor(full_out):
+                raise RuntimeError(
+                    f"Unsupported full_out type: {type(full_out)}"
+                )
+
+            if full_out.dim() != 2:
+                raise RuntimeError(
+                    f"Expected full_out [G,D], got {tuple(full_out.shape)}"
+                )
 
             full_out = torch.nan_to_num(full_out)
 
-            if full_out.dim() != 2:
-                raise RuntimeError(f"Expected full_out [G,D], got {tuple(full_out.shape)}")
-
-            if full_out.shape != seg_pooled.shape:
-                raise RuntimeError(
-                    f"full_out shape {tuple(full_out.shape)} does not match "
-                    f"seg_pooled shape {tuple(seg_pooled.shape)}"
-                )
-
-            alpha = float(getattr(self, "go_segment_mix_alpha", 0.2))
-            pooled = (1.0 - alpha) * full_out + alpha * seg_pooled
-            pooled = torch.nan_to_num(pooled).contiguous()
-        else:
-            pooled = seg_pooled
+        pooled = self._combine_go_representations(
+            seg_pooled=seg_pooled,
+            full_out=full_out,
+        )
 
         self.last_go_segment_info = {
             "segment_weights": segment_weights.detach(),
             "segment_present": seg_present.detach(),
             "segment_names": self.go_segment_names,
-            "mix_alpha": float(getattr(self, "go_segment_mix_alpha", 0.2)),
+            "representation_mode": self.go_segment_representation_mode,
+            "mix_alpha": (
+                self.go_segment_mix_alpha
+                if self.go_segment_representation_mode == "mixed"
+                else None
+            ),
         }
 
         return {

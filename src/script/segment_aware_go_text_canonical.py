@@ -329,11 +329,11 @@ def build_text_entry(
     # Natural marker segments.
     # Keep these markers stable across all GO terms.
     segments: Dict[str, str] = {
-        "name": f"Name: {ensure_sentence(name)}",
-        "namespace": f"Namespace: {ensure_sentence(namespace)}",
-        "definition": f"Definition: {ensure_sentence(definition)}",
-        "is_a": f"Is-a parents: {ensure_sentence(format_list_inline(is_a_parent_names))}",
-        "part_of": f"Part-of parents: {ensure_sentence(format_list_inline(part_of_parent_names))}",
+        "name": f"{ensure_sentence(name)}",
+        "namespace": f"{ensure_sentence(namespace)}",
+        "definition": f"{ensure_sentence(definition)}",
+        "is_a": f"{ensure_sentence(format_list_inline(is_a_parent_names))}",
+        "part_of": f"{ensure_sentence(format_list_inline(part_of_parent_names))}",
     }
 
     if include_synonyms:
@@ -532,5 +532,5 @@ if __name__ == "__main__":
 
         # Obsolete terms candidate vocabulary'ye alınmayacak.
         include_obsolete=False,
-        segment_order=["definition"]
+        segment_order=["name", "definition"]
     )

@@ -945,6 +945,7 @@ def run_training(args):
         protein_n_slots=args.protein_n_slots,
         go_pool_type=args.go_pool_type,
         go_encoder_output_mode=args.go_encoder_output_mode,
+        go_segment_representation_mode=args.go_segment_representation_mode,
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -1483,6 +1484,7 @@ def load_structured_cfg(path: str):
         protein_n_slots=int(general.get("protein_n_slots", 0)),
         go_pool_type=general.get("go_pool_type", "mean"),
         go_encoder_output_mode=general.get("go_encoder_output_mode", "pooled"),
+        go_segment_representation_mode=general.get("go_segment_representation_mode", "segments_only"), #mixed
 
         # paths / store
         train_ids_path=Path(stores.get("train_ids_path")),

@@ -192,6 +192,7 @@ class TrainingContext:
     protein_n_slots: int = 0,
     go_pool_type: str = "mean"
     go_encoder_output_mode: str = "pool"
+    go_segment_representation_mode: str = "segments_only" # mixed
     eval_id_list: List[int] = None
     logger: Any = None
     eval_seen_go_ids: List[int] = None
