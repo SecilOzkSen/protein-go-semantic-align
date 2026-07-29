@@ -2,6 +2,7 @@
 pfresgo:
   branch: BP
   benchmark_protocol: standard #zeroshot
+  evaluation_space: benchmark
   branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_bp.json
   go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
   test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt

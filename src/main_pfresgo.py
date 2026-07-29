@@ -98,10 +98,15 @@ def _training_buckets(train_ids_path: Path, pid2pos_path: Path, branch_ids: Iter
     counts: Counter[int] = Counter()
     for pid in train_ids:
         counts.update(_go_int(g) for g in pid2pos.get(pid, []) if _go_int(g) in branch)
+    benchmark_ids = {
+        go_id
+        for labels in pid2pos.values()
+        for go_id in labels
+    }
     seen = sorted(counts)
     rare = sorted(g for g, count in counts.items() if count < rare_lt)
     zero = sorted(branch - set(seen))
-    return seen, rare, zero
+    return seen, rare, zero, benchmark_ids
 
 
 def _validate(args, pf: dict, branch_ids: List[int]) -> None:
@@ -249,7 +254,7 @@ def configure(config_path: str):
 
     branch_ids = _read_ids(branch_ids_path)
 
-    seen, rare, zero = _training_buckets(
+    seen, rare, zero, benchmark_ids = _training_buckets(
         Path(args.train_ids_path),
         Path(args.pid2pos),
         branch_ids,
@@ -283,16 +288,47 @@ def configure(config_path: str):
     # ---------------------------------------------------------
     # Dynamic GO sets
     # ---------------------------------------------------------
+
     sentinels = {
-        "__PFRESGO_BRANCH__": branch_ids,
+        "__PFRESGO_FULL_BRANCH__": branch_ids,  # 29112
+        "__PFRESGO_BENCHMARK__": benchmark_ids,  # 1943
         "__PFRESGO_SEEN__": seen,
         "__PFRESGO_RARE__": rare,
         "__PFRESGO_ZERO__": zero,
     }
 
+    evaluation_space = str(
+        pf.get("evaluation_space", "benchmark")
+    ).strip().lower()
+
+    if evaluation_space == "benchmark":
+        args.go_path_observed = "__PFRESGO_BENCHMARK__"
+    elif evaluation_space == "full_branch":
+        args.go_path_observed = "__PFRESGO_FULL_BRANCH__"
+    else:
+        raise ValueError(
+            "pfresgo.evaluation_space must be "
+            "'benchmark' or 'full_branch'"
+        )
+
+    if evaluation_space == "benchmark":
+        active_eval_terms = benchmark_ids
+    else:
+        active_eval_terms = branch_ids
+
     args.eval_space = "observed"
-    args.go_path_observed = "__PFRESGO_BRANCH__"
     args.go_path_seen = "__PFRESGO_SEEN__"
+
+    print(
+        f"[PFresGO] "
+        f"branch={args.pfresgo_branch} "
+        f"split={split} "
+        f"protocol={benchmark_protocol} "
+        f"evaluation_space={evaluation_space} "
+        f"full_branch_terms={len(branch_ids)} "
+        f"benchmark_terms={len(benchmark_ids)} "
+        f"active_eval_terms={len(active_eval_terms)} "
+    )
 
     if benchmark_protocol == "zeroshot":
         # Special DeepGOZero-style experiment.
