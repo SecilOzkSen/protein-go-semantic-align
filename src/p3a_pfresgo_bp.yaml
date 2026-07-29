@@ -11,6 +11,7 @@ pfresgo:
   enabled_segments:
     - name
     - definition
+    - is_a
 
 data:
   overlap: 256
