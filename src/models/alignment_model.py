@@ -873,32 +873,81 @@ class ProteinGoAligner(nn.Module):
 
         flat_ids = seg_input_ids.reshape(G * S, L)
         flat_mask = seg_attention_mask.reshape(G * S, L)
+        flat_present = seg_present.reshape(G * S)
 
-        out = self.go_encoder(
-            input_ids=flat_ids,
-            attention_mask=flat_mask,
+        present_flat_indices = torch.nonzero(
+            flat_present,
+            as_tuple=False,
+        ).flatten()
+
+        if present_flat_indices.numel() == 0:
+            raise RuntimeError(
+                "No present GO segments found in the batch."
+            )
+
+        present_ids = flat_ids.index_select(
+            0,
+            present_flat_indices,
+        )
+
+        present_mask = flat_mask.index_select(
+            0,
+            present_flat_indices,
+        )
+
+        present_out = self.go_encoder(
+            input_ids=present_ids,
+            attention_mask=present_mask,
             output_mode="pooled",
         )
 
-        if isinstance(out, tuple):
-            out = out[0]
-        elif isinstance(out, dict):
-            if "pooled" in out:
-                out = out["pooled"]
-            elif "pooler_output" in out:
-                out = out["pooler_output"]
+        if isinstance(present_out, tuple):
+            present_out = present_out[0]
+
+        elif isinstance(present_out, dict):
+            if "pooled" in present_out:
+                present_out = present_out["pooled"]
+            elif "pooler_output" in present_out:
+                present_out = present_out["pooler_output"]
             else:
-                raise RuntimeError("go_encoder dict output missing 'pooled' or 'pooler_output'.")
+                raise RuntimeError(
+                    "go_encoder dict output missing "
+                    "'pooled' or 'pooler_output'."
+                )
 
-        if not torch.is_tensor(out):
-            raise RuntimeError(f"Unsupported go_encoder output type: {type(out)}")
+        if not torch.is_tensor(present_out):
+            raise RuntimeError(
+                f"Unsupported go_encoder output type: "
+                f"{type(present_out)}"
+            )
 
-        if out.dim() != 2:
-            raise RuntimeError(f"Expected flat segment embeddings [G*S,D], got {tuple(out.shape)}")
+        if present_out.dim() != 2:
+            raise RuntimeError(
+                "Expected present segment embeddings [N_present,D], "
+                f"got {tuple(present_out.shape)}"
+            )
 
-        Dg = out.size(-1)
+        present_out = torch.nan_to_num(present_out)
+        Dg = present_out.size(-1)
 
-        segment_embs = torch.nan_to_num(out).view(G, S, Dg).contiguous()  # [G,S,Dg]
+        # Reconstruct fixed [G*S, Dg] representation.
+        # Absent positions remain zero and are later masked by seg_present.
+        flat_segment_embs = present_out.new_zeros(
+            G * S,
+            Dg,
+        )
+
+        flat_segment_embs.index_copy_(
+            0,
+            present_flat_indices,
+            present_out,
+        )
+
+        segment_embs = flat_segment_embs.view(
+            G,
+            S,
+            Dg,
+        ).contiguous()
 
         # Segment gate in raw GO encoder space.
         seg_logits = self.go_segment_gate(segment_embs).squeeze(-1)  # [G,S]

@@ -1969,22 +1969,6 @@ class OppTrainer:
                     segment_gate = self.go_segment_gate_k if self.go_segment_gate_k is not None else self.model.go_segment_gate
 
                     G, S, L = seg_input_ids.shape
-                    flat_ids = seg_input_ids.reshape(G * S, L)
-                    flat_mask = seg_attention_mask.reshape(G * S, L)
-
-                    out = encoder(
-                        input_ids=flat_ids,
-                        attention_mask=flat_mask,
-                        output_mode="pooled",
-                    )
-
-                    if isinstance(out, tuple):
-                        out = out[0]
-                    elif isinstance(out, dict):
-                        out = out["pooled"]
-
-                    Dg = out.size(-1)
-                    segment_embs = torch.nan_to_num(out).view(G, S, Dg).contiguous()
 
                     if seg_present.dtype != torch.bool:
                         seg_present_bool = seg_present != 0
@@ -1992,7 +1976,87 @@ class OppTrainer:
                         seg_present_bool = seg_present
 
                     if (seg_present_bool.sum(dim=1) == 0).any():
-                        raise RuntimeError("Some GO rows have zero present segments.")
+                        bad = torch.nonzero(
+                            seg_present_bool.sum(dim=1) == 0,
+                            as_tuple=False,
+                        ).flatten()[:5]
+
+                        raise RuntimeError(
+                            "Some GO rows have zero present segments. "
+                            f"Example rows: {bad.tolist()}"
+                        )
+
+                    flat_ids = seg_input_ids.reshape(G * S, L)
+                    flat_mask = seg_attention_mask.reshape(G * S, L)
+                    flat_present = seg_present_bool.reshape(G * S)
+
+                    present_flat_indices = torch.nonzero(
+                        flat_present,
+                        as_tuple=False,
+                    ).flatten()
+
+                    present_ids = flat_ids.index_select(
+                        0,
+                        present_flat_indices,
+                    )
+
+                    present_mask = flat_mask.index_select(
+                        0,
+                        present_flat_indices,
+                    )
+
+                    present_out = encoder(
+                        input_ids=present_ids,
+                        attention_mask=present_mask,
+                        output_mode="pooled",
+                    )
+
+                    if isinstance(present_out, tuple):
+                        present_out = present_out[0]
+
+                    elif isinstance(present_out, dict):
+                        if "pooled" in present_out:
+                            present_out = present_out["pooled"]
+                        elif "pooler_output" in present_out:
+                            present_out = present_out["pooler_output"]
+                        else:
+                            raise RuntimeError(
+                                "EMA GO encoder output missing "
+                                "'pooled' or 'pooler_output'."
+                            )
+
+                    if not torch.is_tensor(present_out):
+                        raise RuntimeError(
+                            f"Unsupported EMA GO encoder output type: "
+                            f"{type(present_out)}"
+                        )
+
+                    present_out = torch.nan_to_num(present_out)
+
+                    if present_out.dim() != 2:
+                        raise RuntimeError(
+                            "Expected EMA present segment embeddings "
+                            f"[N_present,D], got {tuple(present_out.shape)}"
+                        )
+
+                    Dg = present_out.size(-1)
+
+                    flat_segment_embs = present_out.new_zeros(
+                        G * S,
+                        Dg,
+                    )
+
+                    flat_segment_embs.index_copy_(
+                        0,
+                        present_flat_indices,
+                        present_out,
+                    )
+
+                    segment_embs = flat_segment_embs.view(
+                        G,
+                        S,
+                        Dg,
+                    ).contiguous()
 
                     seg_logits = segment_gate(segment_embs).squeeze(-1).float()
                     seg_logits = seg_logits.masked_fill(~seg_present_bool, -1e9)

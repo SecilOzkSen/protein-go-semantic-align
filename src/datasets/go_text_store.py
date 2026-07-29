@@ -199,7 +199,9 @@ class GoTextStore:
 
     def _encode_segments(self, gid: int) -> Dict[str, torch.Tensor]:
         if not self.is_go_segmented:
-            raise RuntimeError("_encode_segments called but is_go_segmented=False")
+            raise RuntimeError(
+                "_encode_segments called but is_go_segmented=False"
+            )
 
         gid = int(gid)
 
@@ -207,43 +209,91 @@ class GoTextStore:
             raise RuntimeError("Segment maps are missing.")
 
         if gid not in self.id2segments:
-            raise KeyError(f"GO id {gid} not found in id2segments for phase {self.phase}")
+            raise KeyError(
+                f"GO id {gid} not found in id2segments "
+                f"for phase {self.phase}"
+            )
 
         segs = self.id2segments[gid]
-        present = self.id2seg_present.get(gid, {})
+        present_map = self.id2seg_present.get(gid, {})
 
-        texts = []
-        pres = []
+        S = len(self.segment_names)
+        L = self.segment_max_len
 
-        for s in self.segment_names:
-            txt = segs.get(s, "")
-            if not txt:
-                txt = {
-                    "name": "none.",
-                    "namespace": "none.",
-                    "definition": "none.",
-                    "is_a": "none.",
-                    "part_of": "none.",
-                }.get(s, "none.")
-            texts.append(txt)
-            pres.append(bool(present.get(s, False)))
+        seg_present = torch.zeros(S, dtype=torch.bool)
+
+        present_indices = []
+        present_texts = []
+
+        for segment_idx, segment_name in enumerate(self.segment_names):
+            txt = segs.get(segment_name, "")
+            is_present = bool(
+                present_map.get(segment_name, False)
+                and isinstance(txt, str)
+                and txt.strip()
+            )
+
+            if not is_present:
+                continue
+
+            seg_present[segment_idx] = True
+            present_indices.append(segment_idx)
+            present_texts.append(txt.strip())
+
+        if not present_texts:
+            raise RuntimeError(
+                f"GO id {gid} has zero present GO segments "
+                f"for phase {self.phase}. "
+                f"Segments: {self.segment_names}"
+            )
 
         enc = self.tokenizer(
-            texts,
+            present_texts,
             truncation=True,
-            max_length=self.segment_max_len,
+            max_length=L,
             padding="max_length",
             return_tensors="pt",
             return_attention_mask=True,
         )
 
-        seg_input_ids = enc["input_ids"].to(dtype=torch.long)  # [S,Ls]
-        seg_attention_mask = enc["attention_mask"].to(dtype=torch.long)  # [S,Ls]
-        seg_present = torch.tensor(pres, dtype=torch.bool)  # [S]
+        present_input_ids = enc["input_ids"].to(dtype=torch.long)
+        present_attention_mask = enc["attention_mask"].to(
+            dtype=torch.long
+        )
 
-        if seg_present.sum().item() == 0:
-            # Safety fallback
-            seg_present[0] = True
+        if present_input_ids.shape != (len(present_indices), L):
+            raise RuntimeError(
+                "Unexpected tokenized segment shape: "
+                f"{tuple(present_input_ids.shape)}, expected "
+                f"{(len(present_indices), L)}"
+            )
+
+        pad_token_id = self.tokenizer.pad_token_id
+
+        if pad_token_id is None:
+            raise RuntimeError(
+                "Tokenizer must define pad_token_id for segmented GO encoding."
+            )
+
+        # Fixed [S, L] output is preserved for batching.
+        seg_input_ids = torch.full(
+            size=(S, L),
+            fill_value=int(pad_token_id),
+            dtype=torch.long,
+        )
+
+        seg_attention_mask = torch.zeros(
+            size=(S, L),
+            dtype=torch.long,
+        )
+
+        index_tensor = torch.tensor(
+            present_indices,
+            dtype=torch.long,
+        )
+
+        seg_input_ids[index_tensor] = present_input_ids
+        seg_attention_mask[index_tensor] = present_attention_mask
 
         return {
             "seg_input_ids": seg_input_ids,
