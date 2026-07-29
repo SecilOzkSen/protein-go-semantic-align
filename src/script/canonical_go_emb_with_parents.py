@@ -263,11 +263,11 @@ def main(
 if __name__ == "__main__":
     main(
         go_path=(
-            "/workspace/"
+            "/workspace/data_pfresgo/processed"
             "go_texts_canonical_segmented.jsonl"
         ),
         output_prefix=(
-            "/workspace/go_cache/all/"
+            "/workspace/data_pfresgo/go_cache/all/"
             "go_text_embeddings_canonical"
         ),
         phase="pfresgo_2020_06_01",
