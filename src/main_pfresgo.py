@@ -214,6 +214,21 @@ def configure(config_path: str):
             "pfresgo.branch must be BP, MF, or CC"
         )
 
+    # ---------------------------------------------------------
+    # Benchmark protocol
+    # ---------------------------------------------------------
+    benchmark_protocol = str(
+        pf.get("benchmark_protocol", "standard")
+    ).strip().lower()
+
+    if benchmark_protocol not in {"standard", "zeroshot"}:
+        raise ValueError(
+            "pfresgo.benchmark_protocol must be "
+            "'standard' or 'zeroshot'"
+        )
+
+    args.pfresgo_benchmark_protocol = benchmark_protocol
+
     if "branch_go_ids_path" not in pf:
         raise ValueError(
             "pfresgo.branch_go_ids_path is required"
@@ -278,8 +293,24 @@ def configure(config_path: str):
     args.eval_space = "observed"
     args.go_path_observed = "__PFRESGO_BRANCH__"
     args.go_path_seen = "__PFRESGO_SEEN__"
-    args.few_shot_path = "__PFRESGO_RARE__"
-    args.zero_shot_path = "__PFRESGO_ZERO__"
+
+    if benchmark_protocol == "zeroshot":
+        # Special DeepGOZero-style experiment.
+        # These sets may be used by downstream dataset code
+        # to remove or mask selected training annotations.
+        args.few_shot_path = "__PFRESGO_RARE__"
+        args.zero_shot_path = "__PFRESGO_ZERO__"
+
+        args.apply_few_zero_training_filter = True
+
+    else:
+        # Standard BP / MF / CC benchmark.
+        # Do not remove proteins or annotations based on
+        # rare/zero-shot buckets.
+        args.few_shot_path = None
+        args.zero_shot_path = None
+
+        args.apply_few_zero_training_filter = False
 
     # ---------------------------------------------------------
     # Patch ID loaders
@@ -440,11 +471,14 @@ def configure(config_path: str):
         f"[PFresGO] "
         f"branch={args.pfresgo_branch} "
         f"split={split} "
+        f"protocol={benchmark_protocol} "
         f"segments={pf_enabled_segments} "
         f"candidates={len(branch_ids)} "
         f"seen={len(seen)} "
         f"rare={len(rare)} "
-        f"zero={len(zero)}"
+        f"zero={len(zero)} "
+        f"apply_few_zero_training_filter="
+        f"{args.apply_few_zero_training_filter}"
     )
 
     return args
