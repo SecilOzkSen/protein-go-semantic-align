@@ -56,26 +56,28 @@ from tqdm.auto import tqdm
 # IMPORTANT: use the exact construction path used by retriever training.
 # The new Name+Definition+is_a retriever was trained through main_pfresgo.py.
 try:
-    from src.main_pfresgo import (
-        load_structured_cfg,
-        set_seed,
-        build_go_cache,
-        build_stores,
-        build_datasets,
-        enforce_cache_alignment,
-    )
-    _MAIN_SOURCE = "src.main_pfresgo"
+    import src.main_pfresgo as pfresgo_main
+
+    # configure() is essential: it installs the PFresGO-compatible ID, DAG,
+    # namespace, and segmented GO-text loaders on pfresgo_main.base.
+    configure = pfresgo_main.configure
+    base = pfresgo_main.base
+
+    set_seed = base.set_seed
+    build_go_cache = base.build_go_cache
+    build_stores = base.build_stores
+    build_datasets = base.build_datasets
+    enforce_cache_alignment = base.enforce_cache_alignment
+    _MAIN_SOURCE = "src.main_pfresgo.configure"
 except ImportError:
-    # Backward-compatible fallback for repositories where the PFresGO entry point
-    # only delegates to src.main and does not expose the builders itself.
-    from src.main import (
-        load_structured_cfg,
-        set_seed,
-        build_go_cache,
-        build_stores,
-        build_datasets,
-        enforce_cache_alignment,
-    )
+    import src.main as base
+
+    configure = base.load_structured_cfg
+    set_seed = base.set_seed
+    build_go_cache = base.build_go_cache
+    build_stores = base.build_stores
+    build_datasets = base.build_datasets
+    enforce_cache_alignment = base.enforce_cache_alignment
     _MAIN_SOURCE = "src.main"
 
 from src.training.collate import ContrastiveEmbCollator
@@ -92,20 +94,13 @@ from src.configs.data_classes import (
 )
 
 from src.encoders import BioMedBERTEncoder
-from src.go import load_go_parents, load_go_children
 from src.datasets.go_text_store import GoTextStore
-from src.utils import (
-    load_raw_json,
-    load_raw_pickle,
-    load_go_set,
-    load_go_texts_by_phase,
-)
+from src.utils import load_raw_json
 from src.utils.helpers import (
     build_altid_map_from_go_terms,
     canonicalize_id_list,
     canonicalize_pid2pos,
     go_str_to_int_any,
-    load_go_namespaces,
 )
 
 
@@ -302,10 +297,11 @@ def build_go_encoder_and_text_store(args, device: torch.device):
     full_id2seg_present = None
 
     if is_segmented:
-        id2text, id2segments, id2seg_present = load_go_texts_by_phase(
+        id2text, id2segments, id2seg_present = base.load_go_texts_by_phase(
             args.go_text_folder,
             phase=args.phase,
             return_segments=True,
+            enabled_segments=getattr(args, "pfresgo_enabled_segments", None),
         )
 
         go_id_to_text = {int(args.phase): id2text}
@@ -313,10 +309,11 @@ def build_go_encoder_and_text_store(args, device: torch.device):
         full_id2seg_present = {int(args.phase): id2seg_present}
 
     else:
-        id2text = load_go_texts_by_phase(
+        id2text = base.load_go_texts_by_phase(
             args.go_text_folder,
             phase=args.phase,
             return_segments=False,
+            enabled_segments=getattr(args, "pfresgo_enabled_segments", None),
         )
 
         go_id_to_text = {int(args.phase): id2text}
@@ -338,13 +335,13 @@ def build_go_encoder_and_text_store(args, device: torch.device):
 
 def canonicalize_and_align_inputs(args, go_cache, logger):
     if args.eval_space == "seen":
-        eval_id_list = load_raw_pickle(args.go_path_seen)
+        eval_id_list = base.load_raw_pickle(args.go_path_seen)
     else:
-        eval_id_list = load_raw_pickle(args.go_path_observed)
+        eval_id_list = base.load_raw_pickle(args.go_path_observed)
 
-    eval_seen_go_ids = load_raw_pickle(args.go_path_seen)
-    eval_unseen_ids = load_raw_pickle(args.zero_shot_path)
-    eval_rare_go_ids = load_raw_pickle(args.few_shot_path)
+    eval_seen_go_ids = base.load_raw_pickle(args.go_path_seen)
+    eval_unseen_ids = base.load_raw_pickle(args.zero_shot_path)
+    eval_rare_go_ids = base.load_raw_pickle(args.few_shot_path)
 
     go_terms = load_raw_json(args.go_basic_json)
     alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
@@ -353,8 +350,8 @@ def canonicalize_and_align_inputs(args, go_cache, logger):
     pid2pos_raw = load_raw_json(args.pid2pos)
     pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else pid2pos_raw
 
-    zs = load_go_set(args.zero_shot_path)
-    fs = load_go_set(args.few_shot_path)
+    zs = base.load_go_set(args.zero_shot_path)
+    fs = base.load_go_set(args.few_shot_path)
 
     zs = canonicalize_id_list(list(zs), alt_map) if alt_map else zs
     fs = canonicalize_id_list(list(fs), alt_map) if alt_map else fs
@@ -449,7 +446,7 @@ def build_trainer_for_dump(args, device: torch.device, go_cache, go_encoder, go_
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
-        go_namespace_map=load_go_namespaces(),
+        go_namespace_map=base.load_go_namespaces(),
         scheduler=None,
         go_text_store=go_text_store,
         use_queue_miner=False,
@@ -924,7 +921,7 @@ def main():
     cli = parse_args()
     setup_logging_simple()
 
-    args = load_structured_cfg(cli.config)
+    args = configure(cli.config)
 
     if cli.device is not None:
         args.general_device = cli.device
@@ -951,8 +948,8 @@ def main():
 
     go_cache = build_go_cache(str(args.go_cache_path))
 
-    dag_parents = load_go_parents() if args.use_dag_in_ds else None
-    dag_children = load_go_children() if args.use_dag_in_ds else None
+    dag_parents = base.load_go_parents() if args.use_dag_in_ds else None
+    dag_children = base.load_go_children() if args.use_dag_in_ds else None
 
     go_encoder, go_text_store = build_go_encoder_and_text_store(args, device)
 
