@@ -251,6 +251,57 @@ def cardinality_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Te
     true_count = y.sum(dim=1)
     return F.mse_loss(torch.log1p(pred_count), torch.log1p(true_count))
 
+def pairwise_logistic_ranking_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    valid: torch.Tensor,
+    max_negatives: int = 64,
+) -> torch.Tensor:
+    """
+    Encourage every positive candidate to score above hard negatives.
+
+    For each protein:
+      L = mean softplus(-(s_pos - s_neg))
+
+    To control compute, only the highest-scoring max_negatives
+    negative candidates are used.
+    """
+    valid = valid.bool()
+    labels = labels.bool()
+
+    per_protein_losses: List[torch.Tensor] = []
+
+    for i in range(logits.size(0)):
+        row_valid = valid[i]
+        row_pos = row_valid & labels[i]
+        row_neg = row_valid & ~labels[i]
+
+        if not row_pos.any() or not row_neg.any():
+            continue
+
+        pos_scores = logits[i, row_pos]
+        neg_scores = logits[i, row_neg]
+
+        if max_negatives > 0 and neg_scores.numel() > max_negatives:
+            neg_scores = torch.topk(
+                neg_scores,
+                k=max_negatives,
+                largest=True,
+            ).values
+
+        pairwise_diff = (
+            pos_scores.unsqueeze(1)
+            - neg_scores.unsqueeze(0)
+        )
+
+        row_loss = F.softplus(-pairwise_diff).mean()
+        per_protein_losses.append(row_loss)
+
+    if not per_protein_losses:
+        return logits.sum() * 0.0
+
+    return torch.stack(per_protein_losses).mean()
+
 
 def _go_to_int(x: Any) -> Optional[int]:
     if x is None:
@@ -322,13 +373,13 @@ def dag_loss_fn(logits: torch.Tensor, valid: torch.Tensor, edge_mask: torch.Tens
     diffs = child[edge_mask] - parent[edge_mask] - float(margin)
     return F.softplus(diffs.clamp(-30.0, 30.0)).mean()
 
-
 @dataclass
 class CalibConfig:
     train_dump: str
     val_dump: str
     out_dir: str
-    model_kind: str = "retrievercal"  # retrievercal | scoresetcal | embcal | embsetcal
+
+    model_kind: str = "retrievercal" # retrievercal | scoresetcal | embcal | embsetcal
     topk: int = 500
     batch_size: int = 512
     num_workers: int = 0
@@ -340,9 +391,14 @@ class CalibConfig:
     n_heads: int = 4
     dropout: float = 0.10
     pos_weight_max: float = 50.0
-    lambda_f1: float = 0.25
-    lambda_card: float = 0.05
+
+    lambda_pair: float = 0.25
+    pairwise_max_negatives: int = 64
+
+    lambda_f1: float = 0.0
+    lambda_card: float = 0.0
     lambda_dag: float = 0.0
+
     dag_margin: float = 0.0
     dag_parents_json: str = ""
     eval_every_steps: int = 1000
@@ -433,33 +489,102 @@ class CalibTrainer:
     def _move(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
-    def _forward(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def _forward(
+            self,
+            batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
         kind = self.cfg.model_kind.lower()
-        if kind in {"embcal", "embeddingcal", "embsetcal", "embeddingsetcal", "step3"}:
-            return self.model(batch["score_z"], batch["rank_feature"], batch["valid"], batch["protein_z"], batch["go_z"])
-        return self.model(batch["score_z"], batch["rank_feature"], batch["valid"])
 
-    def _loss(self, logits: torch.Tensor, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if kind in {
+            "embsetcal",
+            "embeddingsetcal",
+            "step3",
+        }:
+            return self.model(
+                batch["score_z"],
+                batch["valid"],
+                batch["protein_z"],
+                batch["go_z"],
+            )
+
+        if kind in {
+            "embcal",
+            "embeddingcal",
+        }:
+            return self.model(
+                batch["score_z"],
+                batch["rank_feature"],
+                batch["valid"],
+                batch["protein_z"],
+                batch["go_z"],
+            )
+
+        return self.model(
+            batch["score_z"],
+            batch["rank_feature"],
+            batch["valid"],
+        )
+
+    def _loss(
+            self,
+            logits: torch.Tensor,
+            batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
         labels = batch["labels"].float()
         valid = batch["valid"].bool()
-        logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
-        logits = torch.where(valid, logits, torch.full_like(logits, -1e9))
+
+        logits = torch.nan_to_num(
+            logits,
+            nan=-1e9,
+            posinf=1e9,
+            neginf=-1e9,
+        )
+        logits = torch.where(
+            valid,
+            logits,
+            torch.full_like(logits, -1e9),
+        )
+
         valid_logits = logits[valid]
         valid_labels = labels[valid]
+
         if valid_logits.numel() == 0:
             bce = logits.sum() * 0.0
         else:
-            pos_weight = torch.as_tensor(self.pos_weight, device=logits.device, dtype=logits.dtype)
-            bce = F.binary_cross_entropy_with_logits(valid_logits, valid_labels, pos_weight=pos_weight, reduction="mean")
-        lf1 = soft_f1_loss(logits, labels, valid) if self.cfg.lambda_f1 > 0 else logits.sum() * 0.0
-        lcard = cardinality_loss(logits, labels, valid) if self.cfg.lambda_card > 0 else logits.sum() * 0.0
-        if self.cfg.lambda_dag > 0 and self.child_to_parents:
-            edge_mask = make_dag_edge_mask(batch["cand_ids"], valid, self.child_to_parents, self.device)
-            ldag = dag_loss_fn(logits, valid, edge_mask, margin=self.cfg.dag_margin)
-        else:
-            ldag = logits.sum() * 0.0
-        total = bce + self.cfg.lambda_f1 * lf1 + self.cfg.lambda_card * lcard + self.cfg.lambda_dag * ldag
-        return {"loss": total, "bce": bce, "soft_f1": lf1, "card": lcard, "dag": ldag}
+            pos_weight = torch.as_tensor(
+                self.pos_weight,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            bce = F.binary_cross_entropy_with_logits(
+                valid_logits,
+                valid_labels,
+                pos_weight=pos_weight,
+                reduction="mean",
+            )
+
+        pairwise = pairwise_logistic_ranking_loss(
+            logits=logits,
+            labels=labels,
+            valid=valid,
+            max_negatives=self.cfg.pairwise_max_negatives,
+        )
+
+        total = (
+                bce
+                + self.cfg.lambda_pair * pairwise
+        )
+
+        zero = logits.sum() * 0.0
+
+        return {
+            "loss": total,
+            "bce": bce,
+            "pairwise": pairwise,
+            "soft_f1": zero,
+            "card": zero,
+            "dag": zero,
+        }
 
     def train(self) -> None:
         logging.info("[calib] device=%s model=%s topk=%d", self.device, self.cfg.model_kind, self.cfg.topk)
@@ -535,6 +660,7 @@ class CalibTrainer:
         f1s: List[float] = []
         cards: List[float] = []
         dags: List[float] = []
+        pairwise_losses: List[float] = []
         for batch in tqdm(self.val_loader, desc="eval", leave=False):
             batch = self._move(batch)
             logits = self._forward(batch)
@@ -546,6 +672,7 @@ class CalibTrainer:
             f1s.append(float(loss_dict["soft_f1"].detach().cpu()))
             cards.append(float(loss_dict["card"].detach().cpu()))
             dags.append(float(loss_dict["dag"].detach().cpu()))
+            pairwise_losses.append(float(loss_dict["pairwise"].detach().cpu()))
             sc = logits.detach().cpu().numpy()
             y = batch["labels"].detach().cpu().numpy()
             valid = batch["valid"].detach().cpu().numpy().astype(bool)
@@ -589,4 +716,5 @@ class CalibTrainer:
             "soft_f1_loss": float(np.mean(f1s)) if f1s else 0.0,
             "card_loss": float(np.mean(cards)) if cards else 0.0,
             "dag_loss": float(np.mean(dags)) if dags else 0.0,
+            "pairwise_loss": (float(np.mean(pairwise_losses)) if pairwise_losses else 0.0),
         }
