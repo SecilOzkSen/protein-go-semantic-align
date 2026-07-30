@@ -92,7 +92,7 @@ def parse_args() -> CalibConfig:
     p.add_argument("--use_stargo_eval", action="store_true", help="Compute StarGO/PFresGO metrics during validation.",)
     p.add_argument("--stargo_ontology", default="bp", choices=["bp", "mf", "cc"],)
     p.add_argument("--stargo_go_obo", default="", help="Path to the GO OBO file used by StarGO evaluation.",)
-    p.add_argument("--stargo_test_csv", default="", help="Path to nrPDB-GO_2019.06.18_test.csv.",)
+#    p.add_argument("--stargo_test_csv", default="", help="Path to nrPDB-GO_2019.06.18_test.csv.",)
     p.add_argument("--stargo_seqid_column", type=int, default=4, help="StarGO sequence-identity subset column. Default: 4.",)
     a = p.parse_args()
     return CalibConfig(**vars(a))
