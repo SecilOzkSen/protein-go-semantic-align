@@ -424,7 +424,6 @@ class CalibConfig:
     use_stargo_eval: bool = False
     stargo_ontology: str = "bp"
     stargo_go_obo: str = ""
-    stargo_test_csv: str = ""
     stargo_seqid_column: int = 4
 
 
@@ -492,22 +491,24 @@ class CalibTrainer:
 
         self.stargo_keep_pidx = None
         if self.cfg.use_stargo_eval:
-            ontology = str(self.cfg.stargo_ontology).strip().lower()
+            ontology = str(
+                self.cfg.stargo_ontology
+            ).strip().lower()
+
             if ontology not in {"bp", "mf", "cc"}:
-                raise ValueError("stargo_ontology must be one of: bp, mf, cc")
+                raise ValueError(
+                    "stargo_ontology must be one of: bp, mf, cc"
+                )
 
-            go_obo = Path(self.cfg.stargo_go_obo).expanduser().resolve()
+            self.stargo_go_obo = Path(
+                self.cfg.stargo_go_obo
+            ).expanduser().resolve()
 
-            test_csv = Path(self.cfg.stargo_test_csv).expanduser().resolve()
-
-            if not go_obo.exists():
-                raise FileNotFoundError(f"StarGO GO graph not found: {go_obo}")
-
-            if not test_csv.exists():
-                raise FileNotFoundError(f"StarGO PFresGO test CSV not found: "
-                                        f"{test_csv}")
-            self.stargo_go_obo = go_obo
-            self.stargo_test_csv = test_csv
+            if not self.stargo_go_obo.exists():
+                raise FileNotFoundError(
+                    f"StarGO GO graph not found: "
+                    f"{self.stargo_go_obo}"
+                )
         with (self.out_dir / "config.json").open("w", encoding="utf-8") as f:
             d = asdict(cfg)
             d.update({"score_mean": self.score_mean, "score_std": self.score_std, "pos_weight": self.pos_weight})
@@ -659,54 +660,11 @@ class CalibTrainer:
             str(self.stargo_go_obo),
         )
 
-        test_prots, seqid_mtrx = load_test_prots(
-            str(self.stargo_test_csv)
-        )
-        seqid_col = int(self.cfg.stargo_seqid_column)
-
-        if seqid_col < 0 or seqid_col >= seqid_mtrx.shape[1]:
-            raise ValueError(
-                f"Invalid stargo_seqid_column={seqid_col}; "
-                f"matrix has {seqid_mtrx.shape[1]} columns."
-            )
-
-        selected = test_prots[
-            seqid_mtrx[:, seqid_col] == 1
-            ]
-
-        pid_to_idx = {
-            str(pid): idx
-            for idx, pid in enumerate(protein_ids)
-        }
-
-        selected_ids = [
-            str(pid).strip()
-            for pid in selected
-        ]
-
-        pid_to_idx = {
-            str(pid).strip(): idx
-            for idx, pid in enumerate(protein_ids)
-        }
-
-        missing = [
-            pid
-            for pid in selected_ids
-            if pid not in pid_to_idx
-        ]
-
-        if missing:
-            raise ValueError(
-                f"{len(missing)} StarGO evaluation proteins "
-                f"are missing from the validation dump. "
-                f"Examples: {missing[:10]}"
-            )
-
-        keep_pidx = np.asarray(
-            [
-                pid_to_idx[pid]
-                for pid in selected_ids
-            ],
+        # During training we evaluate the PFresGO validation split.
+        # Use all validation proteins while preserving StarGO's metric
+        # implementation, GO propagation, and threshold sweep.
+        keep_pidx = np.arange(
+            len(protein_ids),
             dtype=np.int64,
         )
         if keep_pidx.size == 0:
