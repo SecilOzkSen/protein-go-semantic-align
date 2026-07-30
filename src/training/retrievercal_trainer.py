@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import pickle
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,10 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
+from src.evaluators.pfresgo_eval import (
+    Method,
+    load_test_prots,
+)
 from src.models.retrievercal_model import RetrieverCal, ScoreSetCal, EmbCal, EmbSetCal
 
 
@@ -27,13 +32,13 @@ def _first_existing(base: Path, names: List[str]) -> Optional[Path]:
 
 class CandidateDumpDataset(Dataset):
     def __init__(
-        self,
-        dump_dir: str | Path,
-        topk: int,
-        score_mean: float,
-        score_std: float,
-        embedding_dump: str | Path | None = None,
-        require_embeddings: bool = False,
+            self,
+            dump_dir: str | Path,
+            topk: int,
+            score_mean: float,
+            score_std: float,
+            embedding_dump: str | Path | None = None,
+            require_embeddings: bool = False,
     ):
         self.dump_dir = Path(dump_dir)
         self.topk = int(topk)
@@ -61,7 +66,7 @@ class CandidateDumpDataset(Dataset):
             raise ValueError(f"Requested topk={self.topk}, dump has {self.top_scores.shape[1]}")
 
         self.rank_feature = (
-            np.log1p(np.arange(1, self.topk + 1, dtype=np.float32)) / np.log1p(float(self.topk))
+                np.log1p(np.arange(1, self.topk + 1, dtype=np.float32)) / np.log1p(float(self.topk))
         ).astype(np.float32)
 
         self.has_embeddings = False
@@ -73,7 +78,8 @@ class CandidateDumpDataset(Dataset):
         self._setup_embeddings()
 
     def _setup_embeddings(self) -> None:
-        prot_path = _first_existing(self.embedding_dir, ["protein_z.float16.npy", "protein_z.float32.npy", "protein_z.npy"])
+        prot_path = _first_existing(self.embedding_dir,
+                                    ["protein_z.float16.npy", "protein_z.float32.npy", "protein_z.npy"])
         go_path = _first_existing(self.embedding_dir, ["go_z.float16.npy", "go_z.float32.npy", "go_z.npy"])
         if prot_path is None or go_path is None:
             if self.require_embeddings:
@@ -229,7 +235,8 @@ def compute_global_fmax_aupr_from_items(items: List[Tuple[float, int]], n_true_t
         if dr > 0:
             aupr += prec * dr
             prev_rec = rec
-    return {"fmax": float(best_f), "aupr": float(aupr), "best_threshold": float(best_t), "precision": float(best_p), "recall": float(best_r)}
+    return {"fmax": float(best_f), "aupr": float(aupr), "best_threshold": float(best_t), "precision": float(best_p),
+            "recall": float(best_r)}
 
 
 def soft_f1_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -251,11 +258,12 @@ def cardinality_loss(logits: torch.Tensor, labels: torch.Tensor, valid: torch.Te
     true_count = y.sum(dim=1)
     return F.mse_loss(torch.log1p(pred_count), torch.log1p(true_count))
 
+
 def pairwise_logistic_ranking_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    valid: torch.Tensor,
-    max_negatives: int = 64,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        valid: torch.Tensor,
+        max_negatives: int = 64,
 ) -> torch.Tensor:
     """
     Encourage every positive candidate to score above hard negatives.
@@ -290,8 +298,8 @@ def pairwise_logistic_ranking_loss(
             ).values
 
         pairwise_diff = (
-            pos_scores.unsqueeze(1)
-            - neg_scores.unsqueeze(0)
+                pos_scores.unsqueeze(1)
+                - neg_scores.unsqueeze(0)
         )
 
         row_loss = F.softplus(-pairwise_diff).mean()
@@ -340,7 +348,8 @@ def load_child_to_parents_json(path: str | Path) -> Dict[int, List[int]]:
     return out
 
 
-def make_dag_edge_mask(cand_ids: torch.Tensor, valid: torch.Tensor, child_to_parents: Dict[int, List[int]], device: torch.device) -> torch.Tensor:
+def make_dag_edge_mask(cand_ids: torch.Tensor, valid: torch.Tensor, child_to_parents: Dict[int, List[int]],
+                       device: torch.device) -> torch.Tensor:
     B, K = cand_ids.shape
     out = torch.zeros((B, K, K), dtype=torch.bool)
     cand_np = cand_ids.detach().cpu().numpy()
@@ -360,7 +369,8 @@ def make_dag_edge_mask(cand_ids: torch.Tensor, valid: torch.Tensor, child_to_par
     return out.to(device=device, non_blocking=True)
 
 
-def dag_loss_fn(logits: torch.Tensor, valid: torch.Tensor, edge_mask: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
+def dag_loss_fn(logits: torch.Tensor, valid: torch.Tensor, edge_mask: torch.Tensor,
+                margin: float = 0.0) -> torch.Tensor:
     if edge_mask is None or not edge_mask.any():
         return logits.sum() * 0.0
     valid_pair = valid.unsqueeze(2) & valid.unsqueeze(1)
@@ -373,13 +383,14 @@ def dag_loss_fn(logits: torch.Tensor, valid: torch.Tensor, edge_mask: torch.Tens
     diffs = child[edge_mask] - parent[edge_mask] - float(margin)
     return F.softplus(diffs.clamp(-30.0, 30.0)).mean()
 
+
 @dataclass
 class CalibConfig:
     train_dump: str
     val_dump: str
     out_dir: str
 
-    model_kind: str = "retrievercal" # retrievercal | scoresetcal | embcal | embsetcal
+    model_kind: str = "retrievercal"  # retrievercal | scoresetcal | embcal | embsetcal
     topk: int = 500
     batch_size: int = 512
     num_workers: int = 0
@@ -409,6 +420,12 @@ class CalibConfig:
     train_embedding_dump: str = ""
     val_embedding_dump: str = ""
     proj_dim: int = 0
+    # StarGO / PFresGO evaluation
+    use_stargo_eval: bool = False
+    stargo_ontology: str = "bp"
+    stargo_go_obo: str = ""
+    stargo_test_csv: str = ""
+    stargo_seqid_column: int = 4
 
 
 class CalibTrainer:
@@ -417,6 +434,7 @@ class CalibTrainer:
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
         self.out_dir = Path(cfg.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
+
         max_rows = None if cfg.score_stat_rows <= 0 else int(cfg.score_stat_rows)
         self.score_mean, self.score_std = estimate_score_stats(cfg.train_dump, cfg.topk, max_rows=max_rows)
         kind = cfg.model_kind.lower()
@@ -437,16 +455,20 @@ class CalibTrainer:
             embedding_dump=cfg.val_embedding_dump or None,
             require_embeddings=requires_emb,
         )
-        self.train_loader = DataLoader(self.train_ds, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
-        self.val_loader = DataLoader(self.val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
+        self.train_loader = DataLoader(self.train_ds, batch_size=cfg.batch_size, shuffle=True,
+                                       num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
+        self.val_loader = DataLoader(self.val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers,
+                                     collate_fn=collate_batch, pin_memory=True)
         if kind in {"retrievercal", "step1"}:
             self.model: nn.Module = RetrieverCal(hidden_dim=cfg.hidden_dim, dropout=cfg.dropout)
         elif kind in {"scoresetcal", "setcal", "step2"}:
-            self.model = ScoreSetCal(hidden_dim=cfg.hidden_dim, n_layers=cfg.n_layers, n_heads=cfg.n_heads, dropout=cfg.dropout, max_k=max(1024, cfg.topk))
+            self.model = ScoreSetCal(hidden_dim=cfg.hidden_dim, n_layers=cfg.n_layers, n_heads=cfg.n_heads,
+                                     dropout=cfg.dropout, max_k=max(1024, cfg.topk))
         elif kind in {"embcal", "embeddingcal"}:
             if self.train_ds.emb_dim is None:
                 raise RuntimeError("EmbCal requires embeddings but emb_dim is None")
-            self.model = EmbCal(emb_dim=self.train_ds.emb_dim, hidden_dim=cfg.hidden_dim, dropout=cfg.dropout, proj_dim=(cfg.proj_dim or None))
+            self.model = EmbCal(emb_dim=self.train_ds.emb_dim, hidden_dim=cfg.hidden_dim, dropout=cfg.dropout,
+                                proj_dim=(cfg.proj_dim or None))
         elif kind in {"embsetcal", "embeddingsetcal", "step3"}:
             if self.train_ds.emb_dim is None:
                 raise RuntimeError("EmbSetCal requires embeddings but emb_dim is None")
@@ -467,6 +489,25 @@ class CalibTrainer:
         self.child_to_parents = load_child_to_parents_json(cfg.dag_parents_json) if cfg.lambda_dag > 0 else {}
         self.best_metric = -float("inf")
         self.bad_evals = 0
+
+        self.stargo_keep_pidx = None
+        if self.cfg.use_stargo_eval:
+            ontology = str(self.cfg.stargo_ontology).strip().lower()
+            if ontology not in {"bp", "mf", "cc"}:
+                raise ValueError("stargo_ontology must be one of: bp, mf, cc")
+
+            go_obo = Path(self.cfg.stargo_go_obo).expanduser().resolve()
+
+            test_csv = Path(self.cfg.stargo_test_csv).expanduser().resolve()
+
+            if not go_obo.exists():
+                raise FileNotFoundError(f"StarGO GO graph not found: {go_obo}")
+
+            if not test_csv.exists():
+                raise FileNotFoundError(f"StarGO PFresGO test CSV not found: "
+                                        f"{test_csv}")
+            self.stargo_go_obo = go_obo
+            self.stargo_test_csv = test_csv
         with (self.out_dir / "config.json").open("w", encoding="utf-8") as f:
             d = asdict(cfg)
             d.update({"score_mean": self.score_mean, "score_std": self.score_std, "pos_weight": self.pos_weight})
@@ -586,11 +627,129 @@ class CalibTrainer:
             "dag": zero,
         }
 
+    def _compute_stargo_metrics(
+            self,
+            full_pred: np.ndarray,
+            full_true: np.ndarray,
+            eval_go_ids: np.ndarray,
+            protein_ids: list[str],
+    ) -> Dict[str, float]:
+        goterms = [
+            f"GO:{int(go_id):07d}"
+            for go_id in eval_go_ids
+        ]
+
+        eval_file = self.out_dir / "eval_results_tmp.pckl"
+
+        with eval_file.open("wb") as f:
+            pickle.dump(
+                {
+                    "Y_true": full_true,
+                    "Y_pred": full_pred,
+                    "goterms": goterms,
+                    "proteins": protein_ids,
+                },
+                f,
+            )
+
+        method = Method(
+            "embsetcal",
+            str(eval_file),
+            str(self.cfg.stargo_ontology).strip().lower(),
+            str(self.stargo_go_obo),
+        )
+
+        test_prots, seqid_mtrx = load_test_prots(
+            str(self.stargo_test_csv)
+        )
+        seqid_col = int(self.cfg.stargo_seqid_column)
+
+        if seqid_col < 0 or seqid_col >= seqid_mtrx.shape[1]:
+            raise ValueError(
+                f"Invalid stargo_seqid_column={seqid_col}; "
+                f"matrix has {seqid_mtrx.shape[1]} columns."
+            )
+
+        selected = test_prots[
+            seqid_mtrx[:, seqid_col] == 1
+            ]
+
+        pid_to_idx = {
+            str(pid): idx
+            for idx, pid in enumerate(protein_ids)
+        }
+
+        selected_ids = [
+            str(pid).strip()
+            for pid in selected
+        ]
+
+        pid_to_idx = {
+            str(pid).strip(): idx
+            for idx, pid in enumerate(protein_ids)
+        }
+
+        missing = [
+            pid
+            for pid in selected_ids
+            if pid not in pid_to_idx
+        ]
+
+        if missing:
+            raise ValueError(
+                f"{len(missing)} StarGO evaluation proteins "
+                f"are missing from the validation dump. "
+                f"Examples: {missing[:10]}"
+            )
+
+        keep_pidx = np.asarray(
+            [
+                pid_to_idx[pid]
+                for pid in selected_ids
+            ],
+            dtype=np.int64,
+        )
+        if keep_pidx.size == 0:
+            raise ValueError(
+                "No StarGO evaluation proteins matched "
+                "the validation dump."
+            )
+
+        micro_aupr, macro_aupr, _ = (
+            method._function_centric_aupr(
+                keep_pidx=keep_pidx
+            )
+        )
+
+        auc_value = method.AUC(
+            keep_pidx=keep_pidx
+        )
+
+        fscores, recalls, precisions, thresholds = (
+            method._protein_centric_fmax(
+                keep_pidx=keep_pidx
+            )
+        )
+
+        best = int(np.argmax(fscores))
+
+        return {
+            "stargo_fmax": float(fscores[best]),
+            "stargo_threshold": float(thresholds[best]),
+            "stargo_precision": float(precisions[best]),
+            "stargo_recall": float(recalls[best]),
+            "stargo_micro_aupr": float(micro_aupr),
+            "stargo_macro_aupr": float(macro_aupr),
+            "stargo_auc": float(auc_value),
+        }
+
     def train(self) -> None:
         logging.info("[calib] device=%s model=%s topk=%d", self.device, self.cfg.model_kind, self.cfg.topk)
-        logging.info("[calib] score_mean=%.4f score_std=%.4f pos_weight=%.2f", self.score_mean, self.score_std, self.pos_weight)
+        logging.info("[calib] score_mean=%.4f score_std=%.4f pos_weight=%.2f", self.score_mean, self.score_std,
+                     self.pos_weight)
         if getattr(self.train_ds, "has_embeddings", False):
-            logging.info("[calib] embeddings enabled emb_dim=%s train_emb=%s val_emb=%s", self.train_ds.emb_dim, self.train_ds.embedding_dir, self.val_ds.embedding_dir)
+            logging.info("[calib] embeddings enabled emb_dim=%s train_emb=%s val_emb=%s", self.train_ds.emb_dim,
+                         self.train_ds.embedding_dir, self.val_ds.embedding_dir)
         global_step = 0
         for epoch in range(self.cfg.epochs):
             self.model.train()
@@ -612,6 +771,7 @@ class CalibTrainer:
                     metrics = self.evaluate()
                     logging.info("[val@step%d] %s", global_step, metrics)
                     self._maybe_save(epoch, global_step, metrics)
+                    self.model.train()
                     if self.bad_evals >= self.cfg.patience:
                         logging.info("[calib] early stop at epoch=%d step=%d", epoch, global_step)
                         return
@@ -624,7 +784,13 @@ class CalibTrainer:
 
     def _maybe_save(self, epoch: int, step: int, metrics: Dict[str, float]) -> None:
         monitor = self.cfg.monitor
-        val = float(metrics.get(monitor, metrics.get("fmax_full", -float("inf"))))
+        if monitor not in metrics:
+            raise KeyError(
+                f"Monitor metric '{monitor}' was not produced. "
+                f"Available metrics: {sorted(metrics.keys())}"
+            )
+
+        val = float(metrics[monitor])
         if val > self.best_metric:
             self.best_metric = val
             self.bad_evals = 0
@@ -661,6 +827,11 @@ class CalibTrainer:
         cards: List[float] = []
         dags: List[float] = []
         pairwise_losses: List[float] = []
+        all_logits = []
+        all_cand_ids = []
+        all_valid = []
+        all_true_ids = []
+        all_protein_ids = []
         for batch in tqdm(self.val_loader, desc="eval", leave=False):
             batch = self._move(batch)
             logits = self._forward(batch)
@@ -678,6 +849,22 @@ class CalibTrainer:
             valid = batch["valid"].detach().cpu().numpy().astype(bool)
             cand = batch["cand_ids"].detach().cpu().numpy()
             true_ids = batch["true_go_ids"].detach().cpu().numpy()
+            if self.cfg.use_stargo_eval:
+                all_logits.append(
+                    logits.detach().cpu()
+                )
+                all_cand_ids.append(
+                    batch["cand_ids"].detach().cpu()
+                )
+                all_valid.append(
+                    batch["valid"].detach().cpu()
+                )
+                all_true_ids.append(
+                    batch["true_go_ids"].detach().cpu()
+                )
+                all_protein_ids.extend(
+                    batch["protein_id"]
+                )
             B, K = sc.shape
             for i in range(B):
                 pos_set = set(int(x) for x in true_ids[i].tolist() if int(x) >= 0)
@@ -698,7 +885,102 @@ class CalibTrainer:
                 n_prot += 1
         topk_m = compute_global_fmax_aupr_from_items(items, n_true_cand)
         full_m = compute_global_fmax_aupr_from_items(items, n_true_full)
-        return {
+
+        stargo_metrics: Dict[str, float] = {}
+
+        if self.cfg.use_stargo_eval:
+            logits_all = torch.cat(
+                all_logits,
+                dim=0,
+            )
+
+            cand_all = torch.cat(
+                all_cand_ids,
+                dim=0,
+            ).numpy()
+
+            valid_all = torch.cat(
+                all_valid,
+                dim=0,
+            ).numpy().astype(bool)
+
+            true_all = torch.cat(
+                all_true_ids,
+                dim=0,
+            ).numpy()
+
+            probs_all = torch.sigmoid(
+                logits_all
+            ).numpy()
+
+            eval_go_ids = np.asarray(
+                self.val_ds.eval_go_ids,
+                dtype=np.int64,
+            )
+
+            go_to_col = {
+                int(go_id): col
+                for col, go_id in enumerate(eval_go_ids)
+            }
+
+            n_proteins = len(all_protein_ids)
+            n_terms = len(eval_go_ids)
+
+            if n_proteins != len(self.val_ds):
+                raise ValueError(
+                    "Validation protein count mismatch: "
+                    f"{n_proteins} vs {len(self.val_ds)}"
+                )
+
+            full_pred = np.zeros(
+                (n_proteins, n_terms),
+                dtype=np.float32,
+            )
+
+            full_true = np.zeros(
+                (n_proteins, n_terms),
+                dtype=np.int8,
+            )
+
+            for i in range(n_proteins):
+                for j in range(cand_all.shape[1]):
+                    if not valid_all[i, j]:
+                        continue
+
+                    go_id = int(cand_all[i, j])
+                    col = go_to_col.get(go_id)
+
+                    if col is None:
+                        raise KeyError(
+                            f"Candidate GO:{go_id:07d} "
+                            "is missing from eval_go_ids."
+                        )
+
+                    full_pred[i, col] = max(
+                        full_pred[i, col],
+                        float(probs_all[i, j]),
+                    )
+
+            for i in range(n_proteins):
+                for go_id in true_all[i]:
+                    go_id = int(go_id)
+
+                    if go_id < 0:
+                        continue
+
+                    col = go_to_col.get(go_id)
+
+                    if col is not None:
+                        full_true[i, col] = 1
+
+            stargo_metrics = self._compute_stargo_metrics(
+                full_pred=full_pred,
+                full_true=full_true,
+                eval_go_ids=eval_go_ids,
+                protein_ids=all_protein_ids,
+            )
+
+        metrics = {
             "fmax_topk": topk_m["fmax"],
             "aupr_topk": topk_m["aupr"],
             "fmax_full": full_m["fmax"],
@@ -718,3 +1000,5 @@ class CalibTrainer:
             "dag_loss": float(np.mean(dags)) if dags else 0.0,
             "pairwise_loss": (float(np.mean(pairwise_losses)) if pairwise_losses else 0.0),
         }
+        metrics.update(stargo_metrics)
+        return metrics
