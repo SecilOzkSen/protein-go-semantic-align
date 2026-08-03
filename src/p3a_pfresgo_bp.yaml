@@ -77,13 +77,13 @@ queue:
   queue_K: 16384
   queue_start_step: 2000
   queue_hard_frac_start: 0.0
-  queue_hard_frac_end: 0.5
+  queue_hard_frac_end: 0.25
   queue_hard_frac_warmup_steps: 6000
   queue_weight_start: 0.2
   queue_weight_end: 1.0
   queue_weight_warmup_steps: 6000
   k_hard_queue_start: 4
-  k_hard_queue_end: 24
+  k_hard_queue_end: 12
   k_hard_queue_warmup_steps: 6000
 
 optim:
