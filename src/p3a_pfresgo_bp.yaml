@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_queue
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -72,18 +72,20 @@ training:
   trainable_mode: full
   local_window_size: 64
   local_window_stride: 32
+  pairwise_margin: 0.0
+  pairwise_start_step: 2000
 
 queue:
   queue_K: 16384
   queue_start_step: 2000
   queue_hard_frac_start: 0.0
-  queue_hard_frac_end: 0.25
+  queue_hard_frac_end: 0.5
   queue_hard_frac_warmup_steps: 6000
   queue_weight_start: 0.2
   queue_weight_end: 1.0
   queue_weight_warmup_steps: 6000
   k_hard_queue_start: 4
-  k_hard_queue_end: 12
+  k_hard_queue_end: 24
   k_hard_queue_warmup_steps: 6000
 
 optim:
@@ -108,6 +110,7 @@ loss:
   lambda_dag: 0.0
   lambda_attr: 0.0
   lambda_entropy_alpha: 0.0
+  pairwise_lambda: 0.10
   dag_margin: 0.05
   dag_scale: 10.0
   lambda_vtrue: 0.0
@@ -148,5 +151,5 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_queue
+  logs: /workspace/data_pfresgo/logs/bp_name_def_isa
 

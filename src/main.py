@@ -1014,6 +1014,9 @@ def run_training(args):
         lambda_slot_div = float(getattr(args, "lambda_slot_div", 0.0)),
         multivec_slot_lse_tau = float(getattr(args, "multivec_slot_lse_tau", 0.10)),
         multivec_global_residual_init = float(getattr(args, "multivec_global_residual_init", 0.25)),
+        pairwise_start_step=int(getattr(args, "pairwise_start_step", 0)),
+        pairwise_margin=float(getattr(args, "pairwise_margin", 0.0)),
+        pairwise_lambda=float(getattr(args, "pairwise_lambda", 0.0)),
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1542,6 +1545,8 @@ def load_structured_cfg(path: str):
         go_segment_alpha_warmup_steps=int(training.get("go_segment_alpha_warmup_steps", 10000)),
         local_window_size=int(training.get("local_window_size", 64)),
         local_window_stride=int(training.get("local_window_stride", 32)),
+        pairwise_margin=float(training.get("pairwise_margin", 0.0)),
+        pairwise_start_step=int(training.get("pairwise_start_step", 0)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
@@ -1576,8 +1581,8 @@ def load_structured_cfg(path: str):
 
         # loss
         lambda_con=float(loss.get("lambda_con", 1.0)),
-        lambda_dag=float(loss.get("lambda_dag", 0.2)),
-        lambda_attr=float(loss.get("lambda_attr", 0.1)),
+        lambda_dag=float(loss.get("lambda_dag", 0.0)),
+        lambda_attr=float(loss.get("lambda_attr", 0.0)),
         lambda_entropy_alpha=float(loss.get("lambda_entropy_alpha", 0.0)),
         dag_margin=float(loss.get("dag_margin", 0.05)),
         dag_scale=float(loss.get("dag_scale", 10.0)),
@@ -1585,6 +1590,7 @@ def load_structured_cfg(path: str):
         tau_distill=float(loss.get("tau_distill", 1.5)),
         lambda_bce=float(loss.get("lambda_bce", 0.1)),
         lambda_slot_div=float(loss.get("lambda_slot_div", 0.0)),
+        pairwise_lambda=float(loss.get("pairwise_lambda", 0.0)),
 
         # curriculum
         curriculum_epochs=int(curriculum.get("epochs", 4)),

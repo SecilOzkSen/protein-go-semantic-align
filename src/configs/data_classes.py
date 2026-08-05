@@ -213,8 +213,8 @@ class TrainingContext:
 @dataclass
 class AttrConfig:
     lambda_attr: float = 0.0
-    lambda_dag: float = 0.3
-    lambda_bce: float = 0.1
+    lambda_dag: float = 0.0
+    lambda_bce: float = 0.0
     lambda_entropy_alpha: float = 0.05
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64
@@ -259,6 +259,9 @@ class TrainerConfig:
     lambda_slot_div: float = 0.0
     multivec_slot_lse_tau: float = 0.00
     multivec_global_residual_init: float = 0.0
+    pairwise_margin: float = 0.0
+    pairwise_start_step: int = 0
+    pairwise_lambda: float = 0.0
 
 @dataclass
 class QueueConfig:

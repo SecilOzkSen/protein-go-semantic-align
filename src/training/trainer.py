@@ -108,6 +108,64 @@ def multi_positive_infonce_from_candidates_v2(
     return denom.mean() * 0.0
 
 
+def queue_pairwise_ranking_loss(
+        scores: torch.Tensor,
+        pos_mask: torch.Tensor,
+        cand_valid_mask: torch.Tensor,
+        queue_start: int,
+        queue_count: int,
+        margin: float = 0.0,
+) -> torch.Tensor:
+    """
+    Protein-wise pairwise ranking loss over queue negatives only.
+
+    For each protein, compare every positive candidate score against the
+    highest-scoring valid negatives in the queue tail:
+
+        softplus(margin - (s_pos - s_neg))
+
+    scores / masks: [B, K]
+    queue candidates occupy [queue_start:queue_start + queue_count).
+    """
+    if queue_count <= 0:
+        return scores.sum() * 0.0
+
+    pos_mask = pos_mask.bool() & cand_valid_mask.bool()
+    q_end = min(int(scores.size(1)), int(queue_start + queue_count))
+    q_start = max(0, int(queue_start))
+
+    if q_start >= q_end:
+        return scores.sum() * 0.0
+
+    losses = []
+
+    for b in range(scores.size(0)):
+        pos_scores = scores[b][pos_mask[b]]
+        if pos_scores.numel() == 0:
+            continue
+
+        queue_valid = cand_valid_mask[b, q_start:q_end].bool()
+        queue_scores = scores[b, q_start:q_end][queue_valid]
+        if queue_scores.numel() == 0:
+            continue
+
+        hard_neg_scores = queue_scores
+
+        pair_diff = (
+            pos_scores.unsqueeze(1)
+            - hard_neg_scores.unsqueeze(0)
+        )
+
+        losses.append(
+            F.softplus(float(margin) - pair_diff).mean()
+        )
+
+    if not losses:
+        return scores.sum() * 0.0
+
+    return torch.stack(losses).mean()
+
+
 @torch.no_grad()
 def delta_y_from_occlusion_windows(
         H: torch.Tensor,  # [B, L, Dh]
@@ -3048,10 +3106,6 @@ class OppTrainer:
                 go_mask=G_cand_mask,
                 return_alpha=False,
             )
-            l_slot_div = torch.zeros((), device=device)
-            slot_extractor = getattr(self.model, "slot_extractor", None)
-            if slot_extractor is not None and getattr(slot_extractor, "last_slot_div_loss", None) is not None:
-                l_slot_div = slot_extractor.last_slot_div_loss
 
             if self._global_step % 1000 == 0:
                 _tstats(scores_cand, "scores_cand(pre_scale)")
@@ -3186,6 +3240,46 @@ class OppTrainer:
             if not torch.isfinite(l_con):
                 raise RuntimeError("contrastive loss NaN, batch protein_ids=" + str(batch.get("protein_ids", "")[:5]))
 
+            # ---------------------------------------------------------
+            # Queue-based pairwise ranking objective
+            # ---------------------------------------------------------
+            pairwise_lambda = float(getattr(self.cfg, "pairwise_lambda", 0.0))
+            pairwise_margin = float(getattr(self.cfg, "pairwise_margin", 0.0))
+            pairwise_start_step = int(
+                getattr(
+                    self.cfg,
+                    "pairwise_start_step",
+                    self.queue_cfg.queue_start_step,
+                )
+            )
+
+            pairwise_active = (
+                pairwise_lambda > 0.0
+                and kq > 0
+                and self._global_step >= pairwise_start_step
+            )
+
+            if pairwise_active:
+                q_start = U + extra_n
+                l_pairwise = queue_pairwise_ranking_loss(
+                    scores=scores_cand,
+                    pos_mask=pos_mask,
+                    cand_valid_mask=cand_valid_mask,
+                    queue_start=q_start,
+                    queue_count=kq,
+                    margin=pairwise_margin,
+                )
+            else:
+                l_pairwise = scores_cand.sum() * 0.0
+
+            if not torch.isfinite(l_pairwise):
+                raise RuntimeError(
+                    "pairwise loss NaN, batch protein_ids="
+                    + str(batch.get("protein_ids", "")[:5])
+                )
+
+            l_total = l_con + pairwise_lambda * l_pairwise
+
             # positives-only tensors for attr / dag
             B = H.size(0)
             T_max = max((int(x.numel()) for x in pos_local_kept), default=1)
@@ -3218,50 +3312,6 @@ class OppTrainer:
                 )
             else:
                 alpha_info = {}
-
-        # attr + entropy
-        if use_attr and alpha_info and ("alpha_full" in alpha_info):
-            alpha = alpha_info["alpha_full"]
-            delta = delta_y_from_occlusion_windows(
-                H=H.detach(),
-                G_pos=G_pos.detach(),
-                model=self.model,
-                valid_mask=attn_valid,
-                window=32,
-                stride=16,
-                mask_value=0.0,
-                chunk_windows=32,
-            )
-            l_attr = attribution_loss(alpha, delta, mask=None, reduce="mean")
-            l_ent = -self.attr.lambda_entropy_alpha * entropy_regularizer(alpha)
-        else:
-            l_attr = torch.zeros((), device=device)
-            l_ent = torch.zeros((), device=device)
-
-        # DAG only on pooled positive path for now
-        l_dag = torch.zeros((), device=device)
-        if (not self._use_token_align) and self.attr.lambda_dag > 0:
-            pos_go_ids = self._build_pos_go_ids(pos_local_kept, uniq_go_ids)
-            with amp_ctx:
-                scores_pos_dag = self.forward_scores(H.detach(), G_pos, attn_valid, return_alpha=False)
-            scores_pos_dag_f32 = scores_pos_dag.float()
-            l_dag = dag_consistency_loss_pos_ids(
-                scores_pos_dag_f32,
-                pos_go_ids,
-                self.ctx.dag_parents,
-                margin=0.0,
-                scale=1.0
-            )
-
-        lambda_slot_div = float(getattr(self.cfg, "lambda_slot_div", 0.0))
-
-        total = (
-                l_con
-                + self.attr.lambda_dag * l_dag
-                + self.attr.lambda_attr * l_attr
-                + l_ent
-                + lambda_slot_div * l_slot_div
-        )
 
         self._global_step += 1
 
@@ -3337,11 +3387,11 @@ class OppTrainer:
             self.wandb_run.log(
                 {
                     "trainer_step": self._global_step,
-                    "train/total": float(total.detach().item()),
+                    "train/total": float(l_total.detach().item()),
                     "train/contrastive": float(l_con.detach().item()),
-                    "train/dag": float(l_dag.detach().item()),
-                    "train/attr": float(l_attr.detach().item()),
-                    "train/entropy": float(l_ent.detach().item()),
+                    "train/pairwise": float(l_pairwise.detach().item()),
+                    "train/pairwise_weighted": float((pairwise_lambda * l_pairwise).detach().item()),
+                    "train/pairwise_active": float(pairwise_active),
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
                     "train/lr_go_lora": float(
                         self._lora_lr_schedule(self._global_step - 1)
@@ -3349,9 +3399,6 @@ class OppTrainer:
                     "train/queue_hard_frac": float(self._queue_hard_frac_schedule(self._global_step)),
                     "train/queue_weight_eff": float(self._queue_weight_schedule(self._global_step)),
                     "train/k_hard_queue_eff": int(self._k_hard_queue_schedule(self._global_step)),
-                    "train/slot_div": float(l_slot_div.detach().item()),
-                    "train/slot_div_weighted": float(
-                        (float(getattr(self.cfg, "lambda_slot_div", 0.0)) * l_slot_div).detach().item()),
                 },
                 step=int(self._global_step),
             )
@@ -3359,11 +3406,9 @@ class OppTrainer:
             pass
 
         return {
-            "total": total,
+            "total": l_total,
             "contrastive": l_con,
-            "dag": l_dag,
-            "attr": l_attr,
-            "entropy": l_ent
+            "pairwise": l_pairwise,
         }
 
 
