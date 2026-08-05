@@ -7,10 +7,9 @@ import torch
 
 from src.evaluators.pfresgo_eval import Method
 
-
 dump = Path(
     "/workspace/candidate_dumps/"
-    "name_def_isa_step52929_test_top500"
+    "name_def_isa_pairwise_step88215_test_top500"
 )
 
 go_obo = (
