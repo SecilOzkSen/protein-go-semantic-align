@@ -217,12 +217,12 @@ class EmbCal(nn.Module):
         self.bias = nn.Parameter(torch.tensor(0.0))
 
     def forward(
-        self,
-        score_z: torch.Tensor,
-        rank_feature: torch.Tensor,
-        valid: torch.Tensor,
-        protein_z: torch.Tensor,
-        go_z: torch.Tensor,
+            self,
+            score_z: torch.Tensor,
+            rank_feature: torch.Tensor,
+            valid: torch.Tensor,
+            protein_z: torch.Tensor,
+            go_z: torch.Tensor,
     ) -> torch.Tensor:
         valid = valid.bool()
         score_z = torch.nan_to_num(score_z, nan=0.0, posinf=0.0, neginf=0.0).clamp(-20.0, 20.0)
@@ -230,13 +230,14 @@ class EmbCal(nn.Module):
         score_z = torch.where(valid, score_z, torch.zeros_like(score_z))
         rank_feature = torch.where(valid, rank_feature, torch.zeros_like(rank_feature))
 
-        p = self.protein_proj(protein_z.float())       # [B,H]
-        g = self.go_proj(go_z.float())                 # [B,K,H]
+        p = self.protein_proj(protein_z.float())  # [B,H]
+        g = self.go_proj(go_z.float())  # [B,K,H]
         B, K, H = g.shape
         p_rep = p.unsqueeze(1).expand(B, K, H)
         cos = F.cosine_similarity(p_rep, g, dim=-1)
         x = torch.cat(
-            [p_rep, g, torch.abs(p_rep - g), p_rep * g, score_z.unsqueeze(-1), rank_feature.unsqueeze(-1), cos.unsqueeze(-1)],
+            [p_rep, g, torch.abs(p_rep - g), p_rep * g, score_z.unsqueeze(-1), rank_feature.unsqueeze(-1),
+             cos.unsqueeze(-1)],
             dim=-1,
         )
         residual = self.candidate_mlp(x).squeeze(-1)
@@ -264,16 +265,32 @@ class EmbSetCal(nn.Module):
     """
 
     def __init__(
-        self,
-        emb_dim: int,
-        hidden_dim: int = 128,
-        n_layers: int = 1,
-        n_heads: int = 4,
-        dropout: float = 0.10,
-        max_k: int = 1024,
-        proj_dim: Optional[int] = None,
+            self,
+            emb_dim: int,
+            hidden_dim: int = 128,
+            n_layers: int = 1,
+            n_heads: int = 4,
+            dropout: float = 0.10,
+            max_k: int = 1024,
+            proj_dim: Optional[int] = None,
+            pooling_type: str = "mean", #attention
     ):
         super().__init__()
+
+        self.pooling_type = pooling_type
+        print(f"[EMBSETCAL] Pooling type: {self.pooling_type}")
+
+        if pooling_type not in {"mean", "attention"}:
+            raise ValueError(
+                f"Unsupported pooling_type={pooling_type}"
+            )
+
+        if pooling_type == "attention":
+            self.attn_pool = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Tanh(),
+                nn.Linear(hidden_dim, 1),
+            )
 
         self.emb_dim = int(emb_dim)
         self.hidden_dim = int(hidden_dim)
@@ -382,11 +399,11 @@ class EmbSetCal(nn.Module):
         )
 
     def forward(
-        self,
-        score_z: torch.Tensor,
-        valid: torch.Tensor,
-        protein_z: torch.Tensor,
-        go_z: torch.Tensor,
+            self,
+            score_z: torch.Tensor,
+            valid: torch.Tensor,
+            protein_z: torch.Tensor,
+            go_z: torch.Tensor,
     ) -> torch.Tensor:
         valid = valid.bool()
 
@@ -410,7 +427,7 @@ class EmbSetCal(nn.Module):
         )
 
         p = self.protein_proj(protein_z.float())  # [B,P]
-        g = self.go_proj(go_z.float())            # [B,K,P]
+        g = self.go_proj(go_z.float())  # [B,K,P]
 
         _, _, proj_dim = g.shape
         p_rep = p.unsqueeze(1).expand(
@@ -419,12 +436,12 @@ class EmbSetCal(nn.Module):
             proj_dim,
         )
 
-    #    cosine = F.cosine_similarity(
-    #        p_rep,
-    #        g,
-    #        dim=-1,
-    #        eps=1e-8,
-    #    )
+        #    cosine = F.cosine_similarity(
+        #        p_rep,
+        #        g,
+        #        dim=-1,
+        #        eps=1e-8,
+        #    )
 
         token_x = torch.cat(
             [
@@ -469,11 +486,24 @@ class EmbSetCal(nn.Module):
                 + self.bias
         )
 
-        weights = valid.to(h.dtype).unsqueeze(-1)
-        h_summary = (
-            (h * weights).sum(dim=1)
-            / weights.sum(dim=1).clamp_min(1.0)
-        )
+        if self.pooling_type == "mean":
+            weights = valid.to(h.dtype).unsqueeze(-1)
+            h_summary = (
+                    (h * weights).sum(dim=1)
+                    / weights.sum(dim=1).clamp_min(1.0)
+            )
+        elif self.pooling_type == "attention":
+            attn_logits = self.attn_pool(h).squeeze(-1)
+            attn_logits = attn_logits.masked_fill(~valid, -1e9,
+            )
+            attn_weights = torch.softmax(
+                attn_logits,
+                dim=1,
+            )
+            h_summary = torch.sum(
+                h * attn_weights.unsqueeze(-1),
+                dim=1,
+            )
 
         score_summary = self._score_summary(
             score_z,

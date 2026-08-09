@@ -425,6 +425,7 @@ class CalibConfig:
     stargo_ontology: str = "bp"
     stargo_go_obo: str = ""
     stargo_seqid_column: int = 4
+    pooling_type: str = "mean"
 
 
 class CalibTrainer:
@@ -479,6 +480,7 @@ class CalibTrainer:
                 dropout=cfg.dropout,
                 max_k=max(1024, cfg.topk),
                 proj_dim=(cfg.proj_dim or None),
+                pooling_type=cfg.pooling_type
             )
         else:
             raise ValueError(f"Unknown model_kind: {cfg.model_kind}")

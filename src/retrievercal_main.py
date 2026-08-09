@@ -83,6 +83,7 @@ def parse_args() -> CalibConfig:
     p.add_argument("--patience", type=int, default=8)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--score_stat_rows", type=int, default=0)
+    p.add_argument("--pooling_type", type=str, default="mean")
     p.add_argument("--monitor", default="fmax_full")
     p.add_argument("--train_embedding_dump", default="", help="Optional dump providing protein_z/go_z for train; defaults to train_dump")
     p.add_argument("--val_embedding_dump", default="", help="Optional dump providing protein_z/go_z for val; defaults to val_dump")
