@@ -474,9 +474,41 @@ class ProteinGoAligner(nn.Module):
             local_window_stride: int = 32,
             multivec_slot_lse_tau: float = 0.10,
             multivec_global_residual_init: float = 0.25,
+            protein_expert_mode: str = "legacy",  # legacy | global | local | global_local
+            local_slot_aggregation: str = "lse",  # max | lse
+            local_slot_lse_tau: float = 0.10,
+            expert_global_weight: float = 0.50,
+            expert_fusion_learnable: bool = True,
             go_segment_representation_mode: str = "mixed", #segments_only
     ):
         super().__init__()
+
+        allowed_expert_modes = {
+            "legacy",
+            "global",
+            "local",
+            "global_local",
+        }
+
+        if protein_expert_mode not in allowed_expert_modes:
+            raise ValueError(
+                f"Unsupported protein_expert_mode={protein_expert_mode!r}. "
+                f"Expected one of {sorted(allowed_expert_modes)}"
+            )
+
+        if local_slot_aggregation not in {"max", "lse"}:
+            raise ValueError(
+                f"Unsupported local_slot_aggregation={local_slot_aggregation!r}. "
+                "Expected 'max' or 'lse'."
+            )
+
+        if float(local_slot_lse_tau) <= 0:
+            raise ValueError("local_slot_lse_tau must be > 0.")
+
+        if not (0.0 < float(expert_global_weight) < 1.0):
+            raise ValueError(
+                "expert_global_weight must be strictly between 0 and 1."
+            )
 
         if protein_pool_type not in {"mean", "attn", "mean_attn_gate", "local_evidence_gate", "slots"}:
             raise ValueError(f"Unsupported protein_pool_type: {protein_pool_type}")
@@ -494,6 +526,10 @@ class ProteinGoAligner(nn.Module):
         if go_pool_type not in {"mean", "token_align", "multivec_token"}:
             raise ValueError(f"Unsupported go_pool_type: {go_pool_type}")
 
+        self.protein_expert_mode = str(protein_expert_mode)
+        self.local_slot_aggregation = str(local_slot_aggregation)
+        self.local_slot_lse_tau = float(local_slot_lse_tau)
+        self.expert_fusion_learnable = bool(expert_fusion_learnable)
         self.normalize = bool(normalize)
         self.go_encoder = go_encoder
         self.protein_pool_type = protein_pool_type
@@ -523,7 +559,15 @@ class ProteinGoAligner(nn.Module):
             )
 
         self.slot_extractor = None
-        if self.protein_pool_type == "slots":
+
+        needs_local_expert = self.protein_expert_mode in {
+            "local",
+            "global_local",
+        }
+
+        needs_legacy_slots = self.protein_pool_type == "slots"
+
+        if needs_local_expert or needs_legacy_slots:
             self.slot_extractor = ProteinSlotExtractor(
                 d_in=d_h,
                 n_slots=self.protein_n_slots,
@@ -545,6 +589,23 @@ class ProteinGoAligner(nn.Module):
 
         self.protein_ln = nn.LayerNorm(d_h)
         self.go_ln = nn.LayerNorm(d_g)
+
+        # ---------------------------------------------------------
+        # Global/local expert fusion
+        # ---------------------------------------------------------
+
+        w0 = float(expert_global_weight)
+        fusion_logit_init = math.log(w0 / (1.0 - w0))
+
+        self.expert_fusion_logit = nn.Parameter(
+            torch.tensor(
+                fusion_logit_init,
+                dtype=torch.float32,
+            ),
+            requires_grad=self.expert_fusion_learnable,
+        )
+
+        self.last_expert_info = {}
 
         self.go_segment_names = ["name", "namespace", "definition", "is_a", "part_of"]
         self.n_go_segments = len(self.go_segment_names)
@@ -584,6 +645,428 @@ class ProteinGoAligner(nn.Module):
         w = mask.to(x.dtype).unsqueeze(-1)  # [N,L,1]
         denom = w.sum(dim=1).clamp_min(1.0)  # [N,1]
         return (x * w).sum(dim=1) / denom  # [N,D]
+
+    def _encode_global_expert(
+            self,
+            H: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Existing pooled protein representation used as the global expert.
+
+        Returns:
+            Z_global: [B, Dz]
+        """
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask != 0
+
+        if self.protein_pool_type == "mean_attn_gate":
+            h_pool, pool_info = self.protein_mean_attn_gate_pool(
+                H,
+                mask,
+            )
+            self.last_pool_info = pool_info
+
+        elif self.protein_pool_type == "attn":
+            h_pool, alpha = self.protein_attn_pool(
+                H,
+                mask,
+            )
+
+            self.last_pool_info = {
+                "protein_attn_alpha": alpha,
+            }
+
+        elif self.protein_pool_type == "mean":
+            h_pool = self._masked_mean(
+                H,
+                mask,
+            )
+            self.last_pool_info = {}
+
+        elif self.protein_pool_type == "local_evidence_gate":
+            if self.protein_local_evidence_pool is None:
+                raise RuntimeError(
+                    "protein_pool_type='local_evidence_gate' but "
+                    "protein_local_evidence_pool is missing."
+                )
+
+            h_base, base_info = self.protein_mean_attn_gate_pool(
+                H,
+                mask,
+            )
+
+            h_pool, local_info = self.protein_local_evidence_pool(
+                H=H,
+                h_base=h_base,
+                mask=mask,
+            )
+
+            pool_info = {}
+            if base_info:
+                pool_info.update(base_info)
+            if local_info:
+                pool_info.update(local_info)
+
+            self.last_pool_info = pool_info
+
+        elif self.protein_pool_type == "slots":
+            raise RuntimeError(
+                "protein_expert_mode uses protein_pool_type as the "
+                "GLOBAL expert pooling strategy. "
+                "Do not set protein_pool_type='slots' for global/global_local. "
+                "Use e.g. protein_pool_type='mean_attn_gate'."
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported global protein pool: "
+                f"{self.protein_pool_type}"
+            )
+
+        Z = self.protein_ln(h_pool)
+        Z = self.proj_p(Z)
+
+        if self.normalize:
+            Z = self._norm(Z, dim=-1)
+
+        return torch.nan_to_num(Z)
+
+    def _encode_local_expert(
+            self,
+            H: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Local/multi-vector protein expert.
+
+        Returns:
+            Z_local: [B, S, Dz]
+        """
+        if self.slot_extractor is None:
+            raise RuntimeError(
+                "Local expert requested but slot_extractor is missing."
+            )
+
+        if mask is not None and mask.dtype != torch.bool:
+            mask = mask != 0
+
+        slots, slot_attn = self.slot_extractor(
+            H,
+            mask,
+        )  # [B,S,Dh]
+
+        Z = self.protein_ln(slots)
+        Z = self.proj_p(Z)
+
+        if self.normalize:
+            Z = self._norm(Z, dim=-1)
+
+        self.last_expert_info["slot_attn"] = (
+            slot_attn.detach()
+        )
+
+        return torch.nan_to_num(Z)
+
+    def encode_protein_experts(
+            self,
+            H: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Encode protein for the parameterized expert retriever.
+
+        Returns dict:
+            {
+                "global": [B,Dz] or None,
+                "local":  [B,S,Dz] or None,
+            }
+        """
+        mode = self.protein_expert_mode
+
+        if mode == "legacy":
+            raise RuntimeError(
+                "encode_protein_experts() should not be called "
+                "when protein_expert_mode='legacy'."
+            )
+
+        Z_global = None
+        Z_local = None
+
+        if mode in {"global", "global_local"}:
+            Z_global = self._encode_global_expert(
+                H,
+                mask,
+            )
+
+        if mode in {"local", "global_local"}:
+            Z_local = self._encode_local_expert(
+                H,
+                mask,
+            )
+
+        return {
+            "global": Z_global,
+            "local": Z_local,
+        }
+
+    def _aggregate_local_slot_scores(
+            self,
+            slot_scores: torch.Tensor,  # [B,S,K]
+    ) -> torch.Tensor:
+        """
+        Aggregate multiple local protein representations.
+
+        max:
+            hard best-slot matching.
+
+        lse:
+            smooth max implemented as log-mean-exp so its scale
+            remains comparable with global cosine/dot-product scores.
+        """
+        if slot_scores.dim() != 3:
+            raise RuntimeError(
+                f"slot_scores must be [B,S,K], "
+                f"got {tuple(slot_scores.shape)}"
+            )
+
+        if self.local_slot_aggregation == "max":
+            return slot_scores.max(dim=1).values
+
+        if self.local_slot_aggregation == "lse":
+            tau = max(
+                float(self.local_slot_lse_tau),
+                1e-4,
+            )
+
+            S = int(slot_scores.size(1))
+
+            out = tau * (
+                    torch.logsumexp(
+                        slot_scores.float() / tau,
+                        dim=1,
+                    )
+                    - math.log(max(1, S))
+            )
+
+            return out.to(
+                dtype=slot_scores.dtype
+            )
+
+        raise RuntimeError(
+            f"Unknown local_slot_aggregation="
+            f"{self.local_slot_aggregation}"
+        )
+
+    def get_expert_global_weight(self) -> torch.Tensor:
+        """
+        Scalar alpha in (0,1).
+
+        final =
+            alpha * global
+            + (1-alpha) * local
+        """
+        return torch.sigmoid(
+            self.expert_fusion_logit
+        )
+
+    def _fuse_expert_scores(
+            self,
+            global_score: torch.Tensor,
+            local_score: torch.Tensor,
+    ) -> torch.Tensor:
+
+        if global_score.shape != local_score.shape:
+            raise RuntimeError(
+                f"Expert score shape mismatch: "
+                f"global={tuple(global_score.shape)} "
+                f"local={tuple(local_score.shape)}"
+            )
+
+        alpha = self.get_expert_global_weight()
+
+        fused = (
+                alpha * global_score.float()
+                + (1.0 - alpha) * local_score.float()
+        )
+
+        return fused.to(
+            dtype=global_score.dtype
+        )
+
+    def score_from_encoded_experts(
+            self,
+            encoded: dict,
+            G: torch.Tensor,
+            go_mask: Optional[torch.Tensor] = None,
+            return_components: bool = False,
+    ):
+        """
+        Expert-aware scorer.
+
+        Current first experiment deliberately supports pooled GO only:
+
+            G: [B,K,Dg]
+
+        Global:
+            [B,Dz] x [B,K,Dz]
+
+        Local:
+            [B,S,Dz] x [B,K,Dz]
+            followed by max/LSE over slots.
+        """
+
+        if G.dim() != 3:
+            raise RuntimeError(
+                "Protein expert mode currently expects pooled GO "
+                f"candidates [B,K,Dg], got {tuple(G.shape)}. "
+                "Token-level GO interaction is intentionally excluded "
+                "from this first ablation."
+            )
+
+        Gz = self.go_ln(G)
+        Gz = self.proj_g(Gz)
+
+        if self.normalize:
+            Gz = self._norm(Gz, dim=-1)
+
+        return self.score_encoded_experts_projected(
+            encoded=encoded,
+            Gz=Gz,
+            return_components=return_components,
+        )
+
+    def score_encoded_experts_projected(
+            self,
+            encoded: dict,
+            Gz: torch.Tensor,
+            return_components: bool = False,
+    ):
+        """
+        Score encoded protein experts against ALREADY projected
+        and normalized GO representations.
+
+        encoded:
+            global: [B,Dz] or None
+            local:  [B,S,Dz] or None
+
+        Gz:
+            [B,K,Dz] or [K,Dz]
+
+        This is the common scoring geometry used by:
+            1) normal candidate scoring
+            2) queue hard-negative mining
+        """
+
+        if Gz.dim() == 2:
+            # [K,D] -> [B,K,D]
+            B = None
+
+            if encoded.get("global", None) is not None:
+                B = encoded["global"].size(0)
+            elif encoded.get("local", None) is not None:
+                B = encoded["local"].size(0)
+
+            if B is None:
+                raise RuntimeError(
+                    "Cannot infer batch size from empty encoded experts."
+                )
+
+            Gz = Gz.unsqueeze(0).expand(
+                B,
+                Gz.size(0),
+                Gz.size(1),
+            )
+
+        if Gz.dim() != 3:
+            raise RuntimeError(
+                f"Gz must be [K,D] or [B,K,D], got {tuple(Gz.shape)}"
+            )
+
+        Z_global = encoded.get("global", None)
+        Z_local = encoded.get("local", None)
+
+        global_score = None
+        local_score = None
+
+        # --------------------------------------------------
+        # Global expert
+        # --------------------------------------------------
+
+        if Z_global is not None:
+            if Z_global.dim() != 2:
+                raise RuntimeError(
+                    f"Global expert must be [B,D], "
+                    f"got {tuple(Z_global.shape)}"
+                )
+
+            global_score = torch.einsum(
+                "bd,bkd->bk",
+                Z_global,
+                Gz,
+            )
+
+        # --------------------------------------------------
+        # Local expert
+        # --------------------------------------------------
+
+        if Z_local is not None:
+            if Z_local.dim() != 3:
+                raise RuntimeError(
+                    f"Local expert must be [B,S,D], "
+                    f"got {tuple(Z_local.shape)}"
+                )
+
+            slot_scores = torch.einsum(
+                "bsd,bkd->bsk",
+                Z_local,
+                Gz,
+            )
+
+            local_score = self._aggregate_local_slot_scores(
+                slot_scores
+            )
+
+        # --------------------------------------------------
+        # Mode
+        # --------------------------------------------------
+
+        mode = self.protein_expert_mode
+
+        if mode == "global":
+            final_score = global_score
+
+        elif mode == "local":
+            final_score = local_score
+
+        elif mode == "global_local":
+            if global_score is None or local_score is None:
+                raise RuntimeError(
+                    "global_local mode requires both expert scores."
+                )
+
+            final_score = self._fuse_expert_scores(
+                global_score,
+                local_score,
+            )
+
+        else:
+            raise RuntimeError(
+                f"Projected expert scoring called with mode={mode!r}"
+            )
+
+        if final_score is None:
+            raise RuntimeError(
+                f"No score produced for protein_expert_mode={mode!r}"
+            )
+
+        if return_components:
+            return final_score, {
+                "global": global_score,
+                "local": local_score,
+            }
+
+        return final_score
 
     def encode_protein_for_scoring(self, H, mask=None):
         """
@@ -765,8 +1248,38 @@ class ProteinGoAligner(nn.Module):
         if G.dim() == 4 and go_mask is None:
             raise ValueError("go_mask must be provided when G is [B,K,L,Dg].")
 
-        Zp = self.encode_protein_for_scoring(H, mask)
-        scores = self.score_from_encoded_protein(Zp, G, go_mask=go_mask)
+        # ---------------------------------------------------------
+        # Backward-compatible legacy path
+        # ---------------------------------------------------------
+
+        if self.protein_expert_mode == "legacy":
+            Zp = self.encode_protein_for_scoring(
+                H,
+                mask,
+            )
+
+            scores = self.score_from_encoded_protein(
+                Zp,
+                G,
+                go_mask=go_mask,
+            )
+
+            return scores
+
+        # ---------------------------------------------------------
+        # New global/local expert path
+        # ---------------------------------------------------------
+
+        encoded = self.encode_protein_experts(
+            H,
+            mask,
+        )
+
+        scores = self.score_from_encoded_experts(
+            encoded=encoded,
+            G=G,
+            go_mask=go_mask,
+        )
 
         return scores
 

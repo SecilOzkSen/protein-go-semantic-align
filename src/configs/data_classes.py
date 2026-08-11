@@ -262,6 +262,11 @@ class TrainerConfig:
     pairwise_margin: float = 0.0
     pairwise_start_step: int = 0
     pairwise_lambda: float = 0.0
+    protein_expert_mode: str = "legacy"
+    local_slot_aggregation: str = "lse"
+    local_slot_lse_tau: float = 0.10
+    expert_global_weight: float = 0.50
+    expert_fusion_learnable: bool = True
 
 @dataclass
 class QueueConfig:

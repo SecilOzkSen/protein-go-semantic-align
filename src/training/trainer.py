@@ -396,6 +396,11 @@ class OppTrainer:
             multivec_slot_lse_tau=float(getattr(cfg, "multivec_slot_lse_tau", 0.10)),
             multivec_global_residual_init=float(getattr(cfg, "multivec_global_residual_init", 0.25)),
             go_segment_representation_mode=str(getattr(ctx, "go_segment_representation_mode", "mixed")),
+            protein_expert_mode=str(getattr(cfg, "protein_expert_mode", "legacy")),
+            local_slot_aggregation=str(getattr(cfg, "local_slot_aggregation", "lse")),
+            local_slot_lse_tau=float(getattr(cfg, "local_slot_lse_tau", 0.10)),
+            expert_global_weight=float(getattr(cfg, "expert_global_weight", 0.50)),
+            expert_fusion_learnable=bool(getattr(cfg, "expert_fusion_learnable", True)),
         ).to(self.device)
 
         # warmstart configs
@@ -1193,7 +1198,7 @@ class OppTrainer:
         return structured
 
     @torch.no_grad()
-    def _mine_queue_hard_neg_ids(self, prot_query, pos_local, uniq_go_ids):
+    def _mine_queue_hard_neg_ids(self, protein_repr, pos_local, uniq_go_ids):
         """
         Returns:
           neg_idx: [B, k] long  -> indices into current queue snapshot
@@ -1216,24 +1221,84 @@ class OppTrainer:
             raise RuntimeError(f"Queue projected vecs must be [Kq,D], got {tuple(all_neg_proj.shape)}")
 
         device = self.device
-        B = int(prot_query.size(0))
+        expert_mode = getattr(self.model, "protein_expert_mode", "legacy")
 
-        Kmat = all_neg_proj.to(device, non_blocking=True).to(prot_query.dtype)  # [Kq, Dz]
-        Kq = int(Kmat.size(0))
+        # --------------------------------------------------
+        # Legacy single-query mining
+        # --------------------------------------------------
 
-        if all_neg_ids is None:
-            raise RuntimeError("Queue ids missing, cannot mine negative GO ids.")
-        if not torch.is_tensor(all_neg_ids):
-            all_neg_ids = torch.as_tensor(all_neg_ids, dtype=torch.long)
-        all_neg_ids = all_neg_ids.to(device, non_blocking=True).long()  # [Kq]
+        if expert_mode == "legacy":
+            prot_query = protein_repr
 
-        sims = prot_query @ Kmat.T  # [B, Kq]
+            if not torch.is_tensor(prot_query):
+                raise RuntimeError("Legacy queue mining expected tensor protein_repr.")
 
-        if getattr(self, "_global_step", 0) % 200 == 0:
-            qn = float(prot_query.norm(dim=1).mean().item())
-            kn = float(Kmat.norm(dim=1).mean().item())
-            frac_finite = float(torch.isfinite(sims).float().mean().item())
-            print(f"[DBG] queue sims: finite={frac_finite:.3f} Kq={Kq} norms q={qn:.3f} k={kn:.3f}")
+            B = int(prot_query.size(0))
+
+            Kmat = all_neg_proj.to(device, non_blocking=True,).to(prot_query.dtype)
+            Kq = int(Kmat.size(0))
+            sims = prot_query @ Kmat.T
+        # --------------------------------------------------
+        # Expert-aware mining
+        # --------------------------------------------------
+        else:
+            if not isinstance(protein_repr, dict):
+                raise RuntimeError("Expert queue mining expected dict protein_repr.")
+            z_ref = protein_repr.get("global", None)
+
+            if z_ref is None:
+                z_ref = protein_repr.get("local", None)
+
+            if z_ref is None:
+                raise RuntimeError("Expert mining representation contains neither global nor local vectors.")
+
+            B = int(z_ref.size(0))
+            # queue_proj is already:
+            # go_ln -> proj_g -> normalize
+            Kmat = all_neg_proj.to(device, non_blocking=True).to(z_ref.dtype)
+            Kq = int(Kmat.size(0))
+            sims = self.model.score_encoded_experts_projected(
+                encoded=protein_repr,
+                Gz=Kmat,
+                return_components=False,
+            )
+
+        if sims.shape != (B, Kq):
+            raise RuntimeError(
+                f"Queue score shape mismatch: "
+                f"got {tuple(sims.shape)}, expected {(B, Kq)}"
+            )
+
+        # TODO: Debug
+        if expert_mode == "legacy":
+            qn = float(prot_query.norm(dim=-1).mean().item())
+        else:
+            norms = []
+            if protein_repr.get("global", None) is not None:
+                norms.append(
+                    protein_repr["global"]
+                    .float()
+                    .norm(dim=-1)
+                    .mean()
+                )
+            if protein_repr.get("local", None) is not None:
+                norms.append(
+                    protein_repr["local"]
+                    .float()
+                    .norm(dim=-1)
+                    .mean()
+                )
+            qn = float(torch.stack(norms).mean().item())
+
+        kn = float(Kmat.float().norm(dim=-1).mean().item())
+        frac_finite = float(torch.isfinite(sims).float().mean().item())
+        print(
+            f"[DBG] queue sims: "
+            f"mode={expert_mode} "
+            f"finite={frac_finite:.3f} "
+            f"Kq={Kq} "
+            f"norms q={qn:.3f} k={kn:.3f}"
+        )
 
         # false-negative filtering
         if pos_local is not None and len(pos_local) > 0:
@@ -2439,6 +2504,73 @@ class OppTrainer:
 
         return q.detach()
 
+    @torch.no_grad()
+    def _get_protein_mining_repr(
+            self,
+            H: torch.Tensor,
+            attn_valid: torch.Tensor,
+    ):
+        """
+        Protein representation used specifically for queue mining.
+
+        Legacy:
+            returns single [B,Dz] query, preserving old behavior.
+
+        Expert modes:
+            returns {
+                "global": [B,Dz] or None,
+                "local":  [B,S,Dz] or None,
+            }
+
+        Important:
+            Encoding is performed in eval mode so dropout in the
+            pooling / slot extractor does not make hard-negative
+            mining stochastic.
+        """
+
+        if attn_valid is not None and attn_valid.dtype != torch.bool:
+            attn_valid = attn_valid != 0
+
+        model = self.model
+        was_training = model.training
+
+        model.eval()
+
+        try:
+            if getattr(
+                    model,
+                    "protein_expert_mode",
+                    "legacy",
+            ) == "legacy":
+                Dz = self._get_Dz()
+
+                return self._get_prot_query(
+                    H,
+                    attn_valid,
+                    Dz,
+                )
+
+            encoded = model.encode_protein_experts(
+                H,
+                attn_valid,
+            )
+
+            # Explicit detach for mining.
+            out = {}
+
+            for key, value in encoded.items():
+                out[key] = (
+                    None
+                    if value is None
+                    else value.detach()
+                )
+
+            return out
+
+        finally:
+            if was_training:
+                model.train()
+
     def _build_candidates_meta(
             self,
             uniq_go_ids: torch.Tensor,              # [U] global GO ids for current batch uniqs
@@ -3021,16 +3153,16 @@ class OppTrainer:
         # queue mining always in pooled/proj space
         # -----------------------------
         with torch.no_grad():
-            prot_query = self._get_prot_query(H, attn_valid, Dz)
+            protein_mining_repr = self._get_protein_mining_repr(H, attn_valid)
 
-            neg_idx_from_queue = None
             neg_ids_from_queue = None
             neg_raw_from_queue = None
 
             if self._queue_active() and self.queue_miner is not None:
-                neg_idx_from_queue, neg_ids_from_queue = self._mine_queue_hard_neg_ids(
-                    prot_query, pos_local, uniq_go_ids
-                )
+                neg_idx_from_queue, neg_ids_from_queue = (self._mine_queue_hard_neg_ids(
+                    protein_mining_repr,
+                        pos_local,
+                        uniq_go_ids))
 
                 # pooled raw negatives only needed in pooled mode
                 if (not self._use_token_align) and neg_idx_from_queue is not None:
@@ -3043,7 +3175,13 @@ class OppTrainer:
 
             if self._global_step % 1000 == 0:
                 dbg_go = pooled_go if pooled_go is not None else None
-                self._dbg_norms(prot_query=prot_query, uniq_go_embs=dbg_go, tag="[pre-enq]")
+                if getattr(self.model, "protein_expert_mode", "legacy") == "legacy":
+                    dbg_query = protein_mining_repr
+                else:
+                    dbg_query = protein_mining_repr.get("global", None)
+
+                self._dbg_norms(prot_query=dbg_query, uniq_go_embs=dbg_go, tag="[pre-enq]")
+
                 if neg_ids_from_queue is not None:
                     print("[DBG] queue neg ids shape:", tuple(neg_ids_from_queue.shape))
                 if neg_raw_from_queue is not None:
@@ -3998,6 +4136,37 @@ class OppTrainer:
         sum_anc_R50 = 0.0
         sum_anc_num = 0
 
+        # ------------------------------------------------------------
+        # Expert diagnostics
+        # ------------------------------------------------------------
+
+        expert_mode = getattr(self.model, "protein_expert_mode", "legacy")
+        expert_eval_active = expert_mode in {"global", "local", "global_local"}
+        expert_ks = (50, 100, 200, 500, 1000)
+        expert_stats = {
+            "global": {k: {"recall_sum": 0.0, "num": 0} for k in expert_ks},
+            "local": {k: {"recall_sum": 0.0, "num": 0} for k in expert_ks},
+            "fused": {k: {"recall_sum": 0.0, "num": 0} for k in expert_ks},
+        }
+        CARD_BINS = [
+            (1, 5, "1-5"),
+            (6, 10, "6-10"),
+            (11, 20, "11-20"),
+            (21, 40, "21-40"),
+            (41, 80, "41-80"),
+            (81, 160, "81-160"),
+            (161, 10 ** 9, "161+"),
+        ]
+        expert_cardinality_stats = { expert: { label: {"recall500_sum": 0.0, "num": 0,}
+                for _, _, label in CARD_BINS}
+            for expert in ["global", "local", "fused"]
+        }
+        def _cardinality_bin(n_true: int):
+            for lo, hi, label in CARD_BINS:
+                if lo <= n_true <= hi:
+                    return label
+            return None
+
         # Candidate-ceiling metrics for reranker analysis.
         # These quantify how much of the true label set is even present in top-K.
         # oracle_microF@K assumes a perfect reranker that selects only true labels
@@ -4033,8 +4202,109 @@ class OppTrainer:
             # observed eval space
             G_eval, y_true = self._build_eval_space(batch)
 
-            scores_raw = self.forward_scores(H, G_eval, attn_valid, return_alpha=False)
-            scores_rank = scores_raw * scale
+            # ------------------------------------------------------------
+            # Main + expert-specific scoring
+            # ------------------------------------------------------------
+            if expert_eval_active:
+                encoded = self.model.encode_protein_experts(H, attn_valid,)
+                scores_raw, components = self.model.score_from_encoded_experts(
+                    encoded=encoded,
+                    G=G_eval,
+                    return_components=True,
+                )
+                scores_rank = scores_raw * scale
+                global_rank = None
+                local_rank = None
+
+                if components.get("global", None) is not None:
+                    global_rank = components["global"] * scale
+
+                if components.get("local", None) is not None:
+                    local_rank = components["local"] * scale
+
+            else:
+                scores_raw = self.forward_scores(
+                    H,
+                    G_eval,
+                    attn_valid,
+                    return_alpha=False,
+                )
+                scores_rank = scores_raw * scale
+                global_rank = None
+                local_rank = None
+
+            # ------------------------------------------------------------
+            # Expert-specific retrieval diagnostics
+            # ------------------------------------------------------------
+
+            if expert_eval_active:
+                score_sets = {}
+
+                if expert_mode == "global_local":
+                    score_sets["fused"] = scores_rank
+
+                if global_rank is not None:
+                    score_sets["global"] = global_rank
+
+                if local_rank is not None:
+                    score_sets["local"] = local_rank
+
+                for expert_name, expert_scores in score_sets.items():
+                    if expert_scores is None:
+                        continue
+
+                    m_exp = retrieval_metrics_from_scores(expert_scores, y_true, ks=expert_ks)
+                    n_exp = int(m_exp.get("num", 0))
+
+                    if n_exp > 0:
+                        for k in expert_ks:
+                            key = f"R@{k}"
+                            if key in m_exp:
+                                expert_stats[expert_name][k]["recall_sum"] += (
+                                        float(m_exp[key]) * n_exp
+                                )
+                                expert_stats[expert_name][k]["num"] += n_exp
+
+            # ------------------------------------------------------------
+            # Recall@500 by TRUE LABEL CARDINALITY
+            # ------------------------------------------------------------
+            if expert_eval_active:
+                score_sets = {}
+
+                if expert_mode == "global_local":
+                    score_sets["fused"] = scores_rank
+
+                if global_rank is not None:
+                    score_sets["global"] = global_rank
+
+                if local_rank is not None:
+                    score_sets["local"] = local_rank
+
+                y_bool = y_true > 0
+                true_counts = y_bool.sum(dim=1)
+
+                for expert_name, expert_scores in score_sets.items():
+                    if expert_scores is None:
+                        continue
+
+                    k500 = min(500, int(expert_scores.size(1)))
+                    top500 = torch.topk(expert_scores, k=k500, dim=1).indices
+                    hits500 = torch.gather(y_bool.float(),1, top500).sum(dim=1)
+                    recall500 = (hits500 / true_counts.float().clamp_min(1.0))
+
+                    for b in range(expert_scores.size(0)):
+                        n_true = int(true_counts[b].item())
+
+                        if n_true <= 0:
+                            continue
+
+                        bin_label = _cardinality_bin(n_true)
+
+                        if bin_label is None:
+                            continue
+
+                        expert_cardinality_stats[expert_name][bin_label]["recall500_sum"] += float(recall500[b].item())
+                        expert_cardinality_stats[expert_name][bin_label]["num"] += 1
 
             # ------------------------------------------------------------
             # Candidate ceiling metrics for reranker.
@@ -4043,14 +4313,8 @@ class OppTrainer:
             # ------------------------------------------------------------
             with torch.no_grad():
                 max_k = min(max(candidate_ks), int(scores_rank.size(1)))
-
                 # [B, max_k]
-                top_idx_full = torch.topk(
-                    scores_rank,
-                    k=max_k,
-                    dim=1,
-                ).indices
-
+                top_idx_full = torch.topk(scores_rank, k=max_k, dim=1).indices
                 # [B, G], float so gather + sum is safe
                 y_float = (y_true > 0).float()
                 true_counts = y_float.sum(dim=1)  # [B]
@@ -4061,12 +4325,9 @@ class OppTrainer:
 
                     for k in candidate_ks:
                         kk = min(int(k), max_k)
-
                         idx_k = top_idx_full[:, :kk]  # [B, kk]
-
                         # Number of true labels retrieved in top-K per protein
                         hits_k = torch.gather(y_float, 1, idx_k).sum(dim=1)  # [B]
-
                         hits_valid = hits_k[valid]
                         true_valid = true_counts[valid].float().clamp_min(1.0)
 
@@ -4256,5 +4517,94 @@ class OppTrainer:
             logs["debug_pos_cos"] = 0.0
             logs["debug_neg_cos"] = 0.0
             logs["debug_margin"] = 0.0
+
+        # ------------------------------------------------------------
+        # Finish expert diagnostics
+        # ------------------------------------------------------------
+
+        if expert_eval_active:
+            for expert_name in ["global", "local", "fused"]:
+
+                for k in expert_ks:
+                    st = expert_stats[expert_name][k]
+                    n = int(st["num"])
+
+                    if n > 0:
+                        value = st["recall_sum"] / n
+                    else:
+                        value = 0.0
+
+                    logs[f"expert_{expert_name}_R@{k}"] = float(value)
+
+            # ----------------------------------------
+            # Cardinality-stratified Recall@500
+            # ----------------------------------------
+
+            for expert_name in ["global", "local", "fused"]:
+
+                for _, _, bin_label in CARD_BINS:
+                    st = expert_cardinality_stats[expert_name][bin_label]
+                    n = int(st["num"])
+
+                    if n > 0:
+                        value = st["recall500_sum"] / n
+                    else:
+                        value = 0.0
+
+                    safe_label = (
+                        bin_label
+                        .replace("+", "plus")
+                        .replace("-", "_")
+                    )
+
+                    logs[
+                        f"expert_{expert_name}_R@500_card_{safe_label}"
+                    ] = float(value)
+
+                    logs[
+                        f"expert_{expert_name}_N_card_{safe_label}"
+                    ] = int(n)
+
+            # ----------------------------------------
+            # Learned global/local fusion weight
+            # ----------------------------------------
+
+            logs["expert_global_weight"] = float(
+                self.model
+                .get_expert_global_weight()
+                .detach()
+                .cpu()
+                .item()
+            )
+
+            # ----------------------------------------
+            # Sanity check:
+            # fused R@500 must equal normal align_R@500
+            # ----------------------------------------
+
+            if expert_mode == "global_local":
+                fused_r500 = logs.get(
+                    "expert_fused_R@500",
+                    None,
+                )
+
+                align_r500 = logs.get(
+                    "align_R@500",
+                    None,
+                )
+
+                if fused_r500 is not None and align_r500 is not None:
+                    diff = abs(
+                        float(fused_r500)
+                        - float(align_r500)
+                    )
+
+                    if diff > 1e-6:
+                        raise RuntimeError(
+                            "Expert eval inconsistency: "
+                            f"expert_fused_R@500={fused_r500:.8f} "
+                            f"but align_R@500={align_r500:.8f} "
+                            f"(diff={diff:.3e})"
+                        )
 
         return logs

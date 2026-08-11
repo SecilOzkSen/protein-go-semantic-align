@@ -22,7 +22,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "PFresGO_BP_full"
+  ablation_id: "PFresGO-BP-global-local"
   use_queue_miner: true
   go_pooling_strategy: mean
   go_encoder_inner_pooling: mean
@@ -30,7 +30,7 @@ general:
   go_encoder_output_mode: segment_pooled
   go_segment_representation_mode: segments_only
   protein_pooling_strategy: mean_attn_gate
-  protein_n_slots: 0
+  protein_n_slots: 4
   use_lora: false
   use_attribution_loss: false
   return_alpha: false
@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -104,6 +104,11 @@ model:
   win_stride: 256
   multivec_slot_lse_tau: 0.10
   multivec_global_residual_init: 0.25
+  protein_expert_mode: global_local
+  local_slot_aggregation: lse
+  local_slot_lse_tau: 0.10
+  expert_global_weight: 0.5
+  expert_fusion_learnable: true
 
 loss:
   lambda_con: 1.0
@@ -135,7 +140,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "PFresGO-BP-full"
+  wandb_run_name: "PFresGO-BP-global-local"
   mode: online
 
 stores:
@@ -151,5 +156,5 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/bp_name_def_isa
+  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local
 

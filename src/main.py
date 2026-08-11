@@ -1017,6 +1017,11 @@ def run_training(args):
         pairwise_start_step=int(getattr(args, "pairwise_start_step", 0)),
         pairwise_margin=float(getattr(args, "pairwise_margin", 0.0)),
         pairwise_lambda=float(getattr(args, "pairwise_lambda", 0.0)),
+        protein_expert_mode=str(getattr(args, "protein_expert_mode", "legacy")),
+        local_slot_aggregation=str(getattr(args, "local_slot_aggregation", "lse")),
+        local_slot_lse_tau=float(getattr(args, "local_slot_lse_tau", 0.10)),
+        expert_global_weight=float(getattr(args, "expert_global_weight", 0.50)),
+        expert_fusion_learnable=bool(getattr(args, "expert_fusion_learnable", True)),
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1578,6 +1583,11 @@ def load_structured_cfg(path: str):
         win_stride=int(model.get("win_stride", 256)),
         multivec_slot_lse_tau=float(model.get("multivec_slot_lse_tau", 0.10)),
         multivec_global_residual_init=float(model.get("multivec_global_residual_init", 0.25)),
+        protein_expert_mode=str(model.get("protein_expert_mode", "legacy")),
+        local_slot_aggregation=str(model.get("local_slot_aggregation", "lse")),
+        local_slot_lse_tau=float(model.get("local_slot_lse_tau", 0.10)),
+        expert_global_weight=float(model.get("expert_global_weight", 0.50)),
+        expert_fusion_learnable=bool(model.get("expert_fusion_learnable", True)),
 
         # loss
         lambda_con=float(loss.get("lambda_con", 1.0)),
