@@ -276,9 +276,7 @@ def configure(config_path: str):
                 "pfresgo.evaluation_split=test"
             )
 
-        args.val_ids_path = str(
-            Path(test_ids_path).expanduser().resolve()
-        )
+        args.val_ids_path = (Path(test_ids_path).expanduser().resolve())
 
     elif split != "valid":
         raise ValueError(
