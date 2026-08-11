@@ -1313,13 +1313,14 @@ class OppTrainer:
 
         kn = float(Kmat.float().norm(dim=-1).mean().item())
         frac_finite = float(torch.isfinite(sims).float().mean().item())
-        print(
-            f"[DBG] queue sims: "
-            f"mode={expert_mode} "
-            f"finite={frac_finite:.3f} "
-            f"Kq={Kq} "
-            f"norms q={qn:.3f} k={kn:.3f}"
-        )
+        if self._global_step % 1000 == 0:
+            print(
+                f"[DBG] queue sims: "
+                f"mode={expert_mode} "
+                f"finite={frac_finite:.3f} "
+                f"Kq={Kq} "
+                f"norms q={qn:.3f} k={kn:.3f}"
+            )
 
         # false-negative filtering
         if pos_local is not None and len(pos_local) > 0:
