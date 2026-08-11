@@ -1214,13 +1214,34 @@ class OppTrainer:
             return None, None
 
         all_neg_proj, _all_neg_raw, all_neg_ids = res
+
         if all_neg_proj is None or all_neg_proj.numel() == 0:
             return None, None
 
         if all_neg_proj.dim() != 2:
-            raise RuntimeError(f"Queue projected vecs must be [Kq,D], got {tuple(all_neg_proj.shape)}")
+            raise RuntimeError(
+                f"Queue projected vecs must be [Kq,D], got {tuple(all_neg_proj.shape)}"
+            )
 
         device = self.device
+
+        # Queue ids must live on the same device as sims / exclusion ids.
+        if all_neg_ids is None:
+            raise RuntimeError(
+                "Queue returned projected vectors but no GO ids."
+            )
+
+        if not torch.is_tensor(all_neg_ids):
+            all_neg_ids = torch.as_tensor(
+                all_neg_ids,
+                dtype=torch.long,
+            )
+
+        all_neg_ids = all_neg_ids.to(
+            device=device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
         expert_mode = getattr(self.model, "protein_expert_mode", "legacy")
 
         # --------------------------------------------------
@@ -1327,6 +1348,7 @@ class OppTrainer:
                     excl = pos_ids.unique()
 
                 if excl.numel() > 0:
+                    excl = excl.to(device=all_neg_ids.device, dtype=all_neg_ids.dtype, non_blocking=True)
                     mask = torch.isin(all_neg_ids, excl)
                     sims[b].masked_fill_(mask, float("-inf"))
 
