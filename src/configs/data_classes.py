@@ -267,6 +267,7 @@ class TrainerConfig:
     local_slot_lse_tau: float = 0.10
     expert_global_weight: float = 0.50
     expert_fusion_learnable: bool = True
+    cardinality_weighting: bool = False
 
 @dataclass
 class QueueConfig:

@@ -74,6 +74,7 @@ training:
   local_window_stride: 32
   pairwise_margin: 0.0
   pairwise_start_step: 2000
+  cardinality_weighting: true
 
 queue:
   queue_K: 16384

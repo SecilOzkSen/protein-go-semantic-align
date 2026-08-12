@@ -1022,6 +1022,7 @@ def run_training(args):
         local_slot_lse_tau=float(getattr(args, "local_slot_lse_tau", 0.10)),
         expert_global_weight=float(getattr(args, "expert_global_weight", 0.50)),
         expert_fusion_learnable=bool(getattr(args, "expert_fusion_learnable", True)),
+        cardinality_weighting=bool(getattr(args, "cardinality_weighting", True)),
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1552,6 +1553,7 @@ def load_structured_cfg(path: str):
         local_window_stride=int(training.get("local_window_stride", 32)),
         pairwise_margin=float(training.get("pairwise_margin", 0.0)),
         pairwise_start_step=int(training.get("pairwise_start_step", 0)),
+        cardinality_weighting=bool(training.get("cardinality_weighting", False)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

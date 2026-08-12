@@ -67,6 +67,7 @@ def multi_positive_infonce_from_candidates_v2(
         pos_mask: torch.Tensor,
         tau: float,
         cand_valid_mask: torch.Tensor | None = None,
+        sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     scores: (B, K)
@@ -100,13 +101,27 @@ def multi_positive_infonce_from_candidates_v2(
 
     # loss only where we have positives and at least one valid candidate
     keep = pos_any
+
     if keep.any():
         loss = -(num - denom)
-        return loss[keep].mean()
+        loss = loss[keep]
+
+        # Original behavior: equal weight per protein.
+        if sample_weight is None:
+            return loss.mean()
+
+        # Cardinality-aware behavior.
+        w = sample_weight.to(
+            device=loss.device,
+            dtype=loss.dtype,
+        )[keep]
+
+        w = w.clamp_min(1.0)
+
+        return (loss * w).sum() / w.sum()
 
     # return 0 with correct dtype/device
     return denom.mean() * 0.0
-
 
 def queue_pairwise_ranking_loss(
         scores: torch.Tensor,
@@ -3134,6 +3149,26 @@ class OppTrainer:
             H = self.to_f32(H)
 
         pos_local = batch["pos_go_local"]
+        # --------------------------------------------------
+        # True protein annotation cardinality
+        # --------------------------------------------------
+        true_cardinality = torch.as_tensor(
+            [
+                int(gids.numel())
+                for gids in batch["pos_go_global"]
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        #TODO: Debug, erase later
+        if self._global_step % 1000 == 0:
+            print(
+                "[DBG-CARD-WEIGHT]",
+                "enabled=",
+                bool(getattr(self.cfg, "cardinality_weighting", False)),
+                "cardinality=",
+                true_cardinality.detach().cpu().tolist(),
+            )
 
         if getattr(self.ctx, "go_encoder_output_mode", None) == "segment_pooled" and getattr(self.ctx, "go_segment_representation_mode", None) == "mixed":
             if hasattr(self.model, "go_segment_mix_alpha"):
@@ -3391,11 +3426,16 @@ class OppTrainer:
                     print("recomputed score pre mean/std/min/max:",
                           sc_pre.mean().item(), sc_pre.std().item(), sc_pre.min().item(), sc_pre.max().item())
 
+            if bool(getattr(self.cfg, "cardinality_weighting", False)):
+                sample_weight = true_cardinality
+            else:
+                sample_weight = None
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
                 pos_mask,
                 tau=1.0,
                 cand_valid_mask=cand_valid_mask,
+                sample_weight=sample_weight,
             )
 
             if not torch.isfinite(l_con):
