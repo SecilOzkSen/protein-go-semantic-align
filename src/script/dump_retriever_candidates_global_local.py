@@ -1,42 +1,3 @@
-'''
-# Train
-
-python scripts/dump_retriever_candidates.py \
-  --config src/runpod.yaml \
-  --checkpoint /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt \
-  --split train \
-  --topk 1000 \
-  --batch_size 4 \
-  --num_workers 0 \
-  --out_dir /workspace/candidate_dumps/P3a_train_top1000 \
-  --strict_exact
-
-# Validation
-
-python scripts/dump_retriever_candidates.py \
-  --config src/runpod.yaml \
-  --checkpoint /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt \
-  --split val \
-  --topk 1000 \
-  --batch_size 4 \
-  --num_workers 0 \
-  --out_dir /workspace/candidate_dumps/P3a_val_top1000 \
-  --strict_exact
-
-#Test
-
-python script/dump_retriever_candidates.py \
-  --config src/runpod.yaml \
-  --checkpoint /workspace/protein-go-align-outputs-P3a-P2cwarm-segGO-segProjOnly/checkpoint_step83945.pt \
-  --split val \
-  --ids_path /workspace/data/splits/test_ids.txt \
-  --pid2pos_path /workspace/data/pid_to_positives_canonical.json \
-  --topk 1000 \
-  --batch_size 4 \
-  --num_workers 0 \
-  --out_dir /workspace/candidate_dumps/P3a_test_top1000 \
-  --strict_exact
-'''
 
 from __future__ import annotations
 
@@ -53,14 +14,32 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from src.main import (
-    load_structured_cfg,
-    set_seed,
-    build_go_cache,
-    build_stores,
-    build_datasets,
-    enforce_cache_alignment,
-)
+# IMPORTANT: use the exact construction path used by retriever training.
+# The new Name+Definition+is_a retriever was trained through main_pfresgo.py.
+try:
+    import src.main_pfresgo as pfresgo_main
+
+    # configure() is essential: it installs the PFresGO-compatible ID, DAG,
+    # namespace, and segmented GO-text loaders on pfresgo_main.base.
+    configure = pfresgo_main.configure
+    base = pfresgo_main.base
+
+    set_seed = base.set_seed
+    build_go_cache = base.build_go_cache
+    build_stores = base.build_stores
+    build_datasets = base.build_datasets
+    enforce_cache_alignment = base.enforce_cache_alignment
+    _MAIN_SOURCE = "src.main_pfresgo.configure"
+except ImportError:
+    import src.main as base
+
+    configure = base.load_structured_cfg
+    set_seed = base.set_seed
+    build_go_cache = base.build_go_cache
+    build_stores = base.build_stores
+    build_datasets = base.build_datasets
+    enforce_cache_alignment = base.enforce_cache_alignment
+    _MAIN_SOURCE = "src.main"
 
 from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
@@ -76,20 +55,13 @@ from src.configs.data_classes import (
 )
 
 from src.encoders import BioMedBERTEncoder
-from src.go import load_go_parents, load_go_children
 from src.datasets.go_text_store import GoTextStore
-from src.utils import (
-    load_raw_json,
-    load_raw_pickle,
-    load_go_set,
-    load_go_texts_by_phase,
-)
+from src.utils import load_raw_json
 from src.utils.helpers import (
     build_altid_map_from_go_terms,
     canonicalize_id_list,
     canonicalize_pid2pos,
     go_str_to_int_any,
-    load_go_namespaces,
 )
 
 
@@ -187,11 +159,11 @@ def _clean_state_keys(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]
 
 
 def load_model_weights_only(
-    model: torch.nn.Module,
-    checkpoint_path: str | Path,
-    *,
-    device: torch.device,
-    strict_exact: bool = True,
+        model: torch.nn.Module,
+        checkpoint_path: str | Path,
+        *,
+        device: torch.device,
+        strict_exact: bool = True,
 ) -> Dict[str, Any]:
     checkpoint_path = Path(checkpoint_path)
     print(f"[dump] loading checkpoint: {checkpoint_path}")
@@ -286,10 +258,11 @@ def build_go_encoder_and_text_store(args, device: torch.device):
     full_id2seg_present = None
 
     if is_segmented:
-        id2text, id2segments, id2seg_present = load_go_texts_by_phase(
+        id2text, id2segments, id2seg_present = base.load_go_texts_by_phase(
             args.go_text_folder,
             phase=args.phase,
             return_segments=True,
+            enabled_segments=getattr(args, "pfresgo_enabled_segments", None),
         )
 
         go_id_to_text = {int(args.phase): id2text}
@@ -297,10 +270,11 @@ def build_go_encoder_and_text_store(args, device: torch.device):
         full_id2seg_present = {int(args.phase): id2seg_present}
 
     else:
-        id2text = load_go_texts_by_phase(
+        id2text = base.load_go_texts_by_phase(
             args.go_text_folder,
             phase=args.phase,
             return_segments=False,
+            enabled_segments=getattr(args, "pfresgo_enabled_segments", None),
         )
 
         go_id_to_text = {int(args.phase): id2text}
@@ -322,13 +296,13 @@ def build_go_encoder_and_text_store(args, device: torch.device):
 
 def canonicalize_and_align_inputs(args, go_cache, logger):
     if args.eval_space == "seen":
-        eval_id_list = load_raw_pickle(args.go_path_seen)
+        eval_id_list = base.load_raw_pickle(args.go_path_seen)
     else:
-        eval_id_list = load_raw_pickle(args.go_path_observed)
+        eval_id_list = base.load_raw_pickle(args.go_path_observed)
 
-    eval_seen_go_ids = load_raw_pickle(args.go_path_seen)
-    eval_unseen_ids = load_raw_pickle(args.zero_shot_path)
-    eval_rare_go_ids = load_raw_pickle(args.few_shot_path)
+    eval_seen_go_ids = base.load_raw_pickle(args.go_path_seen)
+    eval_unseen_ids = base.load_raw_pickle(args.zero_shot_path)
+    eval_rare_go_ids = base.load_raw_pickle(args.few_shot_path)
 
     go_terms = load_raw_json(args.go_basic_json)
     alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
@@ -337,8 +311,8 @@ def canonicalize_and_align_inputs(args, go_cache, logger):
     pid2pos_raw = load_raw_json(args.pid2pos)
     pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else pid2pos_raw
 
-    zs = load_go_set(args.zero_shot_path)
-    fs = load_go_set(args.few_shot_path)
+    zs = base.load_go_set(args.zero_shot_path)
+    fs = base.load_go_set(args.few_shot_path)
 
     zs = canonicalize_id_list(list(zs), alt_map) if alt_map else zs
     fs = canonicalize_id_list(list(fs), alt_map) if alt_map else fs
@@ -433,7 +407,7 @@ def build_trainer_for_dump(args, device: torch.device, go_cache, go_encoder, go_
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
-        go_namespace_map=load_go_namespaces(),
+        go_namespace_map=base.load_go_namespaces(),
         scheduler=None,
         go_text_store=go_text_store,
         use_queue_miner=False,
@@ -450,6 +424,11 @@ def build_trainer_for_dump(args, device: torch.device, go_cache, go_encoder, go_
         protein_n_slots=args.protein_n_slots,
         go_pool_type=args.go_pool_type,
         go_encoder_output_mode=args.go_encoder_output_mode,
+    )
+
+    # Preserve the exact GO representation mode used during training.
+    training_context.go_segment_representation_mode = str(
+        getattr(args, "go_segment_representation_mode", "mixed")
     )
 
     training_context.run_name = "candidate-dump"
@@ -481,6 +460,19 @@ def build_trainer_for_dump(args, device: torch.device, go_cache, go_encoder, go_
         go_segment_alpha=args.go_segment_alpha,
         trainable_mode=args.trainable_mode,
     )
+
+    # Global/local expert settings are not part of older dump scripts, but
+    # they are required to reconstruct the exact retriever architecture.
+    trainer_cfg.protein_expert_mode = str(getattr(args, "protein_expert_mode", "legacy"))
+    trainer_cfg.local_expert_type = str(getattr(args, "local_expert_type", "slots"))
+    trainer_cfg.local_slot_aggregation = str(getattr(args, "local_slot_aggregation", "lse"))
+    trainer_cfg.local_slot_lse_tau = float(getattr(args, "local_slot_lse_tau", 0.10))
+    trainer_cfg.expert_global_weight = float(getattr(args, "expert_global_weight", 0.50))
+    trainer_cfg.expert_fusion_learnable = bool(getattr(args, "expert_fusion_learnable", True))
+    trainer_cfg.local_window_size = int(getattr(args, "local_window_size", 64))
+    trainer_cfg.local_window_stride = int(getattr(args, "local_window_stride", 32))
+    trainer_cfg.multivec_slot_lse_tau = float(getattr(args, "multivec_slot_lse_tau", 0.10))
+    trainer_cfg.multivec_global_residual_init = float(getattr(args, "multivec_global_residual_init", 0.25))
 
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.0),
@@ -565,18 +557,18 @@ def pad_true_ids(true_ids: List[List[int]], pad_value: int = -1) -> np.ndarray:
 
 @torch.no_grad()
 def dump_candidates(
-    trainer: OppTrainer,
-    loader: DataLoader,
-    out_dir: Path,
-    *,
-    checkpoint_path: str,
-    config_path: str,
-    split_name: str,
-    topk: int,
-    go_project_chunk: int,
-    empty_cache_every: int = 50,
-    overwrite: bool = False,
-    save_top_go_ids: bool = False,
+        trainer: OppTrainer,
+        loader: DataLoader,
+        out_dir: Path,
+        *,
+        checkpoint_path: str,
+        config_path: str,
+        split_name: str,
+        topk: int,
+        go_project_chunk: int,
+        empty_cache_every: int = 50,
+        overwrite: bool = False,
+        save_top_go_ids: bool = False,
 ):
     out_dir = Path(out_dir)
 
@@ -628,6 +620,9 @@ def dump_candidates(
         "config": str(config_path),
         "topk_requested": int(topk),
         "save_top_go_ids": bool(save_top_go_ids),
+        "candidate_order": "descending_retriever_score",
+        "ranked": True,
+        "main_source": _MAIN_SOURCE,
     }
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(initial_metadata, f, indent=2)
@@ -678,12 +673,54 @@ def dump_candidates(
         shape=(n_samples, k_eff),
     )
 
+    # Backward-compatible single protein vector for the existing reranker.
+    # In global_local mode this is the GLOBAL expert vector.
     protein_z_mm = np.lib.format.open_memmap(
         out_dir / "protein_z.float16.npy",
         mode="w+",
         dtype=np.float16,
         shape=(n_samples, dz),
     )
+
+    protein_global_z_mm = None
+    protein_local_z_mm = None
+    top_global_scores_mm = None
+    top_local_scores_mm = None
+
+    expert_mode = str(getattr(trainer.model, "protein_expert_mode", "legacy"))
+    if expert_mode in {"global", "local", "global_local"}:
+        protein_global_z_mm = np.lib.format.open_memmap(
+            out_dir / "protein_global_z.float16.npy",
+            mode="w+",
+            dtype=np.float16,
+            shape=(n_samples, dz),
+        )
+
+        n_slots = int(getattr(trainer.ctx, "protein_n_slots", 0))
+        if expert_mode in {"local", "global_local"}:
+            if n_slots <= 0:
+                raise RuntimeError(
+                    "global/local dump expected protein_n_slots > 0 for local expert"
+                )
+            protein_local_z_mm = np.lib.format.open_memmap(
+                out_dir / "protein_local_z.float16.npy",
+                mode="w+",
+                dtype=np.float16,
+                shape=(n_samples, n_slots, dz),
+            )
+
+        top_global_scores_mm = np.lib.format.open_memmap(
+            out_dir / "top_global_scores.float32.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_samples, k_eff),
+        )
+        top_local_scores_mm = np.lib.format.open_memmap(
+            out_dir / "top_local_scores.float32.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(n_samples, k_eff),
+        )
 
     top_ids_mm = None
     if save_top_go_ids:
@@ -711,19 +748,48 @@ def dump_candidates(
 
         G_eval, y_true = trainer._build_eval_space(batch)
 
-        scores_raw = trainer.forward_scores(
-            H,
-            G_eval,
-            attn_valid,
-            return_alpha=False,
-        )
-        scores_rank = (scores_raw * scale).float()
+        expert_mode = str(getattr(trainer.model, "protein_expert_mode", "legacy"))
 
+        if expert_mode in {"global", "local", "global_local"}:
+            encoded = trainer.model.encode_protein_experts(H, attn_valid)
+            scores_raw, components = trainer.model.score_from_encoded_experts(
+                encoded=encoded,
+                G=G_eval,
+                return_components=True,
+            )
+            scores_rank = (scores_raw * scale).float()
+
+            global_rank = None
+            local_rank = None
+            if components.get("global", None) is not None:
+                global_rank = (components["global"] * scale).float()
+            if components.get("local", None) is not None:
+                local_rank = (components["local"] * scale).float()
+        else:
+            encoded = None
+            global_rank = None
+            local_rank = None
+            scores_raw = trainer.forward_scores(
+                H,
+                G_eval,
+                attn_valid,
+                return_alpha=False,
+            )
+            scores_rank = (scores_raw * scale).float()
+
+        # Ranked candidate dump: candidates are stored in strictly descending
+        # retriever-score order. Positional embeddings in EmbSetCal rely on this.
         vals, idxs = torch.topk(
             scores_rank,
             k=k_eff,
             dim=1,
+            largest=True,
+            sorted=True,
         )
+
+        # Guard against accidental reordering in future refactors. Ties are valid.
+        if vals.size(1) > 1 and not torch.all(vals[:, :-1] >= vals[:, 1:] - 1e-7):
+            raise RuntimeError("[dump] top-K candidates are not sorted by descending retriever score")
 
         B = int(H.size(0))
         s = offset
@@ -738,22 +804,66 @@ def dump_candidates(
             idxs,
         ).detach().cpu()
 
-        # Frozen retriever protein query embedding.
-        Zp = trainer.model.encode_protein_for_scoring(H, attn_valid)
+        # Protein representations. In global_local mode there is no single
+        # fused vector because fusion happens at SCORE level. We therefore:
+        #   1) keep protein_z as the global vector for reranker compatibility
+        #   2) additionally save global and local expert vectors explicitly
+        if encoded is not None:
+            Z_global = encoded.get("global", None)
+            Z_local = encoded.get("local", None)
 
-        if isinstance(Zp, tuple):
-            Zp = Zp[0]
+            if Z_global is None:
+                if Z_local is None:
+                    raise RuntimeError("Expert encoder returned neither global nor local vectors")
+                Z_compat = Z_local.mean(dim=1)
+            else:
+                Z_compat = Z_global
 
-        if Zp.dim() == 3:
-            Zp = Zp.mean(dim=1)
-
-        Zp = F.normalize(Zp.float(), dim=-1)
+            Z_compat = F.normalize(Z_compat.float(), dim=-1)
+        else:
+            Zp = trainer.model.encode_protein_for_scoring(H, attn_valid)
+            if isinstance(Zp, tuple):
+                Zp = Zp[0]
+            if Zp.dim() == 3:
+                Zp = Zp.mean(dim=1)
+            Z_compat = F.normalize(Zp.float(), dim=-1)
+            Z_global = None
+            Z_local = None
 
         top_cols_np = idxs_cpu.numpy().astype(np.int32)
         top_cols_mm[s:e, :] = top_cols_np
         top_scores_mm[s:e, :] = vals_cpu.numpy().astype(np.float32)
         top_labels_mm[s:e, :] = labels.numpy().astype(np.int8)
-        protein_z_mm[s:e, :] = Zp.detach().cpu().half().numpy()
+        protein_z_mm[s:e, :] = Z_compat.detach().cpu().half().numpy()
+
+        if protein_global_z_mm is not None:
+            if Z_global is None:
+                protein_global_z_mm[s:e, :] = Z_compat.detach().cpu().half().numpy()
+            else:
+                protein_global_z_mm[s:e, :] = Z_global.detach().float().cpu().half().numpy()
+
+        if protein_local_z_mm is not None:
+            if Z_local is None:
+                raise RuntimeError("protein_local_z memmap exists but local expert vectors are missing")
+            if Z_local.dim() != 3:
+                raise RuntimeError(f"Expected local protein vectors [B,S,D], got {tuple(Z_local.shape)}")
+            protein_local_z_mm[s:e, :, :] = Z_local.detach().float().cpu().half().numpy()
+
+        # Save component scores AT THE SAME fused top-K positions. These are
+        # diagnostics/features, not separately re-ranked candidate lists.
+        if top_global_scores_mm is not None:
+            if global_rank is None:
+                top_global_scores_mm[s:e, :] = np.nan
+            else:
+                gvals = torch.gather(global_rank, 1, idxs).detach().cpu().float().numpy()
+                top_global_scores_mm[s:e, :] = gvals.astype(np.float32)
+
+        if top_local_scores_mm is not None:
+            if local_rank is None:
+                top_local_scores_mm[s:e, :] = np.nan
+            else:
+                lvals = torch.gather(local_rank, 1, idxs).detach().cpu().float().numpy()
+                top_local_scores_mm[s:e, :] = lvals.astype(np.float32)
 
         if top_ids_mm is not None:
             top_ids = trainer._eval_ids_cpu.index_select(
@@ -788,6 +898,14 @@ def dump_candidates(
             top_scores_mm.flush()
             top_labels_mm.flush()
             protein_z_mm.flush()
+            if protein_global_z_mm is not None:
+                protein_global_z_mm.flush()
+            if protein_local_z_mm is not None:
+                protein_local_z_mm.flush()
+            if top_global_scores_mm is not None:
+                top_global_scores_mm.flush()
+            if top_local_scores_mm is not None:
+                top_local_scores_mm.flush()
             if top_ids_mm is not None:
                 top_ids_mm.flush()
 
@@ -802,6 +920,14 @@ def dump_candidates(
     top_scores_mm.flush()
     top_labels_mm.flush()
     protein_z_mm.flush()
+    if protein_global_z_mm is not None:
+        protein_global_z_mm.flush()
+    if protein_local_z_mm is not None:
+        protein_local_z_mm.flush()
+    if top_global_scores_mm is not None:
+        top_global_scores_mm.flush()
+    if top_local_scores_mm is not None:
+        top_local_scores_mm.flush()
     if top_ids_mm is not None:
         top_ids_mm.flush()
 
@@ -826,6 +952,15 @@ def dump_candidates(
         "top_labels": "top_labels.int8.npy",
     }
 
+    if protein_global_z_mm is not None:
+        files["protein_global_z"] = "protein_global_z.float16.npy"
+    if protein_local_z_mm is not None:
+        files["protein_local_z"] = "protein_local_z.float16.npy"
+    if top_global_scores_mm is not None:
+        files["top_global_scores"] = "top_global_scores.float32.npy"
+    if top_local_scores_mm is not None:
+        files["top_local_scores"] = "top_local_scores.float32.npy"
+
     if save_top_go_ids:
         files["top_go_ids"] = "top_go_ids.int64.npy"
 
@@ -839,13 +974,29 @@ def dump_candidates(
         "topk": int(k_eff),
         "dz": int(dz),
         "save_top_go_ids": bool(save_top_go_ids),
+        "candidate_order": "descending_retriever_score",
+        "ranked": True,
+        "main_source": _MAIN_SOURCE,
+        "retriever_score_definition": "post-logit-scale score used for top-K retrieval",
+        "go_encoder_output_mode": str(getattr(trainer.ctx, "go_encoder_output_mode", "unknown")),
+        "go_segment_alpha": float(getattr(trainer.cfg, "go_segment_alpha", 0.0)),
+        "protein_expert_mode": str(getattr(trainer.model, "protein_expert_mode", "legacy")),
+        "protein_n_slots": int(getattr(trainer.ctx, "protein_n_slots", 0)),
+        "expert_global_weight": float(
+            trainer.model.get_expert_global_weight().detach().cpu().item()
+        ) if hasattr(trainer.model, "get_expert_global_weight") else None,
         "files": files,
         "schema": {
             "row_alignment": "All row-based files align by protein_ids order.",
             "top_go_cols": "Column indices into eval_go_ids and go_z.",
-            "top_scores": "Post-logit-scale retriever scores.",
+            "top_scores": "Post-logit-scale retriever scores in descending order within each row.",
+            "candidate_rank": "Implicit zero-based rank given by array position; no separate rank feature is stored.",
             "top_labels": "1 if candidate is a true GO label for that protein, else 0.",
-            "protein_z": "Frozen retriever protein query embedding.",
+            "protein_z": "Backward-compatible single protein vector. In global_local mode this is the global expert vector; fusion itself occurs at score level.",
+            "protein_global_z": "Global protein expert vector [N,Dz], when expert mode is enabled.",
+            "protein_local_z": "Local protein slot vectors [N,S,Dz], when local expert is enabled.",
+            "top_global_scores": "Global-expert scores gathered at the fused top-K candidate positions.",
+            "top_local_scores": "Local-expert scores gathered at the fused top-K candidate positions.",
             "go_z": "Frozen retriever projected GO embedding bank aligned with eval_go_ids.",
             "true_go_ids": "All true GO ids per protein, padded with -1. Needed for full-space Fmax.",
             "top_go_ids": "Optional. Can be reconstructed as eval_go_ids[top_go_cols].",
@@ -890,7 +1041,7 @@ def main():
     cli = parse_args()
     setup_logging_simple()
 
-    args = load_structured_cfg(cli.config)
+    args = configure(cli.config)
 
     if cli.device is not None:
         args.general_device = cli.device
@@ -913,11 +1064,12 @@ def main():
 
     device = torch.device(args.general_device if args.general_device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
     logging.info("[dump] device=%s", str(device))
+    logging.info("[dump] builder source=%s", _MAIN_SOURCE)
 
     go_cache = build_go_cache(str(args.go_cache_path))
 
-    dag_parents = load_go_parents() if args.use_dag_in_ds else None
-    dag_children = load_go_children() if args.use_dag_in_ds else None
+    dag_parents = base.load_go_parents() if args.use_dag_in_ds else None
+    dag_children = base.load_go_children() if args.use_dag_in_ds else None
 
     go_encoder, go_text_store = build_go_encoder_and_text_store(args, device)
 
