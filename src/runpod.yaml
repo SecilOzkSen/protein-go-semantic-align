@@ -20,7 +20,15 @@ general:
 
   # Protein side new branch
   protein_pooling_strategy: "mean_attn_gate" # "mean_attn_gate" #local_evidence_gate
-  protein_n_slots: 0
+  protein_expert_mode: global_local #global -> baseline.
+  local_expert_type: slots
+  protein_n_slots: 4
+  expert_fusion: weighted_sum
+  expert_global_weight: 0.5
+  expert_fusion_learnable: true
+  local_slot_aggregation: lse
+  local_slot_lse_tau: 0.10
+  multivec_slot_lse_tau: 0.0
 
   use_lora: true
   use_attribution_loss: false
