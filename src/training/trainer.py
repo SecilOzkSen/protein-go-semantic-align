@@ -6,7 +6,6 @@ import math
 
 from go import load_go_parents
 from src.models.alignment_model import ProteinGoAligner
-from src.loss.attribution import attribution_loss
 from src.configs.data_classes import TrainerConfig, AttrConfig, QueueConfig
 from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import (compute_fmax, compute_term_aupr, compute_protein_centric_fmax)
