@@ -614,9 +614,16 @@ class CalibTrainer:
             max_negatives=self.cfg.pairwise_max_negatives,
         )
 
+        card = cardinality_loss(
+            logits=logits,
+            labels=labels,
+            valid=valid,
+        )
+
         total = (
                 bce
                 + self.cfg.lambda_pair * pairwise
+                + self.cfg.lambda_card * card
         )
 
         zero = logits.sum() * 0.0
@@ -626,7 +633,7 @@ class CalibTrainer:
             "bce": bce,
             "pairwise": pairwise,
             "soft_f1": zero,
-            "card": zero,
+            "card": card,
             "dag": zero,
         }
 
