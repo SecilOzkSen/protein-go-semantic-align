@@ -39,6 +39,11 @@ class CandidateDumpDataset(Dataset):
             score_std: float,
             embedding_dump: str | Path | None = None,
             require_embeddings: bool = False,
+            use_expert_scores: bool = False,
+            global_score_mean: float = 0.0,
+            global_score_std: float = 1.0,
+            local_score_mean: float = 0.0,
+            local_score_std: float = 1.0,
     ):
         self.dump_dir = Path(dump_dir)
         self.topk = int(topk)
@@ -47,9 +52,46 @@ class CandidateDumpDataset(Dataset):
         self.embedding_dir = Path(embedding_dump) if embedding_dump else self.dump_dir
         self.require_embeddings = bool(require_embeddings)
 
+        self.use_expert_scores = bool(use_expert_scores)
+
+        self.global_score_mean = float(global_score_mean)
+        self.global_score_std = max(float(global_score_std), 1e-6)
+
+        self.local_score_mean = float(local_score_mean)
+        self.local_score_std = max(float(local_score_std), 1e-6)
+
         self.eval_go_ids = np.load(self.dump_dir / "eval_go_ids.npy", mmap_mode="r").astype(np.int64)
         self.top_cols = np.load(self.dump_dir / "top_go_cols.int32.npy", mmap_mode="r")
         self.top_scores = np.load(self.dump_dir / "top_scores.float32.npy", mmap_mode="r")
+        self.global_scores = None
+        self.local_scores = None
+
+        if self.use_expert_scores:
+            global_path = (self.dump_dir / "top_global_scores.float32.npy")
+            local_path = (self.dump_dir / "top_local_scores.float32.npy")
+
+            if not global_path.exists():
+                raise FileNotFoundError(global_path)
+
+            if not local_path.exists():
+                raise FileNotFoundError(local_path)
+
+            self.global_scores = np.load(global_path, mmap_mode="r")
+
+            self.local_scores = np.load(local_path, mmap_mode="r")
+
+            if (self.global_scores.shape != self.top_scores.shape):
+                raise RuntimeError(
+                    "global score shape mismatch: "
+                    f"{self.global_scores.shape} "
+                    f"vs fused {self.top_scores.shape}")
+
+            if (self.local_scores.shape != self.top_scores.shape):
+                raise RuntimeError(
+                    "local score shape mismatch: "
+                    f"{self.local_scores.shape} "
+                    f"vs fused {self.top_scores.shape}")
+
         self.labels = np.load(self.dump_dir / "top_labels.int8.npy", mmap_mode="r")
         self.true_go_ids = np.load(self.dump_dir / "true_go_ids.npy", mmap_mode="r")
         valid_path = self.dump_dir / "top_valid.int8.npy"
@@ -154,6 +196,21 @@ class CandidateDumpDataset(Dataset):
         score_z = ((scores - self.score_mean) / max(self.score_std, 1e-6)).astype(np.float32)
         score_z[~valid] = 0.0
 
+        global_score_z = None
+        local_score_z = None
+
+        if self.use_expert_scores:
+            global_scores = np.asarray(self.global_scores[idx,:self.topk,], dtype=np.float32)
+
+            local_scores = np.asarray(self.local_scores[idx,:self.topk,], dtype=np.float32,)
+            global_scores = np.nan_to_num(global_scores, nan=0.0, posinf=0.0, neginf=0.0)
+            local_scores = np.nan_to_num(local_scores, nan=0.0, posinf=0.0, neginf=0.0,)
+
+            global_score_z = ((global_scores - self.global_score_mean) / self.global_score_std).astype(np.float32)
+            local_score_z = ((local_scores - self.local_score_mean) / self.local_score_std).astype(np.float32)
+            global_score_z[~valid] = 0.0
+            local_score_z[~valid] = 0.0
+
         item = {
             "protein_id": str(self.protein_ids[idx]),
             "cand_ids": torch.from_numpy(cand_ids.copy()).long(),
@@ -163,6 +220,9 @@ class CandidateDumpDataset(Dataset):
             "valid": torch.from_numpy(valid.copy()).bool(),
             "true_go_ids": torch.from_numpy(np.asarray(self.true_go_ids[idx], dtype=np.int64).copy()).long(),
         }
+        if self.use_expert_scores:
+            item["global_score_z"] = torch.from_numpy(global_score_z.copy()).float()
+            item["local_score_z"] = torch.from_numpy(local_score_z.copy()).float()
 
         if self.has_embeddings:
             prot_row = int(idx if self.protein_row_map is None else self.protein_row_map[idx])
@@ -178,6 +238,8 @@ class CandidateDumpDataset(Dataset):
 def collate_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {"protein_id": [x["protein_id"] for x in items]}
     tensor_keys = ["cand_ids", "score_z", "rank_feature", "labels", "valid", "true_go_ids"]
+    if "global_score_z" in items[0]:
+        tensor_keys += ["global_score_z", "local_score_z"]
     if "protein_z" in items[0]:
         tensor_keys += ["protein_z", "go_z"]
     for k in tensor_keys:
@@ -200,6 +262,43 @@ def estimate_score_stats(dump_dir: str | Path, topk: int, max_rows: Optional[int
         return 0.0, 1.0
     vals = arr[mask]
     return float(vals.mean()), float(vals.std() + 1e-6)
+
+
+def estimate_named_score_stats(
+        dump_dir: str | Path,
+        filename: str,
+        topk: int,
+        max_rows: Optional[int] = None,
+) -> Tuple[float, float]:
+    d = Path(dump_dir)
+    path = d / filename
+
+    if not path.exists():
+        raise FileNotFoundError(f"Required expert score file is missing: {path}")
+
+    scores = np.load(path, mmap_mode="r")
+    n = (scores.shape[0] if max_rows is None else min(scores.shape[0], int(max_rows)))
+    arr = np.asarray(scores[:n, :topk], dtype=np.float32,)
+
+    valid_path = d / "top_valid.int8.npy"
+
+    if valid_path.exists():
+        valid = np.asarray(
+            np.load(valid_path, mmap_mode="r",)[:n, :topk],dtype=bool)
+    else:
+        valid = np.ones_like(arr, dtype=bool)
+
+    mask = (valid & np.isfinite(arr) & (arr > -1e5))
+
+    if not mask.any():
+        return 0.0, 1.0
+
+    vals = arr[mask]
+
+    return (
+        float(vals.mean()),
+        float(vals.std() + 1e-6),
+    )
 
 
 def compute_global_fmax_aupr_from_items(items: List[Tuple[float, int]], n_true_total: int) -> Dict[str, float]:
@@ -426,6 +525,7 @@ class CalibConfig:
     stargo_go_obo: str = ""
     stargo_seqid_column: int = 4
     pooling_type: str = "mean"
+    use_expert_scores: bool = False
 
 
 class CalibTrainer:
@@ -437,6 +537,26 @@ class CalibTrainer:
 
         max_rows = None if cfg.score_stat_rows <= 0 else int(cfg.score_stat_rows)
         self.score_mean, self.score_std = estimate_score_stats(cfg.train_dump, cfg.topk, max_rows=max_rows)
+        self.global_score_mean = 0.0
+        self.global_score_std = 1.0
+
+        self.local_score_mean = 0.0
+        self.local_score_std = 1.0
+
+        if cfg.use_expert_scores:
+            (self.global_score_mean, self.global_score_std) = estimate_named_score_stats(
+                cfg.train_dump,
+                "top_global_scores.float32.npy",
+                cfg.topk,
+                max_rows=max_rows,
+            )
+
+            (self.local_score_mean, self.local_score_std) = estimate_named_score_stats(
+                cfg.train_dump,
+                "top_local_scores.float32.npy",
+                cfg.topk,
+                max_rows=max_rows,
+            )
         kind = cfg.model_kind.lower()
         requires_emb = kind in {"embcal", "embsetcal", "embeddingcal", "embeddingsetcal", "step3"}
         self.train_ds = CandidateDumpDataset(
@@ -444,16 +564,26 @@ class CalibTrainer:
             cfg.topk,
             self.score_mean,
             self.score_std,
-            embedding_dump=cfg.train_embedding_dump or None,
+            embedding_dump=(cfg.train_embedding_dump or None),
             require_embeddings=requires_emb,
+            use_expert_scores=cfg.use_expert_scores,
+            global_score_mean=self.global_score_mean,
+            global_score_std=self.global_score_std,
+            local_score_mean=self.local_score_mean,
+            local_score_std=self.local_score_std,
         )
         self.val_ds = CandidateDumpDataset(
             cfg.val_dump,
             cfg.topk,
             self.score_mean,
             self.score_std,
-            embedding_dump=cfg.val_embedding_dump or None,
+            embedding_dump=(cfg.val_embedding_dump or None),
             require_embeddings=requires_emb,
+            use_expert_scores=cfg.use_expert_scores,
+            global_score_mean=self.global_score_mean,
+            global_score_std=self.global_score_std,
+            local_score_mean=self.local_score_mean,
+            local_score_std=self.local_score_std,
         )
         self.train_loader = DataLoader(self.train_ds, batch_size=cfg.batch_size, shuffle=True,
                                        num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
@@ -480,7 +610,8 @@ class CalibTrainer:
                 dropout=cfg.dropout,
                 max_k=max(1024, cfg.topk),
                 proj_dim=(cfg.proj_dim or None),
-                pooling_type=cfg.pooling_type
+                pooling_type=cfg.pooling_type,
+                use_expert_scores=cfg.use_expert_scores,
             )
         else:
             raise ValueError(f"Unknown model_kind: {cfg.model_kind}")
@@ -513,7 +644,17 @@ class CalibTrainer:
                 )
         with (self.out_dir / "config.json").open("w", encoding="utf-8") as f:
             d = asdict(cfg)
-            d.update({"score_mean": self.score_mean, "score_std": self.score_std, "pos_weight": self.pos_weight})
+            d.update(
+                {
+                    "score_mean": self.score_mean,
+                    "score_std": self.score_std,
+                    "global_score_mean": self.global_score_mean,
+                    "global_score_std": self.global_score_std,
+                    "local_score_mean": self.local_score_mean,
+                    "local_score_std": self.local_score_std,
+                    "pos_weight": self.pos_weight,
+                }
+            )
             json.dump(d, f, indent=2)
 
     def _estimate_pos_weight(self) -> float:
@@ -565,9 +706,11 @@ class CalibTrainer:
 
         return self.model(
             batch["score_z"],
-            batch["rank_feature"],
             batch["valid"],
-        )
+            batch["protein_z"],
+            batch["go_z"],
+            global_score_z=(batch.get("global_score_z") if self.cfg.use_expert_scores else None),
+            local_score_z=(batch.get("local_score_z") if self.cfg.use_expert_scores else None))
 
     def _loss(
             self,
@@ -714,6 +857,16 @@ class CalibTrainer:
         logging.info("[calib] device=%s model=%s topk=%d", self.device, self.cfg.model_kind, self.cfg.topk)
         logging.info("[calib] score_mean=%.4f score_std=%.4f pos_weight=%.2f", self.score_mean, self.score_std,
                      self.pos_weight)
+        if self.cfg.use_expert_scores:
+            logging.info(
+                "[calib] expert scores enabled "
+                "global mean/std=%.4f/%.4f "
+                "local mean/std=%.4f/%.4f",
+                self.global_score_mean,
+                self.global_score_std,
+                self.local_score_mean,
+                self.local_score_std,
+            )
         if getattr(self.train_ds, "has_embeddings", False):
             logging.info("[calib] embeddings enabled emb_dim=%s train_emb=%s val_emb=%s", self.train_ds.emb_dim,
                          self.train_ds.embedding_dir, self.val_ds.embedding_dir)
@@ -768,8 +921,17 @@ class CalibTrainer:
                 "step": int(step),
                 "metrics": metrics,
                 "config": asdict(self.cfg),
+
+                # Fused retriever score normalization
                 "score_mean": self.score_mean,
                 "score_std": self.score_std,
+
+                # Expert-score normalization
+                "global_score_mean": self.global_score_mean,
+                "global_score_std": self.global_score_std,
+                "local_score_mean": self.local_score_mean,
+                "local_score_std": self.local_score_std,
+
                 "pos_weight": self.pos_weight,
             }
             torch.save(ckpt, self.out_dir / f"best_{monitor}.pt")

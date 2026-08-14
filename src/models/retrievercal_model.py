@@ -274,10 +274,12 @@ class EmbSetCal(nn.Module):
             max_k: int = 1024,
             proj_dim: Optional[int] = None,
             pooling_type: str = "mean", #attention
+            use_expert_scores: bool = False,
     ):
         super().__init__()
 
         self.pooling_type = pooling_type
+        self.use_expert_scores = bool(use_expert_scores)
         print(f"[EMBSETCAL] Pooling type: {self.pooling_type}")
 
         if pooling_type not in {"mean", "attention"}:
@@ -310,8 +312,13 @@ class EmbSetCal(nn.Module):
 
         self.pos_emb = nn.Embedding(max_k, hidden_dim)
 
-        # p, g, |p-g|, p*g, retriever score, cosine
-        token_feat_dim = 4 * self.proj_dim + 1
+        # p, g, |p-g|, p*g,
+        # fused retriever score
+        # + optional global/local expert scores
+        token_feat_dim = (4 * self.proj_dim + 1)
+
+        if self.use_expert_scores:
+            token_feat_dim += 2
 
         self.input_proj = nn.Sequential(
             nn.Linear(token_feat_dim, hidden_dim),
@@ -404,6 +411,8 @@ class EmbSetCal(nn.Module):
             valid: torch.Tensor,
             protein_z: torch.Tensor,
             go_z: torch.Tensor,
+            global_score_z: Optional[torch.Tensor] = None,
+            local_score_z: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         valid = valid.bool()
 
@@ -426,6 +435,47 @@ class EmbSetCal(nn.Module):
             torch.zeros_like(score_z),
         )
 
+        if self.use_expert_scores:
+            if global_score_z is None:
+                raise ValueError(
+                    "use_expert_scores=True but "
+                    "global_score_z is missing"
+                )
+
+            if local_score_z is None:
+                raise ValueError(
+                    "use_expert_scores=True but "
+                    "local_score_z is missing"
+                )
+
+            global_score_z = torch.nan_to_num(
+                global_score_z,
+                nan=0.0,
+                posinf=20.0,
+                neginf=-20.0,
+            ).clamp(
+                -20.0,
+                20.0,
+            )
+
+            local_score_z = torch.nan_to_num(
+                local_score_z,
+                nan=0.0,
+                posinf=20.0,
+                neginf=-20.0,).clamp(-20.0,20.0)
+
+            global_score_z = torch.where(
+                valid,
+                global_score_z,
+                torch.zeros_like(global_score_z),
+            )
+
+            local_score_z = torch.where(
+                valid,
+                local_score_z,
+                torch.zeros_like(local_score_z),
+            )
+
         p = self.protein_proj(protein_z.float())  # [B,P]
         g = self.go_proj(go_z.float())  # [B,K,P]
 
@@ -443,14 +493,24 @@ class EmbSetCal(nn.Module):
         #        eps=1e-8,
         #    )
 
+        token_features = [
+            p_rep,
+            g,
+            torch.abs(p_rep - g),
+            p_rep * g,
+            score_z.unsqueeze(-1),
+        ]
+
+        if self.use_expert_scores:
+            token_features.extend(
+                [
+                    global_score_z.unsqueeze(-1),
+                    local_score_z.unsqueeze(-1),
+                ]
+            )
+
         token_x = torch.cat(
-            [
-                p_rep,
-                g,
-                torch.abs(p_rep - g),
-                p_rep * g,
-                score_z.unsqueeze(-1),
-            ],
+            token_features,
             dim=-1,
         )
 
