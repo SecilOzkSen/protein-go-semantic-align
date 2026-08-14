@@ -52,7 +52,7 @@ training:
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "oracle_proteinF@200"
+  monitor_metric: "oracle_microF@500"
   monitor_mode: max
   early_stop_patience: 3
   cand_chunk_k: 4
