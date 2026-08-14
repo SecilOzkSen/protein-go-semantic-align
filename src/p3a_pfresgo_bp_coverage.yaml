@@ -1,0 +1,166 @@
+# PFresGO BP retriever config for src/main_pfresgo.py
+pfresgo:
+  branch: BP
+  benchmark_protocol: standard #zeroshot
+  evaluation_space: benchmark
+  branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_bp.json
+  go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
+  test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
+  evaluation_split: valid
+  rare_lt: 20
+  enabled_segments:
+    - name
+    - definition
+    - is_a
+
+data:
+  overlap: 256
+  max_len: 1024
+  # Keep benchmark labels exact. DAG is still available to the evaluator.
+  use_dag_in_ds: false
+  fs_target_ratio: 0.0
+
+general:
+  phase: -2
+  ablation_id: "PFresGO-BP-global-local-mulsupcon"
+  use_queue_miner: true
+  go_pooling_strategy: mean
+  go_encoder_inner_pooling: mean
+  go_pool_type: mean
+  go_encoder_output_mode: segment_pooled
+  go_segment_representation_mode: segments_only
+  protein_pooling_strategy: mean_attn_gate
+  protein_n_slots: 4
+  use_lora: false
+  use_attribution_loss: false
+  return_alpha: false
+  return_slot_attn: false
+
+training:
+  epochs: 15
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 0
+  fp16: true
+  cpu: false
+  seed: 42
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local_mulsupcon
+  save_every: 10000
+  keep_last_n: 3
+  resume: null
+  warmstart_path: null
+  eval_only: false
+  log_every: 500
+  log_level: INFO
+  monitor_metric: "oracle_proteinF@200"
+  monitor_mode: max
+  early_stop_patience: 3
+  cand_chunk_k: 4
+  pos_chunk_t: 128
+  max_refresh_go: 0
+  eval_go_bs: 256
+  go_text_store_max_len: 128
+  go_segment_max_len: 64
+  is_logit_scale_constant: true
+  go_token_dropout: false
+  go_pooling: none
+  eval_space: observed
+  max_inbatch: 160
+  eval_cand_chunk_k: 64
+  go_segment_alpha: 0.05
+  go_segment_alpha_warmup_steps: 5000
+  trainable_mode: full
+  local_window_size: 64
+  local_window_stride: 32
+  pairwise_margin: 0.0
+  pairwise_start_step: 2000
+  cardinality_weighting: true
+  coverage_start_step: 2000
+
+queue:
+  queue_K: 16384
+  queue_start_step: 2000
+  queue_hard_frac_start: 0.0
+  queue_hard_frac_end: 0.5
+  queue_hard_frac_warmup_steps: 6000
+  queue_weight_start: 0.2
+  queue_weight_end: 1.0
+  queue_weight_warmup_steps: 6000
+  k_hard_queue_start: 4
+  k_hard_queue_end: 24
+  k_hard_queue_warmup_steps: 6000
+
+optim:
+  lr: 0.00001
+  lr_lora: 0.0
+  weight_decay: 0.0
+  grad_clip: 1.0
+
+model:
+  align_dim: 768
+  temperature: 0.07
+  attn_heads: 2
+  attn_dropout: 0.1
+  entropy_reg: 0.01
+  win_size: 1024
+  win_stride: 256
+  multivec_slot_lse_tau: 0.10
+  multivec_global_residual_init: 0.25
+  protein_expert_mode: global_local
+  local_slot_aggregation: lse
+  local_slot_lse_tau: 0.10
+  expert_global_weight: 0.5
+  expert_fusion_learnable: true
+
+loss:
+  lambda_con: 1.0
+  lambda_dag: 0.0
+  lambda_attr: 0.0
+  lambda_entropy_alpha: 0.0
+  pairwise_lambda: 0.10
+  coverage_lambda: 0.10
+  coverage_bottom_frac: 0.25
+  coverage_hard_neg_k: 4
+  coverage_margin: 0.05
+  dag_margin: 0.05
+  dag_scale: 10.0
+  lambda_vtrue: 0.0
+  tau_distill: 1.0
+  lambda_bce: 0.0
+  lambda_slot_div: 0.0
+
+curriculum:
+  epochs: 5
+  warmup_frac: 0.1
+  mode: cosine
+  hard_frac: [0.2, 0.5]
+  shortlist_M: [128, 64]
+  k_hard: [4, 1]
+  hier_up: [0, 0]
+  hier_dn: [0, 0]
+  random_k: [4, 0]
+  inbatch_easy: [1.0, 0.0]
+  neg_k: 8
+
+wandb:
+  enabled: true
+  project: protein-go-align-pfresgo
+  entity: null
+  wandb_run_name: "PFresGO-BP-global-local"
+  mode: online
+
+stores:
+  train_ids_path: /workspace/stargo/datasets/pfresgo/train.txt
+  val_ids_path: /workspace/stargo/datasets/pfresgo/valid.txt
+  go_basic_json: /workspace/data_pfresgo/processed/go_vocab.json
+  pid2pos_path: /workspace/data_pfresgo/processed/pid_to_positives_bp.json
+  zero_shot_path: null
+  few_shot_path: null
+  go_path_seen: null
+  go_path_observed: null
+  embed_dir_res: /workspace/data_pfresgo/protein_embeddings/esm1b_residue
+  go_text_folder: /workspace/data_pfresgo/processed
+  go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
+  seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
+  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local_mulsupcon
+

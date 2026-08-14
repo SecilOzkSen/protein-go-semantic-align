@@ -180,6 +180,128 @@ def queue_pairwise_ranking_loss(
     return torch.stack(losses).mean()
 
 
+def weak_positive_coverage_loss(
+        scores: torch.Tensor,
+        pos_mask: torch.Tensor,
+        cand_valid_mask: torch.Tensor,
+        queue_start: int,
+        queue_count: int,
+        bottom_frac: float = 0.25,
+        hard_neg_k: int = 4,
+        margin: float = 0.05,
+) -> torch.Tensor:
+    """
+    Coverage-oriented ranking loss.
+
+    For each protein:
+      1. Select the lowest-scoring fraction of TRUE GO terms.
+      2. Select the highest-scoring queue negatives.
+      3. Push weak positives above the hard-negative reference.
+
+    This differs from the standard pairwise objective because
+    only the under-retrieved positive tail is optimized.
+
+    scores: [B, K]
+    """
+
+    if queue_count <= 0:
+        return scores.sum() * 0.0
+
+    pos_mask = pos_mask.bool() & cand_valid_mask.bool()
+
+    q_start = max(0, int(queue_start))
+    q_end = min(
+        int(scores.size(1)),
+        q_start + int(queue_count),
+    )
+
+    if q_start >= q_end:
+        return scores.sum() * 0.0
+
+    bottom_frac = float(bottom_frac)
+    bottom_frac = min(max(bottom_frac, 1e-6), 1.0)
+
+    hard_neg_k = max(1, int(hard_neg_k))
+
+    losses = []
+
+    for b in range(scores.size(0)):
+
+        # --------------------------------------
+        # Positive tail
+        # --------------------------------------
+        pos_scores = scores[b][pos_mask[b]]
+
+        if pos_scores.numel() == 0:
+            continue
+
+        n_weak = max(
+            1,
+            int(math.ceil(
+                float(pos_scores.numel())
+                * bottom_frac
+            )),
+        )
+
+        n_weak = min(
+            n_weak,
+            int(pos_scores.numel()),
+        )
+
+        weak_pos = torch.topk(
+            pos_scores,
+            k=n_weak,
+            largest=False,
+        ).values
+
+        # --------------------------------------
+        # Hard queue negatives
+        # --------------------------------------
+        queue_valid = cand_valid_mask[
+            b,
+            q_start:q_end,
+        ].bool()
+
+        queue_scores = scores[
+            b,
+            q_start:q_end,
+        ][queue_valid]
+
+        if queue_scores.numel() == 0:
+            continue
+
+        k_neg = min(
+            hard_neg_k,
+            int(queue_scores.numel()),
+        )
+
+        hard_neg = torch.topk(
+            queue_scores,
+            k=k_neg,
+            largest=True,
+        ).values
+
+        # Mean of the hardest negatives gives
+        # a stable cutoff-like reference.
+        hard_ref = hard_neg.mean()
+
+        # --------------------------------------
+        # Coverage margin
+        # --------------------------------------
+        row_loss = F.softplus(
+            float(margin)
+            + hard_ref
+            - weak_pos
+        ).mean()
+
+        losses.append(row_loss)
+
+    if not losses:
+        return scores.sum() * 0.0
+
+    return torch.stack(losses).mean()
+
+
 @torch.no_grad()
 def delta_y_from_occlusion_windows(
         H: torch.Tensor,  # [B, L, Dh]
@@ -3478,7 +3600,40 @@ class OppTrainer:
                     + str(batch.get("protein_ids", "")[:5])
                 )
 
-            l_total = l_con + pairwise_lambda * l_pairwise
+            # ---------------------------------------------------------
+            # Weak-positive set coverage objective
+            # ---------------------------------------------------------
+
+            coverage_lambda = float(getattr(self.cfg, "coverage_lambda", 0.0))
+            coverage_bottom_frac = float(getattr(self.cfg, "coverage_bottom_frac", 0.25))
+            coverage_hard_neg_k = int(getattr(self.cfg, "coverage_hard_neg_k", 4))
+            coverage_margin = float(getattr(self.cfg, "coverage_margin", 0.05))
+            coverage_start_step = int(getattr(self.cfg, "coverage_start_step", self.queue_cfg.queue_start_step))
+            coverage_active = (coverage_lambda > 0.0 and kq > 0 and self._global_step >= coverage_start_step)
+
+            if coverage_active:
+                q_start = U + extra_n
+
+                l_coverage = weak_positive_coverage_loss(
+                    scores=scores_cand,
+                    pos_mask=pos_mask,
+                    cand_valid_mask=cand_valid_mask,
+                    queue_start=q_start,
+                    queue_count=kq,
+                    bottom_frac=coverage_bottom_frac,
+                    hard_neg_k=coverage_hard_neg_k,
+                    margin=coverage_margin,
+                )
+            else:
+                l_coverage = scores_cand.sum() * 0.0
+
+            if not torch.isfinite(l_coverage):
+                raise RuntimeError(
+                    "coverage loss NaN, batch protein_ids="
+                    + str(batch.get("protein_ids", "")[:5])
+                )
+
+            l_total = (l_con + pairwise_lambda * l_pairwise + coverage_lambda * l_coverage)
 
             # positives-only tensors for attr / dag
             B = H.size(0)
@@ -3592,6 +3747,9 @@ class OppTrainer:
                     "train/pairwise": float(l_pairwise.detach().item()),
                     "train/pairwise_weighted": float((pairwise_lambda * l_pairwise).detach().item()),
                     "train/pairwise_active": float(pairwise_active),
+                    "train/coverage": float(l_coverage.detach().item()),
+                    "train/coverage_weighted": float((coverage_lambda* l_coverage).detach().item()),
+                    "train/coverage_active": float(coverage_active),
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
                     "train/lr_go_lora": float(
                         self._lora_lr_schedule(self._global_step - 1)
@@ -3609,6 +3767,7 @@ class OppTrainer:
             "total": l_total,
             "contrastive": l_con,
             "pairwise": l_pairwise,
+            "coverage": l_coverage,
         }
 
 

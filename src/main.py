@@ -1017,6 +1017,11 @@ def run_training(args):
         pairwise_start_step=int(getattr(args, "pairwise_start_step", 0)),
         pairwise_margin=float(getattr(args, "pairwise_margin", 0.0)),
         pairwise_lambda=float(getattr(args, "pairwise_lambda", 0.0)),
+        coverage_lambda=float(getattr(args, "coverage_lambda", 0.0)),
+        coverage_bottom_frac=float(getattr(args, "coverage_bottom_frac", 0.25)),
+        coverage_hard_neg_k=int(getattr(args, "coverage_hard_neg_k", 4)),
+        coverage_margin=float(getattr(args, "coverage_margin", 0.05)),
+        coverage_start_step=int(getattr(args, "coverage_start_step", 2000)),
         protein_expert_mode=str(getattr(args, "protein_expert_mode", "legacy")),
         local_slot_aggregation=str(getattr(args, "local_slot_aggregation", "lse")),
         local_slot_lse_tau=float(getattr(args, "local_slot_lse_tau", 0.10)),
@@ -1553,6 +1558,7 @@ def load_structured_cfg(path: str):
         local_window_stride=int(training.get("local_window_stride", 32)),
         pairwise_margin=float(training.get("pairwise_margin", 0.0)),
         pairwise_start_step=int(training.get("pairwise_start_step", 0)),
+        coverage_start_step=int(training.get("coverage_start_step", 2000)),
         cardinality_weighting=bool(training.get("cardinality_weighting", False)),
 
         # optim
@@ -1603,6 +1609,10 @@ def load_structured_cfg(path: str):
         lambda_bce=float(loss.get("lambda_bce", 0.1)),
         lambda_slot_div=float(loss.get("lambda_slot_div", 0.0)),
         pairwise_lambda=float(loss.get("pairwise_lambda", 0.0)),
+        coverage_lambda=float(loss.get("coverage_lambda", 0.0)),
+        coverage_bottom_frac=float(loss.get("coverage_bottom_frac", 0.25)),
+        coverage_hard_neg_k=int(loss.get("coverage_hard_neg_k", 4)),
+        coverage_margin=float(loss.get("coverage_margin", 0.05)),
 
         # curriculum
         curriculum_epochs=int(curriculum.get("epochs", 4)),

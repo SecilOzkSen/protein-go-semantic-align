@@ -268,6 +268,11 @@ class TrainerConfig:
     expert_global_weight: float = 0.50
     expert_fusion_learnable: bool = True
     cardinality_weighting: bool = False
+    coverage_lambda: float = 0.0
+    coverage_bottom_frac: float = 0.25
+    coverage_hard_neg_k: int = 4
+    coverage_margin: float = 0.05
+    coverage_start_step: int = 2000
 
 @dataclass
 class QueueConfig:
