@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local_mulsupcon
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local_weakpos
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -162,5 +162,5 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local_mulsupcon
+  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local_weakpos
 
