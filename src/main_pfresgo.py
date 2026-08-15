@@ -128,8 +128,16 @@ def _validate(args, pf: dict, branch_ids: List[int]) -> None:
     absent = sorted(set(branch_ids) - cache_ids)
     if absent:
         raise RuntimeError(f"GO cache misses {len(absent)} branch terms; examples: {absent[:10]}")
-    if bool(args.use_lora) or float(args.lr_lora or 0.0) != 0.0:
-        raise ValueError("PFresGO config must keep LoRA disabled: use_lora=false and lr_lora=0.0")
+
+    use_lora = bool(args.use_lora)
+    lr_lora = float(args.lr_lora or 0.0)
+    if use_lora and lr_lora <= 0.0:
+        raise ValueError("PFresGO LoRA is enabled but lr_lora <= 0. " 
+                         "Set a positive lr_lora.")
+
+    if (not use_lora) and lr_lora != 0.0:
+        raise ValueError("PFresGO lr_lora is non-zero while use_lora=false.")
+
     allow_eval_checkpoint = bool(pf.get("allow_checkpoint_for_eval", False)) and bool(args.eval_only)
     if (args.resume or args.warmstart_path) and not allow_eval_checkpoint:
         raise ValueError("PFresGO benchmark training must start clean: resume=null and warmstart_path=null")
