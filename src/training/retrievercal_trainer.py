@@ -724,7 +724,8 @@ class CalibTrainer:
                 batch["valid"],
                 batch["protein_z"],
                 batch["go_z"],
-            )
+                global_score_z=(batch.get("global_score_z") if self.cfg.use_expert_scores else None),
+                local_score_z=(batch.get("local_score_z") if self.cfg.use_expert_scores else None))
 
         if kind in {
             "embcal",
