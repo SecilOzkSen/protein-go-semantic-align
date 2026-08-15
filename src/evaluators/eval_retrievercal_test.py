@@ -97,6 +97,35 @@ def main():
 
     trainer = CalibTrainer(cfg)
 
+    print("\n=== NORMALIZATION CHECK ===")
+    print(
+        "fused:",
+        trainer.score_mean,
+        trainer.score_std,
+        "| ckpt:",
+        ckpt.get("score_mean"),
+        ckpt.get("score_std"),
+    )
+
+    if cfg.use_expert_scores:
+        print(
+            "global:",
+            trainer.global_score_mean,
+            trainer.global_score_std,
+            "| ckpt:",
+            ckpt.get("global_score_mean"),
+            ckpt.get("global_score_std"),
+        )
+
+        print(
+            "local:",
+            trainer.local_score_mean,
+            trainer.local_score_std,
+            "| ckpt:",
+            ckpt.get("local_score_mean"),
+            ckpt.get("local_score_std"),
+        )
+
     load_result = trainer.model.load_state_dict(
         ckpt["model"],
         strict=True,
