@@ -564,7 +564,7 @@ class CalibTrainer:
             cfg.topk,
             self.score_mean,
             self.score_std,
-            embedding_dump=(cfg.train_embedding_dump or None),
+            embedding_dump=cfg.train_embedding_dump or None,
             require_embeddings=requires_emb,
             use_expert_scores=cfg.use_expert_scores,
             global_score_mean=self.global_score_mean,
@@ -572,18 +572,52 @@ class CalibTrainer:
             local_score_mean=self.local_score_mean,
             local_score_std=self.local_score_std,
         )
+
         self.val_ds = CandidateDumpDataset(
             cfg.val_dump,
             cfg.topk,
             self.score_mean,
             self.score_std,
-            embedding_dump=(cfg.val_embedding_dump or None),
+            embedding_dump=cfg.val_embedding_dump or None,
             require_embeddings=requires_emb,
             use_expert_scores=cfg.use_expert_scores,
             global_score_mean=self.global_score_mean,
             global_score_std=self.global_score_std,
             local_score_mean=self.local_score_mean,
             local_score_std=self.local_score_std,
+        )
+        #TODO: Erase
+        print(
+            "[DBG-EXPERT]",
+            "cfg.use_expert_scores=",
+            cfg.use_expert_scores,
+        )
+
+        print(
+            "[DBG-EXPERT]",
+            "train_ds.use_expert_scores=",
+            self.train_ds.use_expert_scores,
+        )
+
+        sample = self.train_ds[0]
+
+        print(
+            "[DBG-EXPERT] sample keys=",
+            sample.keys(),
+        )
+
+        print(
+            "[DBG-EXPERT] global shape=",
+            sample.get("global_score_z", None).shape
+            if sample.get("global_score_z", None) is not None
+            else None,
+        )
+
+        print(
+            "[DBG-EXPERT] local shape=",
+            sample.get("local_score_z", None).shape
+            if sample.get("local_score_z", None) is not None
+            else None,
         )
         self.train_loader = DataLoader(self.train_ds, batch_size=cfg.batch_size, shuffle=True,
                                        num_workers=cfg.num_workers, collate_fn=collate_batch, pin_memory=True)
