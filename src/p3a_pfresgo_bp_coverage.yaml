@@ -30,7 +30,7 @@ general:
   go_encoder_output_mode: segment_pooled
   go_segment_representation_mode: segments_only
   protein_pooling_strategy: mean_attn_gate
-  protein_n_slots: 4
+  protein_n_slots: 8
   use_lora: false
   use_attribution_loss: false
   return_alpha: false
@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local_weakpos_go_lora
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local_weakpos_slots_8
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -162,5 +162,5 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local_weakpos_go_lora
+  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local_weakpos_slots_8
 
