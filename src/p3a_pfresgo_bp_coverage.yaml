@@ -31,7 +31,7 @@ general:
   go_segment_representation_mode: segments_only
   protein_pooling_strategy: mean_attn_gate
   protein_n_slots: 4
-  use_lora: true
+  use_lora: false
   use_attribution_loss: false
   return_alpha: false
   return_slot_attn: false
@@ -92,7 +92,7 @@ queue:
 
 optim:
   lr: 0.00001
-  lr_lora: 0.00001
+  lr_lora: 0.0
   weight_decay: 0.0
   grad_clip: 1.0
 
