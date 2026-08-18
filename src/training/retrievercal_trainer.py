@@ -798,10 +798,31 @@ class CalibTrainer:
             valid=valid,
         )
 
+        dag = logits.sum() * 0.0
+
+        if (
+                self.cfg.lambda_dag > 0.0
+                and self.child_to_parents
+        ):
+            edge_mask = make_dag_edge_mask(
+                cand_ids=batch["cand_ids"],
+                valid=valid,
+                child_to_parents=self.child_to_parents,
+                device=logits.device,
+            )
+
+            dag = dag_loss_fn(
+                logits=logits,
+                valid=valid,
+                edge_mask=edge_mask,
+                margin=self.cfg.dag_margin,
+            )
+
         total = (
                 bce
                 + self.cfg.lambda_pair * pairwise
                 + self.cfg.lambda_card * card
+                + self.cfg.lambda_dag * dag
         )
 
         zero = logits.sum() * 0.0
@@ -812,7 +833,7 @@ class CalibTrainer:
             "pairwise": pairwise,
             "soft_f1": zero,
             "card": card,
-            "dag": zero,
+            "dag": dag,
         }
 
     def _compute_stargo_metrics(
