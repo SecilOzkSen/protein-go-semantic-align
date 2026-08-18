@@ -4568,14 +4568,14 @@ class OppTrainer:
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200, 500, 1000))
             if m["num"] > 0:
                 sum_num += m["num"]
-                sum_R1 += m["R@1"] * m["num"]
-                sum_R5 += m["R@5"] * m["num"]
-                sum_R10 += m["R@10"] * m["num"]
-                sum_R50 += m["R@50"] * m["num"]
-                sum_R100 += m["R@100"] * m["num"]
-                sum_R200 += m["R@200"] * m["num"]
-                sum_R500 += m["R@500"] * m["num"]
-                sum_R1000 += m["R@1000"] * m["num"]
+                sum_R1 += m.get("R@1", 0.0) * m["num"]
+                sum_R5 += m.get("R@5", 0.0) * m["num"]
+                sum_R10 += m.get("R@10", 0.0) * m["num"]
+                sum_R50 += m.get("R@50", 0.0) * m["num"]
+                sum_R100 += m.get("R@100", 0.0) * m["num"]
+                sum_R200 += m.get("R@200", 0.0) * m["num"]
+                sum_R500 += m.get("R@500", 0.0) * m["num"]
+                sum_R1000 += m.get("R@1000", 0.0) * m["num"]
                 sum_MRR += m["MRR"] * m["num"]
                 sum_nDCG += m["nDCG@10"] * m["num"]
 
