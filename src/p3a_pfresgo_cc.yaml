@@ -3,7 +3,7 @@ pfresgo:
   branch: CC
   benchmark_protocol: standard #zeroshot
   evaluation_space: benchmark
-  branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_bp.json
+  branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_cc.json
   go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
   test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
   evaluation_split: valid
@@ -22,7 +22,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "PFresGO-CC-global-local-weakpos"
+  ablation_id: "PFresGO-CC-global-local-weakpos-slots8"
   use_queue_miner: true
   go_pooling_strategy: mean
   go_encoder_inner_pooling: mean
@@ -30,7 +30,7 @@ general:
   go_encoder_output_mode: segment_pooled
   go_segment_representation_mode: segments_only
   protein_pooling_strategy: mean_attn_gate
-  protein_n_slots: 4
+  protein_n_slots: 8
   use_lora: false
   use_attribution_loss: false
   return_alpha: false
@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/cc/name_def_isa_global_local_weakpos
+  output_dir: /workspace/data_pfresgo/outputs/cc/name_def_isa_global_local_weakpos_slots_8
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -146,7 +146,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "PFresGO-BP-global-local"
+  wandb_run_name: "PFresGO-CC-global-local-weakpos-slots8"
   mode: online
 
 stores:
