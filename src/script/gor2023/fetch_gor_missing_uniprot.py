@@ -316,12 +316,6 @@ def main():
         help="Pause between successful API requests.",
     )
 
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=40,
-    )
-
     args = parser.parse_args()
 
     args.out_dir.mkdir(
