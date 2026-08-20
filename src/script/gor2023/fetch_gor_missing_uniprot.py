@@ -42,6 +42,11 @@ def request_with_retry(
                 timeout=timeout,
             )
 
+            if r.status_code == 400:
+                print("[400] UniProt response:")
+                print(r.text)
+                r.raise_for_status()
+
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
                 wait = int(retry_after) if retry_after else delay
@@ -59,13 +64,19 @@ def request_with_retry(
                 delay = min(delay * 2, 60)
                 continue
 
-            if r.status_code == 400:
-                print("[400] UniProt response:")
-                print(r.text)
-                r.raise_for_status()
-
             r.raise_for_status()
             return r
+
+        except requests.HTTPError:
+            # 4xx errors should not be retried
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                raise
+
+            if attempt == retries - 1:
+                raise
+
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
 
         except requests.RequestException as e:
             if attempt == retries - 1:
@@ -303,6 +314,12 @@ def main():
         type=float,
         default=0.25,
         help="Pause between successful API requests.",
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=40,
     )
 
     args = parser.parse_args()
