@@ -59,6 +59,11 @@ def request_with_retry(
                 delay = min(delay * 2, 60)
                 continue
 
+            if r.status_code == 400:
+                print("[400] UniProt response:")
+                print(r.text)
+                r.raise_for_status()
+
             r.raise_for_status()
             return r
 
@@ -104,9 +109,9 @@ def fetch_batch_json(
         "format": "json",
         "size": 500,
         "fields": (
-            "accession,id,reviewed,sequence,"
+            "accession,id,sequence,"
             "date_sequence_modified,"
-            "date_entry_modified,"
+            "date_modified,"
             "version"
         ),
     }
