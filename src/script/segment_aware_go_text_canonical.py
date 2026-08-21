@@ -1,5 +1,5 @@
 """
-GO Text JSONL Generator, natural markers + typed ontology parents
+GO Text JSONL Generator, markerless segments + typed ontology parents.
 
 Output JSONL example:
 
@@ -12,21 +12,25 @@ Output JSONL example:
   "is_a_parents": ["organelle inheritance", "mitochondrion distribution"],
   "part_of_parents": [],
   "segments": {
-    "name": "Name: mitochondrion inheritance.",
-    "namespace": "Namespace: biological process.",
-    "definition": "Definition: distribution of mitochondria...",
-    "is_a": "Is-a parents: organelle inheritance; mitochondrion distribution.",
-    "part_of": "Part-of parents: none."
+    "name": "mitochondrion inheritance.",
+    "namespace": "biological process.",
+    "definition": "distribution of mitochondria...",
+    "is_a": "organelle inheritance; mitochondrion distribution.",
+    "part_of": "none."
   },
-  "text": "Name: mitochondrion inheritance.\nNamespace: biological process.\nDefinition: distribution of mitochondria...\nIs-a parents: organelle inheritance; mitochondrion distribution.\nPart-of parents: none."
+  "segment_order": ["name", "definition", "is_a"],
+  "segment_format": "markerless_v1",
+  "text": "mitochondrion inheritance.\ndistribution of mitochondria...\norganelle inheritance; mitochondrion distribution."
 }
 
 Design:
 - No custom special tokens.
-- Natural markers only: Name, Namespace, Definition, Is-a parents, Part-of parents.
+- No textual segment markers such as Name:, Definition:, or Is-a parents:.
+- Segment identity is carried structurally by the separate segment axis.
 - is_a and part_of are NOT merged.
 - Path is intentionally excluded for the first stable retriever run.
 - GO id is kept as metadata because downstream cache/eval usually needs it.
+- The locked retriever input is name + definition + is_a.
 """
 
 import json
@@ -177,8 +181,8 @@ def _iter_values(vals: Any) -> Iterable[Any]:
 
 
 def _get_term_name(
-    terms: Dict[str, Dict[str, Any]],
-    go_id: str,
+        terms: Dict[str, Dict[str, Any]],
+        go_id: str,
 ) -> Optional[str]:
     data = terms.get(go_id)
 
@@ -245,9 +249,9 @@ def _get_relation_parent_ids(data: Dict[str, Any], relation: str) -> List[str]:
 
 
 def _parent_names_from_ids(
-    terms: Dict[str, Dict[str, Any]],
-    parent_ids: List[str],
-    max_parents: Optional[int],
+        terms: Dict[str, Dict[str, Any]],
+        parent_ids: List[str],
+        max_parents: Optional[int],
 ) -> List[str]:
     names: List[str] = []
 
@@ -276,14 +280,14 @@ def format_list_inline(items: List[str]) -> str:
 
 
 def build_text_entry(
-    go_id: str,
-    data: Dict[str, Any],
-    terms: Dict[str, Dict[str, Any]],
-    max_is_a_parents: int = 3,
-    max_part_of_parents: int = 3,
-    include_synonyms: bool = False,
-    max_synonyms: int = 3,
-    segment_order: List[str] = None # Leave empty if you need full text.
+        go_id: str,
+        data: Dict[str, Any],
+        terms: Dict[str, Dict[str, Any]],
+        max_is_a_parents: int = 3,
+        max_part_of_parents: int = 3,
+        include_synonyms: bool = False,
+        max_synonyms: int = 3,
+        segment_order: List[str] = None  # Leave empty if you need full text.
 ) -> Dict[str, Any]:
     go_id_norm = _as_go_id(go_id) or str(go_id)
 
@@ -326,26 +330,28 @@ def build_text_entry(
         if max_synonyms is not None and max_synonyms > 0:
             synonyms = synonyms[:max_synonyms]
 
-    # Natural marker segments.
-    # Keep these markers stable across all GO terms.
+    # Markerless segments. Segment identity is represented structurally by
+    # segment_order and by the separate segment axis in the GO text store.
     segments: Dict[str, str] = {
-        "name": f"{ensure_sentence(name)}",
-        "namespace": f"{ensure_sentence(namespace)}",
-        "definition": f"{ensure_sentence(definition)}",
-        "is_a": f"{ensure_sentence(format_list_inline(is_a_parent_names))}",
-        "part_of": f"{ensure_sentence(format_list_inline(part_of_parent_names))}",
+        "name": ensure_sentence(name),
+        "namespace": ensure_sentence(namespace),
+        "definition": ensure_sentence(definition),
+        "is_a": ensure_sentence(format_list_inline(is_a_parent_names)),
+        "part_of": ensure_sentence(format_list_inline(part_of_parent_names)),
     }
 
     if include_synonyms:
-        segments["synonyms"] = f"Synonyms: {format_list_inline(synonyms)}."
+        segments["synonyms"] = ensure_sentence(format_list_inline(synonyms))
 
     if segment_order is None:
         # Full text
         segment_order = ["name", "namespace", "definition", "is_a", "part_of"]
+    else:
+        # Never mutate a list supplied by the caller.
+        segment_order = list(segment_order)
 
     if include_synonyms:
         segment_order.append("synonyms")
-
 
     text = "\n".join(segments[k] for k in segment_order)
 
@@ -361,8 +367,10 @@ def build_text_entry(
         "part_of_parents": part_of_parent_names,
         "segments": segments,
         "segment_order": segment_order,
+        "segment_format": "markerless_v1",
         "text": text,
     }
+
 
 def ensure_sentence(s: str) -> str:
     s = clean_text(s)
@@ -378,16 +386,16 @@ def ensure_sentence(s: str) -> str:
 # -----------------------------
 
 def main(
-    input_path: str,
-    out_path: str,
-    pid_positives_path: Optional[str] = None,
-    only_positive_terms: bool = False,
-    max_is_a_parents: int = 3,
-    max_part_of_parents: int = 3,
-    include_synonyms: bool = False,
-    max_synonyms: int = 3,
-    include_obsolete: bool = False,
-    segment_order: Optional[List[str]] = None,
+        input_path: str,
+        out_path: str,
+        pid_positives_path: Optional[str] = None,
+        only_positive_terms: bool = False,
+        max_is_a_parents: int = 3,
+        max_part_of_parents: int = 3,
+        include_synonyms: bool = False,
+        max_synonyms: int = 3,
+        include_obsolete: bool = False,
+        segment_order: Optional[List[str]] = None,
 ) -> None:
     terms = load_terms(input_path)
 
@@ -427,8 +435,8 @@ def main(
             continue
 
         if (
-            not include_obsolete
-            and data.get("is_obsolete", False)
+                not include_obsolete
+                and data.get("is_obsolete", False)
         ):
             dropped_obsolete += 1
             continue
@@ -442,8 +450,8 @@ def main(
             continue
 
         if (
-            only_positive_terms
-            and go_id_norm not in positive_go_ids
+                only_positive_terms
+                and go_id_norm not in positive_go_ids
         ):
             dropped_not_positive += 1
             continue
@@ -474,7 +482,7 @@ def main(
     for example in examples:
         domain = example["domain"]
         domain_counts[domain] = (
-            domain_counts.get(domain, 0) + 1
+                domain_counts.get(domain, 0) + 1
         )
 
     print(f"Total GO terms in vocab: {len(terms)}")
@@ -497,7 +505,7 @@ def main(
     print("\nWritten terms by domain:")
 
     for domain, count in sorted(
-        domain_counts.items()
+            domain_counts.items()
     ):
         print(f"  {domain}: {count}")
 
@@ -517,7 +525,7 @@ if __name__ == "__main__":
         ),
         out_path=(
             "/workspace/"
-            "go_texts_canonical_segmented.jsonl"
+            "go_texts_canonical_segmented_markerless.jsonl"
         ),
 
         # PFresGO full branch ontology kullanacak.
@@ -532,5 +540,6 @@ if __name__ == "__main__":
 
         # Obsolete terms candidate vocabulary'ye alınmayacak.
         include_obsolete=False,
-        segment_order=["name", "definition"]
+        # Locked markerless retriever input.
+        segment_order=["name", "definition", "is_a"]
     )

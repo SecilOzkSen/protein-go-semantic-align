@@ -14,11 +14,19 @@ ALL_SEGMENT_NAMES = [
 ]
 
 SEGMENT_DEFAULT_TEXT = {
-    "name": "Name: none.",
-    "namespace": "Namespace: none.",
-    "definition": "Definition: none.",
-    "is_a": "Is-a parents: none.",
-    "part_of": "Part-of parents: none.",
+    "name": "none.",
+    "namespace": "none.",
+    "definition": "none.",
+    "is_a": "none.",
+    "part_of": "none.",
+}
+
+LEGACY_SEGMENT_PREFIXES = {
+    "name": "Name:",
+    "namespace": "Namespace:",
+    "definition": "Definition:",
+    "is_a": "Is-a parents:",
+    "part_of": "Part-of parents:",
 }
 
 
@@ -78,21 +86,44 @@ def _segment_is_present(text: str) -> bool:
     t = _clean_text(text).lower()
     if not t:
         return False
+    if t in {"none", "none."}:
+        return False
     if t.endswith(": none.") or t.endswith(": none"):
         return False
     return True
+
+
+def _assert_markerless_segment(
+        segment_name: str,
+        segment_text: str,
+        go_id: str,
+) -> None:
+    """Fail fast if a legacy marker-prefixed segment enters a new run."""
+    prefix = LEGACY_SEGMENT_PREFIXES[segment_name]
+    if _clean_text(segment_text).lower().startswith(prefix.lower()):
+        raise ValueError(
+            "Legacy marker-prefixed GO segment detected for "
+            f"{go_id}, segment={segment_name!r}: {segment_text!r}. "
+            "Regenerate the GO JSONL with segment_format='markerless_v1'."
+        )
+
 
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 
 def load_go_texts_canonical(
-    go_text_path: str,
-    phase: int = -2,
-    return_segments: bool = False,
-    enabled_segments: Optional[Iterable[str]] = None,
+        go_text_path: str,
+        phase: int = -2,
+        return_segments: bool = False,
+        enabled_segments: Optional[Iterable[str]] = None,
+        require_markerless: bool = True,
 ):
     """
     Canonical GO text loader with automatic segment ablation.
+
+    New retriever runs use markerless_v1 segments. With
+    require_markerless=True, legacy values such as "Name: ..." fail fast
+    instead of silently changing the token distribution.
 
     enabled_segments örnekleri:
         ["name", "definition"]
@@ -176,8 +207,8 @@ def load_go_texts_canonical(
             name = _clean_text(el.get("name", ""))
             definition = _clean_text(el.get("definition", ""))
             namespace = (
-                _clean_text(el.get("namespace", ""))
-                or _clean_text(el.get("domain", ""))
+                    _clean_text(el.get("namespace", ""))
+                    or _clean_text(el.get("domain", ""))
             )
 
             is_a_parents = el.get("is_a_parents", []) or []
@@ -206,29 +237,29 @@ def load_go_texts_canonical(
             # --------------------------------------------------
             generated_segments = {
                 "name": (
-                    f"Name: {_ensure_period(name)}"
+                    _ensure_period(name)
                     if name
-                    else SEGMENT_DEFAULT_TEXT["name"]
+                    else "none."
                 ),
                 "namespace": (
-                    f"Namespace: {_ensure_period(namespace)}"
+                    _ensure_period(namespace)
                     if namespace
-                    else SEGMENT_DEFAULT_TEXT["namespace"]
+                    else "none."
                 ),
                 "definition": (
-                    f"Definition: {_ensure_period(definition)}"
+                    _ensure_period(definition)
                     if definition
-                    else SEGMENT_DEFAULT_TEXT["definition"]
+                    else "none."
                 ),
                 "is_a": (
-                    f"Is-a parents: {_ensure_period(is_a_txt)}"
+                    _ensure_period(is_a_txt)
                     if is_a_txt
-                    else SEGMENT_DEFAULT_TEXT["is_a"]
+                    else "none."
                 ),
                 "part_of": (
-                    f"Part-of parents: {_ensure_period(part_of_txt)}"
+                    _ensure_period(part_of_txt)
                     if part_of_txt
-                    else SEGMENT_DEFAULT_TEXT["part_of"]
+                    else "none."
                 ),
             }
 
@@ -249,6 +280,13 @@ def load_go_texts_canonical(
                 if not segment_text:
                     segment_text = generated_segments[segment_name]
 
+                if require_markerless:
+                    _assert_markerless_segment(
+                        segment_name=segment_name,
+                        segment_text=segment_text,
+                        go_id=f"GO:{go_int:07d}",
+                    )
+
                 segments[segment_name] = segment_text
 
             # --------------------------------------------------
@@ -264,8 +302,8 @@ def load_go_texts_canonical(
 
             present = {
                 segment_name: (
-                    raw_presence[segment_name]
-                    and _segment_is_present(segments[segment_name])
+                        raw_presence[segment_name]
+                        and _segment_is_present(segments[segment_name])
                 )
                 for segment_name in segment_names
             }
@@ -297,6 +335,7 @@ def load_go_texts_canonical(
     print(
         "[load_go_texts_canonical] "
         f"enabled_segments={segment_names} | "
+        f"require_markerless={require_markerless} | "
         f"loaded={n_ok}/{n_lines}"
     )
 
@@ -306,13 +345,25 @@ def load_go_texts_canonical(
     return id2text
 
 
-def load_go_texts_by_phase(go_text_folder: str, phase: int = 0, return_segments:bool = False, enabled_segments=None) -> Dict[int, str]:
-    if phase < 0: #ablation 1
+def load_go_texts_by_phase(
+        go_text_folder: str,
+        phase: int = 0,
+        return_segments: bool = False,
+        enabled_segments=None,
+        require_markerless: bool = True,
+) -> Dict[int, str]:
+    if phase < 0:  # ablation 1
         fname = "go_texts_canonical.jsonl"
         path = os.path.join(go_text_folder, fname)
-        return load_go_texts_canonical(path, phase=phase, return_segments=return_segments, enabled_segments=enabled_segments)
+        return load_go_texts_canonical(
+            path,
+            phase=phase,
+            return_segments=return_segments,
+            enabled_segments=enabled_segments,
+            require_markerless=require_markerless,
+        )
     else:
-        fname = f"go_texts_phase_{phase+1}.jsonl"
+        fname = f"go_texts_phase_{phase + 1}.jsonl"
         path = os.path.join(go_text_folder, fname)
         if not os.path.exists(path):
             raise FileNotFoundError(f"Phase file not found: {path}")
@@ -439,83 +490,6 @@ def _is_nonempty_segment_text(x: str) -> bool:
     if x.endswith(": none.") or x.endswith(": none"):
         return False
     return True
-
-
-def load_go_segment_jsonl(path: str):
-    """
-    Returns:
-      texts_by_id: Dict[int, str]
-      segments_by_id: Dict[int, Dict[str, str]]
-      present_by_id: Dict[int, Dict[str, bool]]
-    """
-    texts_by_id: Dict[int, str] = {}
-    segments_by_id: Dict[int, Dict[str, str]] = {}
-    present_by_id: Dict[int, Dict[str, bool]] = {}
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-
-            j = json.loads(line)
-
-            if "go_id" not in j:
-                raise ValueError(f"Missing go_id at line {line_no}")
-
-            gid = go_str_to_int(j["go_id"])
-
-            text = (j.get("text") or "").strip()
-            if not text:
-                raise ValueError(f"Missing text for GO id {gid} at line {line_no}")
-
-            segs = j.get("segments", None)
-            if not isinstance(segs, dict):
-                raise ValueError(f"Missing segments dict for GO id {gid} at line {line_no}")
-
-            # Ensure all segments exist. Missing optional segments become "none".
-            clean_segs = {}
-            for s in SEGMENT_NAMES:
-                if s in segs and str(segs[s]).strip():
-                    clean_segs[s] = str(segs[s]).strip()
-                else:
-                    # Keep natural marker text, but mark absent below.
-                    pretty = {
-                        "name": "Name",
-                        "namespace": "Namespace",
-                        "definition": "Definition",
-                        "is_a": "Is-a parents",
-                        "part_of": "Part-of parents",
-                    }[s]
-                    clean_segs[s] = f"{pretty}: none."
-
-            # Segment presence. Prefer metadata lists when available.
-            present = {
-                "name": bool((j.get("name") or "").strip()),
-                "namespace": bool((j.get("namespace") or "").strip()),
-                "definition": bool((j.get("definition") or "").strip()),
-                "is_a": bool(j.get("is_a_parents") or []),
-                "part_of": bool(j.get("part_of_parents") or []),
-            }
-
-            # Safety: name should always be present. If not, still allow the text segment.
-            if not present["name"]:
-                present["name"] = _is_nonempty_segment_text(clean_segs["name"])
-
-            # Namespace usually present.
-            if not present["namespace"]:
-                present["namespace"] = _is_nonempty_segment_text(clean_segs["namespace"])
-
-            # Ensure at least one segment is present.
-            if not any(present.values()):
-                present["name"] = True
-
-            texts_by_id[gid] = text
-            segments_by_id[gid] = clean_segs
-            present_by_id[gid] = present
-
-    return texts_by_id, segments_by_id, present_by_id
-
 
 
 
