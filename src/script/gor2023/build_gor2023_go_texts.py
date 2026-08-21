@@ -31,6 +31,18 @@ def clean_text(value):
     return re.sub(r"\s+", " ", str(value)).strip()
 
 
+def strip_leading_label(text, label):
+    """Remove one redundant source-level field label, case-insensitively."""
+    text = clean_text(text)
+    return re.sub(
+        rf"^{re.escape(label)}\s*:\s*",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
 def ensure_sentence(text):
     text = clean_text(text)
     if not text:
@@ -144,9 +156,12 @@ def get_parent_names(parent_ids, terms, max_parents):
 
 
 def build_entry(go_id, term, terms):
-    name = clean_text(term["name"])
-    definition = clean_text(term["definition"])
-    namespace = term["namespace"].replace("_", " ").strip()
+    name = strip_leading_label(term["name"], "Name")
+    definition = strip_leading_label(term["definition"], "Definition")
+    namespace = strip_leading_label(
+        term["namespace"].replace("_", " "),
+        "Namespace",
+    )
 
     is_a_ids = sorted(set(term["is_a"]))
     part_of_ids = sorted(set(term["part_of"]))
