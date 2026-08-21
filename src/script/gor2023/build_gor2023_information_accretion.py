@@ -283,6 +283,7 @@ def main() -> None:
     for branch, namespace in BRANCHES.items():
         annotation_path = first_existing(
             [
+                args.root / branch / "pid_to_go_train_canonical.json",
                 args.root / branch / "pid_to_go_train_released_canonical.json",
                 args.root / "go" / "canonical" / branch / "pid_to_go_train_released_canonical.json",
                 args.root / "go" / "canonical" / f"{branch}_pid_to_go_train_released_canonical.json",
