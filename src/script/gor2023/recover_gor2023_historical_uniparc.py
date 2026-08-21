@@ -80,12 +80,52 @@ def request_json(session, params, retries=5):
     raise RuntimeError("UniParc request failed")
 
 
-def candidate_matches_accession(xref, accession):
-    """
-    UniParc JSON schemas have changed slightly over time,
-    so tolerate several common key names.
-    """
+UNIPARC_ENTRY = "https://rest.uniprot.org/uniparc"
 
+
+def fetch_full_uniparc_entry(session, upi, retries=5):
+    url = f"{UNIPARC_ENTRY}/{upi}"
+
+    delay = 2
+
+    for attempt in range(retries):
+        try:
+            r = session.get(
+                url,
+                params={"format": "json"},
+                timeout=120,
+            )
+
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", delay))
+                print(f"[429] sleeping {wait}s")
+                time.sleep(wait)
+                delay = min(delay * 2, 60)
+                continue
+
+            if r.status_code >= 500:
+                print(
+                    f"[{r.status_code}] server error, "
+                    f"retry in {delay}s"
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.RequestException:
+            if attempt == retries - 1:
+                raise
+
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    raise RuntimeError(f"Failed to retrieve UniParc entry {upi}")
+
+
+def candidate_matches_accession(xref, accession):
     candidates = {
         str(xref.get("id", "")),
         str(xref.get("accession", "")),
@@ -103,7 +143,8 @@ def xref_date_range(xref):
     )
 
     last = (
-            xref.get("lastUpdated")
+            xref.get("last")
+            or xref.get("lastUpdated")
             or xref.get("lastSeen")
             or xref.get("lastSeenDate")
     )
@@ -128,10 +169,12 @@ def get_xrefs(entry):
             "uniParcCrossReferences",
             "crossReferences",
             "databaseCrossReferences",
+            "dbReferences",
     ):
-        x = entry.get(key)
-        if isinstance(x, list):
-            return x
+        xrefs = entry.get(key)
+
+        if isinstance(xrefs, list):
+            return xrefs
 
     return []
 
@@ -285,19 +328,33 @@ def main():
                     accession,
                 )
 
-                entries = data.get("results", [])
+                search_entries = data.get("results", [])
 
                 valid_candidates = []
 
-                for entry in entries:
-                    sequence = extract_sequence(entry)
+                for search_entry in search_entries:
+
+                    upi = (
+                            search_entry.get("uniParcId")
+                            or search_entry.get("upi")
+                    )
+
+                    if not upi:
+                        continue
+
+                    full_entry = fetch_full_uniparc_entry(
+                        session,
+                        upi,
+                    )
+
+                    sequence = extract_sequence(full_entry)
 
                     if not sequence:
                         continue
 
                     valid, matching_xrefs = (
                         resolve_accession_at_cutoff(
-                            entry,
+                            full_entry,
                             accession,
                             cutoff,
                         )
@@ -305,7 +362,7 @@ def main():
 
                     if valid:
                         valid_candidates.append({
-                            "entry": entry,
+                            "entry": full_entry,
                             "sequence": sequence,
                             "matching_xrefs": matching_xrefs,
                         })
@@ -335,7 +392,7 @@ def main():
                         "sequence_length":
                             len(cand["sequence"]),
                         "num_api_results":
-                            len(entries),
+                            len(search_entries),
                         "num_valid_candidates":
                             1,
                     }
@@ -345,8 +402,7 @@ def main():
                         "accession": accession,
                         "status":
                             "AMBIGUOUS_MULTIPLE_CANDIDATES",
-                        "num_api_results":
-                            len(entries),
+                        "num_api_results": len(search_entries),
                         "num_valid_candidates":
                             len(valid_candidates),
                     }
@@ -358,8 +414,7 @@ def main():
                         "accession": accession,
                         "status":
                             "NO_VALID_CUTOFF_SEQUENCE",
-                        "num_api_results":
-                            len(entries),
+                        "num_api_results": len(search_entries),
                         "num_valid_candidates":
                             0,
                     }
