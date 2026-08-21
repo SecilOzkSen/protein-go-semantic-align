@@ -180,9 +180,11 @@ def get_xrefs(entry):
 
 
 def resolve_accession_at_cutoff(entry, accession, cutoff):
-    """
-    Returns True if this UniParc sequence has a cross-reference
-    showing that the requested accession existed at the cutoff.
+    """Return the best temporal rank linking accession to this UPI.
+
+    Rank 2 means the accession-to-sequence interval spans the cutoff.
+    Rank 1 means it is a historical interval that ended before cutoff.
+    Within each class, the most recent supported date wins.
     """
 
     matching = []
@@ -199,21 +201,43 @@ def resolve_accession_at_cutoff(entry, accession, cutoff):
             "raw": xref,
         })
 
+    ranked = []
+
     for m in matching:
         first = m["first"]
         last = m["last"]
 
-        # We require evidence that the accession existed by cutoff.
+        # A creation date after cutoff is future information.
         if first and first > cutoff:
             continue
 
-        # If last is absent, treat it as still active.
-        if last and last < cutoff:
+        # At least one dated boundary is required as temporal evidence.
+        if first is None and last is None:
             continue
 
-        return True, matching
+        if last is None or last >= cutoff:
+            # The accession-to-UPI relation spans the cutoff.
+            anchor = first or cutoff
+            rank = (2, anchor.toordinal())
+            strategy = "SPANS_CUTOFF"
+        else:
+            # Historical sequence that disappeared before cutoff. This is
+            # valid for inactive accessions and must not be discarded.
+            rank = (1, last.toordinal())
+            strategy = "LATEST_BEFORE_CUTOFF"
 
-    return False, matching
+        ranked.append({
+            "rank": rank,
+            "strategy": strategy,
+            "first": first,
+            "last": last,
+        })
+
+    if not ranked:
+        return None, None, matching
+
+    best = max(ranked, key=lambda item: item["rank"])
+    return best["rank"], best["strategy"], matching
 
 
 def query_accession(session, accession):
@@ -352,7 +376,7 @@ def main():
                     if not sequence:
                         continue
 
-                    valid, matching_xrefs = (
+                    temporal_rank, strategy, matching_xrefs = (
                         resolve_accession_at_cutoff(
                             full_entry,
                             accession,
@@ -360,15 +384,30 @@ def main():
                         )
                     )
 
-                    if valid:
+                    if temporal_rank is not None:
                         valid_candidates.append({
                             "entry": full_entry,
                             "sequence": sequence,
                             "matching_xrefs": matching_xrefs,
+                            "temporal_rank": temporal_rank,
+                            "selection_strategy": strategy,
                         })
 
-                if len(valid_candidates) == 1:
-                    cand = valid_candidates[0]
+                if valid_candidates:
+                    best_rank = max(
+                        cand["temporal_rank"]
+                        for cand in valid_candidates
+                    )
+                    best_candidates = [
+                        cand
+                        for cand in valid_candidates
+                        if cand["temporal_rank"] == best_rank
+                    ]
+                else:
+                    best_candidates = []
+
+                if len(best_candidates) == 1:
+                    cand = best_candidates[0]
 
                     entry = cand["entry"]
 
@@ -394,10 +433,12 @@ def main():
                         "num_api_results":
                             len(search_entries),
                         "num_valid_candidates":
-                            1,
+                            len(valid_candidates),
+                        "selection_strategy":
+                            cand["selection_strategy"],
                     }
 
-                elif len(valid_candidates) > 1:
+                elif len(best_candidates) > 1:
                     record = {
                         "accession": accession,
                         "status":
@@ -405,6 +446,8 @@ def main():
                         "num_api_results": len(search_entries),
                         "num_valid_candidates":
                             len(valid_candidates),
+                        "num_best_candidates":
+                            len(best_candidates),
                     }
 
                     unresolved.append(accession)
