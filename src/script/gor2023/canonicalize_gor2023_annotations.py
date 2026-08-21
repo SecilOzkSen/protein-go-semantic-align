@@ -272,7 +272,7 @@ def main():
     for branch in BRANCHES:
         print(f"\n{branch.upper()}")
         for split in ("train", "test"):
-            stats = global_summary["branches"][branch]["splits"][split][
+            stats = global_summary["branches"][branch.upper()]["splits"][split][
                 "stats"
             ]
             print(
