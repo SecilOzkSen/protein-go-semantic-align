@@ -161,6 +161,6 @@ stores:
   go_path_observed: null
   embed_dir_res: /workspace/GOR2023/protein_embeddings/esm1b_residue
   go_text_folder: /workspace/GOR2023/processed
-  go_cache_path: /workspace/GOR2023/go_cache/cc/go_text_embeddings_canonical.npy
+  go_cache_path: /workspace/GOR2023/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/GOR2023/protein_embeddings/esm1b_residue/seq_len_lookup.pkl
   logs: /workspace/GOR2023/logs/cc_name_def_isa_markerless_global_local_weakpos_slots_8
