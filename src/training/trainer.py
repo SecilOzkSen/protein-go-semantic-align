@@ -1,5 +1,6 @@
 from typing import List, Optional
 import copy
+import os
 import torch
 import torch.nn.functional as F
 import math
@@ -10,6 +11,10 @@ from src.configs.data_classes import TrainerConfig, AttrConfig, QueueConfig
 from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import (compute_fmax, compute_term_aupr, compute_protein_centric_fmax)
 from src.metrics.retrieval import retrieval_metrics_from_scores
+from src.metrics.gor2023 import (
+    compute_gor2023_wfmax,
+    load_information_accretion,
+)
 from src.utils.helpers import go_str_to_int_any
 import numpy as np
 
@@ -166,8 +171,8 @@ def queue_pairwise_ranking_loss(
         hard_neg_scores = queue_scores
 
         pair_diff = (
-            pos_scores.unsqueeze(1)
-            - hard_neg_scores.unsqueeze(0)
+                pos_scores.unsqueeze(1)
+                - hard_neg_scores.unsqueeze(0)
         )
 
         losses.append(
@@ -503,12 +508,23 @@ class OppTrainer:
         self._eval_cols_unseen = None
         self._current_uniq_go_ids_for_shortlist = None
 
+        # GOR2023 weighted evaluation is opt-in. main_pfresgo.py sets this
+        # only when pfresgo.ia_weights_path is present in the YAML config.
+        self.gor2023_ia_path = os.environ.get("GOR2023_IA_WEIGHTS_PATH")
+        self.gor2023_ia = None
+        if self.gor2023_ia_path:
+            self.gor2023_ia = load_information_accretion(self.gor2023_ia_path)
+            print(
+                "[GOR2023-WFMAX] enabled "
+                f"path={self.gor2023_ia_path} terms={len(self.gor2023_ia):,}"
+            )
+
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
         self.to_f32 = to_f32 if ctx.fp16_enabled else None
         self.return_alpha = ctx.return_alpha
         self.return_slot_attn = ctx.return_slot_attn
         self.dag_ancestors = build_dag_ancestors(self.ctx.dag_parents) if getattr(ctx, "dag_parents") else None
-        self.dag_anc = None #load_go_parents()
+        self.dag_anc = None  # load_go_parents()
 
         mode = getattr(cfg, "trainable_mode", "full")
         self.gate_only = mode == "segment_gate_only"
@@ -1015,6 +1031,7 @@ class OppTrainer:
         bad = [n for n in trainable if not n.startswith(allow)]
         if bad:
             raise RuntimeError(f"local_evidence_query has unexpected trainables: {bad[:20]}")
+
     # ----------------- debug -----------------
     @torch.no_grad()
     def _debug_pos_neg_cosines(
@@ -1082,6 +1099,7 @@ class OppTrainer:
             "margin": float(pos_mean - neg_mean),
             "num_debug_samples": int(len(pos_vals)),
         }
+
     @torch.no_grad()
     def _dbg_norms(self, *, prot_query=None, pos_vecs=None, uniq_go_embs=None, tag=""):
         def _mean_norm(x):
@@ -1392,7 +1410,7 @@ class OppTrainer:
 
             B = int(prot_query.size(0))
 
-            Kmat = all_neg_proj.to(device, non_blocking=True,).to(prot_query.dtype)
+            Kmat = all_neg_proj.to(device, non_blocking=True, ).to(prot_query.dtype)
             Kq = int(Kmat.size(0))
             sims = prot_query @ Kmat.T
         # --------------------------------------------------
@@ -2118,24 +2136,24 @@ class OppTrainer:
             if token_mask.dtype != torch.bool:
                 token_mask = token_mask != 0
 
-        #TODO: Erase later
+        # TODO: Erase later
         if self._global_step % 1000 == 0 and token_embs is not None:
-                with torch.no_grad():
-                    print("\n[DBG-GO-MASK]")
-                    print("token_embs:", tuple(token_embs.shape), token_embs.dtype, token_embs.device)
+            with torch.no_grad():
+                print("\n[DBG-GO-MASK]")
+                print("token_embs:", tuple(token_embs.shape), token_embs.dtype, token_embs.device)
 
-                    if token_mask is None:
-                        print("WARNING: token_mask is None")
-                    else:
-                        print("token_mask:", tuple(token_mask.shape), token_mask.dtype, token_mask.device)
-                        print("valid tokens first rows:", token_mask.sum(dim=-1).detach().cpu().tolist()[:8])
+                if token_mask is None:
+                    print("WARNING: token_mask is None")
+                else:
+                    print("token_mask:", tuple(token_mask.shape), token_mask.dtype, token_mask.device)
+                    print("valid tokens first rows:", token_mask.sum(dim=-1).detach().cpu().tolist()[:8])
 
-                        pad_frac = (~token_mask.bool()).float().mean().item()
-                        print("pad_frac:", pad_frac)
+                    pad_frac = (~token_mask.bool()).float().mean().item()
+                    print("pad_frac:", pad_frac)
 
-                        assert token_mask.shape[-1] == token_embs.shape[-2], (
-                            f"token_mask length {token_mask.shape[-1]} vs token_embs length {token_embs.shape[-2]}"
-                        )
+                    assert token_mask.shape[-1] == token_embs.shape[-2], (
+                        f"token_mask length {token_mask.shape[-1]} vs token_embs length {token_embs.shape[-2]}"
+                    )
 
         ids = batch["uniq_go_ids"].to(device, non_blocking=True).long()
 
@@ -2176,10 +2194,10 @@ class OppTrainer:
             raise RuntimeError(f"Unsupported go_encoder_output_mode: {mode}")
 
         return {
-            "pooled_embs": pooled_embs,   # [G,D] or None
-            "token_embs": token_embs,     # [G,L,D] or None
-            "token_mask": token_mask,     # [G,L] or None
-            "ids": ids,                   # [G]
+            "pooled_embs": pooled_embs,  # [G,D] or None
+            "token_embs": token_embs,  # [G,L,D] or None
+            "token_mask": token_mask,  # [G,L] or None
+            "ids": ids,  # [G]
         }
 
     @torch.no_grad()
@@ -2455,7 +2473,7 @@ class OppTrainer:
 
         N, L, D = tok.shape
         if N != B * K:
-            raise RuntimeError(f"Token encode size mismatch: got N={N}, expected {B*K}")
+            raise RuntimeError(f"Token encode size mismatch: got N={N}, expected {B * K}")
 
         tok = torch.nan_to_num(tok).view(B, K, L, D).contiguous()
         if msk.dtype != torch.bool:
@@ -2732,9 +2750,9 @@ class OppTrainer:
 
     def _build_candidates_meta(
             self,
-            uniq_go_ids: torch.Tensor,              # [U] global GO ids for current batch uniqs
+            uniq_go_ids: torch.Tensor,  # [U] global GO ids for current batch uniqs
             pos_local,
-            neg_ids_from_queue: torch.Tensor | None = None,   # [B,kq] global ids
+            neg_ids_from_queue: torch.Tensor | None = None,  # [B,kq] global ids
             *,
             max_inbatch: int | None = None,
     ):
@@ -2857,12 +2875,12 @@ class OppTrainer:
             cand_valid_mask[:, U + extra_n:U + extra_n + kq] = True
 
         return {
-            "inbatch_local_idx": inbatch_local_idx,      # [U]
-            "inbatch_global_ids": inbatch_global_ids,    # [U]
-            "extra_global_ids": extra_global_ids,        # [extra_n]
-            "queue_global_ids": neg_ids_from_queue,      # [B,kq] or None
-            "pos_mask": pos_mask,                        # [B,K]
-            "cand_valid_mask": cand_valid_mask,          # [B,K]
+            "inbatch_local_idx": inbatch_local_idx,  # [U]
+            "inbatch_global_ids": inbatch_global_ids,  # [U]
+            "extra_global_ids": extra_global_ids,  # [extra_n]
+            "queue_global_ids": neg_ids_from_queue,  # [B,kq] or None
+            "pos_mask": pos_mask,  # [B,K]
+            "cand_valid_mask": cand_valid_mask,  # [B,K]
             "U": U,
             "extra_n": extra_n,
             "kq": kq,
@@ -2873,9 +2891,9 @@ class OppTrainer:
     def _build_candidate_tensors_pooled(
             self,
             meta: dict,
-            pooled_go: torch.Tensor,                     # [G,D]
-            uniq_go_ids: torch.Tensor,                   # [G] global
-            neg_raw_from_queue: torch.Tensor | None = None,   # [B,kq,D]
+            pooled_go: torch.Tensor,  # [G,D]
+            uniq_go_ids: torch.Tensor,  # [G] global
+            neg_raw_from_queue: torch.Tensor | None = None,  # [B,kq,D]
     ):
         device = self.device
         B = len(meta["pos_local_kept"])
@@ -2955,13 +2973,13 @@ class OppTrainer:
 
     def _gather_token_candidates(
             self,
-            token_embs: torch.Tensor,      # [G,L,D]
-            token_mask: torch.Tensor,      # [G,L]
-            local_idx_1d: torch.Tensor,    # [U]
+            token_embs: torch.Tensor,  # [G,L,D]
+            token_mask: torch.Tensor,  # [G,L]
+            local_idx_1d: torch.Tensor,  # [U]
             B: int,
     ):
-        gathered_tok = token_embs.index_select(0, local_idx_1d)   # [U,L,D]
-        gathered_msk = token_mask.index_select(0, local_idx_1d)   # [U,L]
+        gathered_tok = token_embs.index_select(0, local_idx_1d)  # [U,L,D]
+        gathered_msk = token_mask.index_select(0, local_idx_1d)  # [U,L]
 
         U, L, D = gathered_tok.shape
         G_tok = gathered_tok.unsqueeze(0).expand(B, U, L, D).contiguous()
@@ -3000,8 +3018,8 @@ class OppTrainer:
     def _build_candidate_tensors_token(
             self,
             meta: dict,
-            token_go: torch.Tensor,                 # [G,L,D]
-            token_go_mask: torch.Tensor,            # [G,L]
+            token_go: torch.Tensor,  # [G,L,D]
+            token_go_mask: torch.Tensor,  # [G,L]
             queue_global_ids: torch.Tensor | None = None,  # [B,kq]
     ):
         device = self.device
@@ -3068,7 +3086,7 @@ class OppTrainer:
         # -----------------------------------
         # 5) concatenate on candidate dim
         # -----------------------------------
-        G_cand = torch.cat(padded_tok, dim=1).contiguous()       # [B,K,Lmax,D]
+        G_cand = torch.cat(padded_tok, dim=1).contiguous()  # [B,K,Lmax,D]
         G_cand_mask = torch.cat(padded_msk, dim=1).contiguous()  # [B,K,Lmax]
 
         if G_cand.size(1) != K:
@@ -3281,7 +3299,7 @@ class OppTrainer:
             device=device,
             dtype=torch.float32,
         )
-        #TODO: Debug, erase later
+        # TODO: Debug, erase later
         if self._global_step % 1000 == 0:
             print(
                 "[DBG-CARD-WEIGHT]",
@@ -3299,10 +3317,10 @@ class OppTrainer:
                 print("[DBG-SEG-ALPHA]", self.model.go_segment_mix_alpha)
 
         go_pack = self._get_uniq_go_embs(batch)
-        uniq_go_ids = go_pack["ids"]                     # [G]
-        pooled_go = go_pack["pooled_embs"]              # [G,D] or None
-        token_go = go_pack["token_embs"]                # [G,L,D] or None
-        token_go_mask = go_pack["token_mask"]           # [G,L] or None
+        uniq_go_ids = go_pack["ids"]  # [G]
+        pooled_go = go_pack["pooled_embs"]  # [G,D] or None
+        token_go = go_pack["token_embs"]  # [G,L,D] or None
+        token_go_mask = go_pack["token_mask"]  # [G,L] or None
 
         if self._global_step % 200 == 0:
             print("[DBG-GO]")
@@ -3340,8 +3358,8 @@ class OppTrainer:
             if self._queue_active() and self.queue_miner is not None:
                 neg_idx_from_queue, neg_ids_from_queue = (self._mine_queue_hard_neg_ids(
                     protein_mining_repr,
-                        pos_local,
-                        uniq_go_ids))
+                    pos_local,
+                    uniq_go_ids))
 
                 # pooled raw negatives only needed in pooled mode
                 if (not self._use_token_align) and neg_idx_from_queue is not None:
@@ -3576,9 +3594,9 @@ class OppTrainer:
             )
 
             pairwise_active = (
-                pairwise_lambda > 0.0
-                and kq > 0
-                and self._global_step >= pairwise_start_step
+                    pairwise_lambda > 0.0
+                    and kq > 0
+                    and self._global_step >= pairwise_start_step
             )
 
             if pairwise_active:
@@ -3659,7 +3677,7 @@ class OppTrainer:
                         G_pos[b, :t] = pooled_go.index_select(0, loc.to(pooled_go.device))
 
             use_attr = (not self._use_token_align) and self.ctx.attribute_loss_enabled and (
-                epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0
+                    epoch_idx < self.attr.curriculum_epochs and self.attr.lambda_attr > 0.0
             )
             if use_attr:
                 scores_pos, alpha_info = self.forward_scores(
@@ -3670,7 +3688,8 @@ class OppTrainer:
 
         self._global_step += 1
 
-        if self.go_encoder_k is not None and not (self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only or self.segment_projection_only):
+        if self.go_encoder_k is not None and not (
+                self.gate_only or self.local_evidence_only or self.local_evidence_query or self.protein_query_only or self.protein_projection_only or self.segment_projection_only):
             ema_update(self.model.go_encoder, self.go_encoder_k, m=self.m_ema)
 
         if getattr(self, "go_segment_gate_k", None) is not None:
@@ -3748,7 +3767,7 @@ class OppTrainer:
                     "train/pairwise_weighted": float((pairwise_lambda * l_pairwise).detach().item()),
                     "train/pairwise_active": float(pairwise_active),
                     "train/coverage": float(l_coverage.detach().item()),
-                    "train/coverage_weighted": float((coverage_lambda* l_coverage).detach().item()),
+                    "train/coverage_weighted": float((coverage_lambda * l_coverage).detach().item()),
                     "train/coverage_active": float(coverage_active),
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
                     "train/lr_go_lora": float(
@@ -3769,7 +3788,6 @@ class OppTrainer:
             "pairwise": l_pairwise,
             "coverage": l_coverage,
         }
-
 
     @torch.no_grad()
     def _subset_cols_from_ids(self, ids: list[int] | set[int] | torch.Tensor | None):
@@ -3893,8 +3911,8 @@ class OppTrainer:
     @torch.no_grad()
     def _token_score_full_chunked(
             self,
-            H: torch.Tensor,                 # [B,T,Dh]
-            attn_valid: torch.Tensor,        # [B,T]
+            H: torch.Tensor,  # [B,T,Dh]
+            attn_valid: torch.Tensor,  # [B,T]
             chunk_k: int = 128,
             return_cpu: bool = True,
     ):
@@ -3914,8 +3932,8 @@ class OppTrainer:
         device = self.device
         B = H.size(0)
 
-        go_tok_cpu = self._eval_tok_embs_cpu   # [G,L,D]
-        go_msk_cpu = self._eval_tok_mask_cpu   # [G,L]
+        go_tok_cpu = self._eval_tok_embs_cpu  # [G,L,D]
+        go_msk_cpu = self._eval_tok_mask_cpu  # [G,L]
         G_total = int(go_tok_cpu.size(0))
 
         out_chunks = []
@@ -3923,8 +3941,8 @@ class OppTrainer:
         for s in range(0, G_total, chunk_k):
             e = min(G_total, s + chunk_k)
 
-            tok_chunk = go_tok_cpu[s:e].to(device, non_blocking=True)   # [C,L,D]
-            msk_chunk = go_msk_cpu[s:e].to(device, non_blocking=True)   # [C,L]
+            tok_chunk = go_tok_cpu[s:e].to(device, non_blocking=True)  # [C,L,D]
+            msk_chunk = go_msk_cpu[s:e].to(device, non_blocking=True)  # [C,L]
             C = int(tok_chunk.size(0))
 
             G_chunk = tok_chunk.unsqueeze(0).expand(B, C, tok_chunk.size(1), tok_chunk.size(2)).contiguous()
@@ -3960,7 +3978,7 @@ class OppTrainer:
     @torch.no_grad()
     def _topk_from_full_scores(
             self,
-            scores_full: torch.Tensor,   # [B,G] CPU or GPU
+            scores_full: torch.Tensor,  # [B,G] CPU or GPU
             topk: int = 200,
     ):
         """
@@ -4045,7 +4063,7 @@ class OppTrainer:
             attn_valid, _ = self._valid_and_pad_masks(batch)
 
             # full observed eval-space truth
-            _, y_true = self._build_eval_space(batch)   # [B,Gobs]
+            _, y_true = self._build_eval_space(batch)  # [B,Gobs]
             y_true_cpu = y_true.detach().cpu()
 
             # exhaustive token-level full score matrix over observed eval IDs
@@ -4378,10 +4396,11 @@ class OppTrainer:
             (81, 160, "81-160"),
             (161, 10 ** 9, "161+"),
         ]
-        expert_cardinality_stats = { expert: { label: {"recall500_sum": 0.0, "num": 0,}
-                for _, _, label in CARD_BINS}
-            for expert in ["global", "local", "fused"]
-        }
+        expert_cardinality_stats = {expert: {label: {"recall500_sum": 0.0, "num": 0, }
+                                             for _, _, label in CARD_BINS}
+                                    for expert in ["global", "local", "fused"]
+                                    }
+
         def _cardinality_bin(n_true: int):
             for lo, hi, label in CARD_BINS:
                 if lo <= n_true <= hi:
@@ -4396,12 +4415,12 @@ class OppTrainer:
 
         cand_stats = {
             int(k): {
-                "coverage_sum": 0.0,   # mean per-protein recall over true labels
+                "coverage_sum": 0.0,  # mean per-protein recall over true labels
                 "protein_f_sum": 0.0,  # protein-centric perfect-reranker F
-                "any_hit_sum": 0.0,    # fraction of proteins with at least one hit
-                "num_valid": 0,        # proteins with >=1 true label
-                "tp": 0.0,             # micro true positives inside top-K
-                "fn": 0.0,             # micro false negatives outside top-K
+                "any_hit_sum": 0.0,  # fraction of proteins with at least one hit
+                "num_valid": 0,  # proteins with >=1 true label
+                "tp": 0.0,  # micro true positives inside top-K
+                "fn": 0.0,  # micro false negatives outside top-K
             }
             for k in candidate_ks
         }
@@ -4427,7 +4446,7 @@ class OppTrainer:
             # Main + expert-specific scoring
             # ------------------------------------------------------------
             if expert_eval_active:
-                encoded = self.model.encode_protein_experts(H, attn_valid,)
+                encoded = self.model.encode_protein_experts(H, attn_valid, )
                 scores_raw, components = self.model.score_from_encoded_experts(
                     encoded=encoded,
                     G=G_eval,
@@ -4510,7 +4529,7 @@ class OppTrainer:
 
                     k500 = min(500, int(expert_scores.size(1)))
                     top500 = torch.topk(expert_scores, k=k500, dim=1).indices
-                    hits500 = torch.gather(y_bool.float(),1, top500).sum(dim=1)
+                    hits500 = torch.gather(y_bool.float(), 1, top500).sum(dim=1)
                     recall500 = (hits500 / true_counts.float().clamp_min(1.0))
 
                     for b in range(expert_scores.size(0)):
@@ -4668,6 +4687,39 @@ class OppTrainer:
         logs["rare_protein_fmax"], logs["rare_protein_fmax_threshold"] = _finish_protein_fmax(
             preds_rare, trues_rare
         )
+
+        # ------------------------------------------------------------
+        # GOR2023 IA-weighted Fmax.
+        # Matches BioComputingUP/CAFA-evaluator with:
+        #   -norm cafa -prop max -th_step 0.01
+        # Evaluation is over the exact active eval_id_list column order.
+        # ------------------------------------------------------------
+        if self.gor2023_ia is not None:
+            if not preds_obs or not trues_obs:
+                raise RuntimeError(
+                    "GOR2023 wFmax is enabled but evaluation matrices are empty"
+                )
+            if self._eval_ids_cpu is None:
+                raise RuntimeError(
+                    "GOR2023 wFmax is enabled but _eval_ids_cpu is unavailable"
+                )
+
+            wf = compute_gor2023_wfmax(
+                y_true=torch.cat(trues_obs, dim=0).numpy().astype(np.int32),
+                y_score=torch.cat(preds_obs, dim=0).numpy().astype(np.float32),
+                go_ids=self._eval_ids_cpu.tolist(),
+                information_accretion=self.gor2023_ia,
+                dag_parents=getattr(self.ctx, "dag_parents", None),
+                threshold_step=0.01,
+                propagate=True,
+            )
+            logs["obs_wfmax"] = float(wf["wfmax"])
+            logs["obs_wfmax_threshold"] = float(wf["threshold"])
+            logs["obs_weighted_precision"] = float(wf["weighted_precision"])
+            logs["obs_weighted_recall"] = float(wf["weighted_recall"])
+            logs["obs_weighted_coverage"] = float(wf["coverage"])
+            logs["obs_positive_ia_terms"] = int(wf["positive_ia_terms"])
+            logs["obs_zero_ia_terms"] = int(wf["zero_ia_terms"])
 
         if sum_num > 0:
             logs["align_R@1"] = sum_R1 / sum_num

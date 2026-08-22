@@ -13,6 +13,7 @@ import pickle
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
+import os
 
 import yaml
 
@@ -132,7 +133,7 @@ def _validate(args, pf: dict, branch_ids: List[int]) -> None:
     use_lora = bool(args.use_lora)
     lr_lora = float(args.lr_lora or 0.0)
     if use_lora and lr_lora <= 0.0:
-        raise ValueError("PFresGO LoRA is enabled but lr_lora <= 0. " 
+        raise ValueError("PFresGO LoRA is enabled but lr_lora <= 0. "
                          "Set a positive lr_lora.")
 
     if (not use_lora) and lr_lora != 0.0:
@@ -189,7 +190,7 @@ def configure(config_path: str):
         )
 
     unknown_segments = (
-        set(pf_enabled_segments) - set(allowed_segments)
+            set(pf_enabled_segments) - set(allowed_segments)
     )
     if unknown_segments:
         raise ValueError(
@@ -259,6 +260,20 @@ def configure(config_path: str):
     go_text_path = Path(
         pf["go_text_path"]
     ).expanduser().resolve()
+
+    # Optional GOR2023/CAFA information-accretion weights. This is passed
+    # through the environment because the shared structured TrainerConfig
+    # intentionally contains no benchmark-specific fields.
+    ia_weights_raw = pf.get("ia_weights_path")
+    if ia_weights_raw:
+        ia_weights_path = Path(ia_weights_raw).expanduser().resolve()
+        if not ia_weights_path.is_file():
+            raise FileNotFoundError(
+                f"pfresgo.ia_weights_path not found: {ia_weights_path}"
+            )
+        os.environ["GOR2023_IA_WEIGHTS_PATH"] = str(ia_weights_path)
+    else:
+        os.environ.pop("GOR2023_IA_WEIGHTS_PATH", None)
 
     branch_ids = _read_ids(branch_ids_path)
 
@@ -334,6 +349,7 @@ def configure(config_path: str):
         f"full_branch_terms={len(branch_ids)} "
         f"benchmark_terms={len(benchmark_ids)} "
         f"active_eval_terms={len(active_eval_terms)} "
+        f"weighted_fmax={'enabled' if ia_weights_raw else 'disabled'} "
     )
 
     if benchmark_protocol == "zeroshot":
@@ -429,11 +445,11 @@ def configure(config_path: str):
     original_text_loader = base.load_go_texts_by_phase
 
     def load_pfresgo_texts(
-        folder,
-        phase=0,
-        return_segments=False,
-        enabled_segments=None,
-        **kwargs,
+            folder,
+            phase=0,
+            return_segments=False,
+            enabled_segments=None,
+            **kwargs,
     ):
         """
         PFresGO-compatible GO text loader.
@@ -450,7 +466,7 @@ def configure(config_path: str):
         )
 
         unknown = (
-            set(effective_segments) - set(allowed_segments)
+                set(effective_segments) - set(allowed_segments)
         )
         if unknown:
             raise ValueError(

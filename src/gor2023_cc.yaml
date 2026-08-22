@@ -7,6 +7,7 @@ pfresgo:
   branch_go_ids_path: /workspace/GOR2023/processed/go_ids_cc.json
   go_text_path: /workspace/GOR2023/processed/go_texts_canonical.jsonl
   test_ids_path: /workspace/GOR2023/processed/cc/test.txt
+  ia_weights_path: /workspace/GOR2023/evaluation/ia/information_accretion.tsv
   evaluation_split: valid
   rare_lt: 20
   enabled_segments:
@@ -52,7 +53,7 @@ training:
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "oracle_microF@500"
+  monitor_metric: "obs_wfmax"
   monitor_mode: max
   early_stop_patience: 3
   cand_chunk_k: 4
