@@ -4706,7 +4706,7 @@ class OppTrainer:
 
             wf = compute_gor2023_wfmax(
                 y_true=torch.cat(trues_obs, dim=0).numpy().astype(np.int32),
-                y_score=torch.cat(preds_obs, dim=0).numpy().astype(np.float32),
+                y_score=torch.sigmoid(torch.cat(preds_obs, dim=0)).numpy().astype(np.float32),
                 go_ids=self._eval_ids_cpu.tolist(),
                 information_accretion=self.gor2023_ia,
                 dag_parents=getattr(self.ctx, "dag_parents", None),
