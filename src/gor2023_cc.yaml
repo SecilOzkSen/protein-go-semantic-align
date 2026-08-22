@@ -53,7 +53,7 @@ training:
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: "obs_wfmax"
+  monitor_metric: "oracle_wF@500"
   monitor_mode: max
   early_stop_patience: 3
   cand_chunk_k: 4

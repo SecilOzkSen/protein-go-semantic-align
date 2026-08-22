@@ -12,7 +12,6 @@ from src.miners.queue_miner import MoCoQueue
 from src.metrics.cafa import (compute_fmax, compute_term_aupr, compute_protein_centric_fmax)
 from src.metrics.retrieval import retrieval_metrics_from_scores
 from src.metrics.gor2023 import (
-    compute_gor2023_wfmax,
     load_information_accretion,
 )
 from src.utils.helpers import go_str_to_int_any
@@ -1225,7 +1224,6 @@ class OppTrainer:
                 f"(K={self.queue_cfg.queue_K}, k_hard={self._k_hard_queue_schedule(self._global_step)}, Dz={Dz}, start_step={self.queue_cfg.queue_start_step})."
             )
 
-
     def _get_Dz(self) -> int:
         pp = self.model.proj_p
         if hasattr(pp, "fc1"):
@@ -1233,7 +1231,6 @@ class OppTrainer:
         if hasattr(pp, "weight"):
             return int(pp.weight.size(0))
         raise RuntimeError("Cannot infer Dz from proj_p")
-
 
     @torch.no_grad()
     def _fetch_raw_go_embs_from_queue(self, neg_idx_2d: torch.Tensor, dtype: torch.dtype):
@@ -1750,7 +1747,6 @@ class OppTrainer:
             print(f"[DBG-NEG] U={U} extra_n={extra_n} kq={kq} K={K}")
 
         return G_cand, pos_mask, cand_valid_mask, U, kq
-
 
     # ----------------- eval space cache -----------------
     @torch.no_grad()
@@ -2809,7 +2805,7 @@ class OppTrainer:
             inbatch_local_idx = torch.arange(U0, device=device, dtype=torch.long)
 
         U = int(inbatch_local_idx.numel())
-        inbatch_global_ids = uniq_go_ids.index_select(0, inbatch_local_idx)   # [U]
+        inbatch_global_ids = uniq_go_ids.index_select(0, inbatch_local_idx)  # [U]
 
         # -----------------------------
         # 2) extra seen negatives
@@ -4421,9 +4417,28 @@ class OppTrainer:
                 "num_valid": 0,  # proteins with >=1 true label
                 "tp": 0.0,  # micro true positives inside top-K
                 "fn": 0.0,  # micro false negatives outside top-K
+                "ia_recall_sum": 0.0,  # CAFA IA-weighted recall summed over proteins
+                "ia_pred_num": 0,  # proteins with >=1 retrieved positive-IA label
             }
             for k in candidate_ks
         }
+
+        # IA weights aligned once to the exact evaluation-column order.  These
+        # are used only for the GOR2023 retriever oracle and add no forward pass.
+        eval_ia_weights = None
+        if self.gor2023_ia is not None:
+            eval_ia_weights = torch.as_tensor(
+                [
+                    float(self.gor2023_ia.get(f"GO:{int(g):07d}", 0.0))
+                    for g in self._eval_ids_cpu.tolist()
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            if not bool((eval_ia_weights > 0).any().item()):
+                raise RuntimeError(
+                    "GOR2023 IA weights do not overlap the evaluation GO IDs"
+                )
 
         scale = self.logit_scale_tensor()
 
@@ -4583,6 +4598,25 @@ class OppTrainer:
                         cand_stats[int(k)]["tp"] += float(hits_valid.sum().item())
                         cand_stats[int(k)]["fn"] += float((true_valid - hits_valid).sum().item())
 
+                        # Perfect-reranker IA ceiling. Predictions are the true
+                        # positive-IA labels recovered in top-K, hence weighted
+                        # precision is 1 whenever at least one is recovered.
+                        if eval_ia_weights is not None:
+                            true_ia = y_float * eval_ia_weights.unsqueeze(0)
+                            true_ia_total = true_ia.sum(dim=1)
+                            hit_ia = torch.gather(true_ia, 1, idx_k).sum(dim=1)
+                            ia_recall = torch.where(
+                                true_ia_total > 0,
+                                hit_ia / true_ia_total.clamp_min(1e-12),
+                                torch.zeros_like(hit_ia),
+                            )
+                            cand_stats[int(k)]["ia_recall_sum"] += float(
+                                ia_recall[valid].sum().item()
+                            )
+                            cand_stats[int(k)]["ia_pred_num"] += int(
+                                ((hit_ia > 0) & valid).sum().item()
+                            )
+
             # retrieval over observed space
             m = retrieval_metrics_from_scores(scores_rank, y_true, ks=(1, 5, 10, 50, 100, 200, 500, 1000))
             if m["num"] > 0:
@@ -4688,39 +4722,6 @@ class OppTrainer:
             preds_rare, trues_rare
         )
 
-        # ------------------------------------------------------------
-        # GOR2023 IA-weighted Fmax.
-        # Matches BioComputingUP/CAFA-evaluator with:
-        #   -norm cafa -prop max -th_step 0.01
-        # Evaluation is over the exact active eval_id_list column order.
-        # ------------------------------------------------------------
-        if self.gor2023_ia is not None:
-            if not preds_obs or not trues_obs:
-                raise RuntimeError(
-                    "GOR2023 wFmax is enabled but evaluation matrices are empty"
-                )
-            if self._eval_ids_cpu is None:
-                raise RuntimeError(
-                    "GOR2023 wFmax is enabled but _eval_ids_cpu is unavailable"
-                )
-
-            wf = compute_gor2023_wfmax(
-                y_true=torch.cat(trues_obs, dim=0).numpy().astype(np.int32),
-                y_score=torch.cat(preds_obs, dim=0).numpy().astype(np.float32),
-                go_ids=self._eval_ids_cpu.tolist(),
-                information_accretion=self.gor2023_ia,
-                dag_parents=getattr(self.ctx, "dag_parents", None),
-                threshold_step=0.01,
-                propagate=True,
-            )
-            logs["obs_wfmax"] = float(wf["wfmax"])
-            logs["obs_wfmax_threshold"] = float(wf["threshold"])
-            logs["obs_weighted_precision"] = float(wf["weighted_precision"])
-            logs["obs_weighted_recall"] = float(wf["weighted_recall"])
-            logs["obs_weighted_coverage"] = float(wf["coverage"])
-            logs["obs_positive_ia_terms"] = int(wf["positive_ia_terms"])
-            logs["obs_zero_ia_terms"] = int(wf["zero_ia_terms"])
-
         if sum_num > 0:
             logs["align_R@1"] = sum_R1 / sum_num
             logs["align_R@5"] = sum_R5 / sum_num
@@ -4763,6 +4764,20 @@ class OppTrainer:
             logs[f"cand_any_hit@{k}"] = float(any_hit)
             logs[f"oracle_microF@{k}"] = float(oracle_micro_f)
             logs[f"oracle_proteinF@{k}"] = float(oracle_protein_f)
+
+            if self.gor2023_ia is not None:
+                ia_recall = float(st["ia_recall_sum"]) / n
+                ia_coverage = float(st["ia_pred_num"]) / n
+                # CAFA precision is averaged over proteins with a prediction.
+                # A perfect reranker retains only true recovered labels, so P=1.
+                ia_precision = 1.0 if int(st["ia_pred_num"]) > 0 else 0.0
+                oracle_wf = (
+                        (2.0 * ia_precision * ia_recall)
+                        / max(1e-12, ia_precision + ia_recall)
+                )
+                logs[f"oracle_iaR@{k}"] = float(ia_recall)
+                logs[f"oracle_iaCoverage@{k}"] = float(ia_coverage)
+                logs[f"oracle_wF@{k}"] = float(oracle_wf)
 
         if sum_unseen_num > 0:
             logs["unseen_R@10"] = sum_unseen_R10 / sum_unseen_num
