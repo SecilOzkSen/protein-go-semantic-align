@@ -131,10 +131,21 @@ def _to_confidences(y_score: np.ndarray) -> np.ndarray:
     score = np.asarray(y_score, dtype=np.float64)
     if not np.isfinite(score).all():
         raise ValueError("Prediction scores contain NaN or infinity")
-    if score.size and (float(score.min()) < 0.0 or float(score.max()) > 1.0):
-        score = np.clip(score, -50.0, 50.0)
-        score = 1.0 / (1.0 + np.exp(-score))
-    return score
+
+    if score.size == 0:
+        return score
+
+    score_min = float(score.min())
+    score_max = float(score.max())
+
+    if score_max <= score_min:
+        return np.zeros_like(score, dtype=np.float64)
+
+    # Retrieval logits are not calibrated probabilities.
+    # Global affine normalization preserves their ranking while mapping
+    # the complete evaluation score range to CAFA thresholds [0, 1].
+    score = ((score - score_min) / (score_max - score_min))
+    return np.clip(score, 0.0, 1.0)
 
 
 def compute_gor2023_wfmax(
