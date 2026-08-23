@@ -35,8 +35,16 @@ def parse_args():
         "--test_embedding_dump",
         default="",
     )
-    parser.add_argument("--go_obo", required=True)
-    parser.add_argument("--ontology", default="bp")
+    parser.add_argument(
+        "--evaluation",
+        choices=["stargo", "gor2023", "both"],
+        default="stargo",
+    )
+    parser.add_argument("--go_obo", default="")
+    parser.add_argument("--ontology", default="bp", choices=["bp", "mf", "cc"])
+    parser.add_argument("--ia_path", default="")
+    parser.add_argument("--threshold_step", type=float, default=0.01)
+    parser.add_argument("--propagate", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--out_json",
@@ -89,9 +97,28 @@ def main():
     )
 
     saved_cfg["device"] = args.device
-    saved_cfg["use_stargo_eval"] = True
+
+    use_stargo = args.evaluation in {"stargo", "both"}
+    use_gor2023 = args.evaluation in {"gor2023", "both"}
+
+    if (use_stargo or (use_gor2023 and args.propagate)) and not args.go_obo:
+        raise ValueError("--go_obo is required for StarGO or propagated GOR2023 evaluation")
+    if use_gor2023 and not args.ia_path:
+        raise ValueError("--ia_path is required for GOR2023 evaluation")
+
+    saved_cfg["use_stargo_eval"] = use_stargo
     saved_cfg["stargo_ontology"] = args.ontology
     saved_cfg["stargo_go_obo"] = args.go_obo
+    saved_cfg["use_gor2023_eval"] = use_gor2023
+    saved_cfg["gor2023_ia_path"] = args.ia_path
+    saved_cfg["gor2023_go_obo"] = args.go_obo
+    saved_cfg["gor2023_threshold_step"] = float(args.threshold_step)
+    saved_cfg["gor2023_propagate"] = bool(args.propagate)
+
+    # CalibTrainer writes config.json during construction. Keep test-time
+    # artifacts separate so evaluation cannot overwrite the training run.
+    out_path = Path(args.out_json)
+    saved_cfg["out_dir"] = str(out_path.parent / "_eval_runtime")
 
     cfg = CalibConfig(**saved_cfg)
 
@@ -146,10 +173,9 @@ def main():
 
     metrics = trainer.evaluate()
 
-    print("\n=== BP TEST RESULTS ===")
+    print(f"\n=== {args.ontology.upper()} TEST RESULTS ({args.evaluation}) ===")
     print(json.dumps(metrics, indent=2))
 
-    out_path = Path(args.out_json)
     out_path.parent.mkdir(
         parents=True,
         exist_ok=True,
