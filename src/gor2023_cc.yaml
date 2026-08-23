@@ -45,7 +45,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/GOR2023/outputs/cc/name_def_isa_global_local_ia_positive
+  output_dir: /workspace/GOR2023/outputs/cc/name_def_isa_global_local_ia_positive_random_val
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -163,4 +163,4 @@ stores:
   go_text_folder: /workspace/GOR2023/processed
   go_cache_path: /workspace/GOR2023/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/GOR2023/protein_embeddings/esm1b_residue/seq_len_lookup.pkl
-  logs: /workspace/GOR2023/logs/cc_name_def_isa_global_local_ia_positive
+  logs: /workspace/GOR2023/logs/cc_name_def_isa_global_local_ia_positive_random_val
