@@ -138,7 +138,13 @@ def write_ids(path, ids):
 
 
 def constrained_validation_split(annotations, fraction, seed):
-    """Select validation proteins while retaining every label in train."""
+    """Create a seeded random validation split while retaining labels in train.
+
+    Candidate proteins are visited in a genuinely random order. A protein is
+    admitted to validation only when removing it leaves at least one training
+    occurrence of each of its labels. This avoids the distributional bias of
+    ranking proteins by label rarity/cardinality before constructing the split.
+    """
     protein_ids = sorted(annotations)
     target_size = round(len(protein_ids) * fraction)
 
@@ -146,23 +152,9 @@ def constrained_validation_split(annotations, fraction, seed):
     for go_ids in annotations.values():
         remaining_label_counts.update(set(go_ids))
 
-    # Prefer proteins whose labels are frequent, then use seeded random order
-    # within equal rarity groups. This protects rare labels from being removed.
     rng = random.Random(seed)
-    random_tiebreak = {protein_id: rng.random() for protein_id in protein_ids}
-
-    def rarity_key(protein_id):
-        counts = [
-            remaining_label_counts[go_id]
-            for go_id in set(annotations[protein_id])
-        ]
-        return (
-            min(counts) if counts else 0,
-            sum(1.0 / count for count in counts if count > 0),
-            random_tiebreak[protein_id],
-        )
-
-    candidates = sorted(protein_ids, key=rarity_key, reverse=True)
+    candidates = protein_ids.copy()
+    rng.shuffle(candidates)
     validation = set()
 
     for protein_id in candidates:
