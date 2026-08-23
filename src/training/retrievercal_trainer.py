@@ -20,6 +20,56 @@ from src.evaluators.pfresgo_eval import (
     load_test_prots,
 )
 from src.models.retrievercal_model import RetrieverCal, ScoreSetCal, EmbCal, EmbSetCal
+from src.metrics.gor2023 import compute_gor2023_wfmax, load_information_accretion
+
+
+def load_gor2023_parents_from_obo(path: str | Path) -> Dict[str, List[str]]:
+    """Load active-term is_a and part_of edges from a GO OBO snapshot."""
+    parents: Dict[str, List[str]] = {}
+    current_id: Optional[str] = None
+    current_parents: List[str] = []
+    current_obsolete = False
+
+    def flush() -> None:
+        nonlocal current_id, current_parents, current_obsolete
+        if current_id is not None and not current_obsolete:
+            parents[current_id] = sorted(set(current_parents))
+        current_id = None
+        current_parents = []
+        current_obsolete = False
+
+    with Path(path).open("r", encoding="utf-8") as handle:
+        in_term = False
+        for raw in handle:
+            line = raw.strip()
+            if line == "[Term]":
+                if in_term:
+                    flush()
+                in_term = True
+                continue
+            if line.startswith("["):
+                if in_term:
+                    flush()
+                in_term = False
+                continue
+            if not in_term or not line:
+                continue
+            if line.startswith("id: GO:"):
+                current_id = line.split("id:", 1)[1].strip()
+            elif line.startswith("is_a: GO:"):
+                current_parents.append(line.split()[1])
+            elif line.startswith("relationship: part_of GO:"):
+                fields = line.split()
+                if len(fields) >= 3:
+                    current_parents.append(fields[2])
+            elif line == "is_obsolete: true":
+                current_obsolete = True
+        if in_term:
+            flush()
+
+    if not parents:
+        raise ValueError(f"No active GO terms loaded from OBO: {path}")
+    return parents
 
 
 def _first_existing(base: Path, names: List[str]) -> Optional[Path]:
@@ -200,11 +250,11 @@ class CandidateDumpDataset(Dataset):
         local_score_z = None
 
         if self.use_expert_scores:
-            global_scores = np.asarray(self.global_scores[idx,:self.topk,], dtype=np.float32)
+            global_scores = np.asarray(self.global_scores[idx, :self.topk,], dtype=np.float32)
 
-            local_scores = np.asarray(self.local_scores[idx,:self.topk,], dtype=np.float32,)
+            local_scores = np.asarray(self.local_scores[idx, :self.topk,], dtype=np.float32, )
             global_scores = np.nan_to_num(global_scores, nan=0.0, posinf=0.0, neginf=0.0)
-            local_scores = np.nan_to_num(local_scores, nan=0.0, posinf=0.0, neginf=0.0,)
+            local_scores = np.nan_to_num(local_scores, nan=0.0, posinf=0.0, neginf=0.0, )
 
             global_score_z = ((global_scores - self.global_score_mean) / self.global_score_std).astype(np.float32)
             local_score_z = ((local_scores - self.local_score_mean) / self.local_score_std).astype(np.float32)
@@ -278,13 +328,13 @@ def estimate_named_score_stats(
 
     scores = np.load(path, mmap_mode="r")
     n = (scores.shape[0] if max_rows is None else min(scores.shape[0], int(max_rows)))
-    arr = np.asarray(scores[:n, :topk], dtype=np.float32,)
+    arr = np.asarray(scores[:n, :topk], dtype=np.float32, )
 
     valid_path = d / "top_valid.int8.npy"
 
     if valid_path.exists():
         valid = np.asarray(
-            np.load(valid_path, mmap_mode="r",)[:n, :topk],dtype=bool)
+            np.load(valid_path, mmap_mode="r", )[:n, :topk], dtype=bool)
     else:
         valid = np.ones_like(arr, dtype=bool)
 
@@ -524,6 +574,12 @@ class CalibConfig:
     stargo_ontology: str = "bp"
     stargo_go_obo: str = ""
     stargo_seqid_column: int = 4
+    # GOR2023 IA-weighted evaluation
+    use_gor2023_eval: bool = False
+    gor2023_ia_path: str = ""
+    gor2023_go_obo: str = ""
+    gor2023_threshold_step: float = 0.01
+    gor2023_propagate: bool = False
     pooling_type: str = "mean"
     use_expert_scores: bool = False
 
@@ -586,7 +642,7 @@ class CalibTrainer:
             local_score_mean=self.local_score_mean,
             local_score_std=self.local_score_std,
         )
-        #TODO: Erase
+        # TODO: Erase
         print(
             "[DBG-EXPERT]",
             "cfg.use_expert_scores=",
@@ -676,6 +732,29 @@ class CalibTrainer:
                     f"StarGO GO graph not found: "
                     f"{self.stargo_go_obo}"
                 )
+
+        self.gor2023_ia = None
+        self.gor2023_dag_parents = None
+        if self.cfg.use_gor2023_eval:
+            ia_path = Path(self.cfg.gor2023_ia_path).expanduser().resolve()
+            if not ia_path.exists():
+                raise FileNotFoundError(f"GOR2023 IA file not found: {ia_path}")
+            if not (0.0 < float(self.cfg.gor2023_threshold_step) < 1.0):
+                raise ValueError("gor2023_threshold_step must lie strictly between 0 and 1")
+            self.gor2023_ia = load_information_accretion(ia_path)
+
+            if self.cfg.gor2023_propagate:
+                obo_path = Path(self.cfg.gor2023_go_obo).expanduser().resolve()
+                if not obo_path.exists():
+                    raise FileNotFoundError(f"GOR2023 GO OBO not found: {obo_path}")
+                self.gor2023_dag_parents = load_gor2023_parents_from_obo(obo_path)
+
+            logging.info(
+                "[gor2023] enabled ia_terms=%d propagate=%s threshold_step=%.4f",
+                len(self.gor2023_ia),
+                bool(self.cfg.gor2023_propagate),
+                float(self.cfg.gor2023_threshold_step),
+            )
         with (self.out_dir / "config.json").open("w", encoding="utf-8") as f:
             d = asdict(cfg)
             d.update(
@@ -1034,7 +1113,7 @@ class CalibTrainer:
             valid = batch["valid"].detach().cpu().numpy().astype(bool)
             cand = batch["cand_ids"].detach().cpu().numpy()
             true_ids = batch["true_go_ids"].detach().cpu().numpy()
-            if self.cfg.use_stargo_eval:
+            if self.cfg.use_stargo_eval or self.cfg.use_gor2023_eval:
                 all_logits.append(
                     logits.detach().cpu()
                 )
@@ -1072,8 +1151,9 @@ class CalibTrainer:
         full_m = compute_global_fmax_aupr_from_items(items, n_true_full)
 
         stargo_metrics: Dict[str, float] = {}
+        gor2023_metrics: Dict[str, float] = {}
 
-        if self.cfg.use_stargo_eval:
+        if self.cfg.use_stargo_eval or self.cfg.use_gor2023_eval:
             logits_all = torch.cat(
                 all_logits,
                 dim=0,
@@ -1158,12 +1238,33 @@ class CalibTrainer:
                     if col is not None:
                         full_true[i, col] = 1
 
-            stargo_metrics = self._compute_stargo_metrics(
-                full_pred=full_pred,
-                full_true=full_true,
-                eval_go_ids=eval_go_ids,
-                protein_ids=all_protein_ids,
-            )
+            if self.cfg.use_stargo_eval:
+                stargo_metrics = self._compute_stargo_metrics(
+                    full_pred=full_pred,
+                    full_true=full_true,
+                    eval_go_ids=eval_go_ids,
+                    protein_ids=all_protein_ids,
+                )
+
+            if self.cfg.use_gor2023_eval:
+                wf = compute_gor2023_wfmax(
+                    y_true=full_true,
+                    y_score=full_pred,
+                    go_ids=eval_go_ids.tolist(),
+                    information_accretion=self.gor2023_ia,
+                    dag_parents=self.gor2023_dag_parents,
+                    threshold_step=float(self.cfg.gor2023_threshold_step),
+                    propagate=bool(self.cfg.gor2023_propagate),
+                )
+                gor2023_metrics = {
+                    "gor2023_wfmax": float(wf["wfmax"]),
+                    "gor2023_wfmax_threshold": float(wf["threshold"]),
+                    "gor2023_weighted_precision": float(wf["weighted_precision"]),
+                    "gor2023_weighted_recall": float(wf["weighted_recall"]),
+                    "gor2023_weighted_coverage": float(wf["coverage"]),
+                    "gor2023_positive_ia_terms": float(wf["positive_ia_terms"]),
+                    "gor2023_zero_ia_terms": float(wf["zero_ia_terms"]),
+                }
 
         metrics = {
             "fmax_topk": topk_m["fmax"],
@@ -1186,4 +1287,5 @@ class CalibTrainer:
             "pairwise_loss": (float(np.mean(pairwise_losses)) if pairwise_losses else 0.0),
         }
         metrics.update(stargo_metrics)
+        metrics.update(gor2023_metrics)
         return metrics

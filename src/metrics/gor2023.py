@@ -138,6 +138,12 @@ def _to_confidences(y_score: np.ndarray) -> np.ndarray:
     score_min = float(score.min())
     score_max = float(score.max())
 
+    # Calibrators/rerankers normally pass sigmoid probabilities. Preserve
+    # those probabilities so that the selected threshold remains meaningful
+    # and can be reused on the held-out test set.
+    if score_min >= 0.0 and score_max <= 1.0:
+        return np.clip(score, 0.0, 1.0)
+
     if score_max <= score_min:
         return np.zeros_like(score, dtype=np.float64)
 
