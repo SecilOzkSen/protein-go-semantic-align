@@ -556,6 +556,7 @@ class CalibConfig:
     pairwise_max_negatives: int = 64
 
     lambda_f1: float = 0.0
+    lambda_ia_f1: float = 0.0
     lambda_card: float = 0.0
     lambda_dag: float = 0.0
 
@@ -742,7 +743,11 @@ class CalibTrainer:
         self.ia_lookup_tensor = None
         self.ia_positive_mean = 1.0
         self.ia_factor_normalizer = 1.0
-        if self.cfg.use_gor2023_eval or self.cfg.use_ia_weighted_positive_loss:
+        if (
+                self.cfg.use_gor2023_eval
+                or self.cfg.use_ia_weighted_positive_loss
+                or self.cfg.lambda_ia_f1 > 0.0
+        ):
             ia_path = Path(self.cfg.gor2023_ia_path).expanduser().resolve()
             if not ia_path.exists():
                 raise FileNotFoundError(f"GOR2023 IA file not found: {ia_path}")
@@ -767,7 +772,7 @@ class CalibTrainer:
                     float(self.cfg.gor2023_threshold_step),
                 )
 
-        if self.cfg.use_ia_weighted_positive_loss:
+        if self.cfg.use_ia_weighted_positive_loss or self.cfg.lambda_ia_f1 > 0.0:
             self._initialize_ia_positive_loss()
         else:
             logging.info("[loss] standard BCE (IA positive weighting disabled)")
@@ -897,16 +902,82 @@ class CalibTrainer:
         self.ia_lookup_tensor = torch.from_numpy(lookup).to(self.device)
 
         logging.info(
-            "[loss] IA-weighted positive BCE enabled: positive_occurrences=%d "
+            "[loss] IA utilities initialized: positive_occurrences=%d "
             "ia_mean=%.6f power=%.3f pre_norm_clip=[%.3f, %.3f] "
-            "factor_normalizer=%.6f",
+            "factor_normalizer=%.6f positive_bce=%s lambda_ia_f1=%.4f",
             positive_count,
             self.ia_positive_mean,
             power,
             weight_min,
             weight_max,
             self.ia_factor_normalizer,
+            bool(self.cfg.use_ia_weighted_positive_loss),
+            float(self.cfg.lambda_ia_f1),
         )
+
+    def _ia_soft_f1_loss(
+            self,
+            logits: torch.Tensor,
+            labels: torch.Tensor,
+            valid: torch.Tensor,
+            cand_ids: torch.Tensor,
+            true_go_ids: torch.Tensor,
+            eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Differentiable approximation of GOR2023 IA-weighted Fmax."""
+        if self.ia_lookup_tensor is None:
+            raise RuntimeError("IA lookup tensor was not initialized")
+
+        safe_ids = torch.where(valid, cand_ids.long(), torch.zeros_like(cand_ids.long()))
+        valid_ids = safe_ids[valid]
+        if (
+                torch.any(valid_ids < 0)
+                or torch.any(valid_ids >= self.ia_lookup_tensor.numel())
+        ):
+            raise ValueError("Candidate GO id is outside the IA lookup range")
+
+        ia = self.ia_lookup_tensor.index_select(0, safe_ids.reshape(-1)).reshape_as(logits)
+        ia = torch.where(valid, ia.to(logits.dtype), torch.zeros_like(logits))
+        y = torch.where(valid, labels.float(), torch.zeros_like(labels.float()))
+        p = torch.where(valid, torch.sigmoid(logits), torch.zeros_like(logits))
+
+        intersection_weight = (ia * p * y).sum(dim=1)
+        predicted_weight = (ia * p).sum(dim=1)
+
+        full_true_ids = true_go_ids.long()
+        true_id_valid = (
+                (full_true_ids >= 0)
+                & (full_true_ids < self.ia_lookup_tensor.numel())
+        )
+        safe_true_ids = torch.where(
+            true_id_valid,
+            full_true_ids,
+            torch.zeros_like(full_true_ids),
+        )
+        full_true_ia = self.ia_lookup_tensor.index_select(
+            0,
+            safe_true_ids.reshape(-1),
+        ).reshape_as(full_true_ids)
+        full_true_ia = torch.where(
+            true_id_valid,
+            full_true_ia.to(logits.dtype),
+            torch.zeros_like(full_true_ia, dtype=logits.dtype),
+        )
+        true_weight = full_true_ia.sum(dim=1)
+
+        per_protein_precision = intersection_weight / predicted_weight.clamp_min(eps)
+        per_protein_recall = torch.where(
+            true_weight > 0.0,
+            intersection_weight / true_weight.clamp_min(eps),
+            torch.zeros_like(intersection_weight),
+        )
+        weighted_precision = per_protein_precision.mean()
+        weighted_recall = per_protein_recall.mean()
+        soft_wf = (
+                2.0 * weighted_precision * weighted_recall
+                / (weighted_precision + weighted_recall).clamp_min(eps)
+        )
+        return 1.0 - soft_wf
 
     def _move(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -1039,6 +1110,24 @@ class CalibTrainer:
 
         dag = logits.sum() * 0.0
 
+        standard_soft_f1 = logits.sum() * 0.0
+        if self.cfg.lambda_f1 > 0.0:
+            standard_soft_f1 = soft_f1_loss(
+                logits=logits,
+                labels=labels,
+                valid=valid,
+            )
+
+        ia_soft_f1 = logits.sum() * 0.0
+        if self.cfg.lambda_ia_f1 > 0.0:
+            ia_soft_f1 = self._ia_soft_f1_loss(
+                logits=logits,
+                labels=labels,
+                valid=valid,
+                cand_ids=batch["cand_ids"],
+                true_go_ids=batch["true_go_ids"],
+            )
+
         if (
                 self.cfg.lambda_dag > 0.0
                 and self.child_to_parents
@@ -1059,18 +1148,19 @@ class CalibTrainer:
 
         total = (
                 bce
+                + self.cfg.lambda_f1 * standard_soft_f1
+                + self.cfg.lambda_ia_f1 * ia_soft_f1
                 + self.cfg.lambda_pair * pairwise
                 + self.cfg.lambda_card * card
                 + self.cfg.lambda_dag * dag
         )
 
-        zero = logits.sum() * 0.0
-
         return {
             "loss": total,
             "bce": bce,
             "pairwise": pairwise,
-            "soft_f1": zero,
+            "soft_f1": standard_soft_f1,
+            "ia_soft_f1": ia_soft_f1,
             "card": card,
             "dag": dag,
         }
@@ -1248,6 +1338,7 @@ class CalibTrainer:
         losses: List[float] = []
         bces: List[float] = []
         f1s: List[float] = []
+        ia_f1s: List[float] = []
         cards: List[float] = []
         dags: List[float] = []
         pairwise_losses: List[float] = []
@@ -1265,6 +1356,7 @@ class CalibTrainer:
             losses.append(float(loss_dict["loss"].detach().cpu()))
             bces.append(float(loss_dict["bce"].detach().cpu()))
             f1s.append(float(loss_dict["soft_f1"].detach().cpu()))
+            ia_f1s.append(float(loss_dict["ia_soft_f1"].detach().cpu()))
             cards.append(float(loss_dict["card"].detach().cpu()))
             dags.append(float(loss_dict["dag"].detach().cpu()))
             pairwise_losses.append(float(loss_dict["pairwise"].detach().cpu()))
@@ -1442,6 +1534,7 @@ class CalibTrainer:
             "loss": float(np.mean(losses)) if losses else 0.0,
             "bce": float(np.mean(bces)) if bces else 0.0,
             "soft_f1_loss": float(np.mean(f1s)) if f1s else 0.0,
+            "ia_soft_f1_loss": float(np.mean(ia_f1s)) if ia_f1s else 0.0,
             "card_loss": float(np.mean(cards)) if cards else 0.0,
             "dag_loss": float(np.mean(dags)) if dags else 0.0,
             "pairwise_loss": (float(np.mean(pairwise_losses)) if pairwise_losses else 0.0),

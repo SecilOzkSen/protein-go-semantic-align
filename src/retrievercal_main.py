@@ -76,6 +76,12 @@ def parse_args() -> CalibConfig:
     p.add_argument("--dropout", type=float, default=0.10)
     p.add_argument("--pos_weight_max", type=float, default=50.0)
     p.add_argument("--lambda_f1", type=float, default=0.0)
+    p.add_argument(
+        "--lambda_ia_f1",
+        type=float,
+        default=0.0,
+        help="Coefficient for protein-wise IA-weighted soft-F1 loss.",
+    )
     p.add_argument("--lambda_card", type=float, default=0.0)
     p.add_argument("--lambda_dag", type=float, default=0.0)
     p.add_argument("--dag_margin", type=float, default=0.0)
@@ -110,12 +116,6 @@ def parse_args() -> CalibConfig:
     p.add_argument("--ia_positive_weight_min", type=float, default=0.5)
     p.add_argument("--ia_positive_weight_max", type=float, default=2.0)
     p.add_argument("--use_expert_scores", action="store_true")
-    p.add_argument(
-        "--lambda_ia_f1",
-        type=float,
-        default=0.0,
-        help="Coefficient for protein-wise IA-weighted soft-F1 loss.",
-    )
     a = p.parse_args()
     return CalibConfig(**vars(a))
 
