@@ -580,6 +580,10 @@ class CalibConfig:
     gor2023_go_obo: str = ""
     gor2023_threshold_step: float = 0.01
     gor2023_propagate: bool = False
+    use_ia_weighted_positive_loss: bool = False
+    ia_positive_weight_power: float = 0.5
+    ia_positive_weight_min: float = 0.5
+    ia_positive_weight_max: float = 2.0
     pooling_type: str = "mean"
     use_expert_scores: bool = False
 
@@ -735,26 +739,38 @@ class CalibTrainer:
 
         self.gor2023_ia = None
         self.gor2023_dag_parents = None
-        if self.cfg.use_gor2023_eval:
+        self.ia_lookup_tensor = None
+        self.ia_positive_mean = 1.0
+        self.ia_factor_normalizer = 1.0
+        if self.cfg.use_gor2023_eval or self.cfg.use_ia_weighted_positive_loss:
             ia_path = Path(self.cfg.gor2023_ia_path).expanduser().resolve()
             if not ia_path.exists():
                 raise FileNotFoundError(f"GOR2023 IA file not found: {ia_path}")
-            if not (0.0 < float(self.cfg.gor2023_threshold_step) < 1.0):
+            if (
+                    self.cfg.use_gor2023_eval
+                    and not (0.0 < float(self.cfg.gor2023_threshold_step) < 1.0)
+            ):
                 raise ValueError("gor2023_threshold_step must lie strictly between 0 and 1")
             self.gor2023_ia = load_information_accretion(ia_path)
 
-            if self.cfg.gor2023_propagate:
+            if self.cfg.use_gor2023_eval and self.cfg.gor2023_propagate:
                 obo_path = Path(self.cfg.gor2023_go_obo).expanduser().resolve()
                 if not obo_path.exists():
                     raise FileNotFoundError(f"GOR2023 GO OBO not found: {obo_path}")
                 self.gor2023_dag_parents = load_gor2023_parents_from_obo(obo_path)
 
-            logging.info(
-                "[gor2023] enabled ia_terms=%d propagate=%s threshold_step=%.4f",
-                len(self.gor2023_ia),
-                bool(self.cfg.gor2023_propagate),
-                float(self.cfg.gor2023_threshold_step),
-            )
+            if self.cfg.use_gor2023_eval:
+                logging.info(
+                    "[gor2023] enabled ia_terms=%d propagate=%s threshold_step=%.4f",
+                    len(self.gor2023_ia),
+                    bool(self.cfg.gor2023_propagate),
+                    float(self.cfg.gor2023_threshold_step),
+                )
+
+        if self.cfg.use_ia_weighted_positive_loss:
+            self._initialize_ia_positive_loss()
+        else:
+            logging.info("[loss] standard BCE (IA positive weighting disabled)")
         with (self.out_dir / "config.json").open("w", encoding="utf-8") as f:
             d = asdict(cfg)
             d.update(
@@ -766,6 +782,8 @@ class CalibTrainer:
                     "local_score_mean": self.local_score_mean,
                     "local_score_std": self.local_score_std,
                     "pos_weight": self.pos_weight,
+                    "ia_positive_mean": self.ia_positive_mean,
+                    "ia_factor_normalizer": self.ia_factor_normalizer,
                 }
             )
             json.dump(d, f, indent=2)
@@ -783,6 +801,112 @@ class CalibTrainer:
             return 1.0
         neg = max(1, total - pos)
         return float(min(float(self.cfg.pos_weight_max), neg / max(1, pos)))
+
+    @staticmethod
+    def _go_id_string(value: int) -> str:
+        return f"GO:{int(value):07d}"
+
+    def _initialize_ia_positive_loss(self) -> None:
+        """Align IA to GO ids and normalize weights over train positives."""
+        if self.gor2023_ia is None:
+            raise RuntimeError("IA-weighted loss requires a loaded GOR2023 IA map")
+
+        power = float(self.cfg.ia_positive_weight_power)
+        weight_min = float(self.cfg.ia_positive_weight_min)
+        weight_max = float(self.cfg.ia_positive_weight_max)
+        if power <= 0.0:
+            raise ValueError("ia_positive_weight_power must be > 0")
+        if weight_min <= 0.0 or weight_max < weight_min:
+            raise ValueError(
+                "IA positive weights require 0 < weight_min <= weight_max"
+            )
+
+        eval_ids = np.asarray(self.train_ds.eval_go_ids, dtype=np.int64)
+        eval_ia = np.asarray(
+            [
+                float(self.gor2023_ia.get(self._go_id_string(go_id), 0.0))
+                for go_id in eval_ids
+            ],
+            dtype=np.float64,
+        )
+        if not np.any(eval_ia > 0.0):
+            raise ValueError("Training candidate universe has no positive IA terms")
+
+        positive_ia_sum = 0.0
+        positive_count = 0
+        chunk_size = 2048
+        n_rows = len(self.train_ds)
+        for start in range(0, n_rows, chunk_size):
+            stop = min(n_rows, start + chunk_size)
+            cols = np.asarray(
+                self.train_ds.top_cols[start:stop, : self.cfg.topk],
+                dtype=np.int64,
+            )
+            labels = np.asarray(
+                self.train_ds.labels[start:stop, : self.cfg.topk],
+                dtype=np.int8,
+            ) > 0
+            if self.train_ds.valid is not None:
+                labels &= np.asarray(
+                    self.train_ds.valid[start:stop, : self.cfg.topk],
+                    dtype=bool,
+                )
+            if np.any(labels):
+                occurrence_ia = eval_ia[cols][labels]
+                positive_ia_sum += float(occurrence_ia.sum())
+                positive_count += int(occurrence_ia.size)
+
+        if positive_count == 0 or positive_ia_sum <= 0.0:
+            raise ValueError("Training dump has no positive labels with positive IA")
+        self.ia_positive_mean = positive_ia_sum / positive_count
+
+        factor_sum = 0.0
+        factor_count = 0
+        for start in range(0, n_rows, chunk_size):
+            stop = min(n_rows, start + chunk_size)
+            cols = np.asarray(
+                self.train_ds.top_cols[start:stop, : self.cfg.topk],
+                dtype=np.int64,
+            )
+            labels = np.asarray(
+                self.train_ds.labels[start:stop, : self.cfg.topk],
+                dtype=np.int8,
+            ) > 0
+            if self.train_ds.valid is not None:
+                labels &= np.asarray(
+                    self.train_ds.valid[start:stop, : self.cfg.topk],
+                    dtype=bool,
+                )
+            if np.any(labels):
+                occurrence_ia = eval_ia[cols][labels]
+                factors = np.power(
+                    np.maximum(occurrence_ia / self.ia_positive_mean, 0.0),
+                    power,
+                )
+                factors = np.clip(factors, weight_min, weight_max)
+                factor_sum += float(factors.sum())
+                factor_count += int(factors.size)
+
+        self.ia_factor_normalizer = factor_sum / max(1, factor_count)
+        if not np.isfinite(self.ia_factor_normalizer) or self.ia_factor_normalizer <= 0.0:
+            raise ValueError("Invalid IA positive factor normalizer")
+
+        max_go_id = int(eval_ids.max())
+        lookup = np.zeros(max_go_id + 1, dtype=np.float32)
+        lookup[eval_ids] = eval_ia.astype(np.float32)
+        self.ia_lookup_tensor = torch.from_numpy(lookup).to(self.device)
+
+        logging.info(
+            "[loss] IA-weighted positive BCE enabled: positive_occurrences=%d "
+            "ia_mean=%.6f power=%.3f pre_norm_clip=[%.3f, %.3f] "
+            "factor_normalizer=%.6f",
+            positive_count,
+            self.ia_positive_mean,
+            power,
+            weight_min,
+            weight_max,
+            self.ia_factor_normalizer,
+        )
 
     def _move(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -857,12 +981,48 @@ class CalibTrainer:
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            bce = F.binary_cross_entropy_with_logits(
-                valid_logits,
-                valid_labels,
-                pos_weight=pos_weight,
-                reduction="mean",
-            )
+            if not self.cfg.use_ia_weighted_positive_loss:
+                bce = F.binary_cross_entropy_with_logits(
+                    valid_logits,
+                    valid_labels,
+                    pos_weight=pos_weight,
+                    reduction="mean",
+                )
+            else:
+                if self.ia_lookup_tensor is None:
+                    raise RuntimeError("IA lookup tensor was not initialized")
+                valid_cand_ids = batch["cand_ids"][valid].long()
+                if (
+                        torch.any(valid_cand_ids < 0)
+                        or torch.any(valid_cand_ids >= self.ia_lookup_tensor.numel())
+                ):
+                    raise ValueError("Candidate GO id is outside the IA lookup range")
+
+                per_item_bce = F.binary_cross_entropy_with_logits(
+                    valid_logits,
+                    valid_labels,
+                    pos_weight=pos_weight,
+                    reduction="none",
+                )
+                ia_values = self.ia_lookup_tensor.index_select(0, valid_cand_ids)
+                positive_factors = torch.pow(
+                    torch.clamp(
+                        ia_values / float(self.ia_positive_mean),
+                        min=0.0,
+                    ),
+                    float(self.cfg.ia_positive_weight_power),
+                )
+                positive_factors = torch.clamp(
+                    positive_factors,
+                    min=float(self.cfg.ia_positive_weight_min),
+                    max=float(self.cfg.ia_positive_weight_max),
+                ) / float(self.ia_factor_normalizer)
+                item_weights = torch.where(
+                    valid_labels > 0.5,
+                    positive_factors.to(per_item_bce.dtype),
+                    torch.ones_like(per_item_bce),
+                )
+                bce = (per_item_bce * item_weights).sum() / item_weights.sum().clamp_min(1.0)
 
         pairwise = pairwise_logistic_ranking_loss(
             logits=logits,

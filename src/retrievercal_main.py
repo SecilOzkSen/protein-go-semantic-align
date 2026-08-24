@@ -101,6 +101,14 @@ def parse_args() -> CalibConfig:
     p.add_argument("--gor2023_go_obo", default="", help="GOR2023 GO OBO snapshot used for max propagation.")
     p.add_argument("--gor2023_threshold_step", type=float, default=0.01)
     p.add_argument("--gor2023_propagate", action="store_true", help="Propagate truth and scores to is_a/part_of parents before wFmax.")
+    p.add_argument(
+        "--use_ia_weighted_positive_loss",
+        action="store_true",
+        help="Weight positive BCE terms by normalized GOR2023 information accretion.",
+    )
+    p.add_argument("--ia_positive_weight_power", type=float, default=0.5)
+    p.add_argument("--ia_positive_weight_min", type=float, default=0.5)
+    p.add_argument("--ia_positive_weight_max", type=float, default=2.0)
     p.add_argument("--use_expert_scores", action="store_true")
     a = p.parse_args()
     return CalibConfig(**vars(a))
