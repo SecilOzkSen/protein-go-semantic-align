@@ -8,8 +8,8 @@ from src.configs.paths import (
     ZERO_SHOT_TERMS_ID_ONLY_JSON,
     FEW_SHOT_IC_TERMS_ID_ONLY_JSON,
     COMMON_IC_GO_TERMS_ID_ONLY_JSON,
-    GO_INDEX,                 # {1: {"TEXT_EMB": Path, "FAISS_IP": Path, "META": Path}, ...}
-    go_index_paths,           # def go_index_paths(phase:int)->dict[str, Path]
+    GO_INDEX,  # {1: {"TEXT_EMB": Path, "FAISS_IP": Path, "META": Path}, ...}
+    go_index_paths,  # def go_index_paths(phase:int)->dict[str, Path]
 )
 
 @dataclass
@@ -192,7 +192,7 @@ class TrainingContext:
     protein_n_slots: int = 0,
     go_pool_type: str = "mean"
     go_encoder_output_mode: str = "pool"
-    go_segment_representation_mode: str = "segments_only" # mixed
+    go_segment_representation_mode: str = "segments_only"  # mixed
     eval_id_list: List[int] = None
     logger: Any = None
     eval_seen_go_ids: List[int] = None
@@ -219,10 +219,10 @@ class AttrConfig:
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64
     curriculum_epochs: int = 10
-    temperature: float = 0.07          # InfoNCE için (DUPLICATE kaldırıldı)
+    temperature: float = 0.07  # InfoNCE için (DUPLICATE kaldırıldı)
     # teacher loss weight
     lambda_vtrue: float = 0.2
-    tau_distill: float = 1.5           # KL temperature for distillation
+    tau_distill: float = 1.5  # KL temperature for distillation
 
 
 @dataclass
@@ -273,11 +273,19 @@ class TrainerConfig:
     coverage_hard_neg_k: int = 4
     coverage_margin: float = 0.05
     coverage_start_step: int = 2000
+    # Term-frequency balancing for retriever objectives. Frequencies count
+    # distinct training proteins annotated with each GO term.
+    frequency_balancing: bool = False
+    frequency_weight_power: float = 0.5
+    frequency_weight_min: float = 0.5
+    frequency_weight_max: float = 2.0
+    term_frequencies: Optional[Dict[int, int]] = None
+
 
 @dataclass
 class QueueConfig:
     queue_K: int = 65536
-    queue_start_step:int = 0
+    queue_start_step: int = 0
     queue_hard_frac_start: float = 0.0
     queue_hard_frac_end: float = 0.0
     queue_hard_frac_warmup_steps: int = 2000

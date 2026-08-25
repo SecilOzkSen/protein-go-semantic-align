@@ -71,6 +71,7 @@ def multi_positive_infonce_from_candidates_v2(
         tau: float,
         cand_valid_mask: torch.Tensor | None = None,
         sample_weight: torch.Tensor | None = None,
+        positive_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     scores: (B, K)
@@ -95,12 +96,19 @@ def multi_positive_infonce_from_candidates_v2(
     # denom
     denom = torch.logsumexp(logits, dim=-1)  # (B,)
 
-    # numerator: log-mean-exp over positives
+    # numerator: (optionally weighted) log-mean-exp over positives
     pos_any = pos_mask.any(dim=1) & valid_any
     pos_count = pos_mask.sum(dim=1).clamp_min(1)  # avoid log(0)
 
-    pos_logits = logits.masked_fill(~pos_mask, -1e9)
-    num = torch.logsumexp(pos_logits, dim=-1) - pos_count.float().log()  # (B,)
+    if positive_weight is None:
+        pos_logits = logits.masked_fill(~pos_mask, -1e9)
+        num = torch.logsumexp(pos_logits, dim=-1) - pos_count.float().log()
+    else:
+        pw = positive_weight.to(device=logits.device, dtype=logits.dtype)
+        pw = torch.where(pos_mask, pw.clamp_min(1e-12), torch.zeros_like(pw))
+        # Weighted mean-exp keeps the objective scale comparable to baseline.
+        pos_logits = (logits + pw.clamp_min(1e-12).log()).masked_fill(~pos_mask, -1e9)
+        num = torch.logsumexp(pos_logits, dim=-1) - pw.sum(dim=-1).clamp_min(1e-12).log()
 
     # loss only where we have positives and at least one valid candidate
     keep = pos_any
@@ -126,6 +134,7 @@ def multi_positive_infonce_from_candidates_v2(
     # return 0 with correct dtype/device
     return denom.mean() * 0.0
 
+
 def queue_pairwise_ranking_loss(
         scores: torch.Tensor,
         pos_mask: torch.Tensor,
@@ -133,6 +142,7 @@ def queue_pairwise_ranking_loss(
         queue_start: int,
         queue_count: int,
         margin: float = 0.0,
+        positive_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Protein-wise pairwise ranking loss over queue negatives only.
@@ -156,6 +166,7 @@ def queue_pairwise_ranking_loss(
         return scores.sum() * 0.0
 
     losses = []
+    loss_weights = []
 
     for b in range(scores.size(0)):
         pos_scores = scores[b][pos_mask[b]]
@@ -174,13 +185,21 @@ def queue_pairwise_ranking_loss(
                 - hard_neg_scores.unsqueeze(0)
         )
 
-        losses.append(
-            F.softplus(float(margin) - pair_diff).mean()
-        )
+        pair_loss = F.softplus(float(margin) - pair_diff).mean(dim=1)
+        if positive_weight is not None:
+            pos_w = positive_weight[b][pos_mask[b]].to(pair_loss.dtype)
+            losses.append(pair_loss)
+            loss_weights.append(pos_w)
+        else:
+            losses.append(pair_loss.mean())
 
     if not losses:
         return scores.sum() * 0.0
 
+    if positive_weight is not None:
+        all_losses = torch.cat(losses)
+        all_weights = torch.cat(loss_weights)
+        return (all_losses * all_weights).sum() / all_weights.sum().clamp_min(1e-12)
     return torch.stack(losses).mean()
 
 
@@ -516,6 +535,30 @@ class OppTrainer:
             print(
                 "[GOR2023-WFMAX] enabled "
                 f"path={self.gor2023_ia_path} terms={len(self.gor2023_ia):,}"
+            )
+
+        # Precompute capped inverse-frequency weights. The normalization to
+        # mean one is performed on active positives in each batch.
+        self._term_frequency_weights = {}
+        if bool(getattr(cfg, "frequency_balancing", False)):
+            freqs = getattr(cfg, "term_frequencies", None) or {}
+            positive_freqs = [int(v) for v in freqs.values() if int(v) > 0]
+            if not positive_freqs:
+                raise ValueError("frequency_balancing enabled but term_frequencies is empty")
+            median_freq = float(np.median(np.asarray(positive_freqs, dtype=np.float64)))
+            power = float(getattr(cfg, "frequency_weight_power", 0.5))
+            w_min = float(getattr(cfg, "frequency_weight_min", 0.5))
+            w_max = float(getattr(cfg, "frequency_weight_max", 2.0))
+            if not (0.0 < w_min <= w_max):
+                raise ValueError(f"invalid frequency weight clip [{w_min}, {w_max}]")
+            self._term_frequency_weights = {
+                int(g): float(np.clip((median_freq / max(1, int(f))) ** power, w_min, w_max))
+                for g, f in freqs.items()
+            }
+            print(
+                "[FREQ-BALANCE] enabled "
+                f"terms={len(self._term_frequency_weights):,} median={median_freq:.1f} "
+                f"power={power:.3f} clip=[{w_min:.3f},{w_max:.3f}]"
             )
 
         self.normalizer = lambda x, dim: norm_f32(x, p=2, dim=dim)
@@ -1863,6 +1906,7 @@ class OppTrainer:
 
         if was_training:
             enc.train()
+
     @torch.no_grad()
     def _ensure_eval_cache_v2(self, chunk=1024):
 
@@ -3161,6 +3205,29 @@ class OppTrainer:
 
         return sc
 
+    def _candidate_positive_frequency_weights(self, meta: dict, pos_mask: torch.Tensor) -> torch.Tensor | None:
+        """Return [B,K] weights, normalized to mean one over active positives."""
+        if not self._term_frequency_weights:
+            return None
+        B, K = pos_mask.shape
+        inbatch = meta["inbatch_global_ids"].view(1, -1).expand(B, -1)
+        extra = meta["extra_global_ids"].view(1, -1).expand(B, -1)
+        queue_ids = meta.get("queue_global_ids")
+        parts = [inbatch, extra]
+        if queue_ids is not None:
+            parts.append(queue_ids.to(self.device))
+        cand_ids = torch.cat(parts, dim=1)
+        if cand_ids.shape != pos_mask.shape:
+            raise RuntimeError(
+                f"candidate ID/positive mask mismatch: {tuple(cand_ids.shape)} vs {tuple(pos_mask.shape)}"
+            )
+        flat = [self._term_frequency_weights.get(int(g), 1.0) for g in cand_ids.detach().cpu().reshape(-1).tolist()]
+        weights = torch.tensor(flat, device=self.device, dtype=torch.float32).view(B, K)
+        active = weights[pos_mask.bool()]
+        if active.numel() > 0:
+            weights = weights / active.mean().clamp_min(1e-12)
+        return weights
+
     def step_losses(self, batch, epoch_idx: int, debug: bool = False):
         if self._global_step % 1000 == 0:
             info = getattr(self.model, "last_pool_info", {})
@@ -3565,12 +3632,14 @@ class OppTrainer:
                 sample_weight = true_cardinality
             else:
                 sample_weight = None
+            positive_frequency_weight = self._candidate_positive_frequency_weights(meta, pos_mask)
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
                 pos_mask,
                 tau=1.0,
                 cand_valid_mask=cand_valid_mask,
                 sample_weight=sample_weight,
+                positive_weight=positive_frequency_weight,
             )
 
             if not torch.isfinite(l_con):
@@ -3604,6 +3673,7 @@ class OppTrainer:
                     queue_start=q_start,
                     queue_count=kq,
                     margin=pairwise_margin,
+                    positive_weight=positive_frequency_weight,
                 )
             else:
                 l_pairwise = scores_cand.sum() * 0.0
@@ -4422,6 +4492,14 @@ class OppTrainer:
             }
             for k in candidate_ks
         }
+        # Per-term retrieval statistics, grouped by distinct training-protein
+        # frequency. These diagnose rare-term coverage without changing truth.
+        n_eval_terms = len(self._eval_ids_cpu)
+        term_true_counts = torch.zeros(n_eval_terms, dtype=torch.float64)
+        term_hit_counts = {
+            int(k): torch.zeros(n_eval_terms, dtype=torch.float64)
+            for k in candidate_ks
+        }
 
         # IA weights aligned once to the exact evaluation-column order.  These
         # are used only for the GOR2023 retriever oracle and add no forward pass.
@@ -4574,6 +4652,7 @@ class OppTrainer:
                 y_float = (y_true > 0).float()
                 true_counts = y_float.sum(dim=1)  # [B]
                 valid = true_counts > 0
+                term_true_counts += y_float.detach().cpu().double().sum(dim=0)
 
                 if valid.any():
                     valid_n = int(valid.sum().item())
@@ -4583,6 +4662,11 @@ class OppTrainer:
                         idx_k = top_idx_full[:, :kk]  # [B, kk]
                         # Number of true labels retrieved in top-K per protein
                         hits_k = torch.gather(y_float, 1, idx_k).sum(dim=1)  # [B]
+                        retrieved_mask = torch.zeros_like(y_float, dtype=torch.bool)
+                        retrieved_mask.scatter_(1, idx_k, True)
+                        term_hit_counts[int(k)] += (
+                                retrieved_mask & (y_float > 0)
+                        ).detach().cpu().double().sum(dim=0)
                         hits_valid = hits_k[valid]
                         true_valid = true_counts[valid].float().clamp_min(1.0)
 
@@ -4778,6 +4862,41 @@ class OppTrainer:
                 logs[f"oracle_iaR@{k}"] = float(ia_recall)
                 logs[f"oracle_iaCoverage@{k}"] = float(ia_coverage)
                 logs[f"oracle_wF@{k}"] = float(oracle_wf)
+
+            # Macro recall gives every validation GO term with at least one
+            # positive equal weight. Frequency bins use training frequencies.
+            present = term_true_counts > 0
+            per_term_recall = torch.zeros_like(term_true_counts)
+            per_term_recall[present] = term_hit_counts[k][present] / term_true_counts[present]
+            if present.any():
+                logs[f"macro_term_recall@{k}"] = float(per_term_recall[present].mean().item())
+
+            eval_ids = [int(x) for x in self._eval_ids_cpu.tolist()]
+            train_freqs = getattr(self.cfg, "term_frequencies", None) or {}
+            bin_specs = (
+                (0, 0, "unseen_0"),
+                (1, 5, "1_5"),
+                (6, 10, "6_10"),
+                (11, 20, "11_20"),
+                (21, 50, "21_50"),
+                (51, 100, "51_100"),
+                (101, 500, "101_500"),
+                (501, 10 ** 18, "501_plus"),
+            )
+            for lo, hi, label in bin_specs:
+                cols = torch.tensor(
+                    [i for i, g in enumerate(eval_ids) if lo <= int(train_freqs.get(g, 0)) <= hi],
+                    dtype=torch.long,
+                )
+                if cols.numel() == 0:
+                    continue
+                cols = cols[present.index_select(0, cols)]
+                if cols.numel() == 0:
+                    continue
+                logs[f"term_recall@{k}_freq_{label}"] = float(
+                    per_term_recall.index_select(0, cols).mean().item()
+                )
+                logs[f"term_num@{k}_freq_{label}"] = float(cols.numel())
 
         if sum_unseen_num > 0:
             logs["unseen_R@10"] = sum_unseen_R10 / sum_unseen_num
