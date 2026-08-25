@@ -263,11 +263,11 @@ def main(
 if __name__ == "__main__":
     main(
         go_path=(
-            "/workspace/GOR2023/processed/"
+            "/workspace/data_pfresgo/processed/"
             "go_texts_canonical.jsonl"
         ),
         output_prefix=(
-            "/workspace/GOR2023/go_cache/all/"
+            "/workspace/data_pfresgo/go_cache/all/"
             "go_text_embeddings_canonical"
         ),
         phase="gor2023_2023_01_01",

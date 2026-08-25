@@ -524,8 +524,8 @@ if __name__ == "__main__":
             "processed/go_vocab.pkl"
         ),
         out_path=(
-            "/workspace/"
-            "go_texts_canonical_segmented_markerless.jsonl"
+            "/workspace/data_pfresgo/"
+            "processed/go_texts_canonical_segmented.jsonl"
         ),
 
         # PFresGO full branch ontology kullanacak.
