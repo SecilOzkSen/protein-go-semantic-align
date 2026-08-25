@@ -264,7 +264,7 @@ if __name__ == "__main__":
     main(
         go_path=(
             "/workspace/data_pfresgo/processed/"
-            "go_texts_canonical.jsonl"
+            "go_texts_canonical_segmented.jsonl"
         ),
         output_prefix=(
             "/workspace/data_pfresgo/go_cache/all/"
