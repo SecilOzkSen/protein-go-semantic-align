@@ -998,9 +998,15 @@ def run_training(args):
     # used only when frequency_balancing is enabled; the sampler is unchanged.
     from collections import Counter
     _freq = Counter()
-    _train_ds = datasets["train"]
-    for _pid in getattr(_train_ds, "protein_ids", []):
-        _freq.update(set(int(g) for g in _train_ds.pid2pos.get(_pid, [])))
+    # Use the authoritative split file rather than relying on an internal
+    # dataset attribute name. Match build_datasets() by retaining only
+    # proteins present in the residue store.
+    _train_pids_for_freq = [
+        pid for pid in load_raw_txt(args.train_ids_path)
+        if res_store.has(pid)
+    ]
+    for _pid in _train_pids_for_freq:
+        _freq.update(set(int(g) for g in pid2pos.get(_pid, [])))
     train_term_frequencies = dict(_freq)
     if bool(getattr(args, "frequency_balancing", False)):
         logger.info(
