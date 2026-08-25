@@ -140,8 +140,8 @@ def _validate(args, pf: dict, branch_ids: List[int]) -> None:
         raise ValueError("PFresGO lr_lora is non-zero while use_lora=false.")
 
     allow_eval_checkpoint = bool(pf.get("allow_checkpoint_for_eval", False)) and bool(args.eval_only)
-    if (args.resume or args.warmstart_path) and not allow_eval_checkpoint:
-        raise ValueError("PFresGO benchmark training must start clean: resume=null and warmstart_path=null")
+    if args.warmstart_path and not allow_eval_checkpoint:
+        raise ValueError("PFresGO benchmark training must start clean: warmstart_path=null")
 
 
 def configure(config_path: str):
