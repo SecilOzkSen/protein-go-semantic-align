@@ -47,7 +47,7 @@ training:
   output_dir: /workspace/data_pfresgo/outputs/mf/name_def_isa_markerless_freq_balanced
   save_every: 10000
   keep_last_n: 3
-  resume: null
+  resume: /workspace/data_pfresgo/outputs/mf/name_def_isa_markerless_freq_balanced/checkpoint_step62410.pt
   warmstart_path: null
   eval_only: false
   log_every: 500
