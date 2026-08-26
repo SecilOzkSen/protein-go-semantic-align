@@ -22,7 +22,7 @@ data:
 
 general:
   phase: -2
-  ablation_id: "PFresGO-BP-global-local-weakpos-go-lora"
+  ablation_id: "PFresGO-BP-markerless-freq-balanced"
   use_queue_miner: true
   go_pooling_strategy: mean
   go_encoder_inner_pooling: mean
@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_global_local_weakpos_slots_8
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_markerless_freq_balanced
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -53,6 +53,7 @@ training:
   log_every: 500
   log_level: INFO
   monitor_metric: "oracle_microF@500"
+  secondary_monitor_metric: "macro_term_recall@500"
   monitor_mode: max
   early_stop_patience: 3
   cand_chunk_k: 4
@@ -128,6 +129,10 @@ loss:
   tau_distill: 1.0
   lambda_bce: 0.0
   lambda_slot_div: 0.0
+  frequency_balancing: true
+  frequency_weight_power: 0.5
+  frequency_weight_min: 0.5
+  frequency_weight_max: 2.0
 
 curriculum:
   epochs: 5
@@ -146,7 +151,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "PFresGO-BP-global-local"
+  wandb_run_name: "PFresGO-BP-markerless-freq-balanced"
   mode: online
 
 stores:
@@ -162,5 +167,5 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_global_local_weakpos_slots_8
+  logs: /workspace/data_pfresgo/logs/bp_name_def_isa_markerless_freq_balanced
 
