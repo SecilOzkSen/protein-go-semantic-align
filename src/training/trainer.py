@@ -203,126 +203,48 @@ def queue_pairwise_ranking_loss(
     return torch.stack(losses).mean()
 
 
-def weak_positive_coverage_loss(
+def retrieval_boundary_coverage_loss(
         scores: torch.Tensor,
-        pos_mask: torch.Tensor,
-        cand_valid_mask: torch.Tensor,
-        queue_start: int,
-        queue_count: int,
-        bottom_frac: float = 0.25,
-        hard_neg_k: int = 4,
+        gold_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
+        target_k: int = 200,
         margin: float = 0.05,
-) -> torch.Tensor:
-    """
-    Coverage-oriented ranking loss.
-
-    For each protein:
-      1. Select the lowest-scoring fraction of TRUE GO terms.
-      2. Select the highest-scoring queue negatives.
-      3. Push weak positives above the hard-negative reference.
-
-    This differs from the standard pairwise objective because
-    only the under-retrieved positive tail is optimized.
-
-    scores: [B, K]
-    """
-
-    if queue_count <= 0:
-        return scores.sum() * 0.0
-
-    pos_mask = pos_mask.bool() & cand_valid_mask.bool()
-
-    q_start = max(0, int(queue_start))
-    q_end = min(
-        int(scores.size(1)),
-        q_start + int(queue_count),
-    )
-
-    if q_start >= q_end:
-        return scores.sum() * 0.0
-
-    bottom_frac = float(bottom_frac)
-    bottom_frac = min(max(bottom_frac, 1e-6), 1.0)
-
-    hard_neg_k = max(1, int(hard_neg_k))
-
-    losses = []
+) -> tuple[torch.Tensor, dict]:
+    """Push only missed golds above the detached K-th non-gold boundary."""
+    gold_mask = gold_mask.bool() & valid_mask.bool()
+    valid_mask = valid_mask.bool()
+    target_k = max(1, int(target_k))
+    losses, boundary_vals = [], []
+    missed_total = gold_total = 0
 
     for b in range(scores.size(0)):
-
-        # --------------------------------------
-        # Positive tail
-        # --------------------------------------
-        pos_scores = scores[b][pos_mask[b]]
-
-        if pos_scores.numel() == 0:
+        pos_scores = scores[b][gold_mask[b]]
+        neg_scores = scores[b][valid_mask[b] & ~gold_mask[b]]
+        if pos_scores.numel() == 0 or neg_scores.numel() < target_k:
             continue
 
-        n_weak = max(
-            1,
-            int(math.ceil(
-                float(pos_scores.numel())
-                * bottom_frac
-            )),
-        )
+        boundary = torch.topk(
+            neg_scores, k=target_k, largest=True
+        ).values[-1].detach()
 
-        n_weak = min(
-            n_weak,
-            int(pos_scores.numel()),
-        )
+        missed = pos_scores < boundary
+        gold_total += int(pos_scores.numel())
+        missed_total += int(missed.sum().item())
+        boundary_vals.append(boundary.float())
 
-        weak_pos = torch.topk(
-            pos_scores,
-            k=n_weak,
-            largest=False,
-        ).values
+        if missed.any():
+            losses.append(
+                F.softplus(float(margin) + boundary - pos_scores[missed]).mean()
+            )
 
-        # --------------------------------------
-        # Hard queue negatives
-        # --------------------------------------
-        queue_valid = cand_valid_mask[
-            b,
-            q_start:q_end,
-        ].bool()
-
-        queue_scores = scores[
-            b,
-            q_start:q_end,
-        ][queue_valid]
-
-        if queue_scores.numel() == 0:
-            continue
-
-        k_neg = min(
-            hard_neg_k,
-            int(queue_scores.numel()),
-        )
-
-        hard_neg = torch.topk(
-            queue_scores,
-            k=k_neg,
-            largest=True,
-        ).values
-
-        # Mean of the hardest negatives gives
-        # a stable cutoff-like reference.
-        hard_ref = hard_neg.mean()
-
-        # --------------------------------------
-        # Coverage margin
-        # --------------------------------------
-        row_loss = F.softplus(
-            float(margin)
-            + hard_ref
-            - weak_pos
-        ).mean()
-
-        losses.append(row_loss)
-
-    if not losses:
-        return scores.sum() * 0.0
-
-    return torch.stack(losses).mean()
+    loss = torch.stack(losses).mean() if losses else scores.sum() * 0.0
+    stats = {
+        "gold_total": gold_total,
+        "missed_total": missed_total,
+        "missed_frac": float(missed_total) / float(gold_total) if gold_total else 0.0,
+        "boundary_mean": float(torch.stack(boundary_vals).mean().item()) if boundary_vals else 0.0,
+    }
+    return loss, stats
 
 
 @torch.no_grad()
@@ -525,6 +447,9 @@ class OppTrainer:
         self._eval_cols_rare = None
         self._eval_cols_unseen = None
         self._current_uniq_go_ids_for_shortlist = None
+        self._coverage_bank_epoch = None
+        self._coverage_go_ids = None
+        self._coverage_go_proj = None
 
         # GOR2023 weighted evaluation is opt-in. main_pfresgo.py sets this
         # only when pfresgo.ia_weights_path is present in the YAML config.
@@ -2788,6 +2713,141 @@ class OppTrainer:
             if was_training:
                 model.train()
 
+    @torch.no_grad()
+    def _refresh_coverage_mining_bank(self, epoch_idx: int, chunk: int = 256):
+        """Build a branch-specific, no-grad projected GO bank once per epoch."""
+        if (self._coverage_bank_epoch == int(epoch_idx)
+                and self._coverage_go_ids is not None
+                and self._coverage_go_proj is not None):
+            return
+
+        go_ids_cpu = torch.as_tensor(
+            [int(x) for x in self.eval_id_list], dtype=torch.long
+        )
+        if go_ids_cpu.numel() == 0:
+            raise RuntimeError("coverage mining bank: eval_id_list is empty")
+
+        proj_chunks = []
+        for st in range(0, int(go_ids_cpu.numel()), int(chunk)):
+            ids = go_ids_cpu[st:st + int(chunk)].to(self.device, non_blocking=True)
+            raw = self._encode_go_ids_as_pooled_current(
+                ids, dtype=torch.float32, use_ema=False
+            )
+            z = self.model.go_ln(raw)
+            z = self.model.proj_g(z)
+            z = self.model._norm(z, dim=-1)
+            proj_chunks.append(z.detach().float().cpu())
+
+        self._coverage_go_ids = go_ids_cpu.contiguous()
+        self._coverage_go_proj = torch.cat(proj_chunks, dim=0).contiguous()
+        self._coverage_bank_epoch = int(epoch_idx)
+        print(
+            f"[COVERAGE-BANK] epoch={epoch_idx} terms={self._coverage_go_ids.numel()} "
+            f"dim={self._coverage_go_proj.size(1)}"
+        )
+
+    @torch.no_grad()
+    def _mine_coverage_candidates(self, protein_mining_repr, mining_k: int):
+        """Mine pure top-K candidates from the branch GO bank, without random mixing."""
+        if self._coverage_go_ids is None or self._coverage_go_proj is None:
+            raise RuntimeError("coverage mining bank is not initialized")
+
+        bank = self._coverage_go_proj.to(self.device, non_blocking=True)
+        mining_k = min(max(1, int(mining_k)), int(bank.size(0)))
+        expert_mode = getattr(self.model, "protein_expert_mode", "legacy")
+
+        if expert_mode == "legacy":
+            sims = protein_mining_repr.float() @ bank.T
+        else:
+            sims = self.model.score_encoded_experts_projected(
+                encoded=protein_mining_repr,
+                Gz=bank,
+                return_components=False,
+            ).float()
+
+        top_idx = torch.topk(sims, k=mining_k, dim=1, largest=True).indices.cpu()
+        ids = self._coverage_go_ids.index_select(
+            0, top_idx.reshape(-1)
+        ).view(top_idx.size(0), mining_k)
+        return ids.to(self.device, non_blocking=True)
+
+    def _encode_go_ids_as_pooled_trainable(
+            self, go_ids_1d: torch.Tensor, dtype: torch.dtype):
+        """Gradient-enabled shortlist GO encoding."""
+        ids_list = [int(x) for x in go_ids_1d.detach().cpu().long().flatten().tolist()]
+        toks = self.ctx.go_text_store.batch(ids_list)
+        input_ids = toks["input_ids"].to(self.device, non_blocking=True)
+        attention_mask = toks["attention_mask"].to(self.device, non_blocking=True)
+        mode = getattr(self.ctx, "go_encoder_output_mode", "pooled")
+
+        if mode == "segment_pooled":
+            out = self.model.encode_go_segment_aware(
+                seg_input_ids=toks["seg_input_ids"].to(self.device, non_blocking=True),
+                seg_attention_mask=toks["seg_attention_mask"].to(self.device, non_blocking=True),
+                seg_present=toks["seg_present"].to(self.device, non_blocking=True),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            embs = out["pooled"]
+        else:
+            embs = self.model.go_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_mode="pooled",
+            )
+            if isinstance(embs, tuple):
+                embs = embs[0]
+            elif isinstance(embs, dict):
+                embs = embs["pooled"]
+
+        return torch.nan_to_num(embs).to(dtype=dtype)
+
+    def _build_retrieval_coverage_shortlist(
+            self, mined_ids: torch.Tensor, gold_ids_per_protein, dtype: torch.dtype):
+        """Union mined IDs with every gold, deduplicate per row, encode unique IDs once."""
+        B = int(mined_ids.size(0))
+        row_ids, row_gold_sets = [], []
+        max_k = 0
+
+        for b in range(B):
+            gold = [int(x) for x in gold_ids_per_protein[b].detach().cpu().tolist()]
+            gold_set = set(gold)
+            seen, merged = set(), []
+            for gid in mined_ids[b].detach().cpu().tolist() + gold:
+                gid = int(gid)
+                if gid not in seen:
+                    seen.add(gid)
+                    merged.append(gid)
+            row_ids.append(merged)
+            row_gold_sets.append(gold_set)
+            max_k = max(max_k, len(merged))
+
+        valid = torch.zeros((B, max_k), dtype=torch.bool, device=self.device)
+        gold_mask = torch.zeros((B, max_k), dtype=torch.bool, device=self.device)
+
+        unique_ids = sorted({gid for row in row_ids for gid in row})
+        unique_t = torch.tensor(unique_ids, dtype=torch.long, device=self.device)
+        unique_emb = self._encode_go_ids_as_pooled_trainable(unique_t, dtype=dtype)
+        id2u = {gid: i for i, gid in enumerate(unique_ids)}
+
+        G = torch.zeros(
+            B, max_k, unique_emb.size(1),
+            device=self.device, dtype=unique_emb.dtype
+        )
+        for b, row in enumerate(row_ids):
+            n = len(row)
+            if n == 0:
+                continue
+            idx = torch.tensor([id2u[g] for g in row], dtype=torch.long, device=self.device)
+            valid[b, :n] = True
+            gold_mask[b, :n] = torch.tensor(
+                [g in row_gold_sets[b] for g in row],
+                dtype=torch.bool, device=self.device
+            )
+            G[b, :n] = unique_emb.index_select(0, idx)
+
+        return G, gold_mask, valid
+
     def _build_candidates_meta(
             self,
             uniq_go_ids: torch.Tensor,  # [U] global GO ids for current batch uniqs
@@ -3632,7 +3692,8 @@ class OppTrainer:
                 sample_weight = true_cardinality
             else:
                 sample_weight = None
-            positive_frequency_weight = self._candidate_positive_frequency_weights(meta, pos_mask)
+            # Frequency weighting intentionally disabled for this retrieval objective experiment.
+            positive_frequency_weight = None
             l_con = multi_positive_infonce_from_candidates_v2(
                 scores_cand,
                 pos_mask,
@@ -3685,27 +3746,50 @@ class OppTrainer:
                 )
 
             # ---------------------------------------------------------
-            # Weak-positive set coverage objective
+            # Retrieval-aware Top-K coverage objective
             # ---------------------------------------------------------
-
             coverage_lambda = float(getattr(self.cfg, "coverage_lambda", 0.0))
-            coverage_bottom_frac = float(getattr(self.cfg, "coverage_bottom_frac", 0.25))
-            coverage_hard_neg_k = int(getattr(self.cfg, "coverage_hard_neg_k", 4))
+            coverage_target_k = int(getattr(self.cfg, "coverage_target_k", 200))
+            coverage_mining_k = int(getattr(self.cfg, "coverage_mining_k", 512))
             coverage_margin = float(getattr(self.cfg, "coverage_margin", 0.05))
-            coverage_start_step = int(getattr(self.cfg, "coverage_start_step", self.queue_cfg.queue_start_step))
-            coverage_active = (coverage_lambda > 0.0 and kq > 0 and self._global_step >= coverage_start_step)
+            coverage_start_step = int(getattr(self.cfg, "coverage_start_step", 0))
+            coverage_active = (
+                    coverage_lambda > 0.0
+                    and self._global_step >= coverage_start_step
+                    and not self._use_token_align
+            )
+            coverage_stats = {
+                "gold_total": 0, "missed_total": 0,
+                "missed_frac": 0.0, "boundary_mean": 0.0,
+            }
 
             if coverage_active:
-                q_start = U + extra_n
+                self._refresh_coverage_mining_bank(
+                    epoch_idx=epoch_idx,
+                    chunk=int(getattr(self.cfg, "coverage_bank_chunk", 256)),
+                )
+                with torch.no_grad():
+                    mined_ids = self._mine_coverage_candidates(
+                        protein_mining_repr=protein_mining_repr,
+                        mining_k=coverage_mining_k,
+                    )
 
-                l_coverage = weak_positive_coverage_loss(
-                    scores=scores_cand,
-                    pos_mask=pos_mask,
-                    cand_valid_mask=cand_valid_mask,
-                    queue_start=q_start,
-                    queue_count=kq,
-                    bottom_frac=coverage_bottom_frac,
-                    hard_neg_k=coverage_hard_neg_k,
+                G_cov, cov_gold_mask, cov_valid_mask = (
+                    self._build_retrieval_coverage_shortlist(
+                        mined_ids=mined_ids,
+                        gold_ids_per_protein=batch["pos_go_global"],
+                        dtype=pooled_go.dtype,
+                    )
+                )
+                coverage_scores = self.forward_scores(
+                    H, G_cov, attn_valid, return_alpha=False
+                ) * scale
+
+                l_coverage, coverage_stats = retrieval_boundary_coverage_loss(
+                    scores=coverage_scores,
+                    gold_mask=cov_gold_mask,
+                    valid_mask=cov_valid_mask,
+                    target_k=coverage_target_k,
                     margin=coverage_margin,
                 )
             else:
@@ -3713,11 +3797,15 @@ class OppTrainer:
 
             if not torch.isfinite(l_coverage):
                 raise RuntimeError(
-                    "coverage loss NaN, batch protein_ids="
+                    "retrieval coverage loss NaN, batch protein_ids="
                     + str(batch.get("protein_ids", "")[:5])
                 )
 
-            l_total = (l_con + pairwise_lambda * l_pairwise + coverage_lambda * l_coverage)
+            l_total = (
+                    l_con
+                    + pairwise_lambda * l_pairwise
+                    + coverage_lambda * l_coverage
+            )
 
             # positives-only tensors for attr / dag
             B = H.size(0)
@@ -3835,6 +3923,10 @@ class OppTrainer:
                     "train/coverage": float(l_coverage.detach().item()),
                     "train/coverage_weighted": float((coverage_lambda * l_coverage).detach().item()),
                     "train/coverage_active": float(coverage_active),
+                    "train/coverage_missed_frac": float(coverage_stats["missed_frac"]),
+                    "train/coverage_boundary_mean": float(coverage_stats["boundary_mean"]),
+                    "train/coverage_gold_total": int(coverage_stats["gold_total"]),
+                    "train/coverage_missed_total": int(coverage_stats["missed_total"]),
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
                     "train/lr_go_lora": float(
                         self._lora_lr_schedule(self._global_step - 1)
