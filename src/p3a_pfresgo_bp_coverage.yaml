@@ -119,9 +119,10 @@ loss:
   lambda_attr: 0.0
   lambda_entropy_alpha: 0.0
   pairwise_lambda: 0.10
-  coverage_lambda: 0.10
-  coverage_bottom_frac: 0.25
-  coverage_hard_neg_k: 4
+  coverage_lambda: 0.05
+  coverage_target_k: 200
+  coverage_mining_k: 512
+  coverage_start_step: 0
   coverage_margin: 0.05
   dag_margin: 0.05
   dag_scale: 10.0
@@ -129,7 +130,7 @@ loss:
   tau_distill: 1.0
   lambda_bce: 0.0
   lambda_slot_div: 0.0
-  frequency_balancing: true
+  frequency_balancing: false
   frequency_weight_power: 0.5
   frequency_weight_min: 0.5
   frequency_weight_max: 2.0
