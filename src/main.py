@@ -343,9 +343,9 @@ def build_cardinality_sample_weights(
     close to weight 1.0.
     """
 
-    if not hasattr(dataset, "protein_ids"):
+    if not hasattr(dataset, "pids"):
         raise RuntimeError(
-            "Cardinality sampler requires dataset.protein_ids"
+            "Cardinality sampler requires dataset.pids"
         )
 
     if not hasattr(dataset, "pid2pos"):
@@ -359,7 +359,7 @@ def build_cardinality_sample_weights(
                 1,
                 len(dataset.pid2pos.get(pid, [])),
             )
-            for pid in dataset.protein_ids
+            for pid in dataset.pids
         ],
         dtype=np.float64,
     )
