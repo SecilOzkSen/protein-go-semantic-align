@@ -324,14 +324,161 @@ def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore,
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
     return {"train": train_ds, "val": val_ds}
 
-def build_dataset_sample_weights(dataset):
-    weights = []
-    for i in range(len(dataset)):
-        sample = dataset[i]
-        n_rare = int(sample.get("num_rare_go", 0))
-        w = 1.0 + np.log1p(n_rare)
-        weights.append(w)
-    return torch.as_tensor(weights, dtype=torch.double)
+
+def build_cardinality_sample_weights(
+        dataset,
+        power: float = 0.5,
+        min_weight: float = 0.5,
+        max_weight: float = 4.0,
+):
+    """
+    Mildly oversample proteins with high annotation cardinality.
+
+    Weight:
+        w_i = (n_positive_i / median_cardinality) ** power
+
+    followed by clipping to [min_weight, max_weight].
+
+    The median normalization keeps an ordinary training protein
+    close to weight 1.0.
+    """
+
+    if not hasattr(dataset, "protein_ids"):
+        raise RuntimeError(
+            "Cardinality sampler requires dataset.protein_ids"
+        )
+
+    if not hasattr(dataset, "pid2pos"):
+        raise RuntimeError(
+            "Cardinality sampler requires dataset.pid2pos"
+        )
+
+    cardinalities = np.asarray(
+        [
+            max(
+                1,
+                len(dataset.pid2pos.get(pid, [])),
+            )
+            for pid in dataset.protein_ids
+        ],
+        dtype=np.float64,
+    )
+
+    median_cardinality = float(
+        np.median(cardinalities)
+    )
+
+    median_cardinality = max(
+        median_cardinality,
+        1.0,
+    )
+
+    weights = (
+                      cardinalities / median_cardinality
+              ) ** float(power)
+
+    weights = np.clip(
+        weights,
+        float(min_weight),
+        float(max_weight),
+    )
+
+    return (
+        torch.as_tensor(
+            weights,
+            dtype=torch.double,
+        ),
+        cardinalities,
+    )
+
+
+def log_cardinality_sampling_distribution(
+        cardinalities,
+        weights,
+        logger,
+):
+    """
+    Report original vs expected sampling distribution.
+
+    Expected distribution is analytical:
+        P(sample i) proportional to weight_i.
+
+    No Monte Carlo sampling is needed.
+    """
+
+    bins = [
+        (1, 5, "1-5"),
+        (6, 10, "6-10"),
+        (11, 20, "11-20"),
+        (21, 40, "21-40"),
+        (41, 80, "41-80"),
+        (81, 160, "81-160"),
+        (161, None, "161+"),
+    ]
+
+    cardinalities = np.asarray(
+        cardinalities,
+        dtype=np.int64,
+    )
+
+    weights_np = np.asarray(
+        weights,
+        dtype=np.float64,
+    )
+
+    total_n = len(cardinalities)
+    total_weight = weights_np.sum()
+
+    lines = [
+        "",
+        "[cardinality-sampler] expected distribution:",
+        "bin        original     sampled",
+    ]
+
+    for lo, hi, label in bins:
+
+        if hi is None:
+            mask = cardinalities >= lo
+        else:
+            mask = (
+                    (cardinalities >= lo)
+                    & (cardinalities <= hi)
+            )
+
+        original_pct = (
+                100.0 * mask.sum() / total_n
+        )
+
+        sampled_pct = (
+                100.0
+                * weights_np[mask].sum()
+                / total_weight
+        )
+
+        lines.append(
+            f"{label:8s} "
+            f"{original_pct:8.2f}% "
+            f"{sampled_pct:10.2f}%"
+        )
+
+    high41_original = (
+            100.0
+            * np.mean(cardinalities >= 41)
+    )
+
+    high41_sampled = (
+            100.0
+            * weights_np[cardinalities >= 41].sum()
+            / total_weight
+    )
+
+    lines.append(
+        f">=41     "
+        f"{high41_original:8.2f}% "
+        f"{high41_sampled:10.2f}%"
+    )
+
+    logger.info("\n".join(lines))
 
 
 def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout: GoTokenDropout = None):
@@ -368,17 +515,78 @@ def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout: Go
         neg_k=args.neg_k,
         go_dropout=None  # dropout off
     )
-    #    train_weights = build_dataset_sample_weights(datasets["train"])
-    #    train_sampler = WeightedRandomSampler(
-    #        weights=train_weights,
-    #        num_samples=len(train_weights),
-    #        replacement=True,
-    #    )
+
+    train_sampler = None
+
+    use_cardinality_sampling = bool(
+        getattr(
+            args,
+            "cardinality_sampling",
+            False,
+        )
+    )
+
+    if use_cardinality_sampling:
+        sampling_power = float(
+            getattr(
+                args,
+                "cardinality_sampling_power",
+                0.5,
+            )
+        )
+
+        sampling_min_weight = float(
+            getattr(
+                args,
+                "cardinality_sampling_min_weight",
+                0.5,
+            )
+        )
+
+        sampling_max_weight = float(
+            getattr(
+                args,
+                "cardinality_sampling_max_weight",
+                4.0,
+            )
+        )
+
+        train_weights, train_cardinalities = (
+            build_cardinality_sample_weights(
+                train_ds,
+                power=sampling_power,
+                min_weight=sampling_min_weight,
+                max_weight=sampling_max_weight,
+            )
+        )
+
+        train_sampler = WeightedRandomSampler(
+            weights=train_weights,
+            num_samples=len(train_ds),
+            replacement=True,
+        )
+
+        logger.info(
+            "[cardinality-sampler] enabled "
+            "power=%.3f clip=[%.3f, %.3f] "
+            "num_samples=%d",
+            sampling_power,
+            sampling_min_weight,
+            sampling_max_weight,
+            len(train_ds),
+        )
+
+        log_cardinality_sampling_distribution(
+            train_cardinalities,
+            train_weights.numpy(),
+            logger,
+        )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
-        sampler=None,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         persistent_workers=(args.num_workers > 0),
         pin_memory=True,
@@ -1631,7 +1839,12 @@ def load_structured_cfg(path: str):
         pairwise_margin=float(training.get("pairwise_margin", 0.0)),
         pairwise_start_step=int(training.get("pairwise_start_step", 0)),
         coverage_start_step=int(training.get("coverage_start_step", 2000)),
+        coverage_mode=str(loss.get("coverage_mode", "weak")),
         cardinality_weighting=bool(training.get("cardinality_weighting", False)),
+        cardinality_sampling=bool(training.get("cardinality_sampling", False)),
+        cardinality_sampling_power=float(training.get("cardinality_sampling_power", 0.5)),
+        cardinality_sampling_min_weight=float(training.get("cardinality_sampling_min_weight", 0.5)),
+        cardinality_sampling_max_weight=float(training.get("cardinality_sampling_max_weight", 4.0)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),

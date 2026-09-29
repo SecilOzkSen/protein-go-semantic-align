@@ -275,6 +275,7 @@ class TrainerConfig:
     coverage_start_step: int = 2000
     coverage_target_k: int = 0
     coverage_mining_k: int = 0
+    coverage_mode: str = "weak"
     # Term-frequency balancing for retriever objectives. Frequencies count
     # distinct training proteins annotated with each GO term.
     frequency_balancing: bool = False

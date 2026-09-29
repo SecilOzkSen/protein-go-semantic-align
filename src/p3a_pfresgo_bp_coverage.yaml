@@ -76,6 +76,10 @@ training:
   pairwise_margin: 0.0
   pairwise_start_step: 2000
   cardinality_weighting: true
+  cardinality_sampling: true
+  cardinality_sampling_power: 0.5
+  cardinality_sampling_min_weight: 0.5
+  cardinality_sampling_max_weight: 4.0
   coverage_start_step: 2000
 
 queue:
@@ -119,20 +123,16 @@ loss:
   lambda_attr: 0.0
   lambda_entropy_alpha: 0.0
   pairwise_lambda: 0.10
-  coverage_lambda: 0.05
-  coverage_target_k: 200
-  coverage_mining_k: 512
+  coverage_mode: weak
+  coverage_lambda: 0.10
+  coverage_bottom_frac: 0.25
+  coverage_hard_neg_k: 4
   coverage_margin: 0.05
-  dag_margin: 0.05
-  dag_scale: 10.0
   lambda_vtrue: 0.0
   tau_distill: 1.0
   lambda_bce: 0.0
   lambda_slot_div: 0.0
   frequency_balancing: false
-  frequency_weight_power: 0.5
-  frequency_weight_min: 0.5
-  frequency_weight_max: 2.0
 
 curriculum:
   epochs: 5

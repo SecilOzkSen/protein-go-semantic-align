@@ -246,6 +246,113 @@ def retrieval_boundary_coverage_loss(
     }
     return loss, stats
 
+def weak_positive_coverage_loss(
+        scores: torch.Tensor,
+        pos_mask: torch.Tensor,
+        cand_valid_mask: torch.Tensor,
+        queue_start: int,
+        queue_count: int,
+        bottom_frac: float = 0.25,
+        hard_neg_k: int = 4,
+        margin: float = 0.05,
+) -> torch.Tensor:
+    """
+    Original weak-positive coverage objective.
+
+    For each protein:
+      1. Select the lowest-scoring fraction of TRUE GO terms.
+      2. Select the highest-scoring queue negatives.
+      3. Push weak positives above the hard-negative reference.
+    """
+
+    if queue_count <= 0:
+        return scores.sum() * 0.0
+
+    pos_mask = pos_mask.bool() & cand_valid_mask.bool()
+
+    q_start = max(0, int(queue_start))
+    q_end = min(
+        int(scores.size(1)),
+        q_start + int(queue_count),
+    )
+
+    if q_start >= q_end:
+        return scores.sum() * 0.0
+
+    bottom_frac = float(bottom_frac)
+    bottom_frac = min(max(bottom_frac, 1e-6), 1.0)
+
+    hard_neg_k = max(1, int(hard_neg_k))
+
+    losses = []
+
+    for b in range(scores.size(0)):
+
+        # Weakest true GO terms
+        pos_scores = scores[b][pos_mask[b]]
+
+        if pos_scores.numel() == 0:
+            continue
+
+        n_weak = max(
+            1,
+            int(math.ceil(
+                float(pos_scores.numel()) * bottom_frac
+            )),
+        )
+
+        n_weak = min(
+            n_weak,
+            int(pos_scores.numel()),
+        )
+
+        weak_pos = torch.topk(
+            pos_scores,
+            k=n_weak,
+            largest=False,
+        ).values
+
+        # Hard queue negatives
+        queue_valid = cand_valid_mask[
+            b,
+            q_start:q_end,
+        ].bool()
+
+        queue_scores = scores[
+            b,
+            q_start:q_end,
+        ][queue_valid]
+
+        if queue_scores.numel() == 0:
+            continue
+
+        k_neg = min(
+            hard_neg_k,
+            int(queue_scores.numel()),
+        )
+
+        hard_neg = torch.topk(
+            queue_scores,
+            k=k_neg,
+            largest=True,
+        ).values
+
+        hard_ref = hard_neg.mean()
+
+        # Push weak positives above hard-negative reference
+        row_loss = F.softplus(
+            float(margin)
+            + hard_ref
+            - weak_pos
+        ).mean()
+
+        losses.append(row_loss)
+
+    if not losses:
+        return scores.sum() * 0.0
+
+    return torch.stack(losses).mean()
+
 
 @torch.no_grad()
 def delta_y_from_occlusion_windows(
@@ -3744,54 +3851,85 @@ class OppTrainer:
                     "pairwise loss NaN, batch protein_ids="
                     + str(batch.get("protein_ids", "")[:5])
                 )
+            # ---------------------------------------------------------
+            # Coverage objective
+            # ---------------------------------------------------------
+            coverage_lambda = float(
+                getattr(self.cfg, "coverage_lambda", 0.0)
+            )
 
-            # ---------------------------------------------------------
-            # Retrieval-aware Top-K coverage objective
-            # ---------------------------------------------------------
-            coverage_lambda = float(getattr(self.cfg, "coverage_lambda", 0.0))
-            coverage_target_k = int(getattr(self.cfg, "coverage_target_k", 200))
-            coverage_mining_k = int(getattr(self.cfg, "coverage_mining_k", 512))
-            coverage_margin = float(getattr(self.cfg, "coverage_margin", 0.05))
-            coverage_start_step = int(getattr(self.cfg, "coverage_start_step", 0))
+            coverage_mode = str(
+                getattr(self.cfg, "coverage_mode", "weak")
+            ).lower()
+
+            coverage_start_step = int(
+                getattr(
+                    self.cfg,
+                    "coverage_start_step",
+                    self.queue_cfg.queue_start_step,
+                )
+            )
+
             coverage_active = (
                     coverage_lambda > 0.0
+                    and kq > 0
                     and self._global_step >= coverage_start_step
-                    and not self._use_token_align
             )
-            coverage_stats = {
-                "gold_total": 0, "missed_total": 0,
-                "missed_frac": 0.0, "boundary_mean": 0.0,
-            }
 
             if coverage_active:
-                self._refresh_coverage_mining_bank(
-                    epoch_idx=epoch_idx,
-                    chunk=int(getattr(self.cfg, "coverage_bank_chunk", 256)),
-                )
-                with torch.no_grad():
-                    mined_ids = self._mine_coverage_candidates(
-                        protein_mining_repr=protein_mining_repr,
-                        mining_k=coverage_mining_k,
+
+                q_start = U + extra_n
+
+                if coverage_mode == "weak":
+
+                    coverage_bottom_frac = float(
+                        getattr(
+                            self.cfg,
+                            "coverage_bottom_frac",
+                            0.25,
+                        )
                     )
 
-                G_cov, cov_gold_mask, cov_valid_mask = (
-                    self._build_retrieval_coverage_shortlist(
-                        mined_ids=mined_ids,
-                        gold_ids_per_protein=batch["pos_go_global"],
-                        dtype=pooled_go.dtype,
+                    coverage_hard_neg_k = int(
+                        getattr(
+                            self.cfg,
+                            "coverage_hard_neg_k",
+                            4,
+                        )
                     )
-                )
-                coverage_scores = self.forward_scores(
-                    H, G_cov, attn_valid, return_alpha=False
-                ) * scale
 
-                l_coverage, coverage_stats = retrieval_boundary_coverage_loss(
-                    scores=coverage_scores,
-                    gold_mask=cov_gold_mask,
-                    valid_mask=cov_valid_mask,
-                    target_k=coverage_target_k,
-                    margin=coverage_margin,
-                )
+                    coverage_margin = float(
+                        getattr(
+                            self.cfg,
+                            "coverage_margin",
+                            0.05,
+                        )
+                    )
+
+                    l_coverage = weak_positive_coverage_loss(
+                        scores=scores_cand,
+                        pos_mask=pos_mask,
+                        cand_valid_mask=cand_valid_mask,
+                        queue_start=q_start,
+                        queue_count=kq,
+                        bottom_frac=coverage_bottom_frac,
+                        hard_neg_k=coverage_hard_neg_k,
+                        margin=coverage_margin,
+                    )
+
+                elif coverage_mode == "topk_boundary":
+
+                    raise NotImplementedError(
+                        "topk_boundary coverage is temporarily disabled. "
+                        "Use coverage_mode='weak' for the current experiment."
+                    )
+
+                else:
+                    raise ValueError(
+                        f"Unknown coverage_mode={coverage_mode!r}. "
+                        "Expected 'weak' or 'topk_boundary'."
+                    )
+
             else:
                 l_coverage = scores_cand.sum() * 0.0
 
