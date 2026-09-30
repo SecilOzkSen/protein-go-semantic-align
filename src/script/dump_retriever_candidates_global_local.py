@@ -569,6 +569,8 @@ def dump_candidates(
         empty_cache_every: int = 50,
         overwrite: bool = False,
         save_top_go_ids: bool = False,
+        dump_slot_stages: bool = False,
+        slot_stage_max_proteins: int = 200,
 ):
     out_dir = Path(out_dir)
 
@@ -738,6 +740,21 @@ def dump_candidates(
 
     offset = 0
 
+    # ---------------------------------------------------------
+    # D8: optional local-slot intermediate-stage diagnostic
+    # ---------------------------------------------------------
+    slot_stage_buffers = {
+        "query": [],
+        "attention": [],
+        "weighted_raw": [],
+        "extractor_out": [],
+        "protein_ln": [],
+        "projected": [],
+        "normalized": [],
+    }
+
+    slot_stage_count = 0
+
     for step, batch in enumerate(tqdm(loader, desc=f"dump {split_name}")):
         H = batch["prot_emb_pad"].to(device, non_blocking=True)
 
@@ -751,6 +768,171 @@ def dump_candidates(
         expert_mode = str(getattr(trainer.model, "protein_expert_mode", "legacy"))
 
         if expert_mode in {"global", "local", "global_local"}:
+            # -------------------------------------------------
+            # D8: inspect exact local-slot representation path
+            # -------------------------------------------------
+            if (
+                    dump_slot_stages
+                    and slot_stage_count < slot_stage_max_proteins
+                    and expert_mode in {"local", "global_local"}
+            ):
+                model = trainer.model
+                extractor = model.slot_extractor
+
+                if extractor is None:
+                    raise RuntimeError(
+                        "D8 requested but model.slot_extractor is None"
+                    )
+
+                # Only keep as many proteins as still needed.
+                n_keep = min(
+                    int(H.size(0)),
+                    int(slot_stage_max_proteins - slot_stage_count),
+                )
+
+                H_dbg = H[:n_keep]
+
+                mask_dbg = (
+                    attn_valid[:n_keep]
+                    if attn_valid is not None
+                    else None
+                )
+
+                # ---------------------------------------------
+                # Stage 0: learned queries after q_proj
+                # [S, Da]
+                # ---------------------------------------------
+                q_single = extractor.q_proj(
+                    extractor.slot_queries
+                )
+
+                # Repeat per protein only so all saved arrays
+                # have protein-aligned first dimension.
+                q_dbg = q_single.unsqueeze(0).expand(
+                    n_keep,
+                    -1,
+                    -1,
+                )
+
+                # ---------------------------------------------
+                # Reproduce ProteinSlotExtractor.forward()
+                # exactly, but expose intermediate tensors.
+                # ---------------------------------------------
+                k_dbg = extractor.k_proj(H_dbg)
+                v_dbg = extractor.v_proj(H_dbg)
+
+                scores_dbg = torch.einsum(
+                    "bsd,btd->bst",
+                    q_dbg,
+                    k_dbg,
+                ) / extractor.scale
+
+                if mask_dbg is not None:
+                    if mask_dbg.dtype != torch.bool:
+                        mask_dbg = mask_dbg != 0
+
+                    scores_dbg = scores_dbg.masked_fill(
+                        ~mask_dbg.unsqueeze(1),
+                        -1e4,
+                    )
+
+                # IMPORTANT:
+                # model.eval() means extractor.dropout is inactive.
+                # This therefore matches inference exactly.
+                attn_dbg = torch.softmax(
+                    scores_dbg,
+                    dim=-1,
+                )
+
+                attn_dbg = extractor.dropout(
+                    attn_dbg
+                )
+
+                attn_dbg = (
+                        attn_dbg
+                        / attn_dbg.sum(
+                    dim=-1,
+                    keepdim=True,
+                ).clamp_min(1e-6)
+                )
+
+                # Before extractor out_ln.
+                weighted_raw_dbg = torch.einsum(
+                    "bst,btd->bsd",
+                    attn_dbg,
+                    v_dbg,
+                )
+
+                if extractor.use_residual:
+                    weighted_raw_dbg = (
+                            weighted_raw_dbg
+                            + extractor.residual_proj(q_dbg)
+                    )
+
+                # Exact output of ProteinSlotExtractor.
+                extractor_out_dbg = extractor.out_ln(
+                    weighted_raw_dbg
+                )
+
+                # Exact local-expert downstream path.
+                protein_ln_dbg = model.protein_ln(
+                    extractor_out_dbg
+                )
+
+                projected_dbg = model.proj_p(
+                    protein_ln_dbg
+                )
+
+                if model.normalize:
+                    normalized_dbg = model._norm(
+                        projected_dbg,
+                        dim=-1,
+                    )
+                else:
+                    normalized_dbg = projected_dbg
+
+                # ---------------------------------------------
+                # Sanity check against actual model path
+                # ---------------------------------------------
+                actual_local_dbg = model._encode_local_expert(
+                    H_dbg,
+                    mask_dbg,
+                )
+
+                max_abs_err = (
+                        normalized_dbg.float()
+                        - actual_local_dbg.float()
+                ).abs().max().item()
+
+                if max_abs_err > 5e-4:
+                    raise RuntimeError(
+                        "D8 reconstruction mismatch: "
+                        f"max_abs_err={max_abs_err:.8f}"
+                    )
+
+                # ---------------------------------------------
+                # Save CPU float32.
+                # Only ~200 proteins, so tiny.
+                # ---------------------------------------------
+                tensors = {
+                    "query": q_dbg,
+                    "attention": attn_dbg,
+                    "weighted_raw": weighted_raw_dbg,
+                    "extractor_out": extractor_out_dbg,
+                    "protein_ln": protein_ln_dbg,
+                    "projected": projected_dbg,
+                    "normalized": normalized_dbg,
+                }
+
+                for name, tensor in tensors.items():
+                    slot_stage_buffers[name].append(
+                        tensor.detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                    )
+
+                slot_stage_count += n_keep
             encoded = trainer.model.encode_protein_experts(H, attn_valid)
             scores_raw, components = trainer.model.score_from_encoded_experts(
                 encoded=encoded,
@@ -915,6 +1097,54 @@ def dump_candidates(
     if offset != n_samples:
         raise RuntimeError(f"[dump] wrote offset={offset}, expected n_samples={n_samples}")
 
+    # ---------------------------------------------------------
+    # Save D8 intermediate slot stages
+    # ---------------------------------------------------------
+    if dump_slot_stages:
+        if slot_stage_count == 0:
+            raise RuntimeError(
+                "D8 requested but no slot-stage tensors were collected"
+            )
+
+        print(
+            f"[D8] saving slot stages for "
+            f"{slot_stage_count} proteins"
+        )
+
+        for name, chunks in slot_stage_buffers.items():
+            if not chunks:
+                raise RuntimeError(
+                    f"D8 stage {name!r} is empty"
+                )
+
+            arr = np.concatenate(
+                chunks,
+                axis=0,
+            )
+
+            arr = arr[
+                :slot_stage_max_proteins
+            ]
+
+            path = (
+                    out_dir
+                    / f"slot_stage_{name}.float32.npy"
+            )
+
+            np.save(
+                path,
+                arr.astype(
+                    np.float32,
+                    copy=False,
+                ),
+            )
+
+            print(
+                f"[D8] {name:14s} "
+                f"shape={arr.shape} "
+                f"saved={path.name}"
+            )
+
     # Flush large memmaps.
     top_cols_mm.flush()
     top_scores_mm.flush()
@@ -1033,6 +1263,8 @@ def parse_args():
     p.add_argument("--empty_cache_every", type=int, default=50)
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--save_top_go_ids", action="store_true")
+    p.add_argument("--dump_slot_stages", action="store_true", help="Dump D8 local-slot intermediate representations.")
+    p.add_argument("--slot_stage_max_proteins", type=int, default=200, help="Maximum proteins for D8 intermediate slot dump.")
 
     return p.parse_args()
 
@@ -1144,6 +1376,10 @@ def main():
         empty_cache_every=int(cli.empty_cache_every),
         overwrite=bool(cli.overwrite),
         save_top_go_ids=bool(cli.save_top_go_ids),
+        dump_slot_stages=bool(cli.dump_slot_stages),
+        slot_stage_max_proteins=int(
+            cli.slot_stage_max_proteins
+        ),
     )
 
 
