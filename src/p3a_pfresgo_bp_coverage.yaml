@@ -131,7 +131,7 @@ loss:
   lambda_vtrue: 0.0
   tau_distill: 1.0
   lambda_bce: 0.0
-  lambda_slot_div: 0.0
+  lambda_slot_div: 0.05
   frequency_balancing: false
 
 curriculum:
@@ -151,7 +151,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "PFresGO-BP-markerless-freq-balanced"
+  wandb_run_name: "PFresGO-BP-markerless-wc-slotdiv-1"
   mode: online
 
 stores:

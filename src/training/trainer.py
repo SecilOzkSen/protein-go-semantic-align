@@ -3939,12 +3939,144 @@ class OppTrainer:
                     + str(batch.get("protein_ids", "")[:5])
                 )
 
+            # ---------------------------------------------------------
+            # Slot diversity regularization
+            # ---------------------------------------------------------
+            lambda_slot_div = float(
+                getattr(
+                    self.cfg,
+                    "lambda_slot_div",
+                    0.0,
+                )
+            )
+
+            # Zero tensor on the correct graph/device.
+            l_slot_div = scores_cand.sum() * 0.0
+
+            slot_extractor = getattr(
+                self.model,
+                "slot_extractor",
+                None,
+            )
+
+            if (
+                    lambda_slot_div > 0.0
+                    and slot_extractor is not None
+            ):
+                slot_div = getattr(
+                    slot_extractor,
+                    "last_slot_div_loss",
+                    None,
+                )
+
+                if slot_div is not None:
+                    l_slot_div = slot_div
+
+
+            # ---------------------------------------------------------
+            # Slot geometry diagnostics
+            # Monitoring only, no gradient.
+            # ---------------------------------------------------------
+            slot_attn_cos_mean = None
+            slot_attn_cos_min = None
+            slot_attn_cos_max = None
+            slot_effective_rank = None
+
+            slot_attn = None
+
+            expert_info = getattr(
+                self.model,
+                "last_expert_info",
+                None,
+            )
+
+            if isinstance(expert_info, dict):
+                slot_attn = expert_info.get(
+                    "slot_attn",
+                    None,
+                )
+
+            if slot_attn is not None:
+                with torch.no_grad():
+                    a = F.normalize(
+                        slot_attn.detach().float(),
+                        dim=-1,
+                    )
+
+                    slot_sim = torch.matmul(
+                        a,
+                        a.transpose(1, 2),
+                    )
+
+                    S = int(
+                        slot_sim.size(1)
+                    )
+
+                    eye = torch.eye(
+                        S,
+                        dtype=torch.bool,
+                        device=slot_sim.device,
+                    )
+
+                    offdiag = slot_sim[:, ~eye]
+
+                    slot_attn_cos_mean = float(
+                        offdiag.mean().item()
+                    )
+
+                    slot_attn_cos_min = float(
+                        offdiag.min().item()
+                    )
+
+                    slot_attn_cos_max = float(
+                        offdiag.max().item()
+                    )
+
+                    eigvals = torch.linalg.eigvalsh(
+                        slot_sim.float()
+                    ).clamp_min(0.0)
+
+                    probs = (
+                            eigvals
+                            / eigvals.sum(
+                        dim=-1,
+                        keepdim=True,
+                    ).clamp_min(1e-8)
+                    )
+
+                    entropy = -(
+                            probs
+                            * torch.log(
+                        probs.clamp_min(1e-8)
+                    )
+                    ).sum(dim=-1)
+
+                    slot_effective_rank = float(
+                        torch.exp(
+                            entropy
+                        ).mean().item()
+                    )
+
+            if (self._global_step % 500 == 0 and lambda_slot_div > 0.0):
+                print(
+                    "[SLOT-DIV]",
+                    f"step={self._global_step}",
+                    f"lambda={lambda_slot_div:.4f}",
+                    f"loss={float(l_slot_div.detach().item()):.6f}",
+                    f"requires_grad={l_slot_div.requires_grad}",
+                    f"attn_cos={slot_attn_cos_mean}",
+                    f"eff_rank={slot_effective_rank}",
+                )
+
+            # ---------------------------------------------------------
+            # Final objective
+            # ---------------------------------------------------------
             l_total = (
                     l_con
                     + pairwise_lambda * l_pairwise
                     + coverage_lambda * l_coverage
+                    + lambda_slot_div * l_slot_div
             )
-
             # positives-only tensors for attr / dag
             B = H.size(0)
             T_max = max((int(x.numel()) for x in pos_local_kept), default=1)
@@ -4061,28 +4193,30 @@ class OppTrainer:
                     "train/coverage": float(l_coverage.detach().item()),
                     "train/coverage_weighted": float((coverage_lambda * l_coverage).detach().item()),
                     "train/coverage_active": float(coverage_active),
-                    "train/coverage_missed_frac": float(coverage_stats["missed_frac"]),
-                    "train/coverage_boundary_mean": float(coverage_stats["boundary_mean"]),
-                    "train/coverage_gold_total": int(coverage_stats["gold_total"]),
-                    "train/coverage_missed_total": int(coverage_stats["missed_total"]),
+                    "train/slot_div": float(l_slot_div.detach().item()),
+                    "train/slot_div_weighted": float((lambda_slot_div * l_slot_div).detach().item()),
+                    "train/lambda_slot_div": float(lambda_slot_div),
+                    "slots/attention_cosine_mean": (float(slot_attn_cos_mean) if slot_attn_cos_mean is not None else 0.0),
+                    "slots/attention_cosine_min": (float(slot_attn_cos_min) if slot_attn_cos_min is not None else 0.0),
+                    "slots/attention_cosine_max": (float(slot_attn_cos_max) if slot_attn_cos_max is not None else 0.0),
+                    "slots/effective_rank": (float(slot_effective_rank) if slot_effective_rank is not None else 0.0),
                     "train/logit_scale": float(self.logit_scale.detach().exp().item()),
-                    "train/lr_go_lora": float(
-                        self._lora_lr_schedule(self._global_step - 1)
-                    ) if self.model.go_encoder is not None else 0.0,
+                    "train/lr_go_lora": float(self._lora_lr_schedule(self._global_step - 1)) if self.model.go_encoder is not None else 0.0,
                     "train/queue_hard_frac": float(self._queue_hard_frac_schedule(self._global_step)),
                     "train/queue_weight_eff": float(self._queue_weight_schedule(self._global_step)),
                     "train/k_hard_queue_eff": int(self._k_hard_queue_schedule(self._global_step)),
                 },
                 step=int(self._global_step),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print("[WARN] wandb train logging failed:", repr(e))
 
         return {
             "total": l_total,
             "contrastive": l_con,
             "pairwise": l_pairwise,
             "coverage": l_coverage,
+            "slot_div": l_slot_div,
         }
 
     @torch.no_grad()
