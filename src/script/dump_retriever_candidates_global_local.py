@@ -1117,14 +1117,46 @@ def dump_candidates(
                     f"D8 stage {name!r} is empty"
                 )
 
-            arr = np.concatenate(
-                chunks,
-                axis=0,
-            )
+            # Attention has shape [B,S,T], where T varies between
+            # batches because proteins have different padded lengths.
+            # Pad all attention chunks to the same T before concatenation.
+            if name == "attention":
+                max_t = max(
+                    int(chunk.shape[2])
+                    for chunk in chunks
+                )
 
-            arr = arr[
-                :slot_stage_max_proteins
-            ]
+                padded_chunks = []
+
+                for chunk in chunks:
+                    if chunk.shape[2] < max_t:
+                        pad_width = (
+                            (0, 0),
+                            (0, 0),
+                            (0, max_t - chunk.shape[2]),
+                        )
+
+                        chunk = np.pad(
+                            chunk,
+                            pad_width,
+                            mode="constant",
+                            constant_values=0.0,
+                        )
+
+                    padded_chunks.append(chunk)
+
+                arr = np.concatenate(
+                    padded_chunks,
+                    axis=0,
+                )
+
+            else:
+                arr = np.concatenate(
+                    chunks,
+                    axis=0,
+                )
+
+            arr = arr[:slot_stage_max_proteins]
 
             path = (
                     out_dir
