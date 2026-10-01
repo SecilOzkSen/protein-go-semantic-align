@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from src.datasets.residue_store import ESMResidueStore
 
 CARD_BINS = [
     (1, 5, "1_5"),
@@ -146,7 +147,7 @@ def find_embedding(embed_dir, pid):
 
 def build_vectors(
         pids,
-        embed_dir,
+        residue_store,
         pid2pos,
         split,
 ):
@@ -158,23 +159,30 @@ def build_vectors(
 
     for i, pid in enumerate(pids):
 
-        path = find_embedding(
-            embed_dir,
-            pid,
-        )
-
-        if path is None:
+        try:
+            H = residue_store.get(pid)
+        except KeyError:
             missing += 1
             continue
 
-        x = load_embedding_file(path)
+        # H: [L, D], exact tensor returned by the same
+        # residue store used during training.
+        H = H.float()
 
-        # Mean residue representation.
-        v = x.mean(axis=0)
+        if H.ndim != 2:
+            raise RuntimeError(
+                f"{pid}: expected [L,D], "
+                f"got {tuple(H.shape)}"
+            )
 
-        norm = np.linalg.norm(v)
+        # Simple protein-level ESM representation.
+        # D9 is testing the pretrained ESM space itself,
+        # not our learned protein projection.
+        v = H.mean(dim=0)
 
-        if norm < 1e-8:
+        norm = torch.linalg.vector_norm(v)
+
+        if norm.item() < 1e-8:
             continue
 
         v = v / norm
@@ -184,9 +192,14 @@ def build_vectors(
             [],
         )
 
-        vectors.append(v)
+        vectors.append(
+            v.cpu().numpy()
+        )
+
         kept_pids.append(pid)
-        n_gold.append(len(positives))
+        n_gold.append(
+            len(positives)
+        )
 
         if (
                 (i + 1) % 2000 == 0
@@ -208,7 +221,9 @@ def build_vectors(
     )
 
     return (
-        np.stack(vectors).astype(np.float32),
+        np.stack(vectors).astype(
+            np.float32
+        ),
         kept_pids,
         np.asarray(n_gold),
     )
@@ -484,12 +499,36 @@ def main():
         args.pid2pos
     )
 
+    print("Building ESM residue store...")
+
+    residue_store = ESMResidueStore(
+        args.embed_dir,
+        seq_len_lookup={},
+        max_len=1024,
+        overlap=256,
+        prefer_fp16=True,
+    )
+
+    print(
+        "Residue backend:",
+        residue_store._backend,
+    )
+
+    if hasattr(
+            residue_store,
+            "_pid2span",
+    ):
+        print(
+            "Indexed proteins:",
+            len(residue_store._pid2span),
+        )
+
     print("\nBuilding TRAIN vectors...")
 
     train_vec, train_pid, train_ng = (
         build_vectors(
             train_ids,
-            embed_dir,
+            residue_store,
             pid2pos,
             "train",
         )
@@ -500,7 +539,7 @@ def main():
     valid_vec, valid_pid, valid_ng = (
         build_vectors(
             valid_ids,
-            embed_dir,
+            residue_store,
             pid2pos,
             "valid",
         )
@@ -511,7 +550,7 @@ def main():
     test_vec, test_pid, test_ng = (
         build_vectors(
             test_ids,
-            embed_dir,
+            residue_store,
             pid2pos,
             "test",
         )
