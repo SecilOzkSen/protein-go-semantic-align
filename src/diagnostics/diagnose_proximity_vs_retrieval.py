@@ -106,6 +106,7 @@ def load_ranking_dump(dump_dir: Path):
     rank_path = find_file(
         dump_dir,
         [
+            "top_go_cols.int32.npy",
             "top_indices.int32.npy",
             "top_indices.npy",
             "ranking_indices.int32.npy",
@@ -116,14 +117,17 @@ def load_ranking_dump(dump_dir: Path):
     go_path = find_file(
         dump_dir,
         [
-            "go_ids.json",
-            "eval_go_ids.json",
-            "go_id_list.json",
+            "eval_go_ids.npy",
+            "go_ids.npy",
         ],
     )
 
     pids = load_json(pid_path)
-    go_ids = load_json(go_path)
+
+    go_ids = np.load(
+        go_path,
+        allow_pickle=True,
+    ).tolist()
 
     ranking = np.load(
         rank_path,
