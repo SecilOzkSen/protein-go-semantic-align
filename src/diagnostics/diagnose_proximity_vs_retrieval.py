@@ -609,7 +609,7 @@ def main():
         "--valid_dump",
         default=str(
             base
-            / "slotdiv005_step70572_valid"
+            / "slotdiv005_step70572_fullranking_valid"
         ),
     )
 
@@ -617,7 +617,7 @@ def main():
         "--test_dump",
         default=str(
             base
-            / "slotdiv005_step70572_test"
+            / "slotdiv005_step70572_fullranking_test"
         ),
     )
 
