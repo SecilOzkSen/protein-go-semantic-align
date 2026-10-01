@@ -3872,29 +3872,77 @@ class OppTrainer:
 
             coverage_active = (
                     coverage_lambda > 0.0
-                    and kq > 0
                     and self._global_step >= coverage_start_step
+                    and not self._use_token_align
             )
+
+            coverage_stats = {
+                "gold_total": 0,
+                "missed_total": 0,
+                "missed_frac": 0.0,
+                "boundary_mean": 0.0,
+            }
 
             if coverage_active:
 
-                q_start = U + extra_n
-
                 if coverage_mode == "weak":
 
-                    coverage_bottom_frac = float(
+                    # Weak coverage still requires queue negatives.
+                    if kq > 0:
+                        q_start = U + extra_n
+
+                        coverage_bottom_frac = float(
+                            getattr(
+                                self.cfg,
+                                "coverage_bottom_frac",
+                                0.25,
+                            )
+                        )
+
+                        coverage_hard_neg_k = int(
+                            getattr(
+                                self.cfg,
+                                "coverage_hard_neg_k",
+                                4,
+                            )
+                        )
+
+                        coverage_margin = float(
+                            getattr(
+                                self.cfg,
+                                "coverage_margin",
+                                0.05,
+                            )
+                        )
+
+                        l_coverage = weak_positive_coverage_loss(
+                            scores=scores_cand,
+                            pos_mask=pos_mask,
+                            cand_valid_mask=cand_valid_mask,
+                            queue_start=q_start,
+                            queue_count=kq,
+                            bottom_frac=coverage_bottom_frac,
+                            hard_neg_k=coverage_hard_neg_k,
+                            margin=coverage_margin,
+                        )
+                    else:
+                        l_coverage = scores_cand.sum() * 0.0
+
+                elif coverage_mode == "topk_boundary":
+
+                    coverage_target_k = int(
                         getattr(
                             self.cfg,
-                            "coverage_bottom_frac",
-                            0.25,
+                            "coverage_target_k",
+                            200,
                         )
                     )
 
-                    coverage_hard_neg_k = int(
+                    coverage_mining_k = int(
                         getattr(
                             self.cfg,
-                            "coverage_hard_neg_k",
-                            4,
+                            "coverage_mining_k",
+                            512,
                         )
                     )
 
@@ -3906,22 +3954,53 @@ class OppTrainer:
                         )
                     )
 
-                    l_coverage = weak_positive_coverage_loss(
-                        scores=scores_cand,
-                        pos_mask=pos_mask,
-                        cand_valid_mask=cand_valid_mask,
-                        queue_start=q_start,
-                        queue_count=kq,
-                        bottom_frac=coverage_bottom_frac,
-                        hard_neg_k=coverage_hard_neg_k,
-                        margin=coverage_margin,
+                    coverage_bank_chunk = int(
+                        getattr(
+                            self.cfg,
+                            "coverage_bank_chunk",
+                            256,
+                        )
                     )
 
-                elif coverage_mode == "topk_boundary":
+                    # Refresh projected full-GO mining bank.
+                    self._refresh_coverage_mining_bank(
+                        epoch_idx=epoch_idx,
+                        chunk=coverage_bank_chunk,
+                    )
 
-                    raise NotImplementedError(
-                        "topk_boundary coverage is temporarily disabled. "
-                        "Use coverage_mode='weak' for the current experiment."
+                    # Mine retrieval neighbourhood from full GO space.
+                    with torch.no_grad():
+                        mined_ids = self._mine_coverage_candidates(
+                            protein_mining_repr=protein_mining_repr,
+                            mining_k=coverage_mining_k,
+                        )
+
+                    # Union mined candidates with ALL gold GO terms.
+                    G_cov, cov_gold_mask, cov_valid_mask = (
+                        self._build_retrieval_coverage_shortlist(
+                            mined_ids=mined_ids,
+                            gold_ids_per_protein=batch["pos_go_global"],
+                            dtype=pooled_go.dtype,
+                        )
+                    )
+
+                    # Re-score with gradient.
+                    coverage_scores = self.forward_scores(
+                        H,
+                        G_cov,
+                        attn_valid,
+                        return_alpha=False,
+                    ) * scale
+
+                    # Push missed golds above the Top-K non-gold boundary.
+                    l_coverage, coverage_stats = (
+                        retrieval_boundary_coverage_loss(
+                            scores=coverage_scores,
+                            gold_mask=cov_gold_mask,
+                            valid_mask=cov_valid_mask,
+                            target_k=coverage_target_k,
+                            margin=coverage_margin,
+                        )
                     )
 
                 else:
@@ -4205,6 +4284,10 @@ class OppTrainer:
                     "train/queue_hard_frac": float(self._queue_hard_frac_schedule(self._global_step)),
                     "train/queue_weight_eff": float(self._queue_weight_schedule(self._global_step)),
                     "train/k_hard_queue_eff": int(self._k_hard_queue_schedule(self._global_step)),
+                    "coverage/missed_frac": float(coverage_stats["missed_frac"]),
+                    "coverage/boundary_mean": float(coverage_stats["boundary_mean"]),
+                    "coverage/gold_total": int(coverage_stats["gold_total"]),
+                    "coverage/missed_total": int(coverage_stats["missed_total"]),
                 },
                 step=int(self._global_step),
             )

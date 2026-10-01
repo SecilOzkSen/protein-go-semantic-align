@@ -81,6 +81,9 @@ training:
   cardinality_sampling_min_weight: 0.5
   cardinality_sampling_max_weight: 4.0
   coverage_start_step: 2000
+  coverage_target_k: 200
+  coverage_mining_k: 512
+  coverage_bank_chunk: 256
 
 queue:
   queue_K: 16384
@@ -123,7 +126,7 @@ loss:
   lambda_attr: 0.0
   lambda_entropy_alpha: 0.0
   pairwise_lambda: 0.10
-  coverage_mode: weak
+  coverage_mode: topk_boundary #weak
   coverage_lambda: 0.10
   coverage_bottom_frac: 0.25
   coverage_hard_neg_k: 4
@@ -151,7 +154,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "PFresGO-BP-markerless-wc-slotdiv-1"
+  wandb_run_name: "PFresGO-BP-top200-slotdiv005"
   mode: online
 
 stores:
