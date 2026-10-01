@@ -944,5 +944,5 @@ def main():
         / "proximity_retrieval_cardinality_controlled_quartiles.csv"
     )
 
-    if __name__ == "__main__":
-        main()
+if __name__ == "__main__":
+    main()
