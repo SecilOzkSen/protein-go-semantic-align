@@ -220,6 +220,7 @@ def evaluate_loader(
     model.eval()
 
     scale = trainer.logit_scale_tensor()
+    sanity_done = False
 
     # Per-mode accumulators.
     stats = {
@@ -286,15 +287,149 @@ def evaluate_loader(
         # We only need y_true from _build_eval_space.
         # G_eval itself is deliberately ignored because
         # D12 substitutes its own GO banks.
-        _, y_true = trainer._build_eval_space(
-            batch
-        )
+        G_eval, y_true = trainer._build_eval_space(batch)
 
         B = int(H.size(0))
 
         n_gold = (
                 y_true > 0
         ).sum(dim=1)
+
+        # ---------------------------------------------------------
+        # D12 critical sanity check
+        # ---------------------------------------------------------
+
+        if not hasattr(trainer, "_eval_ids_cpu"):
+            raise RuntimeError(
+                "trainer._eval_ids_cpu missing after eval cache preparation"
+            )
+
+        eval_ids_runtime = trainer._eval_ids_cpu.detach().cpu().long()
+
+        eval_ids_bank = torch.as_tensor(
+            [int(x) for x in trainer.eval_id_list],
+            dtype=torch.long,
+        )
+
+        if eval_ids_runtime.shape != eval_ids_bank.shape:
+            raise RuntimeError(
+                "GO ID count mismatch: "
+                f"runtime={tuple(eval_ids_runtime.shape)} "
+                f"bank={tuple(eval_ids_bank.shape)}"
+            )
+
+        same_order = torch.equal(
+            eval_ids_runtime,
+            eval_ids_bank,
+        )
+
+        if not same_order:
+            print(
+                "[D12] WARNING: GO bank order differs from "
+                "_build_eval_space order. Reordering banks."
+            )
+
+            bank_pos = {
+                int(gid): i
+                for i, gid in enumerate(
+                    eval_ids_bank.tolist()
+                )
+            }
+
+            reorder = []
+
+            for gid in eval_ids_runtime.tolist():
+                if int(gid) not in bank_pos:
+                    raise RuntimeError(
+                        f"Runtime GO id {gid} missing from D12 bank"
+                    )
+
+                reorder.append(
+                    bank_pos[int(gid)]
+                )
+
+            reorder_idx = torch.tensor(
+                reorder,
+                dtype=torch.long,
+            )
+
+            banks = {
+                mode: bank.index_select(
+                    0,
+                    reorder_idx,
+                )
+                for mode, bank in banks.items()
+            }
+
+            eval_ids_bank = eval_ids_runtime.clone()
+
+        # ---------------------------------------------------------
+        # D12 pooled-bank sanity check
+        # Run only on the first batch.
+        # ---------------------------------------------------------
+        if not sanity_done:
+            pooled_bank = banks["pooled"].to(
+                device,
+                non_blocking=True,
+            )
+
+            pooled_batch = pooled_bank.unsqueeze(0).expand(
+                B,
+                -1,
+                -1,
+            )
+
+            g_eval_f = G_eval.float()
+            pooled_f = pooled_batch.float()
+
+            print(
+                "[D12-SANITY] G_eval shape:",
+                tuple(g_eval_f.shape),
+            )
+
+            print(
+                "[D12-SANITY] pooled shape:",
+                tuple(pooled_f.shape),
+            )
+
+            if g_eval_f.shape != pooled_f.shape:
+                raise RuntimeError(
+                    "D12 pooled bank does not match normal "
+                    "G_eval shape: "
+                    f"G_eval={tuple(g_eval_f.shape)} "
+                    f"pooled={tuple(pooled_f.shape)}"
+                )
+
+            cos = F.cosine_similarity(
+                g_eval_f.reshape(
+                    -1,
+                    g_eval_f.shape[-1],
+                ),
+                pooled_f.reshape(
+                    -1,
+                    pooled_f.shape[-1],
+                ),
+                dim=-1,
+            )
+
+            max_abs_diff = (
+                    g_eval_f - pooled_f
+            ).abs().max().item()
+
+            print(
+                "[D12-SANITY] G_eval vs pooled cosine "
+                f"mean/min/max = "
+                f"{cos.mean().item():.8f} / "
+                f"{cos.min().item():.8f} / "
+                f"{cos.max().item():.8f}"
+            )
+
+            print(
+                "[D12-SANITY] G_eval vs pooled "
+                f"max_abs_diff = {max_abs_diff:.8e}"
+            )
+
+            sanity_done = True
 
         for mode in MODES:
 
