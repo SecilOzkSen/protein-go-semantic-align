@@ -298,9 +298,21 @@ def evaluate_loader(
 
         for mode in MODES:
 
-            G = banks[mode].to(
+            # banks[mode]: [G, D]
+            G_bank = banks[mode].to(
                 device,
                 non_blocking=True,
+            )
+
+            # score_from_encoded_experts expects pooled GO candidates
+            # in batch form: [B, K, D].
+            #
+            # Every protein is ranked against the SAME complete GO bank,
+            # so expand without materializing B physical copies.
+            G = G_bank.unsqueeze(0).expand(
+                B,
+                -1,
+                -1,
             )
 
             scores_raw, _ = (
@@ -310,6 +322,13 @@ def evaluate_loader(
                     return_components=True,
                 )
             )
+
+            if scores_raw.shape != (B, G_bank.shape[0]):
+                raise RuntimeError(
+                    f"Unexpected score shape for mode={mode}: "
+                    f"{tuple(scores_raw.shape)}, expected "
+                    f"({B}, {G_bank.shape[0]})"
+                )
 
             scores = (
                     scores_raw * scale
