@@ -514,10 +514,8 @@ def evaluate_loader(
                     ng
                 )
 
-                stats[mode]["gold_total"] += ng
-
+                stats[mode]["num_valid"] += 1
                 card_stats[mode][bname]["n"] += 1
-                card_stats[mode][bname]["gold_total"] += ng
 
                 for k in KS:
                     kk = min(
@@ -624,6 +622,7 @@ def evaluate_loader(
             card_rows
         ),
     )
+
 
 def analyze_isa_redundancy(
         jsonl_path: str | Path,
