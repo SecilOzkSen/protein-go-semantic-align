@@ -47,7 +47,7 @@ training:
   output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_markerless_coverage_top200_slotdiv005
   save_every: 10000
   keep_last_n: 3
-  resume: null
+  resume: /workspace/data_pfresgo/outputs/bp/name_def_isa_markerless_coverage_top200_slotdiv005/checkpoint_step60000.pt
   warmstart_path: null
   eval_only: false
   log_every: 500
