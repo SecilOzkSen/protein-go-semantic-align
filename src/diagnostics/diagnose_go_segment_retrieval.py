@@ -72,9 +72,11 @@ def encode_go_banks(
     device = trainer.device
     store = trainer.ctx.go_text_store
 
+    # CRITICAL:
+    # Use the exact runtime GO order used by _build_eval_space.
     eval_ids = [
         int(x)
-        for x in trainer.eval_id_list
+        for x in trainer._eval_ids_cpu.tolist()
     ]
 
     model.eval()
@@ -86,19 +88,29 @@ def encode_go_banks(
 
     segment_index = {
         name: i
-        for i, name in enumerate(model.go_segment_names)
+        for i, name in enumerate(
+            model.go_segment_names
+        )
     }
 
-    for required in ["name", "definition", "is_a"]:
+    for required in [
+        "name",
+        "definition",
+        "is_a",
+    ]:
         if required not in segment_index:
             raise RuntimeError(
-                f"Segment {required!r} not found in "
+                f"Segment {required!r} missing from "
                 f"{model.go_segment_names}"
             )
 
     for start in tqdm(
-            range(0, len(eval_ids), chunk_size),
-            desc="encode GO banks",
+            range(
+                0,
+                len(eval_ids),
+                chunk_size,
+            ),
+            desc="encode raw GO banks",
     ):
         end = min(
             start + chunk_size,
@@ -174,20 +186,23 @@ def encode_go_banks(
             ],
         }
 
+        # CRITICAL:
+        # DO NOT apply go_ln / proj_g / normalization here.
+        #
+        # score_from_encoded_experts expects the same raw GO
+        # representation stage returned by _build_eval_space.
         for mode, raw in raw_by_mode.items():
-            z = model.go_ln(raw)
-            z = model.proj_g(z)
-            z = F.normalize(
-                z.float(),
-                dim=-1,
-            )
-
             buffers[mode].append(
-                z.detach().cpu()
+                raw.detach()
+                .float()
+                .cpu()
             )
 
     banks = {
-        mode: torch.cat(chunks, dim=0)
+        mode: torch.cat(
+            chunks,
+            dim=0,
+        )
         for mode, chunks in buffers.items()
     }
 
@@ -202,7 +217,8 @@ def encode_go_banks(
 
         print(
             f"[GO-BANK] {mode:10s} "
-            f"shape={tuple(bank.shape)}"
+            f"shape={tuple(bank.shape)} "
+            f"norm={bank.norm(dim=-1).mean().item():.4f}"
         )
 
     return banks
@@ -217,12 +233,11 @@ def evaluate_loader(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     device = trainer.device
     model = trainer.model
+
     model.eval()
 
     scale = trainer.logit_scale_tensor()
-    sanity_done = False
 
-    # Per-mode accumulators.
     stats = {
         mode: {
             "gold_total": 0,
@@ -239,17 +254,23 @@ def evaluate_loader(
         for mode in MODES
     }
 
+    card_bins = [
+        "1_5",
+        "6_10",
+        "11_20",
+        "21_40",
+        "41_80",
+        "81_160",
+        "161plus",
+    ]
+
     for mode in MODES:
-        for b in [
-            "1_5",
-            "6_10",
-            "11_20",
-            "21_40",
-            "41_80",
-            "81_160",
-            "161plus",
-        ]:
-            card_stats[mode][b] = {
+        for bname in card_bins:
+            card_stats[
+                mode
+            ][
+                bname
+            ] = {
                 "n": 0,
                 "gold_total": 0,
                 **{
@@ -258,10 +279,22 @@ def evaluate_loader(
                 },
             }
 
+    sanity_done = False
+
+    # Put GO banks on GPU once.
+    banks_device = {
+        mode: bank.to(
+            device,
+            non_blocking=True,
+        )
+        for mode, bank in banks.items()
+    }
+
     for batch in tqdm(
             loader,
             desc=f"D12 retrieval {split_name}",
     ):
+
         H = batch[
             "prot_emb_pad"
         ].to(
@@ -273,152 +306,122 @@ def evaluate_loader(
             H = trainer.to_f32(H)
 
         attn_valid, _ = (
-            trainer._valid_and_pad_masks(batch)
+            trainer._valid_and_pad_masks(
+                batch
+            )
         )
 
-        # IMPORTANT:
-        # Use the exact protein expert encoding path
-        # from the normal retriever dump.
-        encoded = model.encode_protein_experts(
-            H,
-            attn_valid,
+        # Exact normal evaluation space.
+        G_eval, y_true = (
+            trainer._build_eval_space(
+                batch
+            )
         )
 
-        # We only need y_true from _build_eval_space.
-        # G_eval itself is deliberately ignored because
-        # D12 substitutes its own GO banks.
-        G_eval, y_true = trainer._build_eval_space(batch)
-
-        B = int(H.size(0))
-
-        n_gold = (
-                y_true > 0
-        ).sum(dim=1)
-
-        # ---------------------------------------------------------
-        # D12 critical sanity check
-        # ---------------------------------------------------------
-
-        if not hasattr(trainer, "_eval_ids_cpu"):
-            raise RuntimeError(
-                "trainer._eval_ids_cpu missing after eval cache preparation"
-            )
-
-        eval_ids_runtime = trainer._eval_ids_cpu.detach().cpu().long()
-
-        eval_ids_bank = torch.as_tensor(
-            [int(x) for x in trainer.eval_id_list],
-            dtype=torch.long,
+        B = int(
+            H.size(0)
         )
 
-        if eval_ids_runtime.shape != eval_ids_bank.shape:
-            raise RuntimeError(
-                "GO ID count mismatch: "
-                f"runtime={tuple(eval_ids_runtime.shape)} "
-                f"bank={tuple(eval_ids_bank.shape)}"
+        # Exact protein-side representation.
+        encoded = (
+            model.encode_protein_experts(
+                H,
+                attn_valid,
             )
-
-        same_order = torch.equal(
-            eval_ids_runtime,
-            eval_ids_bank,
         )
 
-        if not same_order:
-            print(
-                "[D12] WARNING: GO bank order differs from "
-                "_build_eval_space order. Reordering banks."
-            )
+        # ====================================================
+        # CRITICAL SANITY CHECK
+        #
+        # Our pooled raw GO bank MUST reproduce G_eval.
+        # If not, D12 is invalid and stops immediately.
+        # ====================================================
 
-            bank_pos = {
-                int(gid): i
-                for i, gid in enumerate(
-                    eval_ids_bank.tolist()
-                )
-            }
-
-            reorder = []
-
-            for gid in eval_ids_runtime.tolist():
-                if int(gid) not in bank_pos:
-                    raise RuntimeError(
-                        f"Runtime GO id {gid} missing from D12 bank"
-                    )
-
-                reorder.append(
-                    bank_pos[int(gid)]
-                )
-
-            reorder_idx = torch.tensor(
-                reorder,
-                dtype=torch.long,
-            )
-
-            banks = {
-                mode: bank.index_select(
-                    0,
-                    reorder_idx,
-                )
-                for mode, bank in banks.items()
-            }
-
-            eval_ids_bank = eval_ids_runtime.clone()
-
-        # ---------------------------------------------------------
-        # D12 pooled-bank sanity check
-        # Run only on the first batch.
-        # ---------------------------------------------------------
         if not sanity_done:
-            pooled_bank = banks["pooled"].to(
-                device,
-                non_blocking=True,
-            )
 
-            pooled_batch = pooled_bank.unsqueeze(0).expand(
-                B,
-                -1,
-                -1,
-            )
+            pooled = banks_device[
+                "pooled"
+            ]
 
-            g_eval_f = G_eval.float()
-            pooled_f = pooled_batch.float()
+            pooled_batch = (
+                pooled
+                .unsqueeze(0)
+                .expand(
+                    B,
+                    -1,
+                    -1,
+                )
+            )
 
             print(
                 "[D12-SANITY] G_eval shape:",
-                tuple(g_eval_f.shape),
+                tuple(
+                    G_eval.shape
+                ),
             )
 
             print(
                 "[D12-SANITY] pooled shape:",
-                tuple(pooled_f.shape),
+                tuple(
+                    pooled_batch.shape
+                ),
             )
 
-            if g_eval_f.shape != pooled_f.shape:
+            print(
+                "[D12-SANITY] G_eval norm mean:",
+                float(
+                    G_eval
+                    .float()
+                    .norm(dim=-1)
+                    .mean()
+                    .item()
+                ),
+            )
+
+            print(
+                "[D12-SANITY] pooled norm mean:",
+                float(
+                    pooled_batch
+                    .float()
+                    .norm(dim=-1)
+                    .mean()
+                    .item()
+                ),
+            )
+
+            if (
+                    G_eval.shape
+                    != pooled_batch.shape
+            ):
                 raise RuntimeError(
-                    "D12 pooled bank does not match normal "
-                    "G_eval shape: "
-                    f"G_eval={tuple(g_eval_f.shape)} "
-                    f"pooled={tuple(pooled_f.shape)}"
+                    "D12 pooled shape does not "
+                    "match normal G_eval."
                 )
 
             cos = F.cosine_similarity(
-                g_eval_f.reshape(
+                G_eval
+                .float()
+                .reshape(
                     -1,
-                    g_eval_f.shape[-1],
+                    G_eval.shape[-1],
                 ),
-                pooled_f.reshape(
+                pooled_batch
+                .float()
+                .reshape(
                     -1,
-                    pooled_f.shape[-1],
+                    pooled_batch.shape[-1],
                 ),
                 dim=-1,
             )
 
             max_abs_diff = (
-                    g_eval_f - pooled_f
+                    G_eval.float()
+                    - pooled_batch.float()
             ).abs().max().item()
 
             print(
-                "[D12-SANITY] G_eval vs pooled cosine "
-                f"mean/min/max = "
+                "[D12-SANITY] G_eval vs pooled "
+                "cosine mean/min/max = "
                 f"{cos.mean().item():.8f} / "
                 f"{cos.min().item():.8f} / "
                 f"{cos.max().item():.8f}"
@@ -426,28 +429,44 @@ def evaluate_loader(
 
             print(
                 "[D12-SANITY] G_eval vs pooled "
-                f"max_abs_diff = {max_abs_diff:.8e}"
+                f"max_abs_diff = "
+                f"{max_abs_diff:.8e}"
             )
+
+            # Require essentially identical directions.
+            if cos.min().item() < 0.999:
+                raise RuntimeError(
+                    "D12 pooled GO bank does not "
+                    "reproduce normal G_eval. "
+                    "Stopping before retrieval."
+                )
 
             sanity_done = True
 
+        n_gold = (
+                y_true > 0
+        ).sum(
+            dim=1
+        )
+
+        # ====================================================
+        # Four GO representation modes
+        # ====================================================
+
         for mode in MODES:
 
-            # banks[mode]: [G, D]
-            G_bank = banks[mode].to(
-                device,
-                non_blocking=True,
-            )
+            G_bank = banks_device[
+                mode
+            ]
 
-            # score_from_encoded_experts expects pooled GO candidates
-            # in batch form: [B, K, D].
-            #
-            # Every protein is ranked against the SAME complete GO bank,
-            # so expand without materializing B physical copies.
-            G = G_bank.unsqueeze(0).expand(
-                B,
-                -1,
-                -1,
+            G = (
+                G_bank
+                .unsqueeze(0)
+                .expand(
+                    B,
+                    -1,
+                    -1,
+                )
             )
 
             scores_raw, _ = (
@@ -458,15 +477,19 @@ def evaluate_loader(
                 )
             )
 
-            if scores_raw.shape != (B, G_bank.shape[0]):
+            if scores_raw.shape != (
+                    B,
+                    G_bank.shape[0],
+            ):
                 raise RuntimeError(
-                    f"Unexpected score shape for mode={mode}: "
-                    f"{tuple(scores_raw.shape)}, expected "
-                    f"({B}, {G_bank.shape[0]})"
+                    f"Unexpected score shape "
+                    f"for {mode}: "
+                    f"{tuple(scores_raw.shape)}"
                 )
 
             scores = (
-                    scores_raw * scale
+                    scores_raw
+                    * scale
             ).float()
 
             max_k = min(
@@ -485,25 +508,39 @@ def evaluate_loader(
             for i in range(B):
 
                 ng = int(
-                    n_gold[i].item()
+                    n_gold[
+                        i
+                    ].item()
                 )
 
                 if ng <= 0:
                     continue
 
-                bname = card_bin(ng)
+                bname = card_bin(
+                    ng
+                )
 
-                stats[mode][
+                stats[
+                    mode
+                ][
                     "gold_total"
                 ] += ng
 
-                card_stats[mode][
+                card_stats[
+                    mode
+                ][
                     bname
-                ]["n"] += 1
+                ][
+                    "n"
+                ] += 1
 
-                card_stats[mode][
+                card_stats[
+                    mode
+                ][
                     bname
-                ]["gold_total"] += ng
+                ][
+                    "gold_total"
+                ] += ng
 
                 for k in KS:
                     kk = min(
@@ -524,25 +561,38 @@ def evaluate_loader(
                                     0,
                                     cols,
                                 ) > 0
-                        ).sum().item()
+                        )
+                        .sum()
+                        .item()
                     )
 
-                    stats[mode][
+                    stats[
+                        mode
+                    ][
                         f"hits@{k}"
                     ] += hits
 
-                    card_stats[mode][
+                    card_stats[
+                        mode
+                    ][
                         bname
                     ][
                         f"hits@{k}"
                     ] += hits
 
+    # ========================================================
+    # Aggregate
+    # ========================================================
+
     overall_rows = []
 
     for mode in MODES:
+
         gold_total = stats[
             mode
-        ]["gold_total"]
+        ][
+            "gold_total"
+        ]
 
         row = {
             "split": split_name,
@@ -554,7 +604,9 @@ def evaluate_loader(
             row[
                 f"coverage@{k}"
             ] = (
-                    stats[mode][
+                    stats[
+                        mode
+                    ][
                         f"hits@{k}"
                     ]
                     / max(
@@ -563,14 +615,22 @@ def evaluate_loader(
             )
             )
 
-        overall_rows.append(row)
+        overall_rows.append(
+            row
+        )
 
     card_rows = []
 
     for mode in MODES:
-        for bname, s in (
-                card_stats[mode].items()
-        ):
+
+        for bname in card_bins:
+
+            s = card_stats[
+                mode
+            ][
+                bname
+            ]
+
             if s["n"] == 0:
                 continue
 
@@ -599,13 +659,18 @@ def evaluate_loader(
                 )
                 )
 
-            card_rows.append(row)
+            card_rows.append(
+                row
+            )
 
     return (
-        pd.DataFrame(overall_rows),
-        pd.DataFrame(card_rows),
+        pd.DataFrame(
+            overall_rows
+        ),
+        pd.DataFrame(
+            card_rows
+        ),
     )
-
 
 def analyze_isa_redundancy(
         jsonl_path: str | Path,
