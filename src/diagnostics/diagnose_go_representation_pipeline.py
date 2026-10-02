@@ -737,6 +737,122 @@ def run_go_representation_diagnostic(
             float_format=lambda x: f"{x:.6f}",
         )
     )
+    # ========================================================
+    # D11G: segment-specific projection geometry
+    # ========================================================
+
+    print("\n")
+    print("=" * 110)
+    print("D11G: SEGMENT-SPECIFIC PROJECTION GEOMETRY")
+    print("=" * 110)
+
+    segment_projection_rows = []
+
+    for s, segment_name in enumerate(segment_names):
+
+        mask = segment_present[:, s]
+
+        if int(mask.sum()) < 2:
+            continue
+
+        raw = segment_embs[mask, s].float()
+
+        projected_chunks = []
+
+        for start in range(0, raw.shape[0], chunk_size):
+            end = min(
+                start + chunk_size,
+                raw.shape[0],
+            )
+
+            x = raw[start:end].to(
+                device,
+                non_blocking=True,
+            )
+
+            # Use exactly the same GO-side projection path
+            # as the normal retrieval representation.
+            x_ln = model.go_ln(x)
+            x_proj = model.proj_g(x_ln)
+            x_norm = F.normalize(
+                x_proj.float(),
+                dim=-1,
+            )
+
+            projected_chunks.append(
+                x_norm.detach().cpu()
+            )
+
+        projected_segment = torch.cat(
+            projected_chunks,
+            dim=0,
+        )
+
+        raw_stats = _geometry_summary(
+            f"{segment_name}:raw",
+            raw,
+        )
+
+        proj_stats = _geometry_summary(
+            f"{segment_name}:projected",
+            projected_segment,
+        )
+
+        raw_pairs = _offdiag_cosines(raw)
+        proj_pairs = _offdiag_cosines(
+            projected_segment
+        )
+
+        pair_spearman = _spearman_torch(
+            raw_pairs,
+            proj_pairs,
+        )
+
+        segment_projection_rows.append({
+            "segment": segment_name,
+            "n": int(raw.shape[0]),
+
+            "raw_cos_mean":
+                raw_stats["cos_mean"],
+
+            "raw_cos_std":
+                raw_stats["cos_std"],
+
+            "raw_effective_rank":
+                raw_stats["effective_rank"],
+
+            "projected_cos_mean":
+                proj_stats["cos_mean"],
+
+            "projected_cos_std":
+                proj_stats["cos_std"],
+
+            "projected_effective_rank":
+                proj_stats["effective_rank"],
+
+            "cosine_shift":
+                proj_stats["cos_mean"]
+                - raw_stats["cos_mean"],
+
+            "pairwise_similarity_spearman":
+                pair_spearman,
+        })
+
+    segment_projection_df = pd.DataFrame(
+        segment_projection_rows
+    )
+
+    print(
+        segment_projection_df.to_string(
+            index=False,
+            float_format=lambda x: f"{x:.6f}",
+        )
+    )
+
+    segment_projection_df.to_csv(
+        outdir / "go_segment_projection_geometry.csv",
+        index=False,
+    )
 
     # ========================================================
     # D11E
@@ -990,6 +1106,7 @@ def run_go_representation_diagnostic(
         outdir / "go_pipeline_distortion.csv",
         outdir / "go_segment_agreement.csv",
         outdir / "go_diagnostic_summary.json",
+        outdir / "go_segment_projection_geometry.csv",
     ]:
         print(path)
 
