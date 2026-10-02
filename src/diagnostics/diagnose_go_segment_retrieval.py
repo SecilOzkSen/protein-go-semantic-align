@@ -240,15 +240,14 @@ def evaluate_loader(
 
     stats = {
         mode: {
-            "gold_total": 0,
+            "num_valid": 0,
             **{
-                f"hits@{k}": 0
+                f"recall_sum@{k}": 0.0
                 for k in KS
             },
         }
         for mode in MODES
     }
-
     card_stats = {
         mode: {}
         for mode in MODES
@@ -266,15 +265,10 @@ def evaluate_loader(
 
     for mode in MODES:
         for bname in card_bins:
-            card_stats[
-                mode
-            ][
-                bname
-            ] = {
+            card_stats[mode][bname] = {
                 "n": 0,
-                "gold_total": 0,
                 **{
-                    f"hits@{k}": 0
+                    f"recall_sum@{k}": 0.0
                     for k in KS
                 },
             }
@@ -520,27 +514,10 @@ def evaluate_loader(
                     ng
                 )
 
-                stats[
-                    mode
-                ][
-                    "gold_total"
-                ] += ng
+                stats[mode]["gold_total"] += ng
 
-                card_stats[
-                    mode
-                ][
-                    bname
-                ][
-                    "n"
-                ] += 1
-
-                card_stats[
-                    mode
-                ][
-                    bname
-                ][
-                    "gold_total"
-                ] += ng
+                card_stats[mode][bname]["n"] += 1
+                card_stats[mode][bname]["gold_total"] += ng
 
                 for k in KS:
                     kk = min(
@@ -566,19 +543,21 @@ def evaluate_loader(
                         .item()
                     )
 
+                    recall = float(hits) / float(ng)
+
                     stats[
                         mode
                     ][
-                        f"hits@{k}"
-                    ] += hits
+                        f"recall_sum@{k}"
+                    ] += recall
 
                     card_stats[
                         mode
                     ][
                         bname
                     ][
-                        f"hits@{k}"
-                    ] += hits
+                        f"recall_sum@{k}"
+                    ] += recall
 
     # ========================================================
     # Aggregate
@@ -587,32 +566,18 @@ def evaluate_loader(
     overall_rows = []
 
     for mode in MODES:
-
-        gold_total = stats[
-            mode
-        ][
-            "gold_total"
-        ]
+        num_valid = stats[mode]["num_valid"]
 
         row = {
             "split": split_name,
             "go_repr": mode,
-            "gold_total": gold_total,
+            "num_valid": num_valid,
         }
 
         for k in KS:
-            row[
-                f"coverage@{k}"
-            ] = (
-                    stats[
-                        mode
-                    ][
-                        f"hits@{k}"
-                    ]
-                    / max(
-                gold_total,
-                1,
-            )
+            row[f"coverage@{k}"] = (
+                    stats[mode][f"recall_sum@{k}"]
+                    / max(num_valid, 1)
             )
 
         overall_rows.append(
@@ -639,24 +604,12 @@ def evaluate_loader(
                 "go_repr": mode,
                 "card_bin": bname,
                 "n": s["n"],
-                "gold_total": s[
-                    "gold_total"
-                ],
             }
 
             for k in KS:
-                row[
-                    f"coverage@{k}"
-                ] = (
-                        s[
-                            f"hits@{k}"
-                        ]
-                        / max(
-                    s[
-                        "gold_total"
-                    ],
-                    1,
-                )
+                row[f"coverage@{k}"] = (
+                        s[f"recall_sum@{k}"]
+                        / max(s["n"], 1)
                 )
 
             card_rows.append(
