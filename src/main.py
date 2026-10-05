@@ -5,8 +5,8 @@ import time
 import math
 import yaml
 import random
-from torch.utils.data import DataLoader
-from typing import Dict, List, Set
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from typing import Dict, List, Set, Iterable, Tuple, Any, Optional
 import torch.multiprocessing as mp
 from datetime import datetime
 import glob
@@ -17,19 +17,19 @@ import logging
 import json
 import numpy as np
 import torch
-import torch.nn.functional as F
 import argparse
+import shutil
 
 import wandb
-from src.configs.paths import TRAINING_CONFIG as _TRAINING_CONFIG_DEFAULT, GO_INDEX
-from src.datasets import ESMResidueStore, ESMFusedStore, GoTextStore
-from src.datasets.protein_dataset import ProteinEmbDataset, ProteinFusedQueryDataset
-from src.training.collate import ContrastiveEmbCollator, fused_collator
+from src.datasets import ESMResidueStore, GoTextStore
+from src.datasets.protein_dataset import ProteinEmbDataset
+from src.training.collate import ContrastiveEmbCollator
 from src.training.trainer import OppTrainer
+from src.utils.helpers import _coerce_int_list, _coerce_id2row, _coerce_row2id_list_from_dict, build_altid_map_from_go_terms, canonicalize_id_list, \
+    canonicalize_pid2pos, go_str_to_int_any, load_go_namespaces
 from src.configs.data_classes import (
-    FewZeroConfig, TrainSchedule, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig
+    FewZeroConfig, TrainerConfig, AttrConfig, LoRAParameters, TrainingContext, LoggingConfig, QueueConfig
 )
-from src.training.curriculum import CurriculumConfig, CurriculumScheduler
 from src.go import GoLookupCache, GoDropoutConfig, GoTokenDropout
 from src.go import load_go_parents, load_go_children
 from src.utils import (
@@ -38,19 +38,7 @@ from src.utils import (
 from src.utils.checkpoint import save_checkpoint, load_checkpoint
 from src.encoders import BioMedBERTEncoder
 from math import inf
-
-from src.configs.paths import (
-    PROTEIN_TRAIN_IDS,
-    PROTEIN_VAL_IDS,
-    PID_TO_POSITIVES,
-    ZERO_SHOT_TERMS_ID_ONLY_JSON,
-    FEW_SHOT_IC_TERMS_ID_ONLY_JSON,
-    P_SEQ_LEN_LOOKUP,
-    GOOGLE_DRIVE_MANIFEST_CACHE,
-    TRAINING_CONFIG,
-    COMMON_IC_GO_TERMS_ID_ONLY_JSON,
-    GO_INDEX_NON_PHASE
-)
+from src.configs.paths import YAML_FILE
 
 # To prevent sigint (potential cause)
 try:
@@ -150,7 +138,6 @@ def collect_eval_ids_from_datasets(train_ds, val_ds=None) -> List[int]:
 
 # ============== Builders ==============
 
-
 def build_go_cache(go_cache_path: str) -> GoLookupCache:
     logger = logging.getLogger("build_go_cache")
     p = Path(go_cache_path)
@@ -169,209 +156,332 @@ def build_go_cache(go_cache_path: str) -> GoLookupCache:
                 memmap_path = alt
 
     if memmap_path is not None:
-        # Eşlemleri opsiyonel yan dosyalardan yükle (varsa)
-        id2row = row2id = None
+        id2row: Optional[Dict[int, int]] = None
+        row2id: Optional[List[int]] = None
+
+        # 1) sidecar mapping files
         for fname in ("id2row.json", "row2id.json", "ids.json", "ids.txt"):
             f = memmap_path.with_name(fname)
-            if f.exists():
-                if f.suffix == ".json":
-                    with open(f, "r") as fp:
-                        data = json.load(fp)
+            if not f.exists():
+                continue
+
+            if f.suffix == ".json":
+                with open(f, "r") as fp:
+                    data = json.load(fp)
+
+                if isinstance(data, dict):
                     if "id2row" in data and id2row is None:
-                        id2row = data["id2row"]
+                        id2row = _coerce_id2row(data["id2row"])
                     if "row2id" in data and row2id is None:
-                        row2id = data["row2id"]
-                    if "ids" in data and (id2row is None or row2id is None):
-                        ids = data["ids"]
-                        id2row = {pid: i for i, pid in enumerate(ids)}
-                        row2id = {i: pid for i, pid in enumerate(ids)}
+                        v = data["row2id"]
+                        if isinstance(v, dict):
+                            row2id = _coerce_row2id_list_from_dict(v)
+                        else:
+                            row2id = _coerce_int_list(v)
+                    if "ids" in data and (row2id is None or id2row is None):
+                        ids = _coerce_int_list(data["ids"])
+                        row2id = ids
+                        id2row = {int(g): i for i, g in enumerate(ids)}
                 else:
-                    # ids.txt (satır başına bir id)
-                    with open(f, "r") as fp:
-                        ids = [line.strip() for line in fp if line.strip()]
-                    id2row = {pid: i for i, pid in enumerate(ids)}
-                    row2id = {i: pid for i, pid in enumerate(ids)}
+                    raise ValueError(f"Unexpected JSON format in {f}")
 
-        # Yan dosyalar yoksa: boyutu okumadan basit map üret (isteğe bağlı)
-        if id2row is None or row2id is None:
-            try:
-                # Sadece shape öğrenmek için memmap aç (RAM'e yüklemez)
-                arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
-                n = int(arr.shape[0])
-                id2row = {str(i): i for i in range(n)}
-                row2id = {i: int(i) for i in range(n)}
-            except Exception:
-                # Eşlemeleri boş bırak; GoLookupCache içi tolere edebiliyorsa
-                id2row = None
-                row2id = None
+            else:
+                # ids.txt (one id per line)
+                with open(f, "r") as fp:
+                    ids = [line.strip() for line in fp if line.strip()]
+                ids = _coerce_int_list(ids)
+                row2id = ids
+                id2row = {int(g): i for i, g in enumerate(ids)}
 
+        # 2) fallback: if still missing, build identity mapping 0..n-1 based on memmap shape
+        if row2id is None:
+            arr0 = np.load(memmap_path, mmap_mode="r", allow_pickle=False)
+            n = int(arr0.shape[0])
+            row2id = list(range(n))
+
+        if id2row is None:
+            id2row = {int(g): i for i, g in enumerate(row2id)}
+
+        # 3) sanity: shape must match mapping length
         arr = np.load(memmap_path, mmap_mode="r", allow_pickle=False)  # [N,D]
-        print("memmap path:", memmap_path)
+        if int(arr.shape[0]) != len(row2id):
+            raise RuntimeError(f"GO cache rows={int(arr.shape[0])} != len(row2id)={len(row2id)} for {memmap_path}")
+
+        # 4) sanity: reject zero rows
         norms = np.linalg.norm(arr.astype(np.float32), axis=1)
         n_zero = int((norms < 1e-8).sum())
         if n_zero > 0:
             raise RuntimeError(
                 f"GO cache has {n_zero} zero-embedding rows in {memmap_path}. "
-                "This will produce NaNs in contrastive loss. Rebuild GO embeddings."
+                "Rebuild GO embeddings."
             )
 
         blob = {
             "memmap_path": str(memmap_path),
-            "id2row": id2row,
-            "row2id": row2id,
+            "id2row": id2row,  # int->int
+            "row2id": row2id,  # LIST[int], not dict
         }
-        return GoLookupCache(blob)
+        return GoLookupCache(blob, device="cpu")  # or your desired device
 
+    # non-memmap blob
     blob = torch.load(str(p), map_location="cpu", weights_only=False)
-    return GoLookupCache(blob)
-
-
+    return GoLookupCache(blob, device="cpu")
 
 def build_stores(args):
-    """
-    Returns:
-      res_store:  ESMResidueStore  ([L,D])
-      fused_store: ESMFusedStore or None  ([D])
-    CLI/args beklenen alanlar:
-      - args.seq_len_lookup (pickle path)
-      - args.embed_dir_res (residue kökü)   [zorunlu]
-      - args.embed_dir_fused (fused kökü)   [opsiyonel]
-      - args.fp16 (bool), args.max_len, args.overlap
-    """
-    import logging, os
     logger = logging.getLogger("build_stores")
     logger.info("Building residue+fused stores (lazy, no snapshot)...")
 
-    # 1) seq len lookup
- #   seq_len_lookup = load_raw_pickle(args.seq_len_lookup)
-
-    # 2) HF cache kökü (opsiyonel; şu an lazy fetch kapalı)
-    hub_local_dir = getattr(args, "hub_local_dir", None) or "/content/hf_cache"
-    Path(hub_local_dir).mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("HF_HOME", str(hub_local_dir))
-
     # 3) embed dirs
-    embed_dir_res = getattr(args, "embed_dir_res", None) or hub_local_dir
-
-    embed_dir_fused = getattr(args, "embed_dir_fused", None)  # None olabilir
-
+    embed_dir_res = getattr(args, "embed_dir_res", None)
     # 4) toggles
-    gdrive_cache = False
-    cache_shards = getattr(args, "no_cache_shards", False)
 
     logger.info(
         "Store config:\n"
         f"  embed_dir_res   = {embed_dir_res}\n"
-        f"  embed_dir_fused = {embed_dir_fused}\n"
-        f"  cache_shards    = {cache_shards}\n"
         f"  prefer_fp16     = {args.fp16}\n"
-        f"  max_len/overlap = {getattr(args,'max_len',None)}/{getattr(args,'overlap',None)}"
+        f"  max_len/overlap = {getattr(args, 'max_len', None)}/{getattr(args, 'overlap', None)}"
     )
 
     # 5) Build residue
     res_store = ESMResidueStore(
         embed_dir=embed_dir_res,
-      #  seq_len_lookup=seq_len_lookup,
         max_len=args.max_len,
         overlap=args.overlap,
-        gdrive_cache=gdrive_cache,
         prefer_fp16=args.fp16,
-        # HF lazy fetch paramlarını bilinçli olarak kapalı bırakıyoruz
     )
 
-    # 6) Build fused (opsiyonel)
-    fused_store = None
-    if embed_dir_fused:
-        fused_store = ESMFusedStore(
-            embed_dir=embed_dir_fused,
-            gdrive_cache=gdrive_cache,
-            prefer_fp16=args.fp16,
-        )
-
     logger.info("Stores ready.")
-    return res_store, fused_store
+    return res_store
 
 def build_val_dataset(
-    val_pids,
-    pid2pos_val,
-    go_cache,
-    fewzero_cfg,
-    dag_parents,
-    residue_store: ESMResidueStore,
+        val_pids,
+        pid2pos_val,
+        go_text_store,
+        fewzero_cfg,
+        dag_parents,
+        residue_store: ESMResidueStore,
 ):
     ds_val = ProteinEmbDataset(
         protein_ids=val_pids,
         pid2pos=pid2pos_val,
-        go_cache=go_cache,
+        go_text_store=go_text_store,
         fewzero=fewzero_cfg,
         dag_parents=dag_parents,
         store=residue_store,
-        fused_store=None,
-        include_fused=False,   # validation için fused gereksiz
     )
     return ds_val
 
-def build_datasets(args, res_store: ESMResidueStore, fused_store:ESMFusedStore, go_cache: GoLookupCache, dag_parents=None) -> Dict[str, torch.utils.data.Dataset]:
-    logger = logging.getLogger("build_datasets")
-    logger.info("Building datasets...")
 
+def build_datasets(args, res_store: ESMResidueStore, go_text_store: GoTextStore, dag_parents=None, pid2pos=None, zs=None, fs=None) -> Dict[
+    str, torch.utils.data.Dataset]:
     logger = logging.getLogger("build_datasets")
     logger.info("Building datasets...")
     logger.info(f"PID_TO_POSITIVES path = {args.pid2pos}")
 
-    pid2pos = load_raw_json(args.pid2pos)
-    train_ids = load_raw_txt(PROTEIN_TRAIN_IDS)
-    val_ids = load_raw_txt(PROTEIN_VAL_IDS)
+    if pid2pos == None:
+        pid2pos = load_raw_json(args.pid2pos)
 
-    #test_pids = load_raw_pickle("/workspace/data/processed/test_ids.pkl")
+    train_ids = load_raw_txt(args.train_ids_path)
+    val_ids = load_raw_txt(args.val_ids_path)
 
-    fused_dir = str(Path(args.embed_dir_fused))  # senin kullandığın yol
-    have_fused = _collect_fused_ids(fused_dir)
+    train_ids = [pid for pid in train_ids if res_store.has(pid)]
+    val_ids = [pid for pid in val_ids if res_store.has(pid)]
 
-    def _filter_existing(ids):
-        kept = [pid for pid in ids if pid in have_fused]
-        missing = len(ids) - len(kept)
-        return kept, missing
+    logging.getLogger("data").info(
+        "[residue-filter] train=%d val=%d (filtered by _pid2span)",
+        len(train_ids), len(val_ids)
+    )
+    # TODO: erase
+    have = set(res_store._pid2span.keys())
+    dropped_train = [pid for pid in load_raw_txt(args.train_ids_path) if pid not in have]
+    dropped_val = [pid for pid in load_raw_txt(args.val_ids_path) if pid not in have]
+    logging.getLogger("data").warning(
+        "[residue-filter] dropped train=%d val=%d ex_train=%s ex_val=%s",
+        len(dropped_train), len(dropped_val), dropped_train[:5], dropped_val[:5]
+    )
 
-    train_ids_kept, train_missing = _filter_existing(train_ids)
-    val_ids_kept, val_missing = _filter_existing(val_ids)
+    if zs is None:
+        zs = load_go_set(args.zero_shot_path)
 
-    if train_missing or val_missing:
-        logging.getLogger("build_datasets").warning(
-            "Fused bank'te olmayan ID'ler elendi: train_missing=%d, val_missing=%d",
-            train_missing, val_missing
-        )
-    train_ids = train_ids_kept
-    val_ids = val_ids_kept
+    if fs is None:
+        fs = load_go_set(args.few_shot_path)
 
-    zs = load_go_set(ZERO_SHOT_TERMS_ID_ONLY_JSON)
-    fs = load_go_set(FEW_SHOT_IC_TERMS_ID_ONLY_JSON)
-    common = load_go_set(COMMON_IC_GO_TERMS_ID_ONLY_JSON)
-    fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs, common_terms=common,
+    fz = FewZeroConfig(zero_shot_terms=zs, few_shot_terms=fs,
                        fs_target_ratio=args.fs_target_ratio)
 
     train_ds = ProteinEmbDataset(
         protein_ids=train_ids,
         pid2pos=pid2pos,
-        go_cache=go_cache,
+        go_text_store=go_text_store,
         fewzero=fz,
         dag_parents=dag_parents,
         store=res_store,
-        fused_store=None,  # eğitimde gerekmez
-        include_fused=False
     )
 
-    val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_cache=go_cache, fewzero_cfg=fz,
-                              dag_parents=dag_parents, residue_store=res_store)
-    if fused_store is not None:
-        query_ds = ProteinFusedQueryDataset(train_ids+val_ids, fused_store=fused_store)
-    else:
-        query_ds = None
+    val_ds = build_val_dataset(val_pids=val_ids, pid2pos_val=pid2pos, go_text_store=go_text_store, fewzero_cfg=fz,
+                               dag_parents=dag_parents, residue_store=res_store)
 
     logger.info("Datasets ready. Train=%d%s", len(train_ds), f", Val={len(val_ds)}" if val_ds else "")
-    return {"train": train_ds, "val": val_ds, "query_ds": query_ds}
+    return {"train": train_ds, "val": val_ds}
 
-def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: GoTextStore, go_dropout:GoTokenDropout=None):
+
+def build_cardinality_sample_weights(
+        dataset,
+        power: float = 0.5,
+        min_weight: float = 0.5,
+        max_weight: float = 4.0,
+):
+    """
+    Mildly oversample proteins with high annotation cardinality.
+
+    Weight:
+        w_i = (n_positive_i / median_cardinality) ** power
+
+    followed by clipping to [min_weight, max_weight].
+
+    The median normalization keeps an ordinary training protein
+    close to weight 1.0.
+    """
+
+    if not hasattr(dataset, "pids"):
+        raise RuntimeError(
+            "Cardinality sampler requires dataset.pids"
+        )
+
+    if not hasattr(dataset, "pid2pos"):
+        raise RuntimeError(
+            "Cardinality sampler requires dataset.pid2pos"
+        )
+
+    cardinalities = np.asarray(
+        [
+            max(
+                1,
+                len(dataset.pid2pos.get(pid, [])),
+            )
+            for pid in dataset.pids
+        ],
+        dtype=np.float64,
+    )
+
+    median_cardinality = float(
+        np.median(cardinalities)
+    )
+
+    median_cardinality = max(
+        median_cardinality,
+        1.0,
+    )
+
+    weights = (
+                      cardinalities / median_cardinality
+              ) ** float(power)
+
+    weights = np.clip(
+        weights,
+        float(min_weight),
+        float(max_weight),
+    )
+
+    return (
+        torch.as_tensor(
+            weights,
+            dtype=torch.double,
+        ),
+        cardinalities,
+    )
+
+
+def log_cardinality_sampling_distribution(
+        cardinalities,
+        weights,
+        logger,
+):
+    """
+    Report original vs expected sampling distribution.
+
+    Expected distribution is analytical:
+        P(sample i) proportional to weight_i.
+
+    No Monte Carlo sampling is needed.
+    """
+
+    bins = [
+        (1, 5, "1-5"),
+        (6, 10, "6-10"),
+        (11, 20, "11-20"),
+        (21, 40, "21-40"),
+        (41, 80, "41-80"),
+        (81, 160, "81-160"),
+        (161, None, "161+"),
+    ]
+
+    cardinalities = np.asarray(
+        cardinalities,
+        dtype=np.int64,
+    )
+
+    weights_np = np.asarray(
+        weights,
+        dtype=np.float64,
+    )
+
+    total_n = len(cardinalities)
+    total_weight = weights_np.sum()
+
+    lines = [
+        "",
+        "[cardinality-sampler] expected distribution:",
+        "bin        original     sampled",
+    ]
+
+    for lo, hi, label in bins:
+
+        if hi is None:
+            mask = cardinalities >= lo
+        else:
+            mask = (
+                    (cardinalities >= lo)
+                    & (cardinalities <= hi)
+            )
+
+        original_pct = (
+                100.0 * mask.sum() / total_n
+        )
+
+        sampled_pct = (
+                100.0
+                * weights_np[mask].sum()
+                / total_weight
+        )
+
+        lines.append(
+            f"{label:8s} "
+            f"{original_pct:8.2f}% "
+            f"{sampled_pct:10.2f}%"
+        )
+
+    high41_original = (
+            100.0
+            * np.mean(cardinalities >= 41)
+    )
+
+    high41_sampled = (
+            100.0
+            * weights_np[cardinalities >= 41].sum()
+            / total_weight
+    )
+
+    lines.append(
+        f">=41     "
+        f"{high41_original:8.2f}% "
+        f"{high41_sampled:10.2f}%"
+    )
+
+    logger.info("\n".join(lines))
+
+
+def build_dataloaders(datasets, args, go_text_store: GoTextStore, go_dropout: GoTokenDropout = None):
     logger = logging.getLogger("build_dataloaders")
 
     train_ds = datasets["train"]
@@ -392,31 +502,94 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
         shuffled_text_store.shuffle()
 
     train_collate = ContrastiveEmbCollator(
-        go_lookup=go_cache,
-        go_text_store=shuffled_text_store if shuffled else go_text_store, #tokenizer
+        go_text_store=shuffled_text_store if shuffled else go_text_store,  # tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
         neg_k=args.neg_k,
         go_dropout=go_dropout
     )
     val_collate = ContrastiveEmbCollator(
-        go_lookup=go_cache,
         go_text_store=go_text_store,  # tokenizer
         zs_mask_vec=zs_mask_vec,
         bidirectional=True,
         neg_k=args.neg_k,
-        go_dropout=None # dropout off
+        go_dropout=None  # dropout off
     )
+
+    train_sampler = None
+
+    use_cardinality_sampling = bool(
+        getattr(
+            args,
+            "cardinality_sampling",
+            False,
+        )
+    )
+
+    if use_cardinality_sampling:
+        sampling_power = float(
+            getattr(
+                args,
+                "cardinality_sampling_power",
+                0.5,
+            )
+        )
+
+        sampling_min_weight = float(
+            getattr(
+                args,
+                "cardinality_sampling_min_weight",
+                0.5,
+            )
+        )
+
+        sampling_max_weight = float(
+            getattr(
+                args,
+                "cardinality_sampling_max_weight",
+                4.0,
+            )
+        )
+
+        train_weights, train_cardinalities = (
+            build_cardinality_sample_weights(
+                train_ds,
+                power=sampling_power,
+                min_weight=sampling_min_weight,
+                max_weight=sampling_max_weight,
+            )
+        )
+
+        train_sampler = WeightedRandomSampler(
+            weights=train_weights,
+            num_samples=len(train_ds),
+            replacement=True,
+        )
+
+        logger.info(
+            "[cardinality-sampler] enabled "
+            "power=%.3f clip=[%.3f, %.3f] "
+            "num_samples=%d",
+            sampling_power,
+            sampling_min_weight,
+            sampling_max_weight,
+            len(train_ds),
+        )
+
+        log_cardinality_sampling_distribution(
+            train_cardinalities,
+            train_weights.numpy(),
+            logger,
+        )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         persistent_workers=(args.num_workers > 0),
-#        multiprocessing_context="forkserver",
         pin_memory=True,
-    #    prefetch_factor=2,
         collate_fn=train_collate,
     )
 
@@ -430,96 +603,12 @@ def build_dataloaders(datasets, args, go_cache: GoLookupCache, go_text_store: Go
             persistent_workers=False,
             pin_memory=False,
             collate_fn=val_collate,
-#            multiprocessing_context="forkserver",
+            #            multiprocessing_context="forkserver",
             drop_last=False
         )
 
-    if datasets.get("query_ds") is None:
-        raise RuntimeError("Query dataset is required for retrieval/indexing.")
-
-    query_loader = DataLoader(
-        datasets.get("query_ds"),
-        batch_size=1024,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        collate_fn=fused_collator)
-
     logger.info("Dataloaders ready. batch_size=%d", args.batch_size)
-    return train_loader, val_loader, query_loader
-
-
-def build_scheduler_cfg(args, n_steps_per_epoch: int) -> CurriculumConfig:
-    total_steps = max(1, n_steps_per_epoch * args.curriculum_epochs)
-    warmup = int(args.warmup_frac * n_steps_per_epoch)
-
-    hier_dn_start = int(getattr(args, "hier_dn_start", 0))
-    hier_dn_end = int(getattr(args, "hier_dn_end", 0))
-    hier_up_start = int(getattr(args, "hier_up_start", 0))
-    hier_up_end = int(getattr(args, "hier_up_end", 0))
-
-    shortlist_M_start = int(getattr(args, "shortlist_M_start", 256))
-    shortlist_M_end = int(getattr(args, "shortlist_M_end", 1024))
-    k_hard_start = int(getattr(args, "k_hard_start", 16))
-    k_hard_end = int(getattr(args, "k_hard_end", 64))
-    hard_frac_start = float(getattr(args, "hard_frac_start", 0.2))
-    hard_frac_end = float(getattr(args, "hard_frac_end", 0.7))
-    inbatch_easy_start = float(getattr(args, "inbatch_easy_start", 1.0))
-    inbatch_easy_end = float(getattr(args, "inbatch_easy_end", 0.0))
-    random_k_start = int(getattr(args, "random_k_start", 8))
-    random_k_end = int(getattr(args, "random_k_end", 0))
-
-    cfg = CurriculumConfig(
-        total_steps=total_steps,
-        hard_frac=(hard_frac_start, hard_frac_end),
-        shortlist_M=(shortlist_M_start, shortlist_M_end),
-        k_hard=(k_hard_start, k_hard_end),
-        hier_max_hops_up=(hier_up_start, hier_up_end),
-        hier_max_hops_down=(hier_dn_start, hier_dn_end),
-        random_k=(random_k_start, random_k_end),
-        use_inbatch_easy=(inbatch_easy_start, inbatch_easy_end),
-        mode=args.curriculum_mode,
-        warmup=warmup,
-    )
-    return cfg
-
-# === Add near the other utils in main.py ===
-def materialize_fused_bank(query_loader, *, device: str = "cpu"):
-    """
-    Consume query_loader (ProteinFusedQueryDataset) once and build:
-      - ids:   List[str]               length N
-      - vecs:  torch.FloatTensor [N,D] on CPU (or device)
-      - id2row: Dict[str, int]
-    """
-    import logging
-    logger = logging.getLogger("fused_bank")
-    ids_all: List[str] = []
-    vecs_all: List[torch.Tensor] = []
-
-    with torch.no_grad():
-        for batch in query_loader:
-            # fused_collator -> {"protein_ids": [...], "prot_fused": [B,D]}
-            ids = batch["protein_ids"]
-            Z = batch["prot_fused"]  # [B,D] float32
-            if device and device != "cpu":
-                Z = Z.to(device, non_blocking=True)
-            ids_all.extend(ids)
-            vecs_all.append(Z.cpu() if device == "cpu" else Z)
-
-    if not vecs_all:
-        raise RuntimeError("query_loader yielded no fused vectors.")
-
-    vecs = torch.cat(vecs_all, dim=0).contiguous()  # [N,D]
-    if device != "cpu":  # keep one canonical CPU copy for indexing by row
-        vecs_cpu = vecs.detach().cpu()
-    else:
-        vecs_cpu = vecs
-    if len(ids_all) != vecs_cpu.size(0):
-        raise RuntimeError(f"IDs and vectors length mismatch: {len(ids_all)} vs {vecs_cpu.size(0)}")
-
-    id2row = {pid: i for i, pid in enumerate(ids_all)}
-    logger.info("Fused bank built: N=%d, D=%d", vecs_cpu.size(0), vecs_cpu.size(1))
-    return {"ids": ids_all, "vecs": vecs_cpu, "id2row": id2row}
+    return train_loader, val_loader
 
 def refresh_go_cache_chunked(ids_to_update, go_text_store, go_encoder, go_cache, device, chunk_size=256):
     ids_to_update = list(ids_to_update)
@@ -634,11 +723,13 @@ def wandb_dataset_quickstats(wandb_mod, train_ds, sample_n: int = 512):
                 if isinstance(item, dict):
                     for k in ["res_len", "length", "residue_len"]:
                         if k in item:
-                            L = int(item[k]); break
+                            L = int(item[k]);
+                            break
                     if L is None:
                         for k in ["H", "residue_emb", "emb"]:
                             if k in item and hasattr(item[k], "shape"):
-                                L = int(item[k].shape[0]); break
+                                L = int(item[k].shape[0]);
+                                break
                 elif isinstance(item, (list, tuple)) and len(item) > 0:
                     head = item[0]
                     if hasattr(head, "shape") and len(head.shape) >= 2:
@@ -798,8 +889,75 @@ def sanity_check_go_text(train_ids, pid2pos, go_text_store):
         )
 
 
+def enforce_cache_alignment(
+        *,
+        go_cache,
+        pid2pos: Dict[str, List[int]],
+        eval_id_list: List[int],
+        eval_seen_go_ids: List[int],
+        eval_unseen_ids: List[int],
+        eval_rare_go_ids: List[int],
+        logger=None,
+        drop_empty_proteins: bool = False,
+) -> Tuple[Dict[str, List[int]], List[int], List[int], List[int], List[int]]:
+    """
+    Drops any GO ids not present in go_cache.id2row from:
+      - training labels (pid2pos)
+      - eval spaces (eval_id_list, seen/unseen/rare)
+
+    Returns updated (pid2pos, eval_id_list, eval_seen_go_ids, eval_unseen_ids, eval_rare_go_ids).
+
+    Notes:
+      - Use after canonicalization (alt_id -> primary).
+      - Call BEFORE build_datasets.
+    """
+    cache_ids = set(int(x) for x in go_cache.id2row.keys())
+
+    def _filter_list(xs: Iterable[Any]) -> List[int]:
+        return sorted({int(x) for x in xs if int(x) in cache_ids})
+
+    # ---- eval lists ----
+    e0, s0, u0, r0 = len(eval_id_list), len(eval_seen_go_ids), len(eval_unseen_ids), len(eval_rare_go_ids)
+    eval_id_list_f = _filter_list(eval_id_list)
+    eval_seen_f = _filter_list(eval_seen_go_ids)
+    eval_unseen_f = _filter_list(eval_unseen_ids)
+    eval_rare_f = _filter_list(eval_rare_go_ids)
+
+    # ---- pid2pos ----
+    dropped_labels = 0
+    dropped_proteins = 0
+    new_pid2pos: Dict[str, List[int]] = {}
+
+    for pid, gos in pid2pos.items():
+        gos_i = [int(g) for g in (gos or [])]
+        kept = [g for g in gos_i if g in cache_ids]
+        dropped_labels += (len(gos_i) - len(kept))
+
+        if drop_empty_proteins and len(kept) == 0:
+            dropped_proteins += 1
+            continue
+
+        # keep deterministic + unique
+        new_pid2pos[pid] = sorted(set(kept))
+
+    msg = (
+        f"[align-cache] eval: {e0}->{len(eval_id_list_f)} | "
+        f"seen: {s0}->{len(eval_seen_f)} | unseen: {u0}->{len(eval_unseen_f)} | rare: {r0}->{len(eval_rare_f)} | "
+        f"train_labels_dropped={dropped_labels} | proteins_dropped={dropped_proteins}"
+    )
+    if logger is not None:
+        try:
+            logger.info(msg)
+        except Exception:
+            print(msg)
+    else:
+        print(msg)
+
+    return new_pid2pos, eval_id_list_f, eval_seen_f, eval_unseen_f, eval_rare_f
+
+
 # ============== Runner ==============
-def run_training(args, schedule: TrainSchedule):
+def run_training(args):
     signal.signal(signal.SIGINT, _sigint_handler)
     logger = logging.getLogger("main")
     if args.general_device is not None:
@@ -810,34 +968,14 @@ def run_training(args, schedule: TrainSchedule):
     if args.wandb:
         wandb.login()
 
-
-    # Phase 0 resources
-    if schedule is not None:
-        phase0 = 0
-        go_cache_path = schedule.resolve_go_cache_path(phase0)
-    else:
-        phase0 = -1 # ablation 1 - no phase: -1, full ablation phase 4, new text = -2
-        print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
-      #  print("[MAIN] No schedule provided, running in single-phase mode (phase0 = 4).")
-        go_cache_path = GO_INDEX[phase0]["TEXT_EMB"]
-        #go_cache_path = GO_INDEX[phase0+1]["TEXT_EMB"]
+    print("[MAIN] No schedule provided, running in single-phase mode (phase0 = -1).")
+    # go_cache_path = GO_INDEX[args.phase]["TEXT_EMB"]
+    # go_cache_path = GO_INDEX[phase0+1]["TEXT_EMB"]
+    go_cache_path = args.go_cache_path
 
     go_cache = build_go_cache(str(go_cache_path))
     dag_parents = load_go_parents() if args.use_dag_in_ds else None
     dag_children = load_go_children() if args.use_dag_in_ds else None
-
-    # GO text dict per phase
-    total_phases = (len(schedule.phase_breaks) + 1) if schedule is not None and hasattr(schedule, "phase_breaks") else 1
-    go_id_to_text: Dict[int, Dict[int, str]] = {}
-    if phase0 == -1 or phase0==3 or phase0 == -2: # phase = 4 -> full token activation
-        go_id_to_text[phase0] = load_go_texts_by_phase(args.go_text_folder, phase=phase0)
-    else:
-        for ph in range(total_phases):
-            go_id_to_text[ph] = load_go_texts_by_phase(args.go_text_folder, phase=ph)
-
-    res_store, fused_store = build_stores(args)
-    datasets = build_datasets(args, res_store, fused_store, go_cache)
-    n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
 
     # Text encoder (GO)
     lora_params = LoRAParameters(adapter_name="go_encoder")
@@ -845,7 +983,7 @@ def run_training(args, schedule: TrainSchedule):
         model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
         device=device,
         max_length=512,
-        use_attention_pool=args.use_attention_pooling,
+        attention_pooling_strategy=args.go_encoder_inner_pooling,
         attn_hidden=128,
         attn_dropout=0.1,
         special_token_weights=None,
@@ -854,41 +992,133 @@ def run_training(args, schedule: TrainSchedule):
         use_special_tokens=False,
     )
 
+    # GO text dict per phase
+    is_segmented = (args.go_encoder_output_mode == "segment_pooled")
+
+    full_id2segments = None
+    full_id2seg_present = None
+
+    if is_segmented:
+        # segment_pooled için return_segments kesin True olmalı
+        id2text, id2segments, id2seg_present = load_go_texts_by_phase(
+            args.go_text_folder,
+            phase=args.phase,
+            return_segments=True,
+        )
+
+        go_id_to_text = {int(args.phase): id2text}
+        full_id2segments = {int(args.phase): id2segments}
+        full_id2seg_present = {int(args.phase): id2seg_present}
+
+    else:
+        id2text = load_go_texts_by_phase(
+            args.go_text_folder,
+            phase=args.phase,
+            return_segments=False,
+        )
+
+        go_id_to_text = {int(args.phase): id2text}
+
     # GoTextStore + dataloaders
-    lazy = True if phase0 >=0 and phase0!=3 else False
-    go_text_store = GoTextStore(go_id_to_text, go_encoder.tokenizer, phase=phase0, lazy=False, max_len=args.go_text_store_max_len)
+    go_text_store = GoTextStore(
+        go_id_to_text,
+        go_encoder.tokenizer,
+        phase=args.phase,
+        lazy=True,
+        max_len=args.go_text_store_max_len,
+        is_segmented=is_segmented,
+        segment_max_len=args.go_segment_max_len,
+        full_id2segments=full_id2segments,
+        full_id2seg_present=full_id2seg_present,
+    )
 
-    print("GoTextStore size:", len(go_text_store.id2tok))
+    # TODO: Erase
+    if is_segmented:
+        # hard-code ids yerine store içinden gerçek id seçmek daha güvenli
+        ids = list(go_text_store.id2text.keys())[:2]
 
-    # Training dataset cleaning
-    print("[MAIN] Sanitizing training dataset with GoTextStore...")
-    sanitize_dataset_with_go_text(datasets["train"], go_text_store)
-    sanity_check_go_text(datasets["train"].pids, datasets["train"].pid2pos, go_text_store)
+        b = go_text_store.batch(ids)
 
-    # Val dataset cleaning
-    print("[MAIN] Sanitizing validation dataset with GoTextStore...")
-    sanitize_dataset_with_go_text(datasets["val"], go_text_store)
-    sanity_check_go_text(datasets["val"].pids, datasets["val"].pid2pos, go_text_store)
+        print("input_ids:", b["input_ids"].shape)
+        print("attention_mask:", b["attention_mask"].shape)
+        print("seg_input_ids:", b["seg_input_ids"].shape)
+        print("seg_attention_mask:", b["seg_attention_mask"].shape)
+        print("seg_present:", b["seg_present"].shape)
+        print("segment_names:", b["segment_names"])
+        print("seg_present:", b["seg_present"])
 
-    eval_id_list = collect_eval_ids_from_datasets(datasets["train"], datasets["val"])
+    print("GoTextStore text size:", len(go_text_store.id2text))
+    print("GoTextStore token cache size:", len(go_text_store.id2tok))
+
+    if go_text_store.is_go_segmented:
+        print("GoTextStore segment text size:", len(go_text_store.id2segments))
+        print("GoTextStore segment token cache size:", len(go_text_store.id2seg_tok))
+
+    eval_space = getattr(args, "eval_space", "observed")
+    if eval_space == "seen":
+        eval_id_list = load_raw_pickle(args.go_path_seen)  # seen on training (at least one positive on training.)
+    else:
+        eval_id_list = load_raw_pickle(args.go_path_observed)  # observed: train+val+test positives
+
+    eval_seen_go_ids = load_raw_pickle(args.go_path_seen)
+    eval_unseen_ids = load_raw_pickle(args.zero_shot_path)
+    eval_rare_go_ids = load_raw_pickle(args.few_shot_path)
+
     logging.getLogger("main").info(
         "[eval] using %d GO terms in eval_id_list", len(eval_id_list)
     )
 
+    go_terms = load_raw_json(args.go_basic_json)
+
+    alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
+    logger.info("[canon] alt_id map size = %d", len(alt_map))
+
+    # 2) pid2pos canonicalize
+    pid2pos_raw = load_raw_json(args.pid2pos)  # sen zaten burada load ediyorsun
+    pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else pid2pos_raw
+    logger.info("[canon] pid2pos canonicalized=%s", "yes" if alt_map else "no")
+
+    zs = load_go_set(args.zero_shot_path)
+    fs = load_go_set(args.few_shot_path)
+
+    # 4) optional: also canonicalize few/zero shot sets used by FewZeroConfig
+    zs = canonicalize_id_list(list(zs), alt_map) if alt_map else zs
+    fs = canonicalize_id_list(list(fs), alt_map) if alt_map else fs
+
+    # 3) eval lists canonicalize (observed/seen/unseen/rare)
+    eval_id_list = canonicalize_id_list(eval_id_list, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                eval_id_list]
+    eval_seen_go_ids = canonicalize_id_list(eval_seen_go_ids, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                        eval_seen_go_ids]
+    eval_unseen_ids = canonicalize_id_list(eval_unseen_ids, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                      eval_unseen_ids]
+    eval_rare_go_ids = canonicalize_id_list(eval_rare_go_ids, alt_map) if alt_map else [go_str_to_int_any(x) for x in
+                                                                                        eval_rare_go_ids]
+
+    res_store = build_stores(args)
+    pid2pos, eval_id_list, eval_seen_go_ids, eval_unseen_ids, eval_rare_go_ids = enforce_cache_alignment(
+        go_cache=go_cache,
+        pid2pos=pid2pos,
+        eval_id_list=eval_id_list,
+        eval_seen_go_ids=eval_seen_go_ids,
+        eval_unseen_ids=eval_unseen_ids,
+        eval_rare_go_ids=eval_rare_go_ids,
+        logger=logger,
+        drop_empty_proteins=False,  # True yaparsan label'sız proteinleri de atar
+    )
+    datasets = build_datasets(args, res_store, go_text_store, pid2pos=pid2pos, zs=zs, fs=fs, dag_parents=dag_parents)
+    n_spe = steps_per_epoch(len(datasets["train"]), args.batch_size)
+
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
     go_token_dropout = None
     if args.go_token_dropout:
-        special_tokens_to_protect = set(tid for tid in [go_encoder.tokenizer.pad_token_id, go_encoder.tokenizer.cls_token_id, go_encoder.tokenizer.sep_token_id] if tid is not None)
+        special_tokens_to_protect = set(
+            tid for tid in [go_encoder.tokenizer.pad_token_id, go_encoder.tokenizer.cls_token_id, go_encoder.tokenizer.sep_token_id] if tid is not None)
         special_tokens_to_protect.update(go_encoder.tokenizer.additional_special_tokens_ids)
         go_dropout_config = GoDropoutConfig(enabled=True, p=0.08, pad_id=go_encoder.tokenizer.pad_token_id,
-                    protect_ids=tuple(special_tokens_to_protect))
+                                            protect_ids=tuple(special_tokens_to_protect))
         go_token_dropout = GoTokenDropout(go_dropout_config)
-    train_loader, val_loader, query_loader = build_dataloaders(datasets, args, go_cache, go_text_store, go_dropout=go_token_dropout)
-
-    # Memory bank - GoCache init (Memory bank deprecated, to be cleaned.)
-    memory_bank = go_cache if args.use_go_memory_bank else None
-    if args.use_go_memory_bank:
-        logger.info(f"Using unified GoLookupCache as MemoryBank ({memory_bank.device} fp32, no copies).")
+    train_loader, val_loader = build_dataloaders(datasets, args, go_text_store, go_dropout=go_token_dropout)
 
     seen_go_ids_prev: set = set()
 
@@ -898,22 +1128,14 @@ def run_training(args, schedule: TrainSchedule):
         except Exception:
             pass
 
-    if args.ablation_id == "A1" or args.ablation_id == "A0":
-        scheduler = None
-    else:
-        cur_cfg = build_scheduler_cfg(args, n_spe)
-        scheduler = CurriculumScheduler(cur_cfg)
-
     out_dir = Path(args.output_dir)
 
     # Lightweight runtime context
     training_context = TrainingContext(
         device=device,
-        schedule=schedule,
         go_cache=go_cache,
         faiss_index=None,
-        vres=None, #For similarity searches etc.
-        memory_bank=memory_bank,
+        vres=None,  # For similarity searches etc.
         current_phase=None,
         last_refresh_epoch=None,
         last_refresh_reason=None,
@@ -921,15 +1143,24 @@ def run_training(args, schedule: TrainSchedule):
         maybe_refresh_phase_resources=None,
         dag_parents=dag_parents,
         dag_children=dag_children,
-        scheduler=None, #scheduler,
+        go_namespace_map=load_go_namespaces(),
+        scheduler=None,  # scheduler,
         go_text_store=go_text_store,
         use_queue_miner=bool(args.use_queue_miner),
         attribute_loss_enabled=bool(args.use_attribution_loss),
-        return_alpha = bool(args.return_alpha),
+        return_alpha=bool(args.return_alpha),
+        return_slot_attn=bool(args.return_slot_attn),
         fp16_enabled=args.fp16,
-        pooling_strategy=args.pooling_strategy,
+        protein_pooling_strategy=args.protein_pooling_strategy,
         eval_id_list=eval_id_list,
-        logger=logger
+        logger=logger,
+        eval_seen_go_ids=eval_seen_go_ids,
+        eval_unseen_ids=eval_unseen_ids,
+        eval_rare_go_ids=eval_rare_go_ids,
+        protein_n_slots=args.protein_n_slots,
+        go_pool_type=args.go_pool_type,
+        go_encoder_output_mode=args.go_encoder_output_mode,
+        go_segment_representation_mode=args.go_segment_representation_mode,
     )
     training_context.run_name = args.wandb_run_name or f"run-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     training_context.logging = LoggingConfig(
@@ -940,72 +1171,29 @@ def run_training(args, schedule: TrainSchedule):
         gospec_tau=0.02,
         gospec_topk=32,
     )
-    fused_bank = materialize_fused_bank(query_loader, device=("cpu" if args.cpu else "cuda:0"))
-    training_context.fused_bank = fused_bank
-    missing = [int(g) for g in training_context.eval_id_list if int(g) not in training_context.go_cache.id2row]
+
+    # ---- SPLIT SANITY CHECK (no eval needed) ----
+    eval_set = set(int(x) for x in training_context.eval_id_list)
+    seen_set = set(int(x) for x in training_context.eval_seen_go_ids)
+    rare_set = set(int(x) for x in training_context.eval_rare_go_ids)
+    unseen_set = set(int(x) for x in training_context.eval_unseen_ids)
+
+    print("\n[DBG-SPLIT]")
+    print("|eval| =", len(eval_set))
+    print("|seen| =", len(seen_set), " intersection(eval) =", len(eval_set & seen_set))
+    print("|rare| =", len(rare_set), " intersection(eval) =", len(eval_set & rare_set))
+    print("|unseen| =", len(unseen_set), " intersection(eval) =", len(eval_set & unseen_set))
+    print("seen ∩ unseen =", len(seen_set & unseen_set))
+    print("rare ∩ unseen =", len(rare_set & unseen_set))
+
+    missing = []
+    gos = set(int(x) for x in training_context.go_cache.id2row.keys())
+    for g in training_context.eval_id_list:
+        g_int = int(g)
+        if g_int not in gos:
+            missing.append(g_int)
     if missing:
         raise RuntimeError(f"go_cache missing {len(missing)} eval GO ids, e.g. {missing[:10]}")
-
-     # Sanity check
-
-    assert isinstance(fused_bank, dict) and {"ids", "vecs", "id2row"} <= fused_bank.keys()
-    assert len(fused_bank["ids"]) == fused_bank["vecs"].shape[0] > 0, "fused bank boş/eksik"
-
-    def maybe_refresh_phase_resources(current_epoch: int, *, force: bool = False):
-        if phase0 == -1:
-            return
-        new_phase = training_context.schedule.phase_for_epoch(current_epoch)
-        prev_phase = training_context.current_phase
-
-        if prev_phase is None:
-            training_context.current_phase = new_phase
-            training_context.last_refresh_epoch = current_epoch
-            training_context.last_refresh_reason = "init"
-            training_context.go_text_store.update_phase_and_tokenize(new_phase)
-            return
-
-        if force or (new_phase != prev_phase):
-            logger.info(f"[PHASE SWITCH] epoch={current_epoch} :: {prev_phase + 1} -> {new_phase + 1}")
-
-            # Phase değiştir
-            training_context.go_text_store.update_phase_and_tokenize(new_phase)
-
-            phase_ids = sorted(int(g) for g in training_context.go_text_store.id2text.keys())
-
-            refresh_go_cache_chunked(
-                ids_to_update=phase_ids,
-                go_text_store=training_context.go_text_store,
-                go_encoder=go_encoder,
-                go_cache=training_context.go_cache,  # aynı cache
-                device=device,
-                chunk_size=128
-            )
-
-            training_context.memory_bank = training_context.go_cache if args.use_go_memory_bank else None
-
-            # GoTextStore fazı
-            training_context.go_text_store.update_phase_and_tokenize(new_phase)
-
-            # Dataloader’ları yeniden kur
-            nonlocal train_loader, val_loader, query_loader
-            train_loader, val_loader, query_loader = build_dataloaders(datasets=datasets,
-                                                                                args=args,
-                                                                                go_cache=training_context.go_cache,
-                                                                                go_text_store=training_context.go_text_store,
-                                                                                go_dropout=go_token_dropout)
-            try:
-                trainer.queue_miner.reset()
-                logger.info("[queue] soft reset after phase change")
-            except Exception:
-                pass
-            fused_bank = materialize_fused_bank(query_loader, device="cpu")
-            training_context.fused_bank = fused_bank
-            training_context.current_phase = new_phase
-            training_context.last_refresh_epoch = current_epoch
-            training_context.last_refresh_reason = "phase_change" if not force else "force"
-
-    # expose refresher
-    training_context.maybe_refresh_phase_resources = maybe_refresh_phase_resources if args.is_phasing else None
 
     # infer dims
     with torch.no_grad():
@@ -1014,20 +1202,76 @@ def run_training(args, schedule: TrainSchedule):
     d_g = int(training_context.go_cache.embs.shape[1])
     d_z = int(getattr(args, "align_dim", d_g))
 
+    # Count each GO term at most once per training protein. These counts are
+    # used only when frequency_balancing is enabled; the sampler is unchanged.
+    from collections import Counter
+    _freq = Counter()
+    # Use the authoritative split file rather than relying on an internal
+    # dataset attribute name. Match build_datasets() by retaining only
+    # proteins present in the residue store.
+    _train_pids_for_freq = [
+        pid for pid in load_raw_txt(args.train_ids_path)
+        if res_store.has(pid)
+    ]
+    for _pid in _train_pids_for_freq:
+        _freq.update(set(int(g) for g in pid2pos.get(_pid, [])))
+    train_term_frequencies = dict(_freq)
+    if bool(getattr(args, "frequency_balancing", False)):
+        logger.info(
+            "[freq-balance] enabled terms=%d power=%.3f clip=[%.3f, %.3f]",
+            len(train_term_frequencies),
+            float(getattr(args, "frequency_weight_power", 0.5)),
+            float(getattr(args, "frequency_weight_min", 0.5)),
+            float(getattr(args, "frequency_weight_max", 2.0)),
+        )
+
     trainer_cfg = TrainerConfig(
         d_h=d_h,
         d_g=d_g,
         d_z=d_z,
         device=str(device),
         lr=args.lr,
+        lr_lora=None if args.lr_lora is None else float(args.lr_lora),
+        use_lora=args.use_lora,
         max_epochs=args.epochs,
         cand_chunk_k=args.cand_chunk_k,
         pos_chunk_t=args.pos_chunk_t,
-        k_hard_queue=args.k_hard_queue,
-        queue_K=args.queue_K,
         is_logit_scale_constant=bool(args.is_logit_scale_constant),
         go_pooling=args.go_pooling,
-        eval_go_bs=args.eval_go_bs
+        eval_go_bs=args.eval_go_bs,
+        max_inbatch=args.max_inbatch,
+        eval_cand_chunk_k=args.eval_cand_chunk_k,
+        warmstart_path=args.warmstart_path,
+        go_segment_alpha_warmup_steps=args.go_segment_alpha_warmup_steps,
+        go_segment_alpha=args.go_segment_alpha,
+        trainable_mode=args.trainable_mode,
+        weight_decay=args.weight_decay,
+        local_window_size=args.local_window_size,
+        local_window_stride=args.local_window_stride,
+        lambda_slot_div=float(getattr(args, "lambda_slot_div", 0.0)),
+        multivec_slot_lse_tau=float(getattr(args, "multivec_slot_lse_tau", 0.10)),
+        multivec_global_residual_init=float(getattr(args, "multivec_global_residual_init", 0.25)),
+        pairwise_start_step=int(getattr(args, "pairwise_start_step", 0)),
+        pairwise_margin=float(getattr(args, "pairwise_margin", 0.0)),
+        pairwise_lambda=float(getattr(args, "pairwise_lambda", 0.0)),
+        coverage_lambda=float(getattr(args, "coverage_lambda", 0.0)),
+        coverage_target_k=int(getattr(args, "coverage_target_k", 0)),
+        coverage_mining_k=int(getattr(args, "coverage_mining_k", 0)),
+        coverage_bottom_frac=float(getattr(args, "coverage_bottom_frac", 0.25)),
+        coverage_hard_neg_k=int(getattr(args, "coverage_hard_neg_k", 4)),
+        coverage_margin=float(getattr(args, "coverage_margin", 0.05)),
+        coverage_start_step=int(getattr(args, "coverage_start_step", 2000)),
+        protein_expert_mode=str(getattr(args, "protein_expert_mode", "legacy")),
+        local_slot_aggregation=str(getattr(args, "local_slot_aggregation", "lse")),
+        local_slot_lse_tau=float(getattr(args, "local_slot_lse_tau", 0.10)),
+        expert_global_weight=float(getattr(args, "expert_global_weight", 0.50)),
+        expert_fusion_learnable=bool(getattr(args, "expert_fusion_learnable", True)),
+        cardinality_weighting=bool(getattr(args, "cardinality_weighting", True)),
+        frequency_balancing=bool(getattr(args, "frequency_balancing", False)),
+        frequency_weight_power=float(getattr(args, "frequency_weight_power", 0.5)),
+        frequency_weight_min=float(getattr(args, "frequency_weight_min", 0.5)),
+        frequency_weight_max=float(getattr(args, "frequency_weight_max", 2.0)),
+        term_frequencies=train_term_frequencies,
     )
     attr_cfg = AttrConfig(
         lambda_attr=getattr(args, "lambda_attr", 0.1),
@@ -1038,7 +1282,8 @@ def run_training(args, schedule: TrainSchedule):
         temperature=float(getattr(args, "temperature", 0.07)),
         lambda_vtrue=getattr(args, "lambda_vtrue", 0.2),
         tau_distill=getattr(args, "tau_distill", 1.5),
-        lambda_dag=getattr(args, "lambda_dag", 0.3)
+        lambda_dag=getattr(args, "lambda_dag", 0.3),
+        lambda_bce=getattr(args, "lambda_bce", 0.1),
     )
     run = wandb.init(
         project=args.wandb_project or "protein-go-semantic-align",
@@ -1049,35 +1294,45 @@ def run_training(args, schedule: TrainSchedule):
         settings=wandb.Settings(code_dir=".", _disable_stats=True),
         reinit=False,
     )
+    queue_cfg = QueueConfig(
+        queue_K=args.queue_K,
+        queue_start_step=args.queue_start_step,
+        queue_hard_frac_start=args.queue_hard_frac_start,
+        queue_hard_frac_end=args.queue_hard_frac_end,
+        queue_hard_frac_warmup_steps=args.queue_hard_frac_warmup_steps,
+        queue_weight_start=args.queue_weight_start,
+        queue_weight_end=args.queue_weight_end,
+        queue_weight_warmup_steps=args.queue_weight_warmup_steps,
+        k_hard_queue_start=args.k_hard_queue_start,
+        k_hard_queue_end=args.k_hard_queue_end,
+        k_hard_queue_warmup_steps=args.k_hard_queue_warmup_steps,
+    )
 
-    encoder_for_trainer = go_encoder if args.ablation_id != "A0" else None
-    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, go_encoder=encoder_for_trainer, wandb_run=run)
-
- #   b = next(iter(train_loader))
- #   for i in range(20):
- #       losses = trainer.step_losses(b, epoch_idx=0, debug=True)
- #       print(i, {k: float(v) for k, v in losses.items()})
- #       trainer.opt.zero_grad(set_to_none=True)
- #       losses["total"].backward()
- #       trainer.opt.step()
+    trainer = OppTrainer(cfg=trainer_cfg, attr=attr_cfg, ctx=training_context, queue_cfg=queue_cfg, go_encoder=go_encoder, wandb_run=run)
 
     if bool(args.use_queue_miner):
         print("[INFO] Using Queue Miner.")
     # Resume
+    start_epoch = 0
+    global_step = 0
+
     if getattr(args, "resume", None):
         ckpt_path = str(args.resume)
-        load_checkpoint(trainer, ckpt_path, map_location=trainer.device)
+        start_epoch = load_checkpoint(trainer, ckpt_path, map_location=trainer.device)
+
+        global_step = int(getattr(trainer, "_global_step", 0))
+        logger.info(f"[resume] start_epoch={start_epoch}, global_step={global_step}")
+    else:
+        start_epoch = 0
+        global_step = 0
 
         # --- EVAL ONLY MODU ---
     if getattr(args, "eval_only", False):
         logger.info("Eval-only mode: running validation and exiting, no training.")
         val_logs = trainer.eval_epoch(val_loader, epoch_idx=0)
-        logger.info(
-                "[eval_only] total={total:.4f} contrastive={contrastive:.4f} "
-                "dag={dag:.4f} attr={attr:.4f} entropy={entropy:.4f} "
-                "cafa_fmax={cafa_fmax:.4f} cafa_aupr={cafa_aupr:.4f}".format(**val_logs)
-            )
-        return  # KRİTİK: training loop'a girmeden çık
+        msg = " | ".join([f"{k}: {v:.4f}" for k, v in val_logs.items()])
+        logger.info(f"[eval_only] {msg}")
+        return
 
     # -------------------------   Training loop -------------------------
     logger.info("Start training for %d epochs", args.epochs)
@@ -1087,12 +1342,13 @@ def run_training(args, schedule: TrainSchedule):
         training_context.maybe_refresh_phase_resources(current_epoch=0, force=False)
 
     best_val = -inf if args.monitor_mode == "max" else inf
-    best_step = 0
+    best_step = global_step
+    best_macro_val = -inf
+    best_macro_step = global_step
     no_improve_epochs = 0
     EPS = 1e-6
-    global_step = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
         # ---- Partial MemoryBank refresh  ----
@@ -1108,27 +1364,27 @@ def run_training(args, schedule: TrainSchedule):
                 seen_go_ids_prev = set()
 
             # ---- Partial MemoryBank refresh ----
-            if getattr(args, "ablation_id", None) != "A0":
-                ids_eval = list(map(int, training_context.eval_id_list))
-                ids_seen = sorted(set(int(i) for i in seen_go_ids_prev)) if len(seen_go_ids_prev) > 0 else []
+        #    if getattr(args, "ablation_id", None) != "A0":
+        #        ids_eval = list(map(int, training_context.eval_id_list))
+        #        ids_seen = sorted(set(int(i) for i in seen_go_ids_prev)) if len(seen_go_ids_prev) > 0 else []
 
-                # eval ids are mandatory
-                ids_to_update = ids_eval + [i for i in ids_seen if i not in set(ids_eval)]
+        # eval ids are mandatory
+        #        ids_to_update = ids_eval + [i for i in ids_seen if i not in set(ids_eval)]
 
-                # enforce budget
-                max_r = int(getattr(args, "max_refresh_go", 5000))
-                if max_r > 0 and len(ids_to_update) > max_r:
-                    ids_to_update = ids_to_update[:max_r]
+        # enforce budget
+        #        max_r = int(getattr(args, "max_refresh_go", 5000))
+        #        if max_r > 0 and len(ids_to_update) > max_r:
+        #            ids_to_update = ids_to_update[:max_r]
 
-                if len(ids_to_update) > 0:
-                    refresh_go_cache_chunked(
-                        ids_to_update=ids_to_update,
-                        go_text_store=go_text_store,
-                        go_encoder=go_encoder,
-                        go_cache=training_context.go_cache,
-                        device=device,
-                        chunk_size=128
-                    )
+        #        if len(ids_to_update) > 0:
+        #            refresh_go_cache_chunked(
+        #                ids_to_update=ids_to_update,
+        #                go_text_store=go_text_store,
+        #                go_encoder=go_encoder,
+        #                go_cache=training_context.go_cache,
+        #                device=device,
+        #                chunk_size=128
+        #            )
 
         except Exception as _e:
             logging.getLogger("bank").warning("Partial refresh failed: %r", _e)
@@ -1138,7 +1394,7 @@ def run_training(args, schedule: TrainSchedule):
             training_context.maybe_refresh_phase_resources(current_epoch=epoch, force=False)
 
         trainer.model.train()
-        running = {"total": 0.0, "contrastive": 0.0, "dag": 0.0, "attr": 0.0, "entropy": 0.0}
+        running = {"total": 0.0, "contrastive": 0.0, "pairwise": 0.0}
         n_batches = 0
 
         for batch in train_loader:
@@ -1158,6 +1414,98 @@ def run_training(args, schedule: TrainSchedule):
             # backward
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
+
+            if global_step % 200 == 0:
+                # protein projection grad
+                s = 0.0
+                c = 0
+                for n, p in trainer.model.proj_p.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] proj_p grad_norm_sum={s:.4g} over {c}")
+
+                # protein_ln grad
+                s = 0.0
+                c = 0
+                for n, p in trainer.model.protein_ln.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] protein_ln grad_norm_sum={s:.4g} over {c}")
+
+                # local evidence should be off / absent
+                s = 0.0
+                c = 0
+                lep = getattr(trainer.model, "protein_local_evidence_pool", None)
+                if lep is not None:
+                    for n, p in lep.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                print(f"[DBG] local_evidence grad_norm_sum={s:.4g} over {c}")
+
+                # GO projection should stay frozen
+                s = 0.0
+                c = 0
+                for n, p in trainer.model.proj_g.named_parameters():
+                    if p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] proj_g grad_norm_sum={s:.4g} over {c}")
+
+                # LoRA should stay frozen
+                if getattr(trainer.model, "go_encoder", None) is not None:
+                    s = 0.0
+                    c = 0
+                    for n, p in trainer.model.go_encoder.named_parameters():
+                        if p.requires_grad and p.grad is not None and "lora_" in n:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                    print(f"[DBG] go_lora grad_norm_sum={s:.4g} over {c}")
+
+            if global_step % 200 == 0:
+                # LocalEvidencePool grad
+                s = 0.0
+                c = 0
+                lep = getattr(trainer.model, "protein_local_evidence_pool", None)
+
+                if lep is not None:
+                    for n, p in lep.named_parameters():
+                        if p.requires_grad and p.grad is not None:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+
+                print(f"[DBG] local_evidence grad_norm_sum={s:.4g} over {c}")
+
+                # protein projection grad
+                s = 0.0
+                c = 0
+                for n, p in trainer.model.proj_p.named_parameters():
+                    if p.requires_grad and p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] proj_p grad_norm_sum={s:.4g} over {c}")
+
+                # GO projection should stay frozen
+                pg = trainer.model.proj_g
+                s = 0.0
+                c = 0
+                for n, p in pg.named_parameters():
+                    if p.grad is not None:
+                        s += float(p.grad.detach().float().norm().item())
+                        c += 1
+                print(f"[DBG] proj_g grad_norm_sum={s:.4g} over {c}")
+
+                # LoRA should stay frozen
+                if getattr(trainer.model, "go_encoder", None) is not None:
+                    s = 0.0
+                    c = 0
+                    for n, p in trainer.model.go_encoder.named_parameters():
+                        if p.requires_grad and p.grad is not None and "lora_" in n:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                    print(f"[DBG] go_lora grad_norm_sum={s:.4g} over {c}")
 
             if global_step % 200 == 0:
                 # proj_g grad
@@ -1182,7 +1530,45 @@ def run_training(args, schedule: TrainSchedule):
 
             gc = float(getattr(args, "grad_clip", 0.0) or 0.0)
             if gc > 0:
-                torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), gc)
+                clip_params = [p for p in trainer.model.parameters() if p.requires_grad]
+
+                if getattr(trainer, "logit_scale", None) is not None:
+                    if getattr(trainer.logit_scale, "requires_grad", False):
+                        clip_params.append(trainer.logit_scale)
+
+                if clip_params:
+                    torch.nn.utils.clip_grad_norm_(clip_params, gc)
+
+            if global_step % 1000 == 0:
+                # go_segment_gate grad
+                s = 0.0
+                c = 0
+                if hasattr(trainer.model, "go_segment_gate"):
+                    for n, p in trainer.model.go_segment_gate.named_parameters():
+                        if p.grad is not None:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                print(f"[DBG] go_segment_gate grad_norm_sum={s:.4g} over {c}")
+
+                # proj_g grad
+                pg = trainer.model.proj_g
+                gnorm = 0.0
+                cnt = 0
+                for n, p in pg.named_parameters():
+                    if p.grad is not None:
+                        gnorm += float(p.grad.detach().float().norm().item())
+                        cnt += 1
+                print(f"[DBG] proj_g grad_norm_sum={gnorm:.4g} over {cnt}")
+
+                # go_encoder LoRA grad
+                if getattr(trainer.model, "go_encoder", None) is not None:
+                    s = 0.0
+                    c = 0
+                    for n, p in trainer.model.go_encoder.named_parameters():
+                        if p.requires_grad and p.grad is not None and "lora_" in n:
+                            s += float(p.grad.detach().float().norm().item())
+                            c += 1
+                    print(f"[DBG] go_lora grad_norm_sum={s:.4g} over {c}")
 
             trainer.opt.step()
 
@@ -1192,7 +1578,7 @@ def run_training(args, schedule: TrainSchedule):
                 if k in losses and losses[k] is not None:
                     running[k] += float(losses[k].item() if hasattr(losses[k], "item") else float(losses[k]))
 
-            global_step += 1
+            global_step = int(trainer._global_step)
 
             # per-step logging
             if (global_step % max(1, args.log_every)) == 0:
@@ -1227,6 +1613,7 @@ def run_training(args, schedule: TrainSchedule):
                     epoch=epoch,
                     step=global_step
                 )
+                shutil.copy2(ckpt_path, out_dir / "best_primary.pt")
                 cleanup_old_checkpoints(out_dir, keep_last_n=args.keep_last_n)
                 # (opsiyonel) wandb artifact
 
@@ -1234,7 +1621,6 @@ def run_training(args, schedule: TrainSchedule):
                 with torch.no_grad():
                     scale = trainer.logit_scale.exp().item()
                 logger.info(f"[debug] step={global_step} logit_scale={scale:.4f}")
-
 
         # validation
         if val_loader is not None:
@@ -1248,7 +1634,7 @@ def run_training(args, schedule: TrainSchedule):
 
             trainer.model.go_encoder.eval()
 
-            #VAL
+            # VAL
             val_logs = trainer.eval_epoch(val_loader, epoch)
             msg = " | ".join([f"{k}: {val_logs[k]:.4f}" for k in val_logs])
             logger.info(f"[val]   epoch {epoch} :: {msg}")
@@ -1256,16 +1642,22 @@ def run_training(args, schedule: TrainSchedule):
             # --- monitor ---
             metric_name = args.monitor_metric
             if metric_name not in val_logs:
-                # fallback: total loss’u minimize et
-                metric_name = "total"
+                logger.warning(f"monitor_metric={metric_name} not in val_logs. Falling back to align_MRR.")
+                metric_name = "align_MRR"
+
             score = float(val_logs[metric_name])
 
             improved = (score > best_val + EPS) if args.monitor_mode == "max" else (score < best_val - EPS)
+            macro_metric_name = str(
+                getattr(args, "secondary_monitor_metric", "macro_term_recall@100")
+            )
+            macro_available = macro_metric_name in val_logs
+            macro_score = float(val_logs[macro_metric_name]) if macro_available else -inf
+            macro_improved = macro_available and macro_score > best_macro_val + EPS
 
             if improved:
                 best_val = score
                 best_step = global_step
-                no_improve_epochs = 0
                 # en iyi modeli ayrı etiketle kaydet
                 ckpt_path = save_checkpoint(
                     out_dir=str(out_dir),
@@ -1281,12 +1673,38 @@ def run_training(args, schedule: TrainSchedule):
                     run.summary[f"best/{metric_name}"] = best_val
                     run.summary["best/step"] = best_step
                     run.summary["best/epoch"] = epoch
+            if macro_improved:
+                best_macro_val = macro_score
+                best_macro_step = global_step
+                macro_ckpt_path = save_checkpoint(
+                    out_dir=str(out_dir),
+                    tag=f"macro_step{global_step}",
+                    trainer=trainer,
+                    args=args,
+                    epoch=epoch,
+                    step=global_step,
+                )
+                shutil.copy2(macro_ckpt_path, out_dir / "best_macro.pt")
+                logger.info(
+                    f"[ckpt] new BEST-MACRO {macro_metric_name}={best_macro_val:.4f} "
+                    f"@ epoch {epoch} step {global_step}"
+                )
+                if run is not None:
+                    run.summary[f"best/{macro_metric_name}"] = best_macro_val
+                    run.summary["best/macro_step"] = best_macro_step
+                    run.summary["best/macro_epoch"] = epoch
+
+            if improved or macro_improved:
+                no_improve_epochs = 0
             else:
                 no_improve_epochs += 1
                 if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
                     logger.info(f"[early-stop] no improvement in {no_improve_epochs} epochs; stopping.")
-                    raise SystemExit(f"Stopped early at epoch {epoch} (best {metric_name}={best_val:.4f})")
-
+                    raise SystemExit(
+                        f"Stopped early at epoch {epoch} "
+                        f"(best {metric_name}={best_val:.4f}, "
+                        f"best {macro_metric_name}={best_macro_val:.4f})"
+                    )
 
         # Persist seen GO ids for next epoch's partial refresh
         try:
@@ -1297,7 +1715,7 @@ def run_training(args, schedule: TrainSchedule):
         # epoch checkpoint
         try:
             ckpt_path = save_checkpoint(
-                out_dir=out_dir.name,
+                out_dir=str(out_dir),
                 tag=f"epoch{epoch + 1}",
                 trainer=trainer,
                 args=args,
@@ -1310,7 +1728,7 @@ def run_training(args, schedule: TrainSchedule):
 
     # final checkpoint
     try:
-        final_path = save_checkpoint(out_dir.name, tag="final", trainer=trainer,
+        final_path = save_checkpoint(str(out_dir), tag="final", trainer=trainer,
                                      args=args, epoch=epoch, step=global_step)
     except Exception:
         pass
@@ -1327,63 +1745,57 @@ def run_training(args, schedule: TrainSchedule):
 
 # ============== YAML parser ==============
 
-def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
+def load_structured_cfg(path: str):
     with open(path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
     data = cfg.get("data", {})
-    caches = cfg.get("caches", {})
     training = cfg.get("training", {})
     optim = cfg.get("optim", {})
     model = cfg.get("model", {})
     loss = cfg.get("loss", {})
     curriculum = cfg.get("curriculum", {})
     wandb_block = cfg.get("wandb", {})
-    sched = cfg.get("schedule", {})
     stores = cfg.get("stores", {})
     general = cfg.get("general", {})
-    memory_bank = cfg.get("memory_bank", {})
+    queue = cfg.get("queue", {})
 
     args = types.SimpleNamespace(
         # general
-        use_queue_miner = bool(general.get("use_queue_miner", True)),
-        use_go_memory_bank = bool(general.get("use_go_memory_bank", False)),
-        use_attention_pooling = bool(general.get("use_attention_pooling", False)),
-        use_lora = bool(general.get("use_lora", False)),
-        use_attribution_loss = bool(general.get("use_attribution_loss", False)),
-        return_alpha = bool(general.get("return_alpha", False)),
-        phase_based = bool(general.get("phase_based", False)),
-        pooling_strategy = general.get("pooling_strategy", "mean"),
-        ablation_id = general.get("ablation_id", None),
-        is_phasing = bool(general.get("is_phasing", False)),
-        # paths / store
-        train_ids=Path(stores.get("train_ids_path", PROTEIN_TRAIN_IDS)),
-        pid2pos=Path(stores.get("pid2pos_path", PID_TO_POSITIVES)),
-        val_ids=Path(stores.get("val_ids_path", PROTEIN_VAL_IDS)),
-        embed_dir=Path(stores.get("embed_dir", None) or stores.get("hub_local_dir", None)),
-        embed_dir_res=Path(stores.get("embed_dir_res", None)),
-        embed_dir_fused=Path(stores.get("embed_dir_fused", None)),
-        seq_len_lookup=Path(stores.get("seq_len_lookup_dir", P_SEQ_LEN_LOOKUP)),
-        pro_manifest=Path(stores.get("protein_manifest_file", GOOGLE_DRIVE_MANIFEST_CACHE)),
-        go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
-        hub_local_dir=Path(stores.get("hub_local_dir", None)),
+        use_queue_miner=bool(general.get("use_queue_miner", True)),
+        go_pooling_strategy=general.get("go_pooling_strategy", "mean"),
+        use_lora=bool(general.get("use_lora", False)),
+        use_attribution_loss=bool(general.get("use_attribution_loss", False)),
+        return_alpha=bool(general.get("return_alpha", False)),
+        return_slot_attn=bool(general.get("return_slot_attn", False)),
+        protein_pooling_strategy=general.get("protein_pooling_strategy", "mean"),
+        go_encoder_inner_pooling=general.get("go_encoder_inner_pooling", "mean"),
+        ablation_id=general.get("ablation_id", None),
+        phase=general.get("phase", -2),
+        protein_n_slots=int(general.get("protein_n_slots", 0)),
+        go_pool_type=general.get("go_pool_type", "mean"),
+        go_encoder_output_mode=general.get("go_encoder_output_mode", "pooled"),
+        go_segment_representation_mode=general.get("go_segment_representation_mode", "segments_only"),  # mixed
 
-        overlap=data.get("overlap"),
-        max_len=data.get("max_len", 1024),
-        no_cache_shards=bool(data.get("no_cache_shards", False)),
+        # paths / store
+        train_ids_path=Path(stores.get("train_ids_path")),
+        pid2pos=Path(stores.get("pid2pos_path")),
+        val_ids_path=Path(stores.get("val_ids_path")),
+        embed_dir_res=Path(stores.get("embed_dir_res", None)),
+        go_text_folder=Path(stores.get("go_text_folder")) if stores.get("go_text_folder") else None,
+        go_cache_path=Path(stores.get("go_cache_path")) if stores.get("go_cache_path") else None,
+        go_path_seen=Path(stores.get("go_path_seen")) if stores.get("go_path_seen") else None,
+        go_path_observed=Path(stores.get("go_path_observed")) if stores.get("go_path_observed") else None,
+        go_basic_json=Path(stores.get("go_basic_json")) if stores.get("go_basic_json") else None,
+        seq_len_lookup=Path(stores.get("seq_len_lookup")) if stores.get("seq_len_lookup") else None,
 
         # dataset DAG / expansion / few-zero
+        overlap=data.get("overlap"),
+        max_len=data.get("max_len", 1024),
         use_dag_in_ds=bool(data.get("use_dag_in_ds", False)),
-        min_pos_for_expand=int(data.get("min_pos_for_expand", 3)),
-        max_ancestor_add=int(data.get("max_ancestor_add", 4)),
-        max_hops=int(data.get("max_hops", 3)),
-        ancestor_gamma=float(data.get("ancestor_gamma", 0.7)),
-        zero_shot_terms=stores.get("zero_shot_terms_file", ZERO_SHOT_TERMS_ID_ONLY_JSON),
-        few_shot_terms=stores.get("few_shot_terms_file", FEW_SHOT_IC_TERMS_ID_ONLY_JSON),
+        zero_shot_path=stores.get("zero_shot_path"),
+        few_shot_path=stores.get("few_shot_path"),
         fs_target_ratio=float(data.get("fs_target_ratio", 0.3)),
-
-        # caches (legacy keys kept for compatibility; FAISS yok)
-        go_cache=caches.get("go_cache"),
 
         # training
         epochs=int(training.get("epochs", 10)),
@@ -1397,16 +1809,18 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         save_every=int(training.get("save_every", 1000)),
         keep_last_n=int(training.get("keep_last_n", 3)),
         resume=training.get("resume"),
+        warmstart_path=training.get("warmstart_path"),
         eval_only=bool(training.get("eval_only", False)),
         log_every=int(training.get("log_every", 50)),
         log_level=training.get("log_level", "INFO"),
-        monitor_metric=training.get("monitor_metric", "cafa_fmax"),
+        monitor_metric=training.get("monitor_metric", "align_MRR"),
+        secondary_monitor_metric=training.get(
+            "secondary_monitor_metric", "macro_term_recall@100"
+        ),
         monitor_mode=training.get("monitor_mode", "max"),
         early_stop_patience=int(training.get("early_stop_patience", 0)),
         cand_chunk_k=int(training.get("cand_chunk_k", 8)),
         pos_chunk_t=int(training.get("pos_chunk_t", 128)),
-        k_hard_queue=int(training.get("k_hard_queue", 128)),
-        queue_K=int(training.get("queue_K", 65536)),
         general_device=str(training.get("device", "cuda:0")),
         max_refresh_go=int(training.get("max_refresh_go", 5000)),
         eval_go_bs=int(training.get("eval_go_bs", 256)),
@@ -1414,11 +1828,43 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         is_logit_scale_constant=bool(training.get("is_logit_scale_constant", False)),
         go_token_dropout=bool(training.get("go_token_dropout", False)),
         go_pooling=str(training.get("go_pooling", "mean")),
+        eval_space=str(training.get("eval_space", "seen")),
+        max_inbatch=int(training.get("max_inbatch", 64)),
+        eval_cand_chunk_k=int(training.get("eval_cand_chunk_k", 8)),
+        go_segment_max_len=int(training.get("go_segment_max_len", 64)),
+        go_segment_alpha=float(training.get("go_segment_alpha", 0.5)),
+        go_segment_alpha_warmup_steps=int(training.get("go_segment_alpha_warmup_steps", 10000)),
+        local_window_size=int(training.get("local_window_size", 64)),
+        local_window_stride=int(training.get("local_window_stride", 32)),
+        pairwise_margin=float(training.get("pairwise_margin", 0.0)),
+        pairwise_start_step=int(training.get("pairwise_start_step", 0)),
+        coverage_start_step=int(training.get("coverage_start_step", 2000)),
+        coverage_mode=str(loss.get("coverage_mode", "weak")),
+        cardinality_weighting=bool(training.get("cardinality_weighting", False)),
+        cardinality_sampling=bool(training.get("cardinality_sampling", False)),
+        cardinality_sampling_power=float(training.get("cardinality_sampling_power", 0.5)),
+        cardinality_sampling_min_weight=float(training.get("cardinality_sampling_min_weight", 0.5)),
+        cardinality_sampling_max_weight=float(training.get("cardinality_sampling_max_weight", 4.0)),
 
         # optim
         lr=float(optim.get("lr", 3e-4)),
         weight_decay=float(optim.get("weight_decay", 0.01)),
         grad_clip=float(optim.get("grad_clip", 1.0)),
+        lr_lora=optim.get("lr_lora", None),
+        trainable_mode=str(training.get("trainable_mode", "full")),
+
+        # queue params
+        queue_K=int(queue.get("queue_K", 16384)),
+        queue_start_step=int(queue.get("queue_start_step", 0)),
+        queue_hard_frac_start=float(queue.get("queue_hard_frac_start", 0.0)),
+        queue_hard_frac_end=float(queue.get("queue_hard_frac_end", 0.0)),
+        queue_hard_frac_warmup_steps=float(queue.get("queue_hard_frac_warmup_steps", 0.0)),
+        queue_weight_start=float(queue.get("queue_weight_start", 0.01)),
+        queue_weight_end=float(queue.get("queue_weight_end", 0.01)),
+        queue_weight_warmup_steps=float(queue.get("queue_weight_warmup_steps", 0.0)),
+        k_hard_queue_start=int(queue.get("k_hard_queue_start", 0)),
+        k_hard_queue_end=int(queue.get("k_hard_queue_end", 0)),
+        k_hard_queue_warmup_steps=int(queue.get("k_hard_queue_warmup_steps", 0.0)),
 
         # model / attention
         align_dim=int(model.get("align_dim", 768)),
@@ -1428,16 +1874,36 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         entropy_reg=float(model.get("entropy_reg", 0.01)),
         win_size=int(model.get("win_size", 1024)),
         win_stride=int(model.get("win_stride", 256)),
+        multivec_slot_lse_tau=float(model.get("multivec_slot_lse_tau", 0.10)),
+        multivec_global_residual_init=float(model.get("multivec_global_residual_init", 0.25)),
+        protein_expert_mode=str(model.get("protein_expert_mode", "legacy")),
+        local_slot_aggregation=str(model.get("local_slot_aggregation", "lse")),
+        local_slot_lse_tau=float(model.get("local_slot_lse_tau", 0.10)),
+        expert_global_weight=float(model.get("expert_global_weight", 0.50)),
+        expert_fusion_learnable=bool(model.get("expert_fusion_learnable", True)),
 
         # loss
         lambda_con=float(loss.get("lambda_con", 1.0)),
-        lambda_dag=float(loss.get("lambda_dag", 0.2)),
-        lambda_attr=float(loss.get("lambda_attr", 0.1)),
+        lambda_dag=float(loss.get("lambda_dag", 0.0)),
+        lambda_attr=float(loss.get("lambda_attr", 0.0)),
         lambda_entropy_alpha=float(loss.get("lambda_entropy_alpha", 0.0)),
         dag_margin=float(loss.get("dag_margin", 0.05)),
         dag_scale=float(loss.get("dag_scale", 10.0)),
         lambda_vtrue=float(loss.get("lambda_vtrue", 0.2)),
         tau_distill=float(loss.get("tau_distill", 1.5)),
+        lambda_bce=float(loss.get("lambda_bce", 0.1)),
+        lambda_slot_div=float(loss.get("lambda_slot_div", 0.0)),
+        pairwise_lambda=float(loss.get("pairwise_lambda", 0.0)),
+        coverage_lambda=float(loss.get("coverage_lambda", 0.0)),
+        coverage_target_k=int(loss.get("coverage_target_k", 0)),
+        coverage_mining_k=int(loss.get("coverage_mining_k", 0)),
+        coverage_bottom_frac=float(loss.get("coverage_bottom_frac", 0.25)),
+        coverage_hard_neg_k=int(loss.get("coverage_hard_neg_k", 4)),
+        coverage_margin=float(loss.get("coverage_margin", 0.05)),
+        frequency_balancing=bool(loss.get("frequency_balancing", False)),
+        frequency_weight_power=float(loss.get("frequency_weight_power", 0.5)),
+        frequency_weight_min=float(loss.get("frequency_weight_min", 0.5)),
+        frequency_weight_max=float(loss.get("frequency_weight_max", 2.0)),
 
         # curriculum
         curriculum_epochs=int(curriculum.get("epochs", 4)),
@@ -1459,35 +1925,15 @@ def load_structured_cfg(path: str = _TRAINING_CONFIG_DEFAULT):
         inbatch_easy_end=float((curriculum.get("inbatch_easy") or [1.0, 0.0])[1]),
         neg_k=int(curriculum.get("neg_k", 4)),
 
-        #memory_bank
-        memory_bank_device=str(memory_bank.get("device", "cuda")),
-        memory_bank_dtype=str(memory_bank.get("d_type", "fp16")),
-
-
         # wandb
         wandb=bool(wandb_block.get("enabled", False)),
         wandb_project=wandb_block.get("project", "protein-go-align"),
         wandb_entity=wandb_block.get("entity"),
         wandb_run_name=wandb_block.get("wandb_run_name"),
         wandb_mode=wandb_block.get("mode", "online"),
-
-        # misc
-        n_go=cfg.get("n_go", None),
     )
+    return args
 
-    if args.phase_based is False:
-        return args, None
-    schedule = None
-  #  schedule = TrainSchedule(
-  #      phase_breaks=tuple(sched.get("phase_breaks", (5, 12, 25))),
-  #      stageA_mix=tuple(sched.get("stageA_mix", (1.0, 0.0, 0.0))),
-  #      stageB_mix=tuple(sched.get("stageB_mix", (0.7, 0.3, 0.0))),
-  #      stageC_mix=tuple(sched.get("stageC_mix", (0.4, 0.4, 0.2))),
-  #     stageD_mix=tuple(sched.get("stageD_mix", (0.4, 0.4, 0.2))),
-  #      lambda_attr_start=int(sched.get("lambda_attr_start", 6)),
-  #      lambda_attr_max=float(sched.get("lambda_attr_max", 0.2)),
-  #  )
-    return args, schedule
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Protein–GO Alignment Training")
@@ -1500,24 +1946,24 @@ def parse_args():
 
     args = parser.parse_args()
     if not args.config:
-        args.config = TRAINING_CONFIG
+        args.config = YAML_FILE
         print(f"[main] No --config passed, defaulting to {args.config}")
 
-    args, schedule = load_structured_cfg(args.config)
+    args = load_structured_cfg(args.config)
 
     if args.ablation_id is not None:
         print("[Ablation] Applying ablation ID:", args.ablation_id)
 
-    return args, schedule
+    return args
 
 def main():
-    args, schedule = parse_args()
+    args = parse_args()
     out = Path(args.output_dir)
     setup_logging(out, level=args.log_level)
     set_seed(args.seed)
     t0 = time.time()
     try:
-        run_training(args, schedule)
+        run_training(args)
     except Exception as e:
         logging.exception("Fatal error: %s", repr(e))
         raise

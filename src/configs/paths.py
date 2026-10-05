@@ -127,8 +127,9 @@ def go_index_paths(phase: int) -> dict[str, Path]:
     return GO_INDEX[phase]
 
 # GO helpers
-GO_PARENTS  = TRAINING_READY / "go_dag" / "go_parents.json"
-GO_CHILDREN = TRAINING_READY / "go_dag" / "go_children.json"
+GO_PARENTS  = DATA_DIR / "go_parents.json"
+GO_CHILDREN = DATA_DIR / "go_children.json"
+GO_VOCAB    = DATA_DIR / "go_vocab.json"
 GO_ANCESTOR_STOPLIST = TRAINING_READY / "go_dag" / "ancestor_stoplist.txt"
 
 # PROTEINS
@@ -150,7 +151,7 @@ GOOGLE_DRIVE_MANIFEST_CACHE  = TRAINING_READY / "manifest_cache" / "esm_manifest
 
 # CONFIG
 
-TRAINING_CONFIG = SRC_DIR / "runpod.yaml"
+YAML_FILE = SRC_DIR / "runpod.yaml"
 
 def create_data_folders() -> None:
     for path in [

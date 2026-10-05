@@ -1,14 +1,14 @@
 # protein_emb_dataset.py
 from __future__ import annotations
-import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
+from go.go_index import mask_from_globals, build_go_index
 from src.configs.parameters import ALLOWED_RELS_FOR_DAG
 from src.configs.data_classes import FewZeroConfig
 from src.go.go_dag import expand_with_ancestors
-from src.go.go_cache import GoLookupCache
+from . import GoTextStore
 from .residue_store import ESMResidueStore, ESMFusedStore  # <-- fused import
 
 class ProteinEmbDataset(Dataset):
@@ -16,8 +16,9 @@ class ProteinEmbDataset(Dataset):
         self,
         protein_ids: Sequence[str],
         pid2pos: Dict[str, List[int]],
-        go_cache: GoLookupCache,
         fewzero: FewZeroConfig,
+        go_text_store: GoTextStore,
+
         *,
         dag_parents: Optional[Mapping[int, Sequence[Tuple[int, str]]]] = None,
         min_pos_for_expand: int = 3,
@@ -26,25 +27,18 @@ class ProteinEmbDataset(Dataset):
         ancestor_stoplist: Optional[Set[int]] = None,
         ancestor_gamma: float = 0.7,
         store: ESMResidueStore,
-        fused_store: Optional[ESMFusedStore] = None,
-        include_fused: bool = False,
     ):
         super().__init__()
         if store is None:
             raise ValueError("ProteinEmbDataset requires 'store' (ESMResidueStore).")
-        if include_fused and fused_store is None:
-            raise ValueError("include_fused=True ama fused_store=None.")
 
         self.pids = list(protein_ids)
-        self.n_go = go_cache.n_go
-        self.fewzero = fewzero
         self.store = store
-        self.fused_store = fused_store
-        self.include_fused = bool(include_fused)
 
         # === CANONICAL GO UNIVERSE ===
         # GoLookupCache row2id -> elimizde embedding/text olan global GO id'ler
-        valid_go_ids: Set[int] = set(int(g) for g in go_cache.row2id)
+        go_text_store_ids = list(go_text_store.id2text.keys())
+        valid_go_ids: Set[int] = set(int(g) for g in go_text_store_ids)
 
         self.pid2pos: Dict[str, List[int]] = {}
         self.pos_weights_map: Dict[str, List[float]] = {}
@@ -118,7 +112,10 @@ class ProteinEmbDataset(Dataset):
             self.is_fs.append(any((g in fewzero.few_shot_terms) for g in labels))
 
         # Global ZS maskesi (ileride miner filtreleri için)
-        self.zs_mask = go_cache.mask_from_globals(fewzero.zero_shot_terms)
+        self.n_go = len(go_text_store.id2text.keys())
+        go_index = build_go_index(fewzero.zero_shot_terms)
+        self.zs_mask = mask_from_globals(terms=fewzero.zero_shot_terms, go_index=go_index, n_go=self.n_go)
+        self.rare_go_set = set(fewzero.few_shot_terms)
 
     def __len__(self) -> int:
         return len(self.pids)
@@ -129,16 +126,19 @@ class ProteinEmbDataset(Dataset):
         pos_list = self.pid2pos.get(pid, [])
         pos_wts = self.pos_weights_map.get(pid, [1.0] * len(pos_list))
 
+        num_rare_go = 0
+        if hasattr(self, "rare_go_set") and self.rare_go_set is not None:
+            pos_ids_list = list(pos_list)
+            num_rare_go = sum(1 for g in pos_ids_list if int(g) in self.rare_go_set)
+
         item = {
             "protein_id": pid,
             "prot_emb": prot_emb,  # [L,D]
             "pos_go_ids": torch.as_tensor(pos_list, dtype=torch.long),
             "pos_go_weights": torch.as_tensor(pos_wts, dtype=torch.float32),
             "is_fs": self.is_fs[idx],
+            "num_rare_go": num_rare_go,
         }
-        if self.include_fused:
-            z = self.fused_store.get(pid)  # [D]
-            item["prot_fused"] = z
         return item
 
 # protein_fused_query_dataset

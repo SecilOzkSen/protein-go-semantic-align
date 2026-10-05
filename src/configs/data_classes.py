@@ -8,8 +8,8 @@ from src.configs.paths import (
     ZERO_SHOT_TERMS_ID_ONLY_JSON,
     FEW_SHOT_IC_TERMS_ID_ONLY_JSON,
     COMMON_IC_GO_TERMS_ID_ONLY_JSON,
-    GO_INDEX,                 # {1: {"TEXT_EMB": Path, "FAISS_IP": Path, "META": Path}, ...}
-    go_index_paths,           # def go_index_paths(phase:int)->dict[str, Path]
+    GO_INDEX,  # {1: {"TEXT_EMB": Path, "FAISS_IP": Path, "META": Path}, ...}
+    go_index_paths,  # def go_index_paths(phase:int)->dict[str, Path]
 )
 
 @dataclass
@@ -124,7 +124,6 @@ class GOIndex:
 class FewZeroConfig:
     zero_shot_terms: Set[int]
     few_shot_terms: Set[int]
-    common_terms: Set[int]
     min_pos_per_protein: int = 1
     fs_target_ratio: float = 0.30
 
@@ -153,42 +152,6 @@ class LoRAParameters:
     bias: Literal["none", "all", "lora_only"] = "none"
     task_type: str = "FEATURE_EXTRACTION"
 
-
-@dataclass
-class CurriculumConfig:
-    """
-    Scheduling knobs for FAISS negative mining.
-    """
-    total_steps: int
-    hard_frac: Tuple[float, float] = (0.2, 0.8)
-    shortlist_M: Tuple[int, int] = (32, 256)
-    k_hard: Tuple[int, int] = (8, 32)
-    hier_max_hops_up: Tuple[int, int] = (0, 2)
-    hier_max_hops_down: Tuple[int, int] = (0, 1)
-    random_k: Tuple[int, int] = (8, 0)
-    use_inbatch_easy: Tuple[float, float] = (1.0, 0.0)
-    mix_sibling_queue: Dict[str, float] = field(
-        default_factory=lambda: {"SIBLING": 0.7, "QUEUE": 0.3}
-    )
-    allow_siblings_prob: Tuple[float, float] = (0.0, 1.0)
-    mode: str = "cosine"
-    warmup: int = 0
-
-
-@dataclass(frozen=True)
-class TrainingReadyDataPaths:
-    # Few/Zero/Common ID-only json
-    zero_shot_id_only_json: Path = ZERO_SHOT_TERMS_ID_ONLY_JSON
-    few_shot_id_only_json: Path = FEW_SHOT_IC_TERMS_ID_ONLY_JSON
-    common_id_only_json: Path = COMMON_IC_GO_TERMS_ID_ONLY_JSON
-
-    phases: List[Dict[str, Path]] = field(default_factory=lambda: [
-        dict(embeddings=GO_INDEX[1]["TEXT_EMB"], ip=GO_INDEX[1]["FAISS_IP"], meta=GO_INDEX[1]["META"]),
-        dict(embeddings=GO_INDEX[2]["TEXT_EMB"], ip=GO_INDEX[2]["FAISS_IP"], meta=GO_INDEX[2]["META"]),
-        dict(embeddings=GO_INDEX[3]["TEXT_EMB"], ip=GO_INDEX[3]["FAISS_IP"], meta=GO_INDEX[3]["META"]),
-        dict(embeddings=GO_INDEX[4]["TEXT_EMB"], ip=GO_INDEX[4]["FAISS_IP"], meta=GO_INDEX[4]["META"]),
-    ])
-
 @dataclass
 class LoggingConfig:
     log_every: int = 50
@@ -205,6 +168,7 @@ class TrainingContext:
     go_cache: Any
     dag_parents: Optional[dict] = None
     dag_children: Optional[dict] = None
+    go_namespace_map: Optional[dict] = None
     scheduler: Any = None
     device: Any = "cpu"
     schedule: Any = None
@@ -212,7 +176,6 @@ class TrainingContext:
     maybe_refresh_phase_resources: Optional[Callable[[int], None]] = None
     wandb_run: Any = None
     current_phase: Optional[int] = None
-    memory_bank: Any = None
     last_refresh_epoch: Any = None
     last_refresh_reason: Any = None
     batch_builder: Any = None
@@ -223,10 +186,18 @@ class TrainingContext:
     use_queue_miner: bool = True
     attribute_loss_enabled: bool = False
     return_alpha: bool = False
+    return_slot_attn: bool = False
     fused_bank: Any = None
-    pooling_strategy: str = "mean"
+    protein_pooling_strategy: str = "mean"
+    protein_n_slots: int = 0,
+    go_pool_type: str = "mean"
+    go_encoder_output_mode: str = "pool"
+    go_segment_representation_mode: str = "segments_only"  # mixed
     eval_id_list: List[int] = None
     logger: Any = None
+    eval_seen_go_ids: List[int] = None
+    eval_unseen_ids: List[int] = None
+    eval_rare_go_ids: List[int] = None
 
 
     def to_dict(self):
@@ -242,15 +213,16 @@ class TrainingContext:
 @dataclass
 class AttrConfig:
     lambda_attr: float = 0.0
-    lambda_dag: float = 0.3
+    lambda_dag: float = 0.0
+    lambda_bce: float = 0.0
     lambda_entropy_alpha: float = 0.05
     lambda_entropy_window: float = 0.01
     topk_per_window: int = 64
     curriculum_epochs: int = 10
-    temperature: float = 0.07          # InfoNCE için (DUPLICATE kaldırıldı)
+    temperature: float = 0.07  # InfoNCE için (DUPLICATE kaldırıldı)
     # teacher loss weight
     lambda_vtrue: float = 0.2
-    tau_distill: float = 1.5           # KL temperature for distillation
+    tau_distill: float = 1.5  # KL temperature for distillation
 
 
 @dataclass
@@ -260,11 +232,12 @@ class TrainerConfig:
     d_z: int = 512
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
     lr: float = 2e-4
+    lr_lora: float = 5e-5
+    use_lora: float = True
+    lora_warmup_steps: int = 0
     max_epochs: int = 20,
     cand_chunk_k: int = 8
     pos_chunk_t: int = 128
-    k_hard_queue: int = 64
-    queue_K:int = 65536
     weight_decay: float = 1e-2
     grad_clip: float = 1.0
     batch_size: int = 64
@@ -275,3 +248,53 @@ class TrainerConfig:
     is_logit_scale_constant: bool = False
     go_pooling: str = "masked_mean"  # cls, mean, masked_mean
     eval_go_bs: int = 256
+    max_inbatch: int = 64
+    eval_cand_chunk_k: int = 64
+    warmstart_path: str = None
+    go_segment_alpha: float = 0.0
+    go_segment_alpha_warmup_steps: int = 10000
+    trainable_mode: str = "none"
+    local_window_size: int = 64
+    local_window_stride: int = 32
+    lambda_slot_div: float = 0.0
+    multivec_slot_lse_tau: float = 0.00
+    multivec_global_residual_init: float = 0.0
+    pairwise_margin: float = 0.0
+    pairwise_start_step: int = 0
+    pairwise_lambda: float = 0.0
+    protein_expert_mode: str = "legacy"
+    local_slot_aggregation: str = "lse"
+    local_slot_lse_tau: float = 0.10
+    expert_global_weight: float = 0.50
+    expert_fusion_learnable: bool = True
+    cardinality_weighting: bool = False
+    coverage_lambda: float = 0.0
+    coverage_bottom_frac: float = 0.25
+    coverage_hard_neg_k: int = 4
+    coverage_margin: float = 0.05
+    coverage_start_step: int = 2000
+    coverage_target_k: int = 0
+    coverage_mining_k: int = 0
+    coverage_mode: str = "weak"
+    # Term-frequency balancing for retriever objectives. Frequencies count
+    # distinct training proteins annotated with each GO term.
+    frequency_balancing: bool = False
+    frequency_weight_power: float = 0.5
+    frequency_weight_min: float = 0.5
+    frequency_weight_max: float = 2.0
+    term_frequencies: Optional[Dict[int, int]] = None
+
+
+@dataclass
+class QueueConfig:
+    queue_K: int = 65536
+    queue_start_step: int = 0
+    queue_hard_frac_start: float = 0.0
+    queue_hard_frac_end: float = 0.0
+    queue_hard_frac_warmup_steps: int = 2000
+    queue_weight_start: float = 0.0
+    queue_weight_end: float = 0.0
+    queue_weight_warmup_steps: int = 2000
+    k_hard_queue_start: int = 0
+    k_hard_queue_end: int = 0
+    k_hard_queue_warmup_steps: int = 2000
