@@ -44,7 +44,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_markerless_coverage_top200_slotdiv005
+  output_dir: /workspace/data_pfresgo/outputs/bp/name_def_isa_top500_boundary_slotdiv005
   save_every: 10000
   keep_last_n: 3
   resume: null
@@ -75,14 +75,14 @@ training:
   local_window_stride: 32
   pairwise_margin: 0.0
   pairwise_start_step: 2000
-  cardinality_weighting: true
+  cardinality_weighting: false
   cardinality_sampling: true
   cardinality_sampling_power: 0.5
   cardinality_sampling_min_weight: 0.5
   cardinality_sampling_max_weight: 4.0
   coverage_start_step: 2000
-  coverage_target_k: 200
-  coverage_mining_k: 512
+  coverage_target_k: 500
+  coverage_mining_k: 1000
   coverage_bank_chunk: 256
 
 queue:
@@ -154,7 +154,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: "PFresGO-BP-top200-slotdiv005"
+  wandb_run_name: "PFresGO-BP-top500-boundary-slotdiv005"
   mode: online
 
 stores:
