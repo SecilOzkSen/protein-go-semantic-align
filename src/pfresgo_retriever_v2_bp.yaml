@@ -5,7 +5,7 @@ pfresgo:
   branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_bp.json
   go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
   test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
-  evaluation_split: valid
+  evaluation_split: test
   rare_lt: 20
   enabled_segments:
     - name
@@ -39,9 +39,9 @@ training:
   output_dir: /workspace/data_pfresgo/outputs/bp/retriever_v2_fullgo_pbr
   save_every: 1000000 #10000
   keep_last_n: 3
-  resume: /workspace/data_pfresgo/outputs/bp/retriever_v2_fullgo_pbr/checkpoint_step117620.pt
+  resume: /workspace/data_pfresgo/outputs/bp/retriever_v2_fullgo_pbr/checkpoint_step164668.pt
   warmstart_path: null
-  eval_only: false
+  eval_only: true
   log_every: 500
   log_level: INFO
   monitor_metric: oracle_microF@500
