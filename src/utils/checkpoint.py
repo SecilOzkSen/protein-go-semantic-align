@@ -133,138 +133,287 @@ def _clean_state_keys(state):
     return out
 
 
-def load_checkpoint(trainer, path: str, map_location="cuda"):
-    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+def load_checkpoint(
+        trainer,
+        path: str,
+        map_location="cuda",
+):
+    """
+    Resume a Retriever v2 training run.
+
+    Restores:
+      - model weights
+      - optimizer state
+      - global step
+      - next epoch
+
+    Retriever v2 intentionally has no:
+      - EMA GO encoder
+      - local protein expert
+      - slot state
+      - queue state
+      - logit-scale state
+    """
+    ckpt = torch.load(
+        path,
+        map_location=map_location,
+        weights_only=False,
+    )
 
     if not isinstance(ckpt, dict):
-        raise RuntimeError(f"[checkpoint] Expected dict checkpoint, got {type(ckpt)}")
+        raise RuntimeError(
+            f"[checkpoint] Expected dict checkpoint, got {type(ckpt)}"
+        )
 
     if "model" not in ckpt:
-        raise RuntimeError(f"No 'model' key in checkpoint. Keys: {ckpt.keys()}")
+        raise RuntimeError(
+            f"[checkpoint] No 'model' key. Keys: {list(ckpt.keys())}"
+        )
 
     print(f"[checkpoint] Loading from {path}")
-    print("[checkpoint] top-level keys:", list(ckpt.keys()))
+    print(
+        "[checkpoint] top-level keys:",
+        list(ckpt.keys()),
+    )
 
-    # -------------------------
+    # ------------------------------------------------------------------
     # Model
-    # -------------------------
-    model_state = _unwrap_state_dict(ckpt["model"], name="model")
+    # ------------------------------------------------------------------
+
+    model_state = _unwrap_state_dict(
+        ckpt["model"],
+        name="model",
+    )
     model_state = _clean_state_keys(model_state)
 
-    current = trainer.model.state_dict()
+    current_state = trainer.model.state_dict()
 
-    # Optional strict shape filter, useful if some accidental incompatible keys exist.
     loadable = {}
     skipped_missing = []
     skipped_shape = []
 
-    for k, v in model_state.items():
-        if k not in current:
-            skipped_missing.append(k)
+    for key, value in model_state.items():
+        if key not in current_state:
+            skipped_missing.append(key)
             continue
 
-        if tuple(current[k].shape) != tuple(v.shape):
-            skipped_shape.append((k, tuple(v.shape), tuple(current[k].shape)))
+        if tuple(current_state[key].shape) != tuple(value.shape):
+            skipped_shape.append(
+                (
+                    key,
+                    tuple(value.shape),
+                    tuple(current_state[key].shape),
+                )
+            )
             continue
 
-        loadable[k] = v
+        loadable[key] = value
 
-    if len(loadable) == 0:
-        print("[checkpoint][DEBUG] model_state sample:", list(model_state.keys())[:50])
-        print("[checkpoint][DEBUG] current sample:", list(current.keys())[:50])
-        raise RuntimeError("[checkpoint] Loaded 0 compatible model keys.")
+    if not loadable:
+        print(
+            "[checkpoint][DEBUG] checkpoint model sample:",
+            list(model_state.keys())[:50],
+        )
+        print(
+            "[checkpoint][DEBUG] current model sample:",
+            list(current_state.keys())[:50],
+        )
+        raise RuntimeError(
+            "[checkpoint] Loaded 0 compatible model parameters."
+        )
 
-    missing, unexpected = trainer.model.load_state_dict(loadable, strict=False)
+    missing, unexpected = trainer.model.load_state_dict(
+        loadable,
+        strict=False,
+    )
 
-    print(f"[checkpoint] Model loaded. compatible={len(loadable)} missing={len(missing)} unexpected={len(unexpected)}")
-    if missing:
-        print("[checkpoint][WARN] missing model keys example:", missing[:20])
-    if unexpected:
-        print("[checkpoint][WARN] unexpected model keys example:", unexpected[:20])
+    print(
+        "[checkpoint] Model loaded. "
+        f"compatible={len(loadable)} "
+        f"missing={len(missing)} "
+        f"unexpected={len(unexpected)}"
+    )
+
     if skipped_missing:
-        print("[checkpoint][WARN] skipped_missing example:", skipped_missing[:20])
-    if skipped_shape:
-        print("[checkpoint][WARN] skipped_shape example:", skipped_shape[:10])
+        print(
+            "[checkpoint][WARN] checkpoint keys not present "
+            "in current model:",
+            skipped_missing[:20],
+        )
 
-    # For true resume, missing hundreds of keys is not acceptable.
-    # Same architecture resume should be basically exact.
-    if len(missing) > 20:
+    if skipped_shape:
+        print(
+            "[checkpoint][WARN] shape-mismatched keys:",
+            skipped_shape[:10],
+        )
+
+    if missing:
+        print(
+            "[checkpoint][WARN] missing current-model keys:",
+            missing[:20],
+        )
+
+    if unexpected:
+        print(
+            "[checkpoint][WARN] unexpected keys:",
+            unexpected[:20],
+        )
+
+    # ------------------------------------------------------------------
+    # True resume must match the Retriever v2 architecture.
+    # ------------------------------------------------------------------
+
+    if missing:
         raise RuntimeError(
-            f"[checkpoint] Too many missing model keys after resume: {len(missing)}. "
-            "Checkpoint likely did not load correctly."
+            "[checkpoint] Missing model parameters during Retriever v2 "
+            f"resume: {missing[:20]}"
         )
 
     if unexpected:
         raise RuntimeError(
-            f"[checkpoint] Unexpected model keys after resume: {unexpected[:20]}"
+            "[checkpoint] Unexpected model parameters during Retriever v2 "
+            f"resume: {unexpected[:20]}"
         )
 
-    # Important sanity checks for this P2b run
+    if skipped_shape:
+        raise RuntimeError(
+            "[checkpoint] Shape mismatch during Retriever v2 resume: "
+            f"{skipped_shape[:10]}"
+        )
+
+    # ------------------------------------------------------------------
+    # Critical Retriever v2 modules
+    # ------------------------------------------------------------------
+
     important_prefixes = [
-        "protein_local_evidence_pool.",
+        "protein_mean_attn_gate_pool.",
         "protein_ln.",
         "proj_p.",
+        "go_segment_gate.",
         "go_ln.",
         "proj_g.",
     ]
 
-    for pref in important_prefixes:
-        n_loaded = sum(k.startswith(pref) for k in loadable)
-        print(f"[checkpoint][CHECK] {pref} loaded={n_loaded}")
-
-    # -------------------------
-    # EMA
-    # -------------------------
-    ema_state = ckpt.get("ema", {})
-    if "go_encoder_k" in ema_state and getattr(trainer, "go_encoder_k", None) is not None:
-        missing_ema, unexpected_ema = trainer.go_encoder_k.load_state_dict(
-            ema_state["go_encoder_k"],
-            strict=False,
+    for prefix in important_prefixes:
+        expected = sum(
+            key.startswith(prefix)
+            for key in current_state
         )
+        loaded = sum(
+            key.startswith(prefix)
+            for key in loadable
+        )
+
         print(
-            f"[checkpoint] EMA go_encoder_k loaded. "
-            f"missing={len(missing_ema)} unexpected={len(unexpected_ema)}"
+            f"[checkpoint][CHECK] {prefix} "
+            f"loaded={loaded}/{expected}"
         )
 
-    # -------------------------
+        if expected == 0:
+            raise RuntimeError(
+                "[checkpoint] Expected Retriever v2 module is "
+                f"missing from current model: {prefix}"
+            )
+
+        if loaded != expected:
+            raise RuntimeError(
+                "[checkpoint] Retriever v2 module was not fully restored: "
+                f"{prefix} loaded={loaded}/{expected}"
+            )
+
+    # ------------------------------------------------------------------
     # Optimizer
-    # -------------------------
-    opt_blob = ckpt.get("optimizer", None)
+    # ------------------------------------------------------------------
 
-    if opt_blob is not None and hasattr(trainer, "opt"):
-        try:
-            if isinstance(opt_blob, dict) and "param_groups" in opt_blob:
-                trainer.opt.load_state_dict(opt_blob)
-                print("[checkpoint] Optimizer loaded.")
+    opt_blob = ckpt.get("optimizer")
 
-            elif isinstance(opt_blob, dict) and "optimizer" in opt_blob:
-                trainer.opt.load_state_dict(opt_blob["optimizer"])
-                print("[checkpoint] Optimizer loaded from nested key.")
+    if opt_blob is None:
+        raise RuntimeError(
+            "[checkpoint] No optimizer state found. "
+            "True training resume requires optimizer state."
+        )
 
-            else:
-                keys = list(opt_blob.keys()) if isinstance(opt_blob, dict) else None
-                print(f"[checkpoint][WARN] Optimizer skipped. type={type(opt_blob)} keys={keys}")
+    if not hasattr(trainer, "opt"):
+        raise RuntimeError(
+            "[checkpoint] Trainer has no optimizer."
+        )
 
-        except Exception as e:
-            print(f"[checkpoint][WARN] Optimizer load failed, continuing with fresh optimizer: {repr(e)}")
-    else:
-        print("[checkpoint][WARN] No optimizer found in checkpoint, continuing with fresh optimizer.")
+    try:
+        if (
+                isinstance(opt_blob, dict)
+                and "param_groups" in opt_blob
+        ):
+            trainer.opt.load_state_dict(opt_blob)
 
-    # -------------------------
-    # Meta
-    # -------------------------
+        elif (
+                isinstance(opt_blob, dict)
+                and "optimizer" in opt_blob
+        ):
+            trainer.opt.load_state_dict(
+                opt_blob["optimizer"]
+            )
+
+        else:
+            raise RuntimeError(
+                "Unrecognized optimizer checkpoint format. "
+                f"type={type(opt_blob)}"
+            )
+
+    except Exception as exc:
+        raise RuntimeError(
+            "[checkpoint] Optimizer restore failed. "
+            "Refusing to silently resume with a fresh optimizer."
+        ) from exc
+
+    print("[checkpoint] Optimizer loaded.")
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
     meta = ckpt.get("meta", {})
 
-    trainer._global_step = int(meta.get("global_step", meta.get("step", 0)))
-    start_epoch = int(meta.get("epoch", -1)) + 1
+    if not isinstance(meta, dict):
+        raise RuntimeError(
+            f"[checkpoint] Expected meta dict, got {type(meta)}"
+        )
 
-    if trainer._global_step <= 0:
-        print("[checkpoint][WARN] global_step is 0 after loading.")
-    if start_epoch < 0:
-        raise RuntimeError(f"Invalid start_epoch={start_epoch}")
+    saved_epoch = int(
+        meta.get("epoch", -1)
+    )
+    global_step = int(
+        meta.get(
+            "global_step",
+            meta.get("step", 0),
+        )
+    )
 
-    print(f"[checkpoint] Loaded from {path}")
-    print(f"[checkpoint] meta keys={list(meta.keys())}")
-    print(f"[checkpoint] Resume from epoch={start_epoch}, step={trainer._global_step}")
+    if saved_epoch < 0:
+        raise RuntimeError(
+            "[checkpoint] Missing or invalid epoch metadata: "
+            f"{saved_epoch}"
+        )
+
+    if global_step <= 0:
+        raise RuntimeError(
+            "[checkpoint] Missing or invalid global_step metadata: "
+            f"{global_step}"
+        )
+
+    trainer._global_step = global_step
+
+    # Checkpoint stores the completed epoch.
+    # Resume from the following epoch.
+    start_epoch = saved_epoch + 1
+
+    print(
+        f"[checkpoint] saved_epoch={saved_epoch}"
+    )
+    print(
+        f"[checkpoint] global_step={trainer._global_step}"
+    )
+    print(
+        f"[checkpoint] Resume from epoch={start_epoch}"
+    )
 
     return start_epoch

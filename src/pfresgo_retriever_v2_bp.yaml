@@ -29,7 +29,7 @@ general:
   use_attribution_loss: false
   return_alpha: false
 training:
-  epochs: 15
+  epochs: 20
   batch_size: 4
   eval_batch_size: 4
   num_workers: 0
@@ -41,7 +41,7 @@ training:
   keep_last_n: 3
   resume: /workspace/data_pfresgo/outputs/bp/retriever_v2_fullgo_pbr/checkpoint_step88215.pt
   warmstart_path: null
-  eval_only: true
+  eval_only: false
   log_every: 500
   log_level: INFO
   monitor_metric: oracle_microF@500
