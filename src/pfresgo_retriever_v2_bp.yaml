@@ -64,7 +64,7 @@ model:
   attn_dropout: 0.1
 loss:
   lambda_con: 1.0
-  pbr_lambda: 0.0
+  pbr_lambda: 0.001 # %10 #0.0
   pbr_margin: 0.05
   pbr_tau: 0.05
 evaluation:
