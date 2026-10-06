@@ -29,7 +29,7 @@ general:
   use_attribution_loss: false
   return_alpha: false
 training:
-  epochs: 1 #15
+  epochs: 15
   batch_size: 4
   eval_batch_size: 4
   num_workers: 0
