@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 try:
     import wandb
@@ -441,14 +442,31 @@ class RetrieverWandbLogger:
             )
 
         if heat_metrics and matrix:
-            payload["diagnostics/cardinality_retrieval_heatmap"] = (
-                wandb.plots.HeatMap(
-                    x_labels=heat_metrics,
-                    y_labels=y_labels,
-                    matrix_values=matrix,
-                    show_text=True,
-                )
+            fig, ax = plt.subplots(
+                figsize=(max(7.0, 1.25 * len(heat_metrics)), 5.5)
             )
+            arr = np.asarray(matrix, dtype=np.float64)
+            im = ax.imshow(arr, aspect="auto")
+            ax.set_xticks(np.arange(len(heat_metrics)))
+            ax.set_xticklabels(heat_metrics, rotation=45, ha="right")
+            ax.set_yticks(np.arange(len(y_labels)))
+            ax.set_yticklabels(y_labels)
+            ax.set_xlabel("Metric")
+            ax.set_ylabel("Protein positive cardinality")
+            ax.set_title("Cardinality x Retrieval / PBC")
+
+            for i in range(arr.shape[0]):
+                for j in range(arr.shape[1]):
+                    if np.isfinite(arr[i, j]):
+                        ax.text(
+                            j, i, f"{arr[i, j]:.3f}",
+                            ha="center", va="center", fontsize=8,
+                        )
+
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            payload["diagnostics/cardinality_retrieval_heatmap"] = wandb.Image(fig)
+            plt.close(fig)
 
         self._log(payload, step)
 
@@ -516,14 +534,34 @@ class RetrieverWandbLogger:
         heat_matrix = weights[selected].tolist()
         heat_y = [self._format_go_id(go_ids[i]) for i in selected]
 
-        payload["diagnostics/go_segment_weights_heatmap"] = (
-            wandb.plots.HeatMap(
-                x_labels=segment_names,
-                y_labels=heat_y,
-                matrix_values=heat_matrix,
-                show_text=True,
+        fig, ax = plt.subplots(
+            figsize=(
+                max(6.0, 1.6 * len(segment_names)),
+                max(8.0, 0.28 * n_show),
             )
         )
+        arr = np.asarray(heat_matrix, dtype=np.float64)
+        im = ax.imshow(arr, aspect="auto")
+        ax.set_xticks(np.arange(len(segment_names)))
+        ax.set_xticklabels(segment_names, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(heat_y)))
+        ax.set_yticklabels(heat_y, fontsize=7)
+        ax.set_xlabel("GO text segment")
+        ax.set_ylabel("GO term")
+        ax.set_title("GO Segment Weights, Top 50 Most Non-uniform Terms")
+
+        for i in range(arr.shape[0]):
+            for j in range(arr.shape[1]):
+                if np.isfinite(arr[i, j]):
+                    ax.text(
+                        j, i, f"{arr[i, j]:.2f}",
+                        ha="center", va="center", fontsize=6,
+                    )
+
+        fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+        fig.tight_layout()
+        payload["diagnostics/go_segment_weights_heatmap"] = wandb.Image(fig)
+        plt.close(fig)
 
         self._log(payload, step)
 
