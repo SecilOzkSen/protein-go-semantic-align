@@ -414,6 +414,7 @@ def build_go_text_store(args, go_encoder):
         segment_max_len=args.go_segment_max_len,
         full_id2segments={int(args.phase): id2segments},
         full_id2seg_present={int(args.phase): id2seg_present},
+        segment_names=list(args.enabled_segments),
     )
 
 

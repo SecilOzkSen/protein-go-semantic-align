@@ -1,8 +1,8 @@
-
 from typing import Dict, List, Mapping, Optional, Iterable
 import os
 import math
 import torch
+
 
 class GoTextStore:
     """
@@ -45,7 +45,16 @@ class GoTextStore:
         self.chunk_log = int(chunk_log)
         self.is_go_segmented = bool(is_segmented)
 
-        self.segment_names = segment_names or ["name", "namespace", "definition", "is_a", "part_of"]
+        default_segment_names = ["name", "namespace", "definition", "is_a", "part_of"]
+        self.segment_names = (
+            list(segment_names)
+            if segment_names is not None
+            else default_segment_names
+        )
+        if not self.segment_names:
+            raise ValueError("segment_names must contain at least one segment.")
+        if len(set(self.segment_names)) != len(self.segment_names):
+            raise ValueError(f"Duplicate segment names: {self.segment_names}")
 
         self.full_id2text: Dict[int, Dict[int, str]] = {
             int(p): {int(k): (v or "") for k, v in d.items()} for p, d in full_id2text.items()
@@ -98,6 +107,10 @@ class GoTextStore:
 
             self.id2segments = self.full_id2segments[self.phase]
             self.id2seg_present = self.full_id2seg_present[self.phase]
+            print(
+                f"[GoTextStore] active segments ({len(self.segment_names)}): "
+                f"{self.segment_names}"
+            )
 
         if not self.lazy:
             self._tokenize_all()
