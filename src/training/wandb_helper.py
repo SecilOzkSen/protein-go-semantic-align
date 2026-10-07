@@ -594,3 +594,269 @@ class RetrieverWandbLogger:
                     self.run.summary[f"best/{key}"] = value
 
         self.run.finish()
+
+
+class RerankerV2WandbLogger:
+    """
+    W&B logging for Experiment B:
+    frozen Retriever-v2 dumps + low-rank interaction prediction head + ASL.
+
+    Scientific metrics are computed elsewhere. This class only formats and
+    logs training diagnostics, gradients, adapter movement, validation metrics,
+    and run metadata.
+
+    Safe to instantiate with run=None. All methods then become no-ops.
+    """
+
+    GRADIENT_GROUPS = {
+        "protein_adapter_down": "protein_adapter.down.",
+        "protein_adapter_up": "protein_adapter.up.",
+        "go_adapter_down": "go_adapter.down.",
+        "go_adapter_up": "go_adapter.up.",
+        "predictor": "predictor.",
+    }
+
+    def __init__(self, run, cfg=None):
+        self.run = run
+        self.cfg = cfg
+
+        if self.enabled and wandb is None:
+            raise RuntimeError(
+                "A W&B run was supplied but the wandb package is unavailable."
+            )
+
+    @property
+    def enabled(self) -> bool:
+        return self.run is not None
+
+    @staticmethod
+    def _scalar(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            value = float(value)
+            return value if np.isfinite(value) else None
+
+        if torch.is_tensor(value) and value.numel() == 1:
+            value = float(value.detach().item())
+            return value if np.isfinite(value) else None
+
+        return None
+
+    def _log(self, payload: Dict[str, Any], step: int) -> None:
+        if not self.enabled or not payload:
+            return
+        payload = dict(payload)
+        payload["trainer_step"] = int(step)
+        self.run.log(payload, step=int(step))
+
+    # ------------------------------------------------------------------
+    # Static run metadata
+    # ------------------------------------------------------------------
+
+    def log_run_metadata(
+            self,
+            *,
+            model,
+            go_universe_size: int,
+            embedding_dim: int,
+            adapter_rank: int,
+            hidden_dim: int,
+            dropout: float,
+            gamma_pos: float,
+            gamma_neg: float,
+            asl_clip: float,
+            train_dump: Optional[str] = None,
+            val_dump: Optional[str] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        trainable_total = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
+        frozen_total = sum(
+            p.numel() for p in model.parameters() if not p.requires_grad
+        )
+
+        summary = self.run.summary
+        summary["architecture/experiment"] = "B"
+        summary["architecture/model"] = "low_rank_interaction_prediction_head"
+        summary["architecture/retriever"] = "frozen_retriever_v2_dump"
+        summary["architecture/go_universe_size"] = int(go_universe_size)
+        summary["architecture/embedding_dim"] = int(embedding_dim)
+        summary["architecture/adapter_rank"] = int(adapter_rank)
+        summary["architecture/hidden_dim"] = int(hidden_dim)
+        summary["architecture/dropout"] = float(dropout)
+        summary["architecture/ontology_size_independent"] = True
+        summary["architecture/interaction"] = "adapted_hadamard+retriever_similarity"
+
+        summary["objective/name"] = "asymmetric_loss"
+        summary["objective/gamma_pos"] = float(gamma_pos)
+        summary["objective/gamma_neg"] = float(gamma_neg)
+        summary["objective/clip"] = float(asl_clip)
+
+        summary["params/trainable_total"] = int(trainable_total)
+        summary["params/frozen_total"] = int(frozen_total)
+
+        if train_dump is not None:
+            summary["data/train_dump"] = str(train_dump)
+        if val_dump is not None:
+            summary["data/val_dump"] = str(val_dump)
+
+    # ------------------------------------------------------------------
+    # ASL / prediction diagnostics
+    # ------------------------------------------------------------------
+
+    def log_train(
+            self,
+            *,
+            diagnostics: Mapping[str, Any],
+            lr: float,
+            step: int,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        key_map = {
+            "loss": "train/asl_loss",
+            "positive_loss_mean": "train/asl_positive_mean",
+            "negative_loss_mean": "train/asl_negative_mean",
+            "positive_probability_mean": "prediction/positive_probability_mean",
+            "negative_probability_mean": "prediction/negative_probability_mean",
+            "probability_gap": "prediction/probability_gap",
+            "suppressed_negative_fraction": "asl/suppressed_negative_fraction",
+            "easy_negative_fraction": "asl/easy_negative_fraction",
+            "medium_negative_fraction": "asl/medium_negative_fraction",
+            "hard_negative_fraction": "asl/hard_negative_fraction",
+            "num_positive_pairs": "batch/num_positive_pairs",
+            "num_negative_pairs": "batch/num_negative_pairs",
+        }
+
+        payload: Dict[str, Any] = {"train/lr": float(lr)}
+        for source, target in key_map.items():
+            if source not in diagnostics:
+                continue
+            value = self._scalar(diagnostics[source])
+            if value is not None:
+                payload[target] = value
+
+        self._log(payload, step)
+
+    # ------------------------------------------------------------------
+    # Gradient diagnostics
+    # ------------------------------------------------------------------
+
+    def gradient_norms(self, model) -> Dict[str, float]:
+        """
+        Read gradients after loss.backward() and before clipping/optimizer.step().
+
+        With zero-initialized adapter up projections, adapter down gradients may
+        legitimately be zero on the first optimization step. Up projections and
+        predictor should receive gradient immediately.
+        """
+        result: Dict[str, float] = {}
+
+        for label, prefix in self.GRADIENT_GROUPS.items():
+            sq_sum = 0.0
+            found = False
+
+            for name, param in model.named_parameters():
+                if not name.startswith(prefix) or param.grad is None:
+                    continue
+                grad = param.grad.detach().float()
+                sq_sum += float(torch.sum(grad * grad).item())
+                found = True
+
+            result[f"grad/{label}"] = (
+                float(np.sqrt(sq_sum)) if found else 0.0
+            )
+
+        return result
+
+    def log_gradients(
+            self,
+            *,
+            model,
+            step: int,
+            total_before_clip: Optional[Any] = None,
+    ) -> Dict[str, float]:
+        norms = self.gradient_norms(model)
+
+        if total_before_clip is not None:
+            value = self._scalar(total_before_clip)
+            if value is not None:
+                norms["grad/total_before_clip"] = value
+
+        if self.enabled:
+            self._log(norms, step)
+
+        return norms
+
+    # ------------------------------------------------------------------
+    # Residual-adapter movement
+    # ------------------------------------------------------------------
+
+    def log_adapter_state(
+            self,
+            *,
+            protein_max_delta: Any,
+            go_max_delta: Any,
+            step: int,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        payload: Dict[str, Any] = {}
+        p = self._scalar(protein_max_delta)
+        g = self._scalar(go_max_delta)
+
+        if p is not None:
+            payload["adapter/protein_max_delta"] = p
+        if g is not None:
+            payload["adapter/go_max_delta"] = g
+
+        self._log(payload, step)
+
+    # ------------------------------------------------------------------
+    # Validation metrics
+    # ------------------------------------------------------------------
+
+    def log_validation(
+            self,
+            *,
+            metrics: Mapping[str, Any],
+            step: int,
+            epoch: Optional[int] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        payload: Dict[str, Any] = {}
+        for key, raw in metrics.items():
+            value = self._scalar(raw)
+            if value is not None:
+                payload[f"val/{key}"] = value
+
+        if epoch is not None:
+            payload["epoch"] = int(epoch)
+
+        self._log(payload, step)
+
+    # ------------------------------------------------------------------
+    # End of run
+    # ------------------------------------------------------------------
+
+    def finalize(
+            self,
+            *,
+            best_metrics: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        if best_metrics:
+            for key, raw in best_metrics.items():
+                value = self._scalar(raw)
+                if value is not None:
+                    self.run.summary[f"best/{key}"] = value
+
+        self.run.finish()
