@@ -100,10 +100,12 @@ def build_runtime(args, device):
     dag, _ = base._build_dag(args.go_basic_json) if args.use_dag_in_ds else (None, None)
     enc = BioMedBERTEncoder(
         model_name="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext",
-        device=device, max_length=512,
+        device=device,
+        max_length=512,
         attention_pooling_strategy=args.go_encoder_inner_pooling,
-        attn_hidden=128, attn_dropout=0.1, special_token_weights=None,
-        enable_lora=False, lora_parameters=None, use_special_tokens=False)
+        attn_hidden=128,
+        attn_dropout=0.1,
+    )
     for p in enc.parameters(): p.requires_grad_(False)
     enc.eval()
 
