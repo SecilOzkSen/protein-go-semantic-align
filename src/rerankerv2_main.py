@@ -25,7 +25,7 @@ from src.models.rerankerv2_model import (
     ProteinGOPredictionHead,
 )
 from src.training.wandb_helper import RerankerV2WandbLogger
-from src.evaluation.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
+from src.metrics.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
 
 LOGGER = logging.getLogger("rerankerv2")
 
