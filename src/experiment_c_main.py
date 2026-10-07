@@ -9,7 +9,7 @@ import torch
 from src.experiment_c_runtime import build, load_retriever, load_head, live
 from src.models.rerankerv2_model import PredictionHeadConfig, ProteinGOPredictionHead
 from src.loss.asymmetric_loss import AsymmetricLoss, AsymmetricLossConfig
-from src.evaluation.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
+from src.metrics.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
 
 LOG = logging.getLogger("experiment_c")
 
