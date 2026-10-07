@@ -75,7 +75,23 @@ def load_retriever(model, path):
             f"{list(ck.keys()) if isinstance(ck, dict) else type(ck)}"
         )
 
+    # Checkpoint structure is:
+    # ck["model"]["model"] -> actual ProteinGoAligner state_dict.
+    # Unwrap defensively in case there are additional wrapper levels.
     raw = ck["model"]
+
+    while (
+            isinstance(raw, dict)
+            and "model" in raw
+            and isinstance(raw["model"], dict)
+    ):
+        raw = raw["model"]
+
+    if not isinstance(raw, dict):
+        raise RuntimeError(
+            f"[Experiment C] Could not unwrap Retriever state_dict. "
+            f"Got type={type(raw)}"
+        )
 
     state = {
         clean_key(k): v
@@ -102,6 +118,12 @@ def load_retriever(model, path):
         if k.startswith(required_prefixes)
     }
 
+    if not required_current:
+        raise RuntimeError(
+            "[Experiment C] No required Retriever alignment tensors "
+            "were found in the current model."
+        )
+
     missing = [
         k
         for k in required_current
@@ -115,9 +137,11 @@ def load_retriever(model, path):
             tuple(required_current[k].shape),
         )
         for k in required_current
-        if k in state
-           and tuple(state[k].shape)
-           != tuple(required_current[k].shape)
+        if (
+                k in state
+                and tuple(state[k].shape)
+                != tuple(required_current[k].shape)
+        )
     ]
 
     if missing:
@@ -142,7 +166,9 @@ def load_retriever(model, path):
         strict=False,
     )
 
-    # Missing go_encoder.* is EXPECTED.
+    # go_encoder.* is intentionally NOT loaded from the Retriever
+    # checkpoint. It has already been reconstructed from pretrained
+    # BioMedBERT and remains frozen.
     bad_missing = [
         k
         for k in missing_after
@@ -174,6 +200,11 @@ def load_retriever(model, path):
         print(
             f"[Experiment C][CHECK] {pref} loaded={n}"
         )
+
+        if n == 0:
+            raise RuntimeError(
+                f"[Experiment C] Required block loaded zero tensors: {pref}"
+            )
 
     meta = ck.get("meta", {})
 
