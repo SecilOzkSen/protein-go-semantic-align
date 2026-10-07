@@ -4,7 +4,6 @@ import argparse
 import logging
 import random
 from pathlib import Path
-from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -25,7 +24,6 @@ from src.models.rerankerv2_model import (
     ProteinGOPredictionHead,
 )
 from src.training.wandb_helper import RerankerV2WandbLogger
-from src.evaluation.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
 
 LOGGER = logging.getLogger("rerankerv2")
 
@@ -69,17 +67,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preflight_steps", type=int, default=200)
     p.add_argument("--preflight_val_every", type=int, default=50)
     p.add_argument("--raw_fmax_thresholds", type=int, default=101)
-
-    # Full training
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--output_dir", type=Path, default=Path("outputs/rerankerv2"))
-    p.add_argument("--ontology", choices=["bp", "mf", "cc"], default="bp")
-    p.add_argument("--go_graph_path", type=Path, default=None)
-    p.add_argument("--resume", type=Path, default=None)
-    p.add_argument("--early_stop_patience", type=int, default=3)
-    p.add_argument("--min_delta", type=float, default=0.0)
-    p.add_argument("--log_every", type=int, default=100)
-    p.add_argument("--gradient_log_every", type=int, default=500)
 
     # W&B
     p.add_argument("--wandb", action="store_true")
@@ -184,7 +171,7 @@ def create_wandb_run(args, train_ds, n_params: int):
         )
 
     run_name = args.wandb_run_name or (
-        f"RerankerV2-"
+        f"RerankerV2-Preflight-"
         f"gp{args.gamma_pos:g}-"
         f"gn{args.gamma_neg:g}-"
         f"clip{args.asl_clip:g}"
@@ -216,10 +203,6 @@ def create_wandb_run(args, train_ds, n_params: int):
             "grad_clip": args.grad_clip,
             "batch_size": args.batch_size,
             "trainable_parameters": n_params,
-            "epochs": args.epochs,
-            "ontology": args.ontology,
-            "early_stop_patience": args.early_stop_patience,
-            "monitor_metric": "protein_fmax",
         },
     )
 
@@ -554,365 +537,6 @@ def run_preflight(
     LOGGER.info("[preflight] PASSED")
 
 
-def resolve_go_graph_path(args) -> Path:
-    if args.go_graph_path is not None:
-        path = Path(args.go_graph_path)
-        if not path.exists():
-            raise FileNotFoundError(f"GO graph not found: {path}")
-        return path
-
-    # Common project locations. We do not silently invent a graph if none exists.
-    candidates = [
-        Path("/workspace/data_pfresgo/processed/go-basic.obo"),
-        Path("/workspace/data_pfresgo/processed/go.obo"),
-        Path("/workspace/data_pfresgo/go-basic.obo"),
-        Path("/workspace/stargo/Datasets/go-basic.obo"),
-    ]
-    for path in candidates:
-        if path.exists():
-            LOGGER.info("Auto-detected GO graph: %s", path)
-            return path
-
-    raise FileNotFoundError(
-        "Could not auto-detect GO OBO file. Pass --go_graph_path /path/to/go.obo"
-    )
-
-
-def save_checkpoint(
-        path: Path,
-        *,
-        model,
-        optimizer,
-        epoch: int,
-        global_step: int,
-        best_fmax: float,
-        best_epoch: int,
-        best_metrics: Optional[Dict[str, float]],
-        args,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "meta": {
-            "epoch": int(epoch),
-            "global_step": int(global_step),
-            "best_fmax": float(best_fmax),
-            "best_epoch": int(best_epoch),
-            "best_metrics": dict(best_metrics or {}),
-            "architecture": {
-                "adapter_rank": int(args.adapter_rank),
-                "hidden_dim": int(args.hidden_dim),
-                "dropout": float(args.dropout),
-            },
-            "loss": {
-                "gamma_pos": float(args.gamma_pos),
-                "gamma_neg": float(args.gamma_neg),
-                "clip": float(args.asl_clip),
-            },
-        },
-    }
-    torch.save(payload, path)
-    LOGGER.info("[checkpoint] Saved -> %s", path)
-
-
-def load_training_checkpoint(path: Path, *, model, optimizer, device):
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    if not isinstance(ckpt, dict) or "model" not in ckpt:
-        raise RuntimeError(f"Invalid reranker checkpoint: {path}")
-
-    model.load_state_dict(ckpt["model"], strict=True)
-
-    if "optimizer" in ckpt and ckpt["optimizer"] is not None:
-        optimizer.load_state_dict(ckpt["optimizer"])
-
-    meta = ckpt.get("meta", {})
-    start_epoch = int(meta.get("epoch", -1)) + 1
-    global_step = int(meta.get("global_step", 0))
-    best_fmax = float(meta.get("best_fmax", -1.0))
-    best_epoch = int(meta.get("best_epoch", -1))
-    best_metrics = dict(meta.get("best_metrics", {}))
-
-    LOGGER.info(
-        "[checkpoint] Loaded %s | resume_epoch=%d | step=%d | best_fmax=%.4f",
-        path, start_epoch, global_step, best_fmax,
-    )
-    return start_epoch, global_step, best_fmax, best_epoch, best_metrics
-
-
-@torch.no_grad()
-def validate_full(
-        *,
-        model,
-        criterion,
-        val_loader,
-        go_z,
-        device,
-        evaluator: StarGOPFresGOEvaluator,
-):
-    model.eval()
-
-    probs_all = []
-    labels_all = []
-    weighted_loss_sum = 0.0
-    n_samples = 0
-
-    for batch_cpu in val_loader:
-        batch = move_batch(batch_cpu, device)
-        logits = model(
-            protein_z=batch["protein_z"],
-            go_z=go_z,
-            retriever_scores=batch["retriever_scores"],
-        )
-        loss = criterion(logits, batch["labels"])
-
-        bsz = int(batch["labels"].shape[0])
-        weighted_loss_sum += float(loss.item()) * bsz
-        n_samples += bsz
-
-        probs_all.append(torch.sigmoid(logits.float()).cpu().numpy())
-        labels_all.append(batch["labels"].cpu().numpy().astype(np.int8))
-
-    y_pred = np.concatenate(probs_all, axis=0)
-    y_true = np.concatenate(labels_all, axis=0)
-
-    metrics = evaluator.evaluate(y_true, y_pred)
-    metrics["asl_loss"] = weighted_loss_sum / max(1, n_samples)
-
-    pos = y_true > 0
-    neg = ~pos
-    metrics["positive_probability_mean"] = float(y_pred[pos].mean())
-    metrics["negative_probability_mean"] = float(y_pred[neg].mean())
-    metrics["probability_gap"] = (
-            metrics["positive_probability_mean"]
-            - metrics["negative_probability_mean"]
-    )
-
-    model.train()
-    return metrics
-
-
-def run_full_training(
-        *,
-        args,
-        model,
-        criterion,
-        optimizer,
-        train_loader,
-        val_loader,
-        train_ds,
-        go_z,
-        device,
-        wb,
-):
-    if args.epochs <= 0:
-        raise ValueError("--epochs must be > 0")
-    if args.early_stop_patience < 0:
-        raise ValueError("--early_stop_patience must be >= 0")
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    go_graph_path = resolve_go_graph_path(args)
-    evaluator = StarGOPFresGOEvaluator(
-        goterms=np.asarray(train_ds.eval_go_ids),
-        ontology=args.ontology,
-        go_graph_path=go_graph_path,
-    )
-
-    start_epoch = 0
-    global_step = 0
-    best_fmax = -1.0
-    best_epoch = -1
-    best_metrics: Dict[str, float] = {}
-    bad_epochs = 0
-
-    if args.resume is not None:
-        (
-            start_epoch,
-            global_step,
-            best_fmax,
-            best_epoch,
-            best_metrics,
-        ) = load_training_checkpoint(
-            Path(args.resume),
-            model=model,
-            optimizer=optimizer,
-            device=device,
-        )
-
-    LOGGER.info(
-        "[train] start_epoch=%d epochs=%d steps_per_epoch=%d "
-        "monitor=protein_fmax patience=%d",
-        start_epoch,
-        args.epochs,
-        len(train_loader),
-        args.early_stop_patience,
-    )
-
-    for epoch in range(start_epoch, args.epochs):
-        model.train()
-
-        running_loss = 0.0
-        running_batches = 0
-
-        for batch_idx, batch_cpu in enumerate(train_loader, start=1):
-            global_step += 1
-            batch = move_batch(batch_cpu, device)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            logits = model(
-                protein_z=batch["protein_z"],
-                go_z=go_z,
-                retriever_scores=batch["retriever_scores"],
-            )
-
-            loss, diagnostics = criterion(
-                logits,
-                batch["labels"],
-                return_diagnostics=True,
-            )
-
-            if not torch.isfinite(loss):
-                raise RuntimeError(
-                    f"Non-finite training loss at epoch={epoch} step={global_step}"
-                )
-
-            loss.backward()
-
-            # Individual gradients must be read before clipping.
-            grad_metrics = None
-            if (
-                    args.gradient_log_every > 0
-                    and global_step % args.gradient_log_every == 0
-            ):
-                grad_metrics = wb.gradient_norms(model)
-
-            total_grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=args.grad_clip,
-            )
-
-            if not torch.isfinite(total_grad_norm):
-                raise RuntimeError(
-                    f"Non-finite gradient norm at epoch={epoch} step={global_step}"
-                )
-
-            optimizer.step()
-
-            running_loss += float(loss.item())
-            running_batches += 1
-
-            if args.log_every > 0 and global_step % args.log_every == 0:
-                wb.log_train(
-                    diagnostics=diagnostics,
-                    lr=float(optimizer.param_groups[0]["lr"]),
-                    step=global_step,
-                )
-                LOGGER.info(
-                    "[train] epoch=%d step=%d/%d global=%d | "
-                    "loss=%.6f p_pos=%.4f p_neg=%.4f gap=%.4f",
-                    epoch,
-                    batch_idx,
-                    len(train_loader),
-                    global_step,
-                    diagnostics["loss"],
-                    diagnostics["positive_probability_mean"],
-                    diagnostics["negative_probability_mean"],
-                    diagnostics["probability_gap"],
-                )
-
-            if grad_metrics is not None and wb.enabled:
-                payload = dict(grad_metrics)
-                payload["grad/total_before_clip"] = float(total_grad_norm.item())
-                wb._log(payload, global_step)
-
-        train_epoch_loss = running_loss / max(1, running_batches)
-
-        val_metrics = validate_full(
-            model=model,
-            criterion=criterion,
-            val_loader=val_loader,
-            go_z=go_z,
-            device=device,
-            evaluator=evaluator,
-        )
-        val_metrics["train_epoch_loss"] = train_epoch_loss
-
-        wb.log_validation(
-            metrics=val_metrics,
-            step=global_step,
-            epoch=epoch,
-        )
-
-        LOGGER.info(
-            "[val] epoch=%d | protein_fmax=%.4f @ %.2f | "
-            "P=%.4f R=%.4f | macro_aupr=%.4f micro_aupr=%.4f "
-            "auc=%.4f | asl=%.6f",
-            epoch,
-            val_metrics["protein_fmax"],
-            val_metrics["protein_fmax_threshold"],
-            val_metrics["protein_precision_at_fmax"],
-            val_metrics["protein_recall_at_fmax"],
-            val_metrics["macro_aupr"],
-            val_metrics["micro_aupr"],
-            val_metrics["auc"],
-            val_metrics["asl_loss"],
-        )
-
-        current_fmax = float(val_metrics["protein_fmax"])
-        improved = current_fmax > (best_fmax + args.min_delta)
-
-        if improved:
-            best_fmax = current_fmax
-            best_epoch = epoch
-            best_metrics = dict(val_metrics)
-            bad_epochs = 0
-
-            save_checkpoint(
-                output_dir / "checkpoint_best.pt",
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                global_step=global_step,
-                best_fmax=best_fmax,
-                best_epoch=best_epoch,
-                best_metrics=best_metrics,
-                args=args,
-            )
-        else:
-            bad_epochs += 1
-
-        save_checkpoint(
-            output_dir / "checkpoint_last.pt",
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            global_step=global_step,
-            best_fmax=best_fmax,
-            best_epoch=best_epoch,
-            best_metrics=best_metrics,
-            args=args,
-        )
-
-        if (
-                args.early_stop_patience > 0
-                and bad_epochs >= args.early_stop_patience
-        ):
-            LOGGER.info(
-                "[early-stop] epoch=%d | best_epoch=%d | best_fmax=%.4f",
-                epoch, best_epoch, best_fmax,
-            )
-            break
-
-    LOGGER.info(
-        "[done] best_epoch=%d best_protein_fmax=%.4f output=%s",
-        best_epoch, best_fmax, output_dir,
-    )
-    return best_metrics
-
-
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -1050,7 +674,6 @@ def main() -> None:
         val_dump=str(args.val_dump),
     )
 
-    best_metrics = None
     try:
         if args.preflight:
             run_preflight(
@@ -1069,21 +692,13 @@ def main() -> None:
             )
             return
 
-        best_metrics = run_full_training(
-            args=args,
-            model=model,
-            criterion=criterion,
-            optimizer=optimizer,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            train_ds=train_ds,
-            go_z=go_z,
-            device=device,
-            wb=wb,
+        raise RuntimeError(
+            "Full Experiment-B training loop is not enabled yet. "
+            "Run --preflight first."
         )
 
     finally:
-        wb.finalize(best_metrics=best_metrics)
+        wb.finalize()
 
 
 if __name__ == "__main__":
