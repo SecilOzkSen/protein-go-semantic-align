@@ -63,15 +63,130 @@ def clean(k):
 
 
 def load_retriever(model, path):
-    ck = torch.load(path, map_location='cpu', weights_only=False);
-    st = ck.get('model', ck)
-    st = {clean(k): v for k, v in st.items() if torch.is_tensor(v)};
-    cur = model.state_dict()
-    bad = [k for k in cur if k not in st or tuple(st[k].shape) != tuple(cur[k].shape)]
-    if bad: raise RuntimeError(f'Retriever checkpoint mismatch: {bad[:20]}')
-    model.load_state_dict({k: st[k] for k in cur}, strict=True)
-    m = ck.get('meta', {});
-    LOG.info('[init] Retriever A exact load OK | tensors=%d epoch=%s step=%s', len(cur), m.get('epoch'), m.get('global_step', m.get('step')))
+    ck = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if not isinstance(ck, dict) or "model" not in ck:
+        raise RuntimeError(
+            f"Invalid Retriever checkpoint. Keys: "
+            f"{list(ck.keys()) if isinstance(ck, dict) else type(ck)}"
+        )
+
+    raw = ck["model"]
+
+    state = {
+        clean_key(k): v
+        for k, v in raw.items()
+        if torch.is_tensor(v)
+    }
+
+    current = model.state_dict()
+
+    # These are the Experiment-A alignment blocks that MUST
+    # come from the trained Retriever checkpoint.
+    required_prefixes = (
+        "protein_mean_attn_gate_pool.",
+        "protein_ln.",
+        "proj_p.",
+        "go_ln.",
+        "proj_g.",
+        "go_segment_gate.",
+    )
+
+    required_current = {
+        k: v
+        for k, v in current.items()
+        if k.startswith(required_prefixes)
+    }
+
+    missing = [
+        k
+        for k in required_current
+        if k not in state
+    ]
+
+    shape_bad = [
+        (
+            k,
+            tuple(state[k].shape),
+            tuple(required_current[k].shape),
+        )
+        for k in required_current
+        if k in state
+           and tuple(state[k].shape)
+           != tuple(required_current[k].shape)
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "[Experiment C] Retriever checkpoint is missing "
+            f"trained alignment tensors: {missing[:20]}"
+        )
+
+    if shape_bad:
+        raise RuntimeError(
+            "[Experiment C] Retriever checkpoint has incompatible "
+            f"alignment tensors: {shape_bad[:10]}"
+        )
+
+    loadable = {
+        k: state[k]
+        for k in required_current
+    }
+
+    missing_after, unexpected = model.load_state_dict(
+        loadable,
+        strict=False,
+    )
+
+    # Missing go_encoder.* is EXPECTED.
+    bad_missing = [
+        k
+        for k in missing_after
+        if not k.startswith("go_encoder.")
+    ]
+
+    if bad_missing:
+        raise RuntimeError(
+            "[Experiment C] Unexpected missing Retriever tensors "
+            f"after load: {bad_missing[:20]}"
+        )
+
+    if unexpected:
+        raise RuntimeError(
+            "[Experiment C] Unexpected Retriever checkpoint "
+            f"tensors: {unexpected[:20]}"
+        )
+
+    print(
+        f"[Experiment C] Retriever alignment load OK: "
+        f"{len(loadable)} tensors"
+    )
+
+    for pref in required_prefixes:
+        n = sum(
+            k.startswith(pref)
+            for k in loadable
+        )
+        print(
+            f"[Experiment C][CHECK] {pref} loaded={n}"
+        )
+
+    meta = ck.get("meta", {})
+
+    print(
+        "[Experiment C] Retriever checkpoint meta: "
+        f"epoch={meta.get('epoch')} "
+        f"step={meta.get('global_step', meta.get('step'))}"
+    )
+
+    print(
+        "[Experiment C] go_encoder.* intentionally NOT loaded "
+        "from Retriever checkpoint; pretrained BioMedBERT remains frozen."
+    )
 
 
 def load_head(head, path):
