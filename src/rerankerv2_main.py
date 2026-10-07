@@ -305,17 +305,13 @@ def run_preflight(
                 f"Non-finite ASL at step {step}"
             )
 
-        loss.backward()
-
-        # Read/log gradients AFTER backward and BEFORE clipping.
-        grad_metrics = wb.log_gradients(
-            model=model,
-            step=step,
-        )
-
         # Zero-init residual adapter invariant:
         # up must receive gradient immediately.
         # down may be zero on step 1 because up.weight starts at zero.
+        loss.backward()
+
+        grad_metrics = wb.gradient_norms(model)
+
         if step == 1:
             if grad_metrics.get("grad/protein_adapter_up", 0.0) <= 0.0:
                 raise RuntimeError(
@@ -337,20 +333,18 @@ def run_preflight(
             max_norm=grad_clip,
         )
 
-        if not torch.isfinite(total_grad_norm):
-            raise RuntimeError(
-                f"Non-finite gradient norm at step {step}"
-            )
+        wb.log_gradients(
+            model=model,
+            step=step,
+            total_before_clip=total_grad_norm,
+        )
 
         lr = float(optimizer.param_groups[0]["lr"])
 
         wb.log_train(
-            losses=diagnostics,
+            diagnostics=diagnostics,
             lr=lr,
             step=step,
-            total_grad_norm_before_clip=float(
-                total_grad_norm.item()
-            ),
         )
 
         optimizer.step()
