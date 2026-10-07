@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--eval_batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=0)
 
     # Architecture
@@ -63,7 +64,9 @@ def parse_args() -> argparse.Namespace:
 
     # Preflight
     p.add_argument("--preflight", action="store_true")
-    p.add_argument("--preflight_steps", type=int, default=5)
+    p.add_argument("--preflight_steps", type=int, default=200)
+    p.add_argument("--preflight_val_every", type=int, default=50)
+    p.add_argument("--raw_fmax_thresholds", type=int, default=101)
 
     # W&B
     p.add_argument("--wandb", action="store_true")
@@ -204,16 +207,111 @@ def create_wandb_run(args, train_ds, n_params: int):
     )
 
 
+@torch.no_grad()
+def raw_protein_fmax(probs, labels, n_thresholds=101):
+    """Temporary raw protein-centric diagnostic, without GO propagation.
+
+    This is NOT the final StarGO-compatible Fmax.
+    """
+    thresholds = torch.linspace(0.0, 1.0, n_thresholds)
+    true_count = labels.sum(dim=1).clamp_min(1.0)
+
+    best = {
+        "raw_protein_fmax": -1.0,
+        "raw_protein_fmax_threshold": 0.0,
+        "raw_protein_precision_at_fmax": 0.0,
+        "raw_protein_recall_at_fmax": 0.0,
+    }
+
+    for t in thresholds:
+        pred = probs >= t
+        tp = (pred & (labels > 0.5)).sum(dim=1).float()
+        pred_count = pred.sum(dim=1).float()
+
+        has_pred = pred_count > 0
+        precision = (
+            (tp[has_pred] / pred_count[has_pred]).mean()
+            if has_pred.any()
+            else torch.tensor(0.0)
+        )
+        recall = (tp / true_count).mean()
+
+        denom = precision + recall
+        f = (
+            2.0 * precision * recall / denom
+            if float(denom.item()) > 0
+            else torch.tensor(0.0)
+        )
+
+        if float(f.item()) > best["raw_protein_fmax"]:
+            best = {
+                "raw_protein_fmax": float(f.item()),
+                "raw_protein_fmax_threshold": float(t.item()),
+                "raw_protein_precision_at_fmax": float(precision.item()),
+                "raw_protein_recall_at_fmax": float(recall.item()),
+            }
+
+    return best
+
+
+@torch.no_grad()
+def validate_preflight(model, criterion, val_loader, go_z, device, n_thresholds):
+    model.eval()
+
+    probs_all = []
+    labels_all = []
+    loss_sum = 0.0
+    n_batches = 0
+
+    for batch_cpu in val_loader:
+        batch = move_batch(batch_cpu, device)
+        logits = model(
+            protein_z=batch["protein_z"],
+            go_z=go_z,
+            retriever_scores=batch["retriever_scores"],
+        )
+        loss = criterion(logits, batch["labels"])
+        loss_sum += float(loss.item())
+        n_batches += 1
+        probs_all.append(torch.sigmoid(logits.float()).cpu())
+        labels_all.append(batch["labels"].cpu())
+
+    probs = torch.cat(probs_all, dim=0)
+    labels = torch.cat(labels_all, dim=0)
+    pos = labels > 0.5
+    neg = ~pos
+
+    p_pos = float(probs[pos].mean().item())
+    p_neg = float(probs[neg].mean().item())
+
+    metrics = {
+        "asl_loss": loss_sum / max(1, n_batches),
+        "positive_probability_mean": p_pos,
+        "negative_probability_mean": p_neg,
+        "probability_gap": p_pos - p_neg,
+        "predicted_probability_mean": float(probs.mean().item()),
+        "predicted_probability_p01": float(torch.quantile(probs, 0.01).item()),
+        "predicted_probability_p50": float(torch.quantile(probs, 0.50).item()),
+        "predicted_probability_p99": float(torch.quantile(probs, 0.99).item()),
+    }
+    metrics.update(raw_protein_fmax(probs, labels, n_thresholds))
+    model.train()
+    return metrics
+
+
 def run_preflight(
         *,
         model: ProteinGOPredictionHead,
         criterion: AsymmetricLoss,
         optimizer: torch.optim.Optimizer,
         train_loader: DataLoader,
+        val_loader: DataLoader,
         go_z: torch.Tensor,
         device: torch.device,
         max_steps: int,
+        val_every: int,
         grad_clip: float,
+        n_thresholds: int,
         wb: RerankerV2WandbLogger,
 ) -> None:
     if max_steps <= 0:
@@ -305,13 +403,17 @@ def run_preflight(
                 f"Non-finite ASL at step {step}"
             )
 
+        loss.backward()
+
+        # Read/log gradients AFTER backward and BEFORE clipping.
+        grad_metrics = wb.log_gradients(
+            model=model,
+            step=step,
+        )
+
         # Zero-init residual adapter invariant:
         # up must receive gradient immediately.
         # down may be zero on step 1 because up.weight starts at zero.
-        loss.backward()
-
-        grad_metrics = wb.gradient_norms(model)
-
         if step == 1:
             if grad_metrics.get("grad/protein_adapter_up", 0.0) <= 0.0:
                 raise RuntimeError(
@@ -333,11 +435,10 @@ def run_preflight(
             max_norm=grad_clip,
         )
 
-        wb.log_gradients(
-            model=model,
-            step=step,
-            total_before_clip=total_grad_norm,
-        )
+        if not torch.isfinite(total_grad_norm):
+            raise RuntimeError(
+                f"Non-finite gradient norm at step {step}"
+            )
 
         lr = float(optimizer.param_groups[0]["lr"])
 
@@ -348,6 +449,28 @@ def run_preflight(
         )
 
         optimizer.step()
+
+        if step % val_every == 0 or step == max_steps:
+            val_metrics = validate_preflight(
+                model, criterion, val_loader, go_z, device, n_thresholds
+            )
+            wb.log_validation(metrics=val_metrics, step=step)
+            LOGGER.info(
+                "[val-preflight] step=%d | raw_Fmax=%.4f @ %.2f | "
+                "P=%.4f R=%.4f | p_pos=%.4f p_neg=%.4f gap=%.4f | "
+                "p01=%.4f p50=%.4f p99=%.4f",
+                step,
+                val_metrics["raw_protein_fmax"],
+                val_metrics["raw_protein_fmax_threshold"],
+                val_metrics["raw_protein_precision_at_fmax"],
+                val_metrics["raw_protein_recall_at_fmax"],
+                val_metrics["positive_probability_mean"],
+                val_metrics["negative_probability_mean"],
+                val_metrics["probability_gap"],
+                val_metrics["predicted_probability_p01"],
+                val_metrics["predicted_probability_p50"],
+                val_metrics["predicted_probability_p99"],
+            )
 
         LOGGER.info(
             "[preflight] step=%d | "
@@ -451,6 +574,12 @@ def main() -> None:
         num_workers=args.num_workers,
         shuffle=True,
     )
+    val_loader = make_loader(
+        val_ds,
+        batch_size=args.eval_batch_size,
+        num_workers=args.num_workers,
+        shuffle=False,
+    )
 
     # Shared GO bank, moved once.
     go_z = train_ds.get_go_z_tensor(
@@ -531,6 +660,20 @@ def main() -> None:
         cfg=args,
     )
 
+    wb.log_run_metadata(
+        model=model,
+        go_universe_size=train_ds.num_go,
+        embedding_dim=train_ds.embedding_dim,
+        adapter_rank=args.adapter_rank,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
+        gamma_pos=args.gamma_pos,
+        gamma_neg=args.gamma_neg,
+        asl_clip=args.asl_clip,
+        train_dump=str(args.train_dump),
+        val_dump=str(args.val_dump),
+    )
+
     try:
         if args.preflight:
             run_preflight(
@@ -538,10 +681,13 @@ def main() -> None:
                 criterion=criterion,
                 optimizer=optimizer,
                 train_loader=train_loader,
+                val_loader=val_loader,
                 go_z=go_z,
                 device=device,
                 max_steps=args.preflight_steps,
+                val_every=args.preflight_val_every,
                 grad_clip=args.grad_clip,
+                n_thresholds=args.raw_fmax_thresholds,
                 wb=wb,
             )
             return
