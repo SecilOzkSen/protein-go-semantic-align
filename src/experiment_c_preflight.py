@@ -62,6 +62,21 @@ def clean(k):
     return k
 
 
+def clean_key(key: str) -> str:
+    prefixes = (
+        "trainer.model.",
+        "module.",
+        "model.",
+    )
+
+    while True:
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                break
+        else:
+            return key
+
 def load_retriever(model, path):
     ck = torch.load(
         path,
