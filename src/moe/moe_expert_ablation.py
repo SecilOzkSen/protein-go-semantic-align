@@ -72,7 +72,23 @@ def main():
     predictions = {k: np.concatenate(v) for k, v in predictions.items()}
     assert labels.shape == (len(ds), len(ds.go_ids))
     assert all(x.shape == labels.shape for x in predictions.values())
-    assert all((x >= 0).all() and (x <= 1).all() for x in predictions.values())
+    for name, x in predictions.items():
+        print(
+            f"[RANGE CHECK] {name}: "
+            f"min={x.min():.6f}, "
+            f"max={x.max():.6f}, "
+            f"mean={x.mean():.6f}, "
+            f"finite={np.isfinite(x).all()}"
+        )
+
+        if not np.isfinite(x).all():
+            raise RuntimeError(f"Non-finite predictions: {name}")
+
+        if x.min() < -1e-6 or x.max() > 1.000001:
+            raise RuntimeError(
+                f"{name} outside probability range: "
+                f"[{x.min():.6f}, {x.max():.6f}]"
+            )
     evaluator = StarGOPFresGOEvaluator(goterms=ds.go_ids, ontology=a.ontology, go_graph_path=a.go_graph_path)
     results = {}
     for name, probs in predictions.items():
