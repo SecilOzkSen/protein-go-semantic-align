@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from src.moe.dataset import MoEDataset
 from src.moe.model import MoEConfig, NeighbourGuidedMoE
-from src.evaluation.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
+from src.metrics.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
 
 
 def args_parser():
