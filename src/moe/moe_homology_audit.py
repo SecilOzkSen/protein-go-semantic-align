@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from Bio import SeqIO
 import parasail
-from src.evaluation.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
+from src.metrics.stargo_pfresgo_metrics import StarGOPFresGOEvaluator
 
 
 def read_json(path):
