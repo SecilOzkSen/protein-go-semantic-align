@@ -131,7 +131,6 @@ class ProteinGoAligner(nn.Module):
     ------------
     residue embeddings [B,T,Dh]
         -> GatedMeanAttnPool1D
-        -> protein_ln
         -> proj_p
         -> L2 normalization
         -> one protein vector [B,Dz]
@@ -143,7 +142,6 @@ class ProteinGoAligner(nn.Module):
         segment embeddings [G,S,Dg]
         -> go_segment_gate
         -> weighted pooled GO [G,Dg]
-        -> go_ln
         -> proj_g
         -> L2 normalization
 
@@ -204,13 +202,11 @@ class ProteinGoAligner(nn.Module):
             dropout=0.05,
         )
 
-        self.protein_ln = nn.LayerNorm(d_h)
         self.proj_p = ProjectionHead(
             d_in=d_h,
             d_out=d_z,
         )
 
-        self.go_ln = nn.LayerNorm(d_g)
         self.proj_g = ProjectionHead(
             d_in=d_g,
             d_out=d_z,
@@ -274,8 +270,7 @@ class ProteinGoAligner(nn.Module):
         )
         self.last_pool_info = pool_info
 
-        z = self.protein_ln(h_pool)
-        z = self.proj_p(z)
+        z = self.proj_p(h_pool)
 
         if self.normalize:
             z = self._norm(z, dim=-1)
@@ -379,8 +374,7 @@ class ProteinGoAligner(nn.Module):
                 f"GO tensor must be [G,Dg] or [B,G,Dg], got {tuple(G.shape)}"
             )
 
-        z = self.go_ln(G)
-        z = self.proj_g(z)
+        z = self.proj_g(G)
 
         if self.normalize:
             z = self._norm(z, dim=-1)

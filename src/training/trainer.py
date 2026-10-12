@@ -12,22 +12,24 @@ from src.models.alignment_model import ProteinGoAligner
 
 
 def multi_positive_full_go_infonce(scores, pos_mask, temperature):
-    """Multi-positive InfoNCE over the complete active GO universe."""
+    """Experiment F1: per-positive full-GO InfoNCE, protein-balanced.
+
+    Each annotated GO contributes its own log-softmax loss. No IC weights.
+    The function name is retained for compatibility with the existing trainer.
+    """
     if scores.ndim != 2 or pos_mask.shape != scores.shape:
         raise ValueError("InfoNCE expects scores and pos_mask with shape [B,G].")
     tau = max(float(temperature), 1e-8)
     pos_mask = pos_mask.bool()
-    counts = pos_mask.sum(1)
+    counts = pos_mask.sum(dim=1)
     if (counts == 0).any():
         raise RuntimeError("InfoNCE received a protein with zero positives.")
     logits = scores.float() / tau
-    denom = torch.logsumexp(logits, dim=1)
-    pos_logits = logits.masked_fill(~pos_mask, float("-inf"))
-    num = torch.logsumexp(pos_logits, dim=1) - counts.float().log()
-    loss = -(num - denom)
-    if not torch.isfinite(loss).all():
-        raise RuntimeError("Non-finite full-GO InfoNCE.")
-    return loss.mean()
+    log_probs = F.log_softmax(logits, dim=1)
+    per_protein = -(log_probs * pos_mask.float()).sum(dim=1) / counts.float()
+    if not torch.isfinite(per_protein).all():
+        raise RuntimeError("Non-finite per-positive full-GO InfoNCE.")
+    return per_protein.mean()
 
 
 def positive_block_rank_loss(scores, pos_mask, margin, tau):
@@ -230,8 +232,7 @@ class OppTrainer:
 
     def _project_go_bank(self):
         raw, weights = self._current_go_raw_bank()
-        z = self.model.go_ln(raw)
-        z = self.model.proj_g(z)
+        z = self.model.proj_g(raw)
         z = F.normalize(z.float(), dim=-1)
         return z, weights
 
