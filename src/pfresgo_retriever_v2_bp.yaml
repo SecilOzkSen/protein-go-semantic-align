@@ -5,7 +5,7 @@ pfresgo:
   branch_go_ids_path: /workspace/data_pfresgo/processed/go_ids_bp.json
   go_text_path: /workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl
   test_ids_path: /workspace/stargo/datasets/pfresgo/test.txt
-  evaluation_split: test
+  evaluation_split: valid
   rare_lt: 20
   enabled_segments:
     - name
@@ -18,7 +18,7 @@ data:
   fs_target_ratio: 0.0
 general:
   phase: -2
-  ablation_id: PFresGO-BP-RetrieverV2-FullGO-PBR
+  ablation_id: PFresGO-BP-PerPositive-PBR
   go_pooling_strategy: mean
   go_encoder_inner_pooling: mean
   go_pool_type: mean
@@ -36,12 +36,12 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/retriever_v2_fullgo_pbr
+  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_f1_per_positive
   save_every: 1000000 #10000
   keep_last_n: 3
-  resume: /workspace/data_pfresgo/outputs/bp/retriever_v2_fullgo_pbr/checkpoint_step164668.pt
+  resume: null
   warmstart_path: null
-  eval_only: true
+  eval_only: false
   log_every: 500
   log_level: INFO
   monitor_metric: oracle_microF@500
@@ -88,7 +88,7 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: PFresGO-BP-RetrieverV2-FullGO-PBR
+  wandb_run_name: ExperimentF1-BP-PerPositive-PBR
   mode: online
 stores:
   train_ids_path: /workspace/stargo/datasets/pfresgo/train.txt
@@ -103,4 +103,4 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/retriever_v2_fullgo_pbr
+  logs: /workspace/data_pfresgo/logs/experiment_f1_per_positive
