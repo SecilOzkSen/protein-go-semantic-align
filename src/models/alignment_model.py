@@ -123,6 +123,53 @@ class GatedMeanAttnPool1D(nn.Module):
         return pooled, info
 
 
+class LowRankResidualInteraction(nn.Module):
+    """Full-GO pairwise scorer; never materializes the 768x768 outer product.
+
+    Shared low-rank channels interact nonlinearly. A zero-initialized output
+    ensures exact cosine parity at initialization.
+    """
+
+    def __init__(self, dim: int, rank: int = 128, residual_scale: float = 0.02, chunk_size: int = 256):
+        super().__init__()
+        self.protein_features = nn.Linear(dim, rank, bias=False)
+        self.go_features = nn.Linear(dim, rank, bias=False)
+        self.output = nn.Linear(rank, 1, bias=False)
+        nn.init.zeros_(self.output.weight)
+        self.residual_scale = float(residual_scale)
+        self.chunk_size = int(chunk_size)
+
+    def forward(self, zp: torch.Tensor, zg: torch.Tensor) -> torch.Tensor:
+        if zp.ndim != 2 or zg.ndim not in (2, 3):
+            raise ValueError("Expected protein [B,D], GO [G,D] or [B,G,D].")
+        # FP32 interaction avoids BF16/FP16 accumulation problems.
+        zp = zp.float()
+        zg = zg.float()
+        if zg.ndim == 2:
+            if zp.shape[-1] != zg.shape[-1]:
+                raise ValueError("Protein/GO dimensions do not match.")
+            base = zp @ zg.T
+            u = self.protein_features(zp)
+            blocks = []
+            for start in range(0, zg.shape[0], self.chunk_size):
+                v = self.go_features(zg[start:start + self.chunk_size])
+                h = F.gelu(u[:, None, :] * v[None, :, :])
+                blocks.append(self.output(h).squeeze(-1))
+            delta = torch.cat(blocks, dim=1)
+        else:
+            if zp.shape[0] != zg.shape[0] or zp.shape[-1] != zg.shape[-1]:
+                raise ValueError("Batch or embedding dimensions do not match.")
+            base = torch.einsum("bd,bgd->bg", zp, zg)
+            u = self.protein_features(zp)
+            blocks = []
+            for start in range(0, zg.shape[1], self.chunk_size):
+                v = self.go_features(zg[:, start:start + self.chunk_size])
+                h = F.gelu(u[:, None, :] * v)
+                blocks.append(self.output(h).squeeze(-1))
+            delta = torch.cat(blocks, dim=1)
+        return base + self.residual_scale * delta
+
+
 class ProteinGoAligner(nn.Module):
     """
     Retriever v2 alignment model.
@@ -227,6 +274,10 @@ class ProteinGoAligner(nn.Module):
         # Uniform weighting at initialization.
         nn.init.zeros_(self.go_segment_gate[-1].weight)
         nn.init.zeros_(self.go_segment_gate[-1].bias)
+
+        self.interaction_scorer = LowRankResidualInteraction(
+            dim=d_z, rank=128, residual_scale=0.02, chunk_size=256
+        )
 
         self.last_pool_info = {}
         self.last_go_segment_info = {}
@@ -400,19 +451,7 @@ class ProteinGoAligner(nn.Module):
                 f"Zp must be [B,Dz], got {tuple(Zp.shape)}"
             )
 
-        if Zg.ndim == 2:
-            return Zp @ Zg.transpose(0, 1)
-
-        if Zg.ndim == 3:
-            return torch.einsum(
-                "bd,bgd->bg",
-                Zp,
-                Zg,
-            )
-
-        raise RuntimeError(
-            f"Zg must be [G,Dz] or [B,G,Dz], got {tuple(Zg.shape)}"
-        )
+        return self.interaction_scorer(Zp, Zg)
 
     def forward(
             self,

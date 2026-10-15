@@ -266,7 +266,7 @@ class OppTrainer:
     def _score_full_go(self, batch):
         zp = self._encode_protein(batch)
         zg, seg_weights = self._project_go_bank()
-        scores = zp @ zg.T
+        scores = self.model.score_projected(zp, zg)
         return scores, seg_weights
 
     @torch.no_grad()
