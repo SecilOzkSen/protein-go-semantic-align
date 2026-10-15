@@ -65,7 +65,7 @@ def main():
                 z = F.normalize(self.model.proj_p(x).float(), dim=-1)
                 local = (z @ go_bank.T).max(dim=0).values
                 rows['global'].append(scores[i].detach().float().cpu().numpy())
-                rows['local'].append(local.detach().cpu().numpy())
+                rows['local'].append(local.detach().float().cpu().numpy())
                 rows['labels'].append(labels[i])
                 rows['ids'].append(str(batch['protein_ids'][i]))
                 n += 1
