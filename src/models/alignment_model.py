@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from src.encoders import BioMedBERTEncoder
 from src.models.projection import ProjectionHead
+import torch.nn.functional as F
 
 
 class AttentionPool1D(nn.Module):
