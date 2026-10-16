@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import json
+import os
 
 import numpy as np
 import torch
@@ -124,6 +126,7 @@ class OppTrainer:
         self._go_id2col = {g: i for i, g in enumerate(self.eval_id_list)}
 
         self._build_frozen_segment_bank()
+        self._build_parent_bank()
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.opt = torch.optim.AdamW(
@@ -217,6 +220,62 @@ class OppTrainer:
         self._segment_names = list(toks.get("segment_names", []))
         print("[GO-SEGMENT-BANK]", tuple(bank.shape), self._segment_names)
 
+    @torch.no_grad()
+    def _build_parent_bank(self):
+        """Resolve parent IDs from canonical JSONL; encode parent names with frozen encoder."""
+        path = os.environ.get("EXPH_GO_JSONL", "/workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Experiment H needs canonical GO JSONL: {path}")
+        records = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                row = json.loads(line)
+                records[row["go_id"]] = row
+
+        def key(g):
+            s = str(g)
+            return s if s.startswith("GO:") else f"GO:{int(g):07d}"
+
+        parents = []
+        for gid in self.eval_id_list:
+            row = records.get(key(gid))
+            if row is None:
+                raise RuntimeError(f"Missing canonical record: {gid}")
+            ids = row.get("is_a_parent_ids", [])
+            # Never infer ID/name alignment from is_a_parents order.
+            parents.append([pid for pid in ids if pid in records and records[pid].get("name")])
+        P = max(1, max(map(len, parents)))
+        unique = sorted({pid for ids in parents for pid in ids})
+        vectors = {}
+        if unique:
+            tokenizer = self.ctx.go_text_store.tokenizer
+            bs = max(1, int(self.cfg.eval_go_bs))
+            self.model.go_encoder.eval()
+            for st in range(0, len(unique), bs):
+                ids = unique[st:st + bs]
+                enc = tokenizer([records[x]["name"] for x in ids], truncation=True,
+                                max_length=self.ctx.go_text_store.segment_max_len,
+                                padding="max_length", return_tensors="pt")
+                out = self.model.go_encoder(input_ids=enc["input_ids"].to(self.device),
+                                            attention_mask=enc["attention_mask"].to(self.device),
+                                            output_mode="pooled")
+                if isinstance(out, tuple):
+                    out = out[0]
+                elif isinstance(out, dict):
+                    out = out.get("pooled", out.get("pooler_output"))
+                if not torch.is_tensor(out): raise RuntimeError("Bad parent encoding")
+                for pid, vec in zip(ids, out.float().cpu()): vectors[pid] = vec
+        bank = torch.zeros(len(parents), P, self.cfg.d_g, dtype=torch.float32)
+        present = torch.zeros(len(parents), P, dtype=torch.bool)
+        for i, ids in enumerate(parents):
+            for j, pid in enumerate(ids):
+                bank[i, j] = vectors[pid]
+                present[i, j] = True
+        self._parent_bank_cpu = bank
+        self._parent_present_cpu = present
+        print(f"[EXPERIMENT-H] parent bank={tuple(bank.shape)} unique_parents={len(unique)} "
+              f"GO_with_parents={int(present.any(1).sum())}")
+
     def _current_go_raw_bank(self):
         if self.ctx.go_segment_representation_mode != "segments_only":
             raise RuntimeError("Retriever v2 currently requires segments_only.")
@@ -264,9 +323,21 @@ class OppTrainer:
         return mask
 
     def _score_full_go(self, batch):
-        zp = self._encode_protein(batch)
-        zg, seg_weights = self._project_go_bank()
-        scores = self.model.score_projected(zp, zg)
+        H = batch["prot_emb_pad"].to(self.device, non_blocking=True).float()
+        mask = batch["prot_attn_mask"].to(self.device, non_blocking=True).bool()
+        raw, seg_weights = self._current_go_raw_bank()
+        names = self._segment_names
+        if "name" not in names or "definition" not in names:
+            raise RuntimeError("Experiment H requires name and definition GO segments")
+        name_idx = names.index("name")
+        definition_idx = names.index("definition")
+        seg = self._segment_embs_cpu.to(self.device, non_blocking=True)
+        present = self._segment_present_cpu.to(self.device, non_blocking=True)
+        parents = self._parent_bank_cpu.to(self.device, non_blocking=True)
+        parent_present = self._parent_present_cpu.to(self.device, non_blocking=True)
+        scores = self.model.score_fine_grained(
+            H, mask, seg[:, name_idx], seg[:, definition_idx],
+            present[:, definition_idx], parents, parent_present, raw)
         return scores, seg_weights
 
     @torch.no_grad()
@@ -360,6 +431,7 @@ class OppTrainer:
             raise RuntimeError("Non-finite Retriever v2 total loss.")
 
         score_diag = self._score_diagnostics(scores.detach(), pos_mask)
+        score_diag.update(self.model.last_h_diagnostics)
         rank_diag = self._rank_diagnostics(scores.detach(), pos_mask)
         self._global_step += 1
 
