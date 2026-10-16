@@ -1,13 +1,14 @@
-"""Experiment H validation-only four-way ablation, one dataset pass.
+"""Experiment H per-protein global versus fused retrieval audit, validation only.
 
-Place at src/diagnostics/experiment_h_ablation.py.
-Run: python -m src.diagnostics.experiment_h_ablation --config src/pfresgo_experiment_h_bp.yaml --checkpoint /path/to/best_primary.pt --out /path/to/ablation.json
+Place at src/diagnostics/experiment_h_per_protein_audit.py.
+Run: python -m src.diagnostics.experiment_h_per_protein_audit --config src/pfresgo_experiment_h_bp.yaml --checkpoint /path/to/best_primary.pt --out /path/to/per_protein_audit.json
 
 No optimizer step. Does not select thresholds using test data.
 """
 from __future__ import annotations
 import argparse
 import json
+import csv
 from pathlib import Path
 import numpy as np
 import torch
@@ -44,6 +45,7 @@ def main():
         self.model.go_encoder.eval()
         results = {k: {'scores': [], 'true': []} for k in ('global_only', 'local_only', 'fused', 'fused_parents_off')}
         diagnostics = {'alpha_sum': 0., 'alpha_n': 0, 'parent_abs_sum': 0., 'parent_n': 0}
+        protein_rows = []
         with torch.no_grad():
             raw, _ = self._current_go_raw_bank()
             seg = self._segment_embs_cpu.to(self.device)
@@ -102,6 +104,33 @@ def main():
                 diagnostics['alpha_n'] += alpha.numel()
                 diagnostics['parent_abs_sum'] += torch.cat(adj_parts, dim=1).abs().sum().item()
                 diagnostics['parent_n'] += alpha.numel()
+                # Per-protein, per-GO retrieval diagnostics, computed without changing scores.
+                for b in range(B):
+                    yt = y[b].astype(bool)
+                    global_s = base[b].detach().float().cpu().numpy()
+                    fused_s = fused[b].detach().float().cpu().numpy()
+                    global_order = np.argsort(-global_s, kind='stable')
+                    fused_order = np.argsort(-fused_s, kind='stable')
+                    row = {
+                        'protein_id': str(batch['protein_ids'][b]),
+                        'residue_length': int(mask[b].sum().item()),
+                        'cardinality': int(yt.sum()),
+                        'mean_local_weight': float(alpha[b].mean().item()),
+                        'mean_abs_local_global_gap': float((local[b] - base[b]).abs().mean().item()),
+                        'mean_abs_parent_adjustment': float(torch.cat(adj_parts, dim=1)[b].abs().mean().item()),
+                    }
+                    for k in (50, 100, 200, 500):
+                        g_hits = set(int(i) for i in global_order[:k] if yt[i])
+                        f_hits = set(int(i) for i in fused_order[:k] if yt[i])
+                        denom = max(1, int(yt.sum()))
+                        row[f'global_R@{k}'] = len(g_hits) / denom
+                        row[f'fused_R@{k}'] = len(f_hits) / denom
+                        row[f'delta_R@{k}'] = (len(f_hits) - len(g_hits)) / denom
+                        row[f'gain_count@{k}'] = len(f_hits - g_hits)
+                        row[f'loss_count@{k}'] = len(g_hits - f_hits)
+                        row[f'gain_go_ids@{k}'] = ';'.join(str(self.eval_id_list[i]) for i in sorted(f_hits - g_hits))
+                        row[f'loss_go_ids@{k}'] = ';'.join(str(self.eval_id_list[i]) for i in sorted(g_hits - f_hits))
+                    protein_rows.append(row)
                 for key, scores in [('global_only', base), ('local_only', local), ('fused', fused), ('fused_parents_off', off)]:
                     results[key]['scores'].append(scores.float().cpu().numpy())
                     results[key]['true'].append(y)
@@ -122,11 +151,52 @@ def main():
             entry['obs_aupr'] = float(compute_term_aupr(y, s))
             output[key] = entry
         output['metadata']['proteins'] = int(y.shape[0])
+        output['metadata']['audit_version'] = 'per_protein_v2'
+        if len(protein_rows) != int(y.shape[0]):
+            raise RuntimeError('Protein rows and score matrix length disagree')
+
+        def summarize(rows):
+            if not rows:
+                return {'n': 0}
+            summary = {'n': len(rows),
+                       'mean_length': float(np.mean([r['residue_length'] for r in rows])),
+                       'mean_cardinality': float(np.mean([r['cardinality'] for r in rows])),
+                       'mean_local_weight': float(np.mean([r['mean_local_weight'] for r in rows]))}
+            for k in (50, 100, 200, 500):
+                ds = np.array([r[f'delta_R@{k}'] for r in rows], dtype=float)
+                summary[f'delta_R@{k}_mean'] = float(ds.mean())
+                summary[f'proteins_improved@{k}'] = int((ds > 1e-12).sum())
+                summary[f'proteins_worsened@{k}'] = int((ds < -1e-12).sum())
+                summary[f'proteins_unchanged@{k}'] = int((np.abs(ds) <= 1e-12).sum())
+                summary[f'GO_gains@{k}'] = int(sum(r[f'gain_count@{k}'] for r in rows))
+                summary[f'GO_losses@{k}'] = int(sum(r[f'loss_count@{k}'] for r in rows))
+            return summary
+
+        output['per_protein_audit'] = {'overall': summarize(protein_rows)}
+        card_groups = [('1_5', 1, 5), ('6_10', 6, 10), ('11_20', 11, 20), ('21_40', 21, 40), ('41_80', 41, 80), ('81_160', 81, 160), ('161plus', 161, 10 ** 9)]
+        output['per_protein_audit']['by_cardinality'] = {name: summarize([r for r in protein_rows if lo <= r['cardinality'] <= hi]) for name, lo, hi in
+                                                         card_groups}
+        length_bins = [('1_128', 1, 128), ('129_256', 129, 256), ('257_512', 257, 512), ('513_1024', 513, 1024), ('1025plus', 1025, 10 ** 9)]
+        output['per_protein_audit']['by_length'] = {name: summarize([r for r in protein_rows if lo <= r['residue_length'] <= hi]) for name, lo, hi in
+                                                    length_bins}
+        output['per_protein_audit']['top_improved_R50'] = [
+            {'protein_id': r['protein_id'], 'cardinality': r['cardinality'], 'residue_length': r['residue_length'], 'delta_R@50': r['delta_R@50'],
+             'mean_local_weight': r['mean_local_weight']} for r in sorted(protein_rows, key=lambda r: r['delta_R@50'], reverse=True)[:15]]
+        output['per_protein_audit']['top_worsened_R50'] = [
+            {'protein_id': r['protein_id'], 'cardinality': r['cardinality'], 'residue_length': r['residue_length'], 'delta_R@50': r['delta_R@50'],
+             'mean_local_weight': r['mean_local_weight']} for r in sorted(protein_rows, key=lambda r: r['delta_R@50'])[:15]]
         path = Path(args.out)
         path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path = path.with_name(path.stem + '_per_protein.csv')
+        with csv_path.open('w', newline='') as fp:
+            writer = csv.DictWriter(fp, fieldnames=list(protein_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(protein_rows)
+        output['metadata']['per_protein_csv'] = str(csv_path)
         path.write_text(json.dumps(output, indent=2))
-        print(json.dumps(output, indent=2))
-        print('SAVED', path)
+        compact = {k: v for k, v in output.items() if k not in ('global_only', 'local_only', 'fused', 'fused_parents_off')}
+        print(json.dumps(compact, indent=2))
+        print('SAVED', path, csv_path)
         raise _Finished()
 
     original = OppTrainer.eval_epoch
