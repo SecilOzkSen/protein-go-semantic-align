@@ -504,8 +504,15 @@ class OppTrainer:
         term_hit = {k: torch.zeros(G, dtype=torch.float64) for k in ks}
         final_segment_weights = None
 
+        parent_adjustment_sum = 0.0
+        parent_adjustment_batches = 0
+
         for batch in loader:
             scores, segment_weights = self._score_full_go(batch)
+            parent_adjustment_sum += self.model.last_h_diagnostics[
+                "h/parent_adjustment_mean_abs"
+            ]
+            parent_adjustment_batches += 1
             y = self._positive_mask(batch)
             final_segment_weights = segment_weights.detach().float().cpu()
 
@@ -700,6 +707,9 @@ class OppTrainer:
         )
         logs["obs_protein_fmax"] = float(protein_fmax)
         logs["obs_protein_fmax_threshold"] = float(threshold)
+        logs["h/parent_adjustment_mean_abs"] = (
+                parent_adjustment_sum / max(1, parent_adjustment_batches)
+        )
 
         # Raw diagnostics for RetrieverWandbLogger. Trainer does not construct
         # W&B tables/plots.
