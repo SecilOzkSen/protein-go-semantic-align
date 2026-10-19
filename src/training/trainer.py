@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from src.configs.data_classes import TrainerConfig
 from src.metrics.cafa import compute_protein_centric_fmax, compute_term_aupr
 from src.models.alignment_model import ProteinGoAligner
+from src.metrics.cafa import protein_centric_f_at_threshold
 
 
 def multi_positive_full_go_infonce(scores, pos_mask, temperature):
@@ -709,6 +710,14 @@ class OppTrainer:
         )
         logs["obs_protein_fmax"] = float(protein_fmax)
         logs["obs_protein_fmax_threshold"] = float(threshold)  # RAW score threshold
+        fixed_t = 0.3359
+
+        logs["fixed_threshold"] = fixed_t
+        logs["protein_F_at_valid_threshold"] = (
+            protein_centric_f_at_threshold(
+                true_np, score_np, fixed_t
+            )
+        )
         logs["h/parent_adjustment_mean_abs"] = (
                 parent_adjustment_sum / max(1, parent_adjustment_batches)
         )
