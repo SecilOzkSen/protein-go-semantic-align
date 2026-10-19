@@ -685,28 +685,30 @@ class OppTrainer:
             cardinality_table.append(row)
 
         # Downstream threshold metrics remain separate from retrieval metrics.
-        tmin, tmax = float(score_np.min()), float(score_np.max())
-        best_f = 0.0
-        if np.isfinite(tmin) and np.isfinite(tmax) and tmin != tmax:
-            for threshold in np.linspace(tmin, tmax, 101, dtype=np.float32):
-                pred = (score_np >= threshold).astype(np.int32)
-                tp = (pred & true_np).sum()
-                fp = (pred & (1 - true_np)).sum()
-                fn = ((1 - pred) & true_np).sum()
-                precision = tp / (tp + fp + 1e-12)
-                recall = tp / (tp + fn + 1e-12)
-                best_f = max(
-                    best_f,
-                    float(2.0 * precision * recall / (precision + recall + 1e-12)),
-                )
+        # Exact raw-score micro Fmax, with ties grouped.
+        flat_scores = score_np.ravel()
+        flat_true = true_np.ravel()
+        sort_idx = np.argsort(-flat_scores, kind="stable")
+        ordered_scores = flat_scores[sort_idx]
+        ordered_true = flat_true[sort_idx]
+        boundaries = np.r_[0, np.flatnonzero(
+            ordered_scores[1:] != ordered_scores[:-1]
+        ) + 1]
+        ends = np.r_[boundaries[1:], len(ordered_scores)]
+        cumulative_tp = np.cumsum(ordered_true, dtype=np.int64)
+        tp_at = cumulative_tp[ends - 1].astype(np.float64)
+        pred_at = ends.astype(np.float64)
+        total_pos = float(flat_true.sum())
+        micro_f = 2.0 * tp_at / np.maximum(pred_at + total_pos, 1.0)
+        best_f = float(micro_f.max()) if len(micro_f) else 0.0
 
         logs["obs_fmax"] = best_f
         logs["obs_aupr"] = float(compute_term_aupr(true_np, score_np))
         protein_fmax, threshold = compute_protein_centric_fmax(
-            true_np, score_np, num_thresholds=101
+            true_np, score_np
         )
         logs["obs_protein_fmax"] = float(protein_fmax)
-        logs["obs_protein_fmax_threshold"] = float(threshold)
+        logs["obs_protein_fmax_threshold"] = float(threshold)  # RAW score threshold
         logs["h/parent_adjustment_mean_abs"] = (
                 parent_adjustment_sum / max(1, parent_adjustment_batches)
         )

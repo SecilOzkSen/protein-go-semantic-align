@@ -23,9 +23,11 @@ def _find_first_key(batch: Dict[str, Any], candidates: List[str]) -> Optional[st
             return k
     return None
 
+
 import numpy as np
 
 import numpy as np
+
 
 def cafa_metrics_sanity(y_true, y_pred, name="val", sample=2048, seed=0):
     """
@@ -116,11 +118,11 @@ def cafa_metrics_sanity(y_true, y_pred, name="val", sample=2048, seed=0):
 # ----------------------------------------
 @torch.no_grad()
 def collect_probs_and_labels_from_dict_batch(
-    model,
-    data_loader,
-    device,
-    label_key: Optional[str] = None,
-    input_key: Optional[str] = None,
+        model,
+        data_loader,
+        device,
+        label_key: Optional[str] = None,
+        input_key: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
@@ -198,14 +200,16 @@ def collect_probs_and_labels_from_dict_batch(
     y_true = (y_true > 0.0).astype(np.int32)
     return y_pred, y_true
 
+
 import numpy as np
 from typing import Tuple
 
+
 def compute_fmax(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    num_thresholds: int = 101,
-    eps: float = 1e-8
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        num_thresholds: int = 101,
+        eps: float = 1e-8
 ) -> Tuple[float, float]:
     """
     Proper CAFA-style protein-centric Fmax:
@@ -237,7 +241,7 @@ def compute_fmax(
         fn = (~pred & yt).sum(axis=1).astype(np.float32)
 
         prec_i = tp / np.clip(tp + fp, 1.0, None)
-        rec_i  = tp / np.clip(tp + fn, 1.0, None)
+        rec_i = tp / np.clip(tp + fn, 1.0, None)
 
         f1_i = (2.0 * prec_i * rec_i) / np.clip(prec_i + rec_i, eps, None)
 
@@ -252,10 +256,10 @@ def compute_fmax(
 # CAFA-style protein-centric Fmax
 # -----------------------------
 def compute_fmax_old(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    num_thresholds: int = 101,
-    eps: float = 1e-8
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        num_thresholds: int = 101,
+        eps: float = 1e-8
 ) -> Tuple[float, float]:
     """
     CAFA-style protein-centric Fmax.
@@ -285,7 +289,7 @@ def compute_fmax_old(
         has_true = denom_r > 0
 
         prec = float(np.mean(tp[has_pred] / (denom_p[has_pred] + eps))) if np.any(has_pred) else 0.0
-        rec  = float(np.mean(tp[has_true] / (denom_r[has_true] + eps))) if np.any(has_true) else 0.0
+        rec = float(np.mean(tp[has_true] / (denom_r[has_true] + eps))) if np.any(has_true) else 0.0
 
         f = (2.0 * prec * rec) / (prec + rec + eps)
         if f > fmax:
@@ -294,61 +298,76 @@ def compute_fmax_old(
     return fmax, best_t
 
 
-
-def compute_protein_centric_fmax(
-    y_true: np.ndarray,
-    y_score: np.ndarray,
-    num_thresholds: int = 101,
-    eps: float = 1e-12,
-) -> Tuple[float, float]:
-    """CAFA-style protein-centric Fmax.
-
-    At each threshold, precision is averaged over proteins having at least one
-    prediction and recall is averaged over proteins having at least one true
-    label. Their harmonic mean is maximized over thresholds.
-
-    Raw logits are converted to sigmoid confidences. Inputs already in [0, 1]
-    are treated as confidences.
-    """
+def _validate_raw_scores(y_true, y_score):
     yt = np.asarray(y_true) > 0
-    score = np.asarray(y_score, dtype=np.float32)
+    scores = np.asarray(y_score, dtype=np.float32)
+    if yt.ndim != 2 or scores.shape != yt.shape:
+        raise ValueError(f"Expected matching [N,G] arrays, got {yt.shape} and {scores.shape}")
+    if not np.isfinite(scores).all():
+        raise ValueError("Non-finite raw prediction scores")
+    return yt, scores
 
-    if yt.ndim != 2 or score.ndim != 2 or yt.shape != score.shape:
-        raise ValueError(f"Expected matching [N,G] arrays, got {yt.shape} and {score.shape}")
-    if not np.isfinite(score).all():
-        raise ValueError("Non-finite prediction scores in protein-centric Fmax")
-    if yt.shape[0] == 0 or not np.any(yt):
+
+def protein_centric_f_at_threshold(y_true, y_score, threshold):
+    """CAFA-style protein-centric F at a fixed RAW score threshold."""
+    yt, scores = _validate_raw_scores(y_true, y_score)
+    pred = scores >= float(threshold)
+    tp = np.sum(pred & yt, axis=1)
+    n_pred = np.sum(pred, axis=1)
+    n_true = np.sum(yt, axis=1)
+    has_pred = n_pred > 0
+    has_true = n_true > 0
+    precision = float(np.mean(tp[has_pred] / n_pred[has_pred])) if has_pred.any() else 0.0
+    recall = float(np.mean(tp[has_true] / n_true[has_true])) if has_true.any() else 0.0
+    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+
+def compute_protein_centric_fmax(y_true, y_score, num_thresholds=101, eps=1e-12):
+    """Exact CAFA-style Fmax on RAW scores, including all tied-score boundaries.
+
+    No implicit sigmoid, softmax, min-max scaling, or split-specific normalization.
+    num_thresholds is retained only for backward-compatible callers and ignored.
+    Returns (best_F, raw_threshold). Use protein_centric_f_at_threshold on test.
+    """
+    yt, scores = _validate_raw_scores(y_true, y_score)
+    n, g = yt.shape
+    if n == 0 or not yt.any():
         return 0.0, 0.0
 
-    if float(score.min()) < 0.0 or float(score.max()) > 1.0:
-        # Stable sigmoid for raw similarity/logit scores.
-        score = np.clip(score, -50.0, 50.0)
-        score = 1.0 / (1.0 + np.exp(-score))
+    # Per-protein descending order gives precision/recall at every prefix.
+    order = np.argsort(-scores, axis=1, kind="stable")
+    sorted_true = np.take_along_axis(yt, order, axis=1)
+    sorted_scores = np.take_along_axis(scores, order, axis=1)
+    tp = np.cumsum(sorted_true, axis=1, dtype=np.int32)
+    counts = np.arange(1, g + 1, dtype=np.float64)[None, :]
+    precision = tp / counts
+    delta_precision = np.diff(precision, axis=1, prepend=np.zeros((n, 1)))
+    n_true = yt.sum(axis=1)
+    active_true = n_true > 0
+    delta_recall = np.zeros_like(precision)
+    delta_recall[active_true] = sorted_true[active_true] / n_true[active_true, None]
 
-    thresholds = np.linspace(0.0, 1.0, int(num_thresholds), dtype=np.float32)
-    true_count = yt.sum(axis=1).astype(np.float32)
-    has_true = true_count > 0
+    # Each protein becomes eligible for precision averaging at its first prediction.
+    first = np.zeros((n, g), dtype=np.int8)
+    first[:, 0] = 1
 
-    best_f = 0.0
-    best_t = 0.0
-    for threshold in thresholds:
-        pred = score >= threshold
-        tp = (pred & yt).sum(axis=1).astype(np.float32)
-        pred_count = pred.sum(axis=1).astype(np.float32)
-        has_pred = pred_count > 0
+    flat_scores = sorted_scores.ravel()
+    idx = np.argsort(-flat_scores, kind="stable")
+    s = flat_scores[idx]
+    boundaries = np.r_[0, np.flatnonzero(s[1:] != s[:-1]) + 1]
+    dp = np.add.reduceat(delta_precision.ravel()[idx], boundaries)
+    dr = np.add.reduceat(delta_recall.ravel()[idx], boundaries)
+    dn = np.add.reduceat(first.ravel()[idx], boundaries)
+    p_sum = np.cumsum(dp)
+    r_sum = np.cumsum(dr)
+    n_with_pred = np.cumsum(dn)
+    p_mean = np.divide(p_sum, n_with_pred, out=np.zeros_like(p_sum), where=n_with_pred > 0)
+    r_mean = r_sum / int(active_true.sum())
+    f = np.divide(2 * p_mean * r_mean, p_mean + r_mean,
+                  out=np.zeros_like(p_mean), where=(p_mean + r_mean) > eps)
+    best_idx = int(np.argmax(f))
+    return float(f[best_idx]), float(s[boundaries[best_idx]])
 
-        precision = (
-            float(np.mean(tp[has_pred] / np.maximum(pred_count[has_pred], 1.0)))
-            if np.any(has_pred) else 0.0
-        )
-        recall = float(np.mean(tp[has_true] / np.maximum(true_count[has_true], 1.0)))
-        f_value = (2.0 * precision * recall) / max(eps, precision + recall)
-
-        if f_value > best_f:
-            best_f = float(f_value)
-            best_t = float(threshold)
-
-    return best_f, best_t
 
 # -----------------------------
 # Term-centric AUPR
@@ -371,12 +390,12 @@ def compute_term_aupr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 # -----------------------------
 @torch.no_grad()
 def eval_fmax_aupr_from_loader(
-    model,
-    data_loader,
-    device,
-    label_key: Optional[str] = None,
-    input_key: Optional[str] = None,
-    num_thresholds: int = 101
+        model,
+        data_loader,
+        device,
+        label_key: Optional[str] = None,
+        input_key: Optional[str] = None,
+        num_thresholds: int = 101
 ) -> Dict[str, float]:
     y_pred, y_true = collect_probs_and_labels_from_dict_batch(
         model=model,
