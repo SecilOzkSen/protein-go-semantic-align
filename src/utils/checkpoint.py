@@ -57,6 +57,7 @@ def save_checkpoint(out_dir: str,
     print(f"[checkpoint] Saved → {ckpt_path}")
     return str(ckpt_path)
 
+
 def _looks_like_state_dict(d):
     if not isinstance(d, dict):
         return False
@@ -282,42 +283,34 @@ def load_checkpoint(
         )
 
     # ------------------------------------------------------------------
-    # Critical Retriever v2 modules
+    # Architecture-aware critical module verification.
+    # Older Retriever-v2 checkpoints and local-only MIL models do not
+    # necessarily define the same modules. Check every module that exists
+    # in the CURRENT model, rather than requiring obsolete module names.
+    # Missing current-model keys and shape mismatches are already fatal above.
     # ------------------------------------------------------------------
 
-    important_prefixes = [
+    important_prefixes = (
         "protein_mean_attn_gate_pool.",
         "protein_ln.",
         "proj_p.",
         "go_segment_gate.",
         "go_ln.",
         "proj_g.",
-    ]
+        "proj_local.",
+        "fusion_gate.",
+    )
 
     for prefix in important_prefixes:
-        expected = sum(
-            key.startswith(prefix)
-            for key in current_state
-        )
-        loaded = sum(
-            key.startswith(prefix)
-            for key in loadable
-        )
-
-        print(
-            f"[checkpoint][CHECK] {prefix} "
-            f"loaded={loaded}/{expected}"
-        )
-
+        expected = sum(key.startswith(prefix) for key in current_state)
         if expected == 0:
-            raise RuntimeError(
-                "[checkpoint] Expected Retriever v2 module is "
-                f"missing from current model: {prefix}"
-            )
-
+            # This architecture does not define the module.
+            continue
+        loaded = sum(key.startswith(prefix) for key in loadable)
+        print(f"[checkpoint][CHECK] {prefix} loaded={loaded}/{expected}")
         if loaded != expected:
             raise RuntimeError(
-                "[checkpoint] Retriever v2 module was not fully restored: "
+                "[checkpoint] Current-model module was not fully restored: "
                 f"{prefix} loaded={loaded}/{expected}"
             )
 
