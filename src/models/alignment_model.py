@@ -244,6 +244,13 @@ class ProteinGoAligner(nn.Module):
         nn.init.zeros_(self.go_segment_gate[-1].weight)
         nn.init.zeros_(self.go_segment_gate[-1].bias)
 
+        # Experiment H-Local: global modules retained for API compatibility only.
+        # They receive no gradients and are excluded from the optimizer.
+        for module in (self.protein_mean_attn_gate_pool, self.proj_p,
+                       self.go_segment_gate):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+
         self.proj_local = ProjectionHead(d_in=d_h, d_out=d_z)
         self.mil = SmoothMIL(tau=0.1)
         # Parent contribution is bounded and cannot independently produce a high score.
@@ -252,6 +259,8 @@ class ProteinGoAligner(nn.Module):
         self.fusion_gate = nn.Linear(3, 1)
         nn.init.zeros_(self.fusion_gate.weight)
         nn.init.constant_(self.fusion_gate.bias, -1.38629436)  # alpha = 0.2
+        for parameter in self.fusion_gate.parameters():
+            parameter.requires_grad_(False)
         self.window_length = 128
         self.window_stride = 64
         self.go_chunk_size = 128
@@ -467,14 +476,13 @@ class ProteinGoAligner(nn.Module):
 
         name_raw, definition_raw [G,Dg]; parent_raw [G,P,Dg].
         """
-        zp = self.encode_protein_for_scoring(H, mask)
+        # LOCAL ONLY: no global protein embedding, no global GO pooling,
+        # no fusion gate. Retain the original MIL and parent scoring rules.
         zw, valid = self.encode_local_windows(H, mask)
-        zg = self.project_go(global_go_raw).float()
-        base = self.score_projected(zp, zg)
         gn = self.project_go(name_raw).float()
         gd = self.project_go(definition_raw).float()
-        B, G = base.shape
-        chunks, local_chunks, parent_chunks = [], [], []
+        B, G = zw.shape[0], gn.shape[0]
+        chunks, parent_chunks = [], []
         for st in range(0, G, self.go_chunk_size):
             ed = min(G, st + self.go_chunk_size)
             sn = self.mil(torch.einsum("bkd,gd->bkg", zw, gn[st:ed]), valid)
@@ -501,14 +509,11 @@ class ProteinGoAligner(nn.Module):
             else:
                 parent_adjustment = torch.zeros_like(child)
             local = child + parent_adjustment
-            features = torch.stack((base[:, st:ed], local, local - base[:, st:ed]), -1)
-            alpha = torch.sigmoid(self.fusion_gate(features)).squeeze(-1)
-            chunks.append((1 - alpha) * base[:, st:ed] + alpha * local)
-            local_chunks.append(local)
+            chunks.append(local)
             parent_chunks.append(parent_adjustment)
         result = torch.cat(chunks, 1)
         self.last_h_diagnostics = {
-            "h/local_global_mean_abs_gap": float((torch.cat(local_chunks, 1).detach() - base.detach()).abs().mean().item()),
+            "h/local_only": 1.0,
             "h/parent_adjustment_mean_abs": float(torch.cat(parent_chunks, 1).detach().abs().mean().item()),
             "h/window_count_mean": float(valid.sum(1).float().mean().item()),
         }
