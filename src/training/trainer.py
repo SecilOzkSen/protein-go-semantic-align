@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from src.configs.data_classes import TrainerConfig
 from src.metrics.cafa import compute_protein_centric_fmax, compute_term_aupr
+from src.metrics.retrieval import compute_retrieval_metrics
 from src.models.alignment_model import ProteinGoAligner
 from src.metrics.cafa import protein_centric_f_at_threshold
 
@@ -604,7 +605,7 @@ class OppTrainer:
         score_np = score_cpu.numpy().astype(np.float32)
         true_np = true_cpu.numpy().astype(np.int32)
 
-        logs = {}
+        logs = compute_retrieval_metrics(score_np, true_np)
         total_valid = int((true_cpu.sum(dim=1) > 0).sum().item())
 
         for k in ks:

@@ -37,10 +37,10 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only
+  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/InfoNCE
   save_every: 1000000
   keep_last_n: 3
-  resume: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/checkpoint_epoch17.pt
+  resume: null
   warmstart_path: null
   eval_only: false
   log_every: 500
@@ -68,7 +68,7 @@ model:
   attn_dropout: 0.1
 loss:
   lambda_con: 1.0
-  pbr_lambda: 0.001
+  pbr_lambda: 0.0 #0.001
   pbr_margin: 0.05
   pbr_tau: 0.05
 evaluation:
@@ -107,4 +107,4 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/retriever_v2_fullgo_pbr
+  logs: /workspace/data_pfresgo/logs/retriever_v2_fullgo_pbr/InfoNCE
