@@ -37,10 +37,10 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/diagnostics/raw_exact_epoch16
+  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only
   save_every: 1000000
   keep_last_n: 3
-  resume: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/checkpoint_epoch17.pt
+  resume: null
   warmstart_path: null
   eval_only: true
   log_every: 500
