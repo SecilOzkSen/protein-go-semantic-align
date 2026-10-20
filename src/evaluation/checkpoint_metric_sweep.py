@@ -1,4 +1,4 @@
-import argparse, csv, json, os, subprocess, sys
+import argparse, csv, json, os, subprocess, sys, re, tempfile
 from pathlib import Path
 
 RUNNER = r"""
@@ -72,10 +72,25 @@ def main():
         if dest.exists(): dest.unlink()
         env = os.environ.copy();
         env["METRIC_OUT"] = str(dest.resolve())
-        cmd = [sys.executable, "-c", RUNNER, "--config", args.config, "--resume", str(ck.resolve())]
+        config_path = Path(args.config).resolve()
+        config_text = config_path.read_text()
+        # Change only the existing YAML resume scalar, retaining all other settings.
+        pattern = r"(?m)^(\s*resume\s*:\s*)(?:[^#\n]*)(\s*(?:#.*)?)$"
+        if len(re.findall(pattern, config_text)) != 1:
+            raise SystemExit("Expected exactly one resume: entry in evaluation YAML")
+        temp_text = re.sub(pattern, lambda m: m.group(1) + str(ck.resolve()), config_text, count=1)
+        # Place temporary config beside the original, preserving relative-path semantics.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", prefix=".checkpoint_sweep_",
+                                         dir=config_path.parent, delete=False) as tmp:
+            tmp.write(temp_text)
+            temp_config = Path(tmp.name)
+        cmd = [sys.executable, "-c", RUNNER, "--config", str(temp_config)]
         print("Evaluating", ck.name, flush=True)
-        with (out / (ck.stem + ".log")).open("w") as log:
-            proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            with (out / (ck.stem + ".log")).open("w") as log:
+                proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        finally:
+            temp_config.unlink(missing_ok=True)
         if proc.returncode or not dest.exists():
             print("FAILED", ck.name, "see log", flush=True)
             if not args.continue_on_error: raise SystemExit(1)
