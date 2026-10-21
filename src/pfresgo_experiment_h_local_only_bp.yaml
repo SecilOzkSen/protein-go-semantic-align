@@ -37,7 +37,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/InfoNCE
+  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/PBROnly
   save_every: 1000000
   keep_last_n: 3
   resume: null
@@ -67,8 +67,8 @@ model:
   attn_heads: 2
   attn_dropout: 0.1
 loss:
-  lambda_con: 1.0
-  pbr_lambda: 0.0 #0.001
+  lambda_con: 0.0 #1.0
+  pbr_lambda: 1.0 #0.0 #0.001
   pbr_margin: 0.05
   pbr_tau: 0.05
 evaluation:
@@ -107,4 +107,4 @@ stores:
   go_text_folder: /workspace/data_pfresgo/processed
   go_cache_path: /workspace/data_pfresgo/go_cache/all/go_text_embeddings_canonical.npy
   seq_len_lookup: /workspace/data_pfresgo/processed/seq_len_lookup.pkl
-  logs: /workspace/data_pfresgo/logs/retriever_v2_fullgo_pbr/InfoNCE
+  logs: /workspace/data_pfresgo/logs/retriever_v2_fullgo_pbr/PBROnly
