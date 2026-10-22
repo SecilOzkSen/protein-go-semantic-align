@@ -70,7 +70,9 @@ def main():
     trainer=OppTrainer(cfg=cfg,ctx=ctx,go_encoder=encoder)
     state=torch.load(a.checkpoint,map_location='cpu',weights_only=False)
     if 'model' not in state: raise ValueError('Checkpoint has no model key')
-    missing,unexpected=trainer.model.load_state_dict(state['model'],strict=True)
+    missing, unexpected = trainer.model.load_state_dict(
+        state["model"]["model"], strict=True
+    )
     trainer.model.eval()
     all_scores=[]; all_labels=[]; all_pids=[]
     with torch.inference_mode():
