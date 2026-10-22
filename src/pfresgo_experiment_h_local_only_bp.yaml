@@ -37,7 +37,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/data_pfresgo/outputs/bp/experiment_h_local_only/PBROnly
+  output_dir: /workspace/data_pfresgo/outputs/bp/calibration_study/infonce
   save_every: 1000000
   keep_last_n: 3
   resume: null
@@ -45,7 +45,7 @@ training:
   eval_only: false
   log_every: 500
   log_level: INFO
-  monitor_metric: oracle_microF@500
+  monitor_metric: protein_wise_map #oracle_microF@500
   secondary_monitor_metric: macro_term_recall@500
   monitor_mode: max
   early_stop_patience: 3
@@ -67,8 +67,8 @@ model:
   attn_heads: 2
   attn_dropout: 0.1
 loss:
-  lambda_con: 0.0 #1.0
-  pbr_lambda: 1.0 #0.0 #0.001
+  lambda_con: 1.0
+  pbr_lambda: 0.0 #0.001
   pbr_margin: 0.05
   pbr_tau: 0.05
 evaluation:
