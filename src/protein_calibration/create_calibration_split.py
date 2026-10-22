@@ -16,7 +16,7 @@ import numpy as np
 
 BINS = ((1, 5, '1_5'), (6, 10, '6_10'), (11, 20, '11_20'),
         (21, 40, '21_40'), (41, 80, '41_80'), (81, 160, '81_160'),
-        (161, 10 ** 12, '161plus'))
+        (161, 10**12, '161plus'))
 
 
 def go_int(value):
@@ -104,7 +104,7 @@ def main():
             n_cal = 0
         calibration.extend(shuffled[:n_cal].tolist())
         retriever.extend(shuffled[n_cal:].tolist())
-        bin_counts[name] = {'total': len(members), 'retriever': len(members) - n_cal, 'calibration': n_cal}
+        bin_counts[name] = {'total': len(members), 'retriever': len(members)-n_cal, 'calibration': n_cal}
 
     ret, cal, zero = set(retriever), set(calibration), set(excluded_zero)
     if (ret & cal) or (ret & zero) or (cal & zero) or ret | cal | zero != set(train_ids):
