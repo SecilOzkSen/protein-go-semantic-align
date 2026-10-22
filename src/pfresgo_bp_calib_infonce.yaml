@@ -48,7 +48,7 @@ training:
   monitor_metric: protein_wise_map #oracle_microF@500
   secondary_monitor_metric: macro_term_recall@500
   monitor_mode: max
-  early_stop_patience: 3
+  early_stop_patience: 5
   eval_go_bs: 256
   go_text_store_max_len: 128
   go_segment_max_len: 64
@@ -92,10 +92,10 @@ wandb:
   enabled: true
   project: protein-go-align-pfresgo
   entity: null
-  wandb_run_name: ExperimentH-LocalOnly-BP
+  wandb_run_name: ExperimentH-LocalOnly-BP-CalibSplit-InfoNCE
   mode: online
 stores:
-  train_ids_path: /workspace/stargo/datasets/pfresgo/train.txt
+  train_ids_path: /workspace/data_pfresgo/splits/bp_calibration_seed42/retriever_train_ids.txt
   val_ids_path: /workspace/stargo/datasets/pfresgo/valid.txt
   go_basic_json: /workspace/data_pfresgo/processed/go_vocab.json
   pid2pos_path: /workspace/data_pfresgo/processed/pid_to_positives_bp.json
