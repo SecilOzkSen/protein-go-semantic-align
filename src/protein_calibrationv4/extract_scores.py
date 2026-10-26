@@ -83,14 +83,31 @@ def main():
             mask = batch['prot_attn_mask'].bool()
             if residues.ndim != 3 or mask.shape != residues.shape[:2]:
                 raise RuntimeError('Unexpected residue/mask dimensions')
-            zw, valid_windows = trainer.model.encode_local_windows(residues, mask)
+            model_device = next(trainer.model.proj_local.parameters()).device
+
+            residues = residues.to(device=model_device, dtype=torch.float32)
+            mask = mask.to(device=model_device, dtype=torch.bool)
+
+            zw, valid_windows = trainer.model.encode_local_windows(
+                residues, mask
+            )
             if zw.ndim != 3 or not valid_windows.any(dim=1).all():
                 raise RuntimeError('Invalid learned local-window representations')
             w = valid_windows.float().unsqueeze(-1)
-            protein_rep = (zw.float() * w).sum(dim=1) / w.sum(dim=1).clamp_min(1)
-            # Normalize the pooled learned vector for stable calibration features.
-            protein_rep = torch.nn.functional.normalize(protein_rep, dim=-1)
-            all_protein_embeddings.append(protein_rep.cpu().numpy().astype(np.float32))
+
+            protein_rep = (
+                    (zw * w).sum(dim=1)
+                    / w.sum(dim=1).clamp_min(1)
+            )
+
+            # Normalize pooled learned representation
+            protein_rep = torch.nn.functional.normalize(
+                protein_rep.float(), dim=-1
+            )
+
+            all_protein_embeddings.append(
+                protein_rep.detach().cpu().numpy()
+            )
             y=trainer._positive_mask(batch)
             all_scores.append(s.float().cpu().numpy());all_labels.append(y.cpu().numpy().astype(np.uint8))
             all_pids.extend(map(str,batch['protein_ids']))
