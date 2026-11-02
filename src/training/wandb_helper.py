@@ -138,13 +138,32 @@ class RetrieverWandbLogger:
             go_text_trainable
         )
 
-        # Retriever-v2 invariant.
-        if go_text_trainable != 0:
+        use_lora = bool(getattr(self.cfg, "use_lora", False))
+
+        if not use_lora and go_text_trainable > 0:
             raise RuntimeError(
-                "Retriever v2 invariant violated: GO text encoder has "
-                f"{go_text_trainable} trainable parameters."
+                f"Frozen baseline has {go_text_trainable} "
+                "unexpected trainable GO encoder parameters."
             )
 
+        if use_lora:
+            trainable_go = [
+                name for name, p in model.go_encoder.named_parameters()
+                if p.requires_grad
+            ]
+
+            if not trainable_go:
+                raise RuntimeError("LoRA enabled but no trainable GO parameters.")
+
+            unexpected = [
+                name for name in trainable_go
+                if "lora_" not in name
+            ]
+
+            if unexpected:
+                raise RuntimeError(
+                    f"Unexpected trainable GO parameters: {unexpected[:10]}"
+                )
     # ------------------------------------------------------------------
     # Training scalars
     # ------------------------------------------------------------------
