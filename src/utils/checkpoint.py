@@ -43,6 +43,8 @@ def save_checkpoint(out_dir: str,
         global_step=getattr(trainer, "_global_step", step),
         m_ema=getattr(trainer, "m_ema", None),
         config=getattr(args, "__dict__", {}),
+        use_lora=bool(getattr(getattr(trainer, "cfg", None), "use_lora", False)),
+        lora_parameter_keys=sorted(k for k in trainer.model.state_dict() if "lora_" in k),
     )
 
     # --- 5- Aggregate checkpoint ---
@@ -181,11 +183,23 @@ def load_checkpoint(
     # Model
     # ------------------------------------------------------------------
 
+    saved_meta = ckpt.get("meta", {})
+    current_lora = bool(getattr(getattr(trainer, "cfg", None), "use_lora", False))
+    if "use_lora" in saved_meta and bool(saved_meta["use_lora"]) != current_lora:
+        raise RuntimeError("[checkpoint] LoRA mode mismatch between checkpoint and current model")
+    if current_lora and not saved_meta.get("lora_parameter_keys"):
+        raise RuntimeError("[checkpoint] LoRA checkpoint has no recorded adapter keys")
+
     model_state = _unwrap_state_dict(
         ckpt["model"],
         name="model",
     )
     model_state = _clean_state_keys(model_state)
+    if current_lora:
+        actual_lora = {k for k in model_state if "lora_" in k}
+        expected_lora = {k for k in trainer.model.state_dict() if "lora_" in k}
+        if actual_lora != expected_lora:
+            raise RuntimeError(f"[checkpoint] LoRA adapter key mismatch: missing={sorted(expected_lora-actual_lora)[:8]}, extra={sorted(actual_lora-expected_lora)[:8]}")
 
     current_state = trainer.model.state_dict()
 
