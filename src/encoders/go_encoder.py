@@ -121,6 +121,28 @@ class BioMedBERTEncoder(nn.Module):
 
         self.to(self.device)
 
+    def enable_lora(self, r=16, alpha=32, dropout=0.05, last_n_layers=6):
+        """Enable LoRA only on the last N BioMedBERT attention blocks."""
+        from peft import LoraConfig, get_peft_model
+        if hasattr(self, "_lora_enabled") and self._lora_enabled:
+            return
+        n_layers = int(self.model.config.num_hidden_layers)
+        start = max(0, n_layers - int(last_n_layers))
+        targets = [f"encoder.layer.{i}.attention.self.{part}"
+                   for i in range(start, n_layers) for part in ("query", "value")]
+        config = LoraConfig(r=int(r), lora_alpha=int(alpha),
+                            lora_dropout=float(dropout), bias="none",
+                            target_modules=targets)
+        self.model = get_peft_model(self.model, config)
+        self.model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self._lora_enabled = True
+        n = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        if n == 0:
+            raise RuntimeError("LoRA enabled but no trainable adapter weights.")
+        print(f"[GO-LORA] layers={start}..{n_layers-1}, trainable={n:,}")
+
     @staticmethod
     def _masked_mean_pool(
             H: torch.Tensor,

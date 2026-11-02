@@ -93,13 +93,17 @@ class OppTrainer:
         self.device = torch.device(cfg.device)
         self.wandb_run = wandb_run  # compatibility only; W&B logging is external
         self._global_step = 0
+        self._eval_go_bank_cache = None
 
         if ctx.protein_pooling_strategy != "mean_attn_gate":
             raise ValueError("Retriever v2 requires mean_attn_gate protein pooling.")
         if ctx.go_encoder_output_mode != "segment_pooled":
             raise ValueError("Retriever v2 requires segment_pooled GO mode.")
-        if cfg.use_lora:
-            raise ValueError("Retriever v2 requires use_lora=False.")
+        self.use_go_lora = bool(cfg.use_lora)
+        if self.use_go_lora:
+            if cfg.warmstart_path:
+                raise ValueError("Controlled LoRA ablation must train from scratch, no warmstart.")
+            go_encoder.enable_lora()
 
         self.model = ProteinGoAligner(
             d_h=cfg.d_h,
@@ -114,9 +118,12 @@ class OppTrainer:
 
         if self.model.go_encoder is None:
             raise RuntimeError("GO encoder is required.")
-        for p in self.model.go_encoder.parameters():
-            p.requires_grad_(False)
-        self.model.go_encoder.eval()
+        if not self.use_go_lora:
+            for p in self.model.go_encoder.parameters():
+                p.requires_grad_(False)
+            self.model.go_encoder.eval()
+        else:
+            self.model.go_encoder.train()
 
         if cfg.warmstart_path:
             self._load_warmstart(cfg.warmstart_path)
@@ -127,8 +134,11 @@ class OppTrainer:
         self._go_ids_cpu = torch.tensor(self.eval_id_list, dtype=torch.long)
         self._go_id2col = {g: i for i, g in enumerate(self.eval_id_list)}
 
-        self._build_frozen_segment_bank()
-        self._build_parent_bank()
+        if self.use_go_lora:
+            self._prepare_dynamic_go_tokens()
+        else:
+            self._build_frozen_segment_bank()
+            self._build_parent_bank()
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.opt = torch.optim.AdamW(
@@ -138,8 +148,10 @@ class OppTrainer:
 
     def _print_trainable_summary(self):
         bad = [n for n, p in self.model.go_encoder.named_parameters() if p.requires_grad]
-        if bad:
+        if not self.use_go_lora and bad:
             raise RuntimeError(f"Frozen GO encoder has trainables: {bad[:10]}")
+        if self.use_go_lora and not bad:
+            raise RuntimeError("GO LoRA enabled but encoder has no trainable parameters.")
         names = [n for n, p in self.model.named_parameters() if p.requires_grad]
         print("[RETRIEVER-V2] active GO terms:", len(self.eval_id_list))
         print("[RETRIEVER-V2] trainable sample:", names[:40])
@@ -175,6 +187,109 @@ class OppTrainer:
             raise RuntimeError("Warmstart loaded zero compatible tensors.")
         missing, unexpected = self.model.load_state_dict(loadable, strict=False)
         print(f"[WARMSTART] loaded={len(loadable)} missing={len(missing)} unexpected={len(unexpected)}")
+
+    def _prepare_dynamic_go_tokens(self):
+        """Cache token IDs only; never cache trainable GO embeddings."""
+        toks = self.ctx.go_text_store.batch(self.eval_id_list)
+        self._segment_ids_cpu = toks["seg_input_ids"].contiguous()
+        self._segment_masks_cpu = toks["seg_attention_mask"].contiguous()
+        self._segment_present_cpu = toks["seg_present"].bool().contiguous()
+        self._segment_names = list(toks["segment_names"])
+        if "name" not in self._segment_names or "definition" not in self._segment_names:
+            raise RuntimeError("Local-only scoring requires name and definition segments.")
+        path = os.environ.get(
+            "EXPH_GO_JSONL",
+            "/workspace/data_pfresgo/processed/go_texts_canonical_segmented.jsonl"
+        )
+        records = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                rec = json.loads(line)
+                records[rec["go_id"]] = rec
+        def key(g):
+            return f"GO:{int(g):07d}"
+        parent_lists = []
+        for gid in self.eval_id_list:
+            rec = records.get(key(gid))
+            if rec is None:
+                raise RuntimeError(f"Missing GO record: {gid}")
+            parent_lists.append([
+                pid for pid in rec.get("is_a_parent_ids", [])
+                if pid in records and records[pid].get("name")
+            ])
+        unique = sorted({pid for ids in parent_lists for pid in ids})
+        index = {pid: i for i, pid in enumerate(unique)}
+        P = max(1, max(map(len, parent_lists)))
+        parent_indices = torch.zeros(len(parent_lists), P, dtype=torch.long)
+        parent_present = torch.zeros(len(parent_lists), P, dtype=torch.bool)
+        for i, parents in enumerate(parent_lists):
+            for j, pid in enumerate(parents):
+                parent_indices[i, j] = index[pid]
+                parent_present[i, j] = True
+        tokenizer = self.ctx.go_text_store.tokenizer
+        enc = tokenizer(
+            [records[pid]["name"] for pid in unique],
+            padding="max_length", truncation=True,
+            max_length=self.ctx.go_text_store.segment_max_len,
+            return_tensors="pt"
+        )
+        self._parent_ids_cpu = enc["input_ids"].contiguous()
+        self._parent_masks_cpu = enc["attention_mask"].contiguous()
+        self._parent_indices_cpu = parent_indices
+        self._parent_present_cpu = parent_present
+        self._go_chunk_bs = max(1, int(self.cfg.eval_go_bs))
+        print("[GO-LORA] token cache:", tuple(self._segment_ids_cpu.shape),
+              "unique parents:", len(unique), "chunk:", self._go_chunk_bs)
+
+    def _encode_token_chunks(self, ids, masks, present=None):
+        """Differentiable GO encoding with per-chunk Transformer checkpointing."""
+        if present is None:
+            present = masks.any(dim=-1)
+        present = present.bool()
+        selected = torch.nonzero(present, as_tuple=False).flatten()
+        if selected.numel() == 0:
+            raise RuntimeError("No present GO texts.")
+        vectors = []
+        for part in selected.split(self._go_chunk_bs):
+            out = self.model.go_encoder(
+                input_ids=ids.index_select(0, part).to(self.device),
+                attention_mask=masks.index_select(0, part).to(self.device),
+                output_mode="pooled"
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            elif isinstance(out, dict):
+                out = out["pooled"]
+            vectors.append(out.float())
+        selected_vectors = torch.cat(vectors, dim=0)
+        # index_copy is differentiable w.r.t. selected_vectors.
+        full = selected_vectors.new_zeros((ids.shape[0], selected_vectors.shape[-1]))
+        return full.index_copy(0, selected.to(self.device), selected_vectors)
+
+    def _dynamic_banks(self):
+        if not torch.is_grad_enabled() and self._eval_go_bank_cache is not None:
+            return self._eval_go_bank_cache
+        ids = self._segment_ids_cpu
+        masks = self._segment_masks_cpu
+        G, S, L = ids.shape
+        present = self._segment_present_cpu
+        seg = self._encode_token_chunks(
+            ids.reshape(G*S, L), masks.reshape(G*S, L), present.reshape(-1)
+        ).reshape(G, S, -1)
+        parent_unique = self._encode_token_chunks(
+            self._parent_ids_cpu, self._parent_masks_cpu
+        )
+        parent_indices = self._parent_indices_cpu.to(self.device)
+        parent_present = self._parent_present_cpu.to(self.device)
+        parents = parent_unique[parent_indices]
+        # Segment gate remains frozen as in baseline.
+        raw, weights = self.model.pool_go_segments(
+            seg, present.to(self.device)
+        )
+        result = (seg, present.to(self.device), parents, parent_present, raw, weights)
+        if not torch.is_grad_enabled():
+            self._eval_go_bank_cache = result
+        return result
 
     @torch.no_grad()
     def _build_frozen_segment_bank(self):
@@ -279,6 +394,9 @@ class OppTrainer:
               f"GO_with_parents={int(present.any(1).sum())}")
 
     def _current_go_raw_bank(self):
+        if self.use_go_lora:
+            _, _, _, _, raw, weights = self._dynamic_banks()
+            return raw, weights
         if self.ctx.go_segment_representation_mode != "segments_only":
             raise RuntimeError("Retriever v2 currently requires segments_only.")
         emb = self._segment_embs_cpu.to(self.device, non_blocking=True)
@@ -327,19 +445,21 @@ class OppTrainer:
     def _score_full_go(self, batch):
         H = batch["prot_emb_pad"].to(self.device, non_blocking=True).float()
         mask = batch["prot_attn_mask"].to(self.device, non_blocking=True).bool()
-        raw, seg_weights = self._current_go_raw_bank()
+        if self.use_go_lora:
+            seg, present, parents, parent_present, raw, seg_weights = self._dynamic_banks()
+        else:
+            raw, seg_weights = self._current_go_raw_bank()
+            seg = self._segment_embs_cpu.to(self.device, non_blocking=True)
+            present = self._segment_present_cpu.to(self.device, non_blocking=True)
+            parents = self._parent_bank_cpu.to(self.device, non_blocking=True)
+            parent_present = self._parent_present_cpu.to(self.device, non_blocking=True)
         names = self._segment_names
-        if "name" not in names or "definition" not in names:
-            raise RuntimeError("Experiment H requires name and definition GO segments")
         name_idx = names.index("name")
         definition_idx = names.index("definition")
-        seg = self._segment_embs_cpu.to(self.device, non_blocking=True)
-        present = self._segment_present_cpu.to(self.device, non_blocking=True)
-        parents = self._parent_bank_cpu.to(self.device, non_blocking=True)
-        parent_present = self._parent_present_cpu.to(self.device, non_blocking=True)
         scores = self.model.score_fine_grained(
             H, mask, seg[:, name_idx], seg[:, definition_idx],
-            present[:, definition_idx], parents, parent_present, raw)
+            present[:, definition_idx], parents, parent_present, raw
+        )
         return scores, seg_weights
 
     @torch.no_grad()
@@ -413,8 +533,10 @@ class OppTrainer:
         return out
 
     def step_losses(self, batch, epoch_idx, debug=False):
+        self._eval_go_bank_cache = None
         self.model.train()
-        self.model.go_encoder.eval()
+        if not self.use_go_lora:
+            self.model.go_encoder.eval()
 
         scores, seg_weights = self._score_full_go(batch)
         pos_mask = self._positive_mask(batch)
@@ -474,6 +596,7 @@ class OppTrainer:
         Returns scalar metrics. Raw diagnostics for the future
         RetrieverWandbLogger are stored in self.last_eval_diagnostics.
         """
+        self._eval_go_bank_cache = None
         self.model.eval()
         self.model.go_encoder.eval()
 

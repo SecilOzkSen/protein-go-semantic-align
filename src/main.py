@@ -307,8 +307,10 @@ def load_structured_cfg(path: str):
         seq_len_lookup=opt_path(stores.get("seq_len_lookup")),
     )
 
-    if args.use_lora:
-        raise ValueError("Retriever v2 requires use_lora=false; GO text encoder is frozen.")
+    if args.use_lora and (args.pbr_lambda != 0 or args.lambda_con != 1):
+        raise ValueError("Controlled LoRA run requires InfoNCE-only (lambda_con=1, pbr_lambda=0).")
+    if args.use_lora and args.warmstart_path:
+        raise ValueError("Controlled LoRA experiment must start without warmstart.")
 
     required = [
         args.train_ids_path, args.val_ids_path, args.go_basic_json, args.pid2pos,
@@ -531,13 +533,14 @@ def run_training(args):
         attention_pooling_strategy=args.go_encoder_inner_pooling,
         attn_hidden=128,
         attn_dropout=0.1,
-        gradient_checkpointing=False,
+        gradient_checkpointing=args.use_lora,
     )
 
-    # Retriever v2 invariant: text encoder is frozen.
-    for p in go_encoder.parameters():
-        p.requires_grad = False
-    go_encoder.eval()
+    # Trainer installs LoRA adapters in LoRA mode. Preserve frozen baseline otherwise.
+    if not args.use_lora:
+        for p in go_encoder.parameters():
+            p.requires_grad_(False)
+        go_encoder.eval()
 
     go_text_store = build_go_text_store(args, go_encoder)
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
@@ -582,7 +585,7 @@ def run_training(args):
         secondary_monitor_metric=args.secondary_monitor_metric,
         monitor_mode=args.monitor_mode,
         protein_pooling_strategy=args.protein_pooling_strategy,
-        use_lora=False,
+        use_lora=args.use_lora,
         go_pooling=args.go_pooling,
         go_pool_type=args.go_pool_type,
         go_encoder_output_mode=args.go_encoder_output_mode,
@@ -635,7 +638,7 @@ def run_training(args):
         active_go_ids=active_go_ids,
         protein_pooling=args.protein_pooling_strategy,
         go_segments=args.enabled_segments,
-        objective="full_go_infonce+pbr",
+        objective="full_go_infonce_only" if args.pbr_lambda == 0 else "full_go_infonce+pbr",
     )
 
     # Dataset-level metadata remains orchestration/data information.
@@ -707,8 +710,9 @@ def run_training(args):
 
     for epoch in range(start_epoch, args.epochs):
         trainer.model.train()
-        # Frozen text encoder must remain eval even when the alignment model trains.
-        trainer.model.go_encoder.eval()
+        # Frozen mode stays in eval; LoRA mode needs train mode for adapter dropout.
+        if not args.use_lora:
+            trainer.model.go_encoder.eval()
 
         running = {"total": 0.0, "contrastive": 0.0, "pbr": 0.0}
         n_batches = 0
