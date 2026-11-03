@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import pickle
 import random
@@ -263,6 +264,7 @@ def load_structured_cfg(path: str):
         monitor_mode=str(training.get("monitor_mode", "max")),
         early_stop_patience=int(training.get("early_stop_patience", 3)),
         eval_go_bs=int(training.get("eval_go_bs", 256)),
+        go_share_microbatches=int(training.get("go_share_microbatches", 1)),
         go_text_store_max_len=int(training.get("go_text_store_max_len", 128)),
         go_segment_max_len=int(training.get("go_segment_max_len", 64)),
         go_pooling=str(training.get("go_pooling", "none")),
@@ -307,6 +309,10 @@ def load_structured_cfg(path: str):
         seq_len_lookup=opt_path(stores.get("seq_len_lookup")),
     )
 
+    if args.go_share_microbatches < 1:
+        raise ValueError("go_share_microbatches must be >= 1")
+    if args.go_share_microbatches > 1 and not args.use_lora:
+        raise ValueError("GO sharing is enabled only for LoRA; use batch_size=32 for frozen control.")
     if args.use_lora and (args.pbr_lambda != 0 or args.lambda_con != 1):
         raise ValueError("Controlled LoRA run requires InfoNCE-only (lambda_con=1, pbr_lambda=0).")
     if args.use_lora and args.warmstart_path:
@@ -717,68 +723,77 @@ def run_training(args):
         running = {"total": 0.0, "contrastive": 0.0, "pbr": 0.0}
         n_batches = 0
 
-        for batch in train_loader:
-            with torch.autocast(
-                    device_type=device.type,
-                    dtype=torch.bfloat16,
-                    enabled=use_bf16,
-            ):
-                losses = trainer.step_losses(batch, epoch)
-                loss = losses["total"]
-
+        # GO embeddings are computed once per optimizer update and shared across
+        # up to `go_share_microbatches` protein microbatches. All losses are
+        # combined into ONE backward to avoid reusing a freed autograd graph.
+        from itertools import islice
+        loader_iter = iter(train_loader)
+        while True:
+            microbatches = list(islice(loader_iter, args.go_share_microbatches))
+            if not microbatches:
+                break
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
+                                enabled=use_bf16):
+                shared_banks = (trainer._dynamic_banks()
+                                if args.use_lora and args.go_share_microbatches > 1
+                                else None)
+                losses_group = []
+                weights = []
+                for batch in microbatches:
+                    losses_i = trainer.step_losses(
+                        batch, epoch, shared_banks=shared_banks
+                    )
+                    losses_group.append(losses_i)
+                    weights.append(len(batch["pos_go_global"]))
+                n_proteins = sum(weights)
+                loss = sum(item["total"] * (n / n_proteins)
+                           for item, n in zip(losses_group, weights))
             trainer.opt.zero_grad(set_to_none=True)
             loss.backward()
-
-            # Gradients exist here and are still unclipped.
-            # This is the correct point for optimization diagnostics.
+            if args.use_lora and n_batches == 0 and epoch == start_epoch:
+                lora_grads = [p.grad.detach().float().norm().item()
+                              for name, p in trainer.model.named_parameters()
+                              if "lora_" in name and p.grad is not None]
+                logger.info("[FAST-SMOKE] LoRA gradients=%d sum_norm=%.6g peak_vram_gib=%.2f",
+                            len(lora_grads), sum(lora_grads),
+                            torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else 0)
+                if not lora_grads or sum(lora_grads) <= 0:
+                    raise RuntimeError("LoRA gradient smoke test failed")
             if args.log_gradient_norms:
-                wb.log_gradients(
-                    model=trainer.model,
-                    step=int(getattr(trainer, "_global_step", global_step + 1)),
-                )
-
+                wb.log_gradients(model=trainer.model,
+                                 step=int(getattr(trainer, "_global_step", global_step + 1)))
             if args.grad_clip > 0:
                 params = [p for p in trainer.model.parameters() if p.requires_grad]
                 torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
-
             trainer.opt.step()
+            if os.environ.get("FAST_SMOKE_ONLY") == "1":
+                logger.info("[FAST-SMOKE] completed one optimizer update successfully")
+                wb.finalize()
+                return
+            del shared_banks, loss
             n_batches += 1
-
             for key in running:
-                if key in losses and losses[key] is not None:
-                    value = losses[key]
-                    running[key] += float(value.item() if hasattr(value, "item") else value)
-
+                running[key] += sum(
+                    float(item[key].detach().item()) * n / n_proteins
+                    for item, n in zip(losses_group, weights)
+                )
+            losses = losses_group[-1]
             global_step = int(getattr(trainer, "_global_step", global_step + 1))
-
-            if global_step % max(1, args.log_every) == 0:
+            if global_step % max(1, args.log_every) < len(microbatches):
                 avg = {k: v / max(1, n_batches) for k, v in running.items()}
                 lr0 = trainer.opt.param_groups[0].get("lr")
-                logger.info(
-                    "[train] epoch %d step %d :: %s | lr:%.2e",
-                    epoch, global_step,
-                    " | ".join(f"{k}:{v:.4f}" for k, v in avg.items()),
-                    lr0,
-                )
-                # Use averaged core losses for the interval, while retaining
-                # current-batch diagnostics such as score gap and PBR ranks.
+                logger.info("[train] epoch %d step %d updates %d :: %s | lr:%.2e",
+                            epoch, global_step, n_batches,
+                            " | ".join(f"{k}:{v:.4f}" for k, v in avg.items()), lr0)
                 wb_losses = dict(losses)
-                wb_losses["total"] = avg["total"]
-                wb_losses["contrastive"] = avg["contrastive"]
-                wb_losses["pbr"] = avg["pbr"]
-
-                wb.log_train(
-                    losses=wb_losses,
-                    lr=lr0,
-                    step=global_step,
-                )
-
-            if global_step % max(1, args.save_every) == 0:
-                save_checkpoint(
-                    out_dir=str(out_dir), tag=f"step{global_step}",
-                    trainer=trainer, args=args, epoch=epoch, step=global_step,
-                )
+                for key in running:
+                    wb_losses[key] = avg[key]
+                wb.log_train(losses=wb_losses, lr=lr0, step=global_step)
+            if global_step % max(1, args.save_every) < len(microbatches):
+                save_checkpoint(out_dir=str(out_dir), tag=f"step{global_step}",
+                                trainer=trainer, args=args, epoch=epoch, step=global_step)
                 cleanup_old_checkpoints(out_dir, args.keep_last_n)
+            del losses_group, microbatches
 
         with torch.autocast(
                 device_type=device.type,

@@ -442,10 +442,12 @@ class OppTrainer:
             mask[b, torch.tensor(cols, device=self.device, dtype=torch.long)] = True
         return mask
 
-    def _score_full_go(self, batch):
+    def _score_full_go(self, batch, shared_banks=None):
         H = batch["prot_emb_pad"].to(self.device, non_blocking=True).float()
         mask = batch["prot_attn_mask"].to(self.device, non_blocking=True).bool()
-        if self.use_go_lora:
+        if shared_banks is not None:
+            seg, present, parents, parent_present, raw, seg_weights = shared_banks
+        elif self.use_go_lora:
             seg, present, parents, parent_present, raw, seg_weights = self._dynamic_banks()
         else:
             raw, seg_weights = self._current_go_raw_bank()
@@ -532,23 +534,25 @@ class OppTrainer:
             )
         return out
 
-    def step_losses(self, batch, epoch_idx, debug=False):
+    def step_losses(self, batch, epoch_idx, debug=False, shared_banks=None):
         self._eval_go_bank_cache = None
         self.model.train()
         if not self.use_go_lora:
             self.model.go_encoder.eval()
 
-        scores, seg_weights = self._score_full_go(batch)
+        scores, seg_weights = self._score_full_go(batch, shared_banks=shared_banks)
         pos_mask = self._positive_mask(batch)
 
         l_con = multi_positive_full_go_infonce(
             scores, pos_mask, temperature=self.cfg.temperature
         )
-        l_pbr, pbr_stats = positive_block_rank_loss(
-            scores, pos_mask,
-            margin=self.cfg.pbr_margin,
-            tau=self.cfg.pbr_tau,
-        )
+        if self.cfg.pbr_lambda != 0:
+            l_pbr, pbr_stats = positive_block_rank_loss(
+                scores, pos_mask, margin=self.cfg.pbr_margin, tau=self.cfg.pbr_tau
+            )
+        else:
+            l_pbr = scores.new_zeros(())
+            pbr_stats = {}
         l_total = self.cfg.lambda_con * l_con + self.cfg.pbr_lambda * l_pbr
 
         if not torch.isfinite(l_total):
