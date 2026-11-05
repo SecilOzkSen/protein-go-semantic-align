@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import pickle
@@ -181,6 +182,8 @@ def load_structured_cfg(path: str):
     cfg_path = Path(path).expanduser().resolve()
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
 
+    mz = raw.get("mzsgo", {})
+    is_mzsgo = bool(mz.get("enabled", False))
     pf = raw.get("pfresgo", {})
     data = raw.get("data", {})
     general = raw.get("general", {})
@@ -194,7 +197,7 @@ def load_structured_cfg(path: str):
     stores = raw.get("stores", {})
 
     allowed_segments = ["name", "namespace", "definition", "is_a", "part_of"]
-    requested = [str(x).strip() for x in pf.get("enabled_segments", ["name", "definition"]) if str(x).strip()]
+    requested = [str(x).strip() for x in pf.get("enabled_segments", ["name", "definition", "is_a"] if is_mzsgo else ["name", "definition"]) if str(x).strip()]
     unknown = set(requested) - set(allowed_segments)
     if unknown:
         raise ValueError(f"Unknown PFresGO segments: {sorted(unknown)}")
@@ -202,7 +205,7 @@ def load_structured_cfg(path: str):
     if not enabled_segments:
         raise ValueError("At least one GO segment must be enabled.")
 
-    branch = str(pf.get("branch", "")).strip().upper()
+    branch = str(mz.get("branch", pf.get("branch", "")) if is_mzsgo else pf.get("branch", "")).strip().upper()
     if branch not in {"BP", "MF", "CC"}:
         raise ValueError("pfresgo.branch must be BP, MF, or CC")
 
@@ -210,14 +213,22 @@ def load_structured_cfg(path: str):
     if protocol not in {"standard", "zeroshot"}:
         raise ValueError("pfresgo.benchmark_protocol must be standard or zeroshot")
 
-    branch_ids_path = Path(pf["branch_go_ids_path"]).expanduser().resolve()
-    go_text_path = Path(pf["go_text_path"]).expanduser().resolve()
+    if is_mzsgo:
+        mz_root = Path(mz.get("root", "/workspace/MZSGO_temporal")).expanduser().resolve()
+        mz_proc = mz_root / "processed" / branch.lower()
+        branch_ids_path = mz_proc / f"candidate_go_ids_{branch.lower()}.json"
+        go_text_path = mz_proc / "go_texts_canonical_segmented_dual_2023_2025.jsonl"
+    else:
+        branch_ids_path = Path(pf["branch_go_ids_path"]).expanduser().resolve()
+        go_text_path = Path(pf["go_text_path"]).expanduser().resolve()
 
     def opt_path(v):
         return Path(v).expanduser().resolve() if v else None
 
     args = types.SimpleNamespace(
         config_path=cfg_path,
+        mzsgo_enabled=is_mzsgo,
+        mzsgo_root=opt_path(mz.get("root", "/workspace/MZSGO_temporal")) if is_mzsgo else None,
         pfresgo_branch=branch,
         pfresgo_benchmark_protocol=protocol,
         enabled_segments=enabled_segments,
@@ -295,28 +306,33 @@ def load_structured_cfg(path: str):
         wandb_run_name=wandb_cfg.get("wandb_run_name"),
         wandb_mode=str(wandb_cfg.get("mode", "online")),
 
-        train_ids_path=opt_path(stores.get("train_ids_path")),
-        val_ids_path=opt_path(stores.get("val_ids_path")),
-        go_basic_json=opt_path(stores.get("go_basic_json")),
-        pid2pos=opt_path(stores.get("pid2pos_path")),
+        train_ids_path=(mz_root / "mzsgo_graphs/train_homology30_v2.txt") if is_mzsgo else opt_path(stores.get("train_ids_path")),
+        val_ids_path=(mz_root / "mzsgo_graphs/valid_homology30_v2.txt") if is_mzsgo else opt_path(stores.get("val_ids_path")),
+        go_basic_json=None if is_mzsgo else opt_path(stores.get("go_basic_json")),
+        pid2pos=(mz_proc / f"pid_to_go_train_{branch.lower()}.json") if is_mzsgo else opt_path(stores.get("pid2pos_path")),
         zero_shot_path=opt_path(stores.get("zero_shot_path")),
         few_shot_path=opt_path(stores.get("few_shot_path")),
-        embed_dir_res=opt_path(stores.get("embed_dir_res")),
+        embed_dir_res=opt_path(stores.get("embed_dir_res", str(mz_root / "protein_embeddings/esm2_residue_overlap") if is_mzsgo else None)),
         go_text_folder=opt_path(stores.get("go_text_folder")),
-        go_cache_path=opt_path(stores.get("go_cache_path")),
+        go_cache_path=None if is_mzsgo else opt_path(stores.get("go_cache_path")),
         seq_len_lookup=opt_path(stores.get("seq_len_lookup")),
+        mzsgo_frozen_bank=(mz_root / "go_cache" / branch.lower() / "frozen_segment_parent_bank.pt") if is_mzsgo else None,
     )
 
     if args.use_lora:
         raise ValueError("Retriever v2 requires use_lora=false; GO text encoder is frozen.")
 
     required = [
-        args.train_ids_path, args.val_ids_path, args.go_basic_json, args.pid2pos,
-        args.embed_dir_res, args.go_cache_path, args.go_text_path, args.branch_go_ids_path,
+        args.train_ids_path, args.val_ids_path, args.pid2pos,
+        args.embed_dir_res, args.go_text_path, args.branch_go_ids_path,
+        *((args.mzsgo_frozen_bank,) if is_mzsgo else (args.go_basic_json, args.go_cache_path)),
     ]
     missing = [str(x) for x in required if x is None or not Path(x).exists()]
     if missing:
         raise FileNotFoundError("Missing required resources: " + ", ".join(missing))
+
+    if is_mzsgo and args.evaluation_split == "test":
+        raise ValueError("MZSGO temporal test requires separate temporal ground truth and evaluator; do not use validation evaluator")
 
     if args.evaluation_split == "test":
         if args.test_ids_path is None:
@@ -488,11 +504,48 @@ def run_training(args):
     device = torch.device("cpu" if args.cpu else args.general_device)
     logger.info("Device: %s", device)
 
+    if args.mzsgo_enabled:
+        # Explicit, leakage-safe MZSGO seen GO universe and V2 split.
+        root = args.mzsgo_root
+        branch = args.pfresgo_branch.lower()
+        proc = root / "processed" / branch
+        graph = root / "mzsgo_graphs"
+        candidate = set(_read_ids(proc / f"candidate_go_ids_{branch}.json"))
+        temporal = set(_read_ids(proc / f"temporal_go_ids_{branch}.json"))
+        if not temporal or not temporal < candidate:
+            raise RuntimeError("Invalid MZSGO temporal GO universe")
+        seen_universe = sorted(candidate - temporal)
+        if branch == "bp" and (len(candidate), len(temporal), len(seen_universe)) != (20345, 34, 20311):
+            raise RuntimeError("BP MZSGO candidate counts differ from locked protocol")
+        args.train_ids_path = graph / "train_homology30_v2.txt"
+        args.val_ids_path = graph / "valid_homology30_v2.txt"
+        args.pid2pos = proc / f"pid_to_go_train_{branch}.json"
+        args.go_text_path = proc / "go_texts_canonical_segmented_dual_2023_2025.jsonl"
+        args.branch_go_ids_path = proc / f"candidate_go_ids_{branch}.json"
+        for path in (args.train_ids_path, args.val_ids_path, args.pid2pos, args.go_text_path):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        train_pids = set(load_raw_txt(args.train_ids_path))
+        val_pids = set(load_raw_txt(args.val_ids_path))
+        if train_pids & val_pids:
+            raise RuntimeError("MZSGO train/validation protein leakage")
+        if branch == "bp" and (len(train_pids), len(val_pids)) != (46456, 5162):
+            raise RuntimeError("MZSGO BP V2 split counts changed")
+        raw_annotations = _read_json(args.pid2pos)
+        for pid in train_pids | val_pids:
+            labels = {_go_int(g) for g in raw_annotations.get(pid, [])}
+            if not labels or not labels <= set(seen_universe):
+                raise RuntimeError(f"Invalid seen GO labels for protein {pid}")
+        if args.monitor_metric != "protein_wise_map":
+            raise RuntimeError("MZSGO validation checkpoint metric must be protein_wise_map")
+        os.environ["EXPH_GO_JSONL"] = str(args.go_text_path)
+        logger.info("[MZSGO] %s: train=%d valid=%d seen=%d temporal=%d", branch,
+                    len(train_pids), len(val_pids), len(seen_universe), len(temporal))
     branch_ids = _read_ids(args.branch_go_ids_path)
     seen, rare, zero, benchmark_ids = _training_buckets(
         args.train_ids_path, args.pid2pos, branch_ids, args.rare_lt
     )
-    active_go_ids = benchmark_ids if args.evaluation_space == "benchmark" else branch_ids
+    active_go_ids = seen_universe if args.mzsgo_enabled else (benchmark_ids if args.evaluation_space == "benchmark" else branch_ids)
 
     logger.info(
         "[PFresGO] branch=%s split=%s protocol=%s evaluation_space=%s "
@@ -502,9 +555,36 @@ def run_training(args):
         args.enabled_segments,
     )
 
-    go_cache = build_go_cache(str(args.go_cache_path))
-    go_terms = load_raw_json(args.go_basic_json)
-    alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
+    if args.mzsgo_enabled:
+        # The old pooled GoLookupCache is not used by the local-only retriever.
+        # Build a lightweight ID/dimension reference from the exact frozen bank.
+        # All actual scoring vectors are loaded by OppTrainer from this bank.
+        payload = torch.load(args.mzsgo_frozen_bank, map_location="cpu", weights_only=False)
+        if payload.get("format") != "mzsgo_frozen_segment_parent_v1":
+            raise RuntimeError("Invalid MZSGO frozen GO bank format")
+        ids = [int(x) for x in payload["go_ids"]]
+        if len(ids) != len(set(ids)) or set(ids) != candidate:
+            raise RuntimeError("MZSGO frozen bank IDs do not match candidate universe")
+        digest = hashlib.sha256(args.go_text_path.read_bytes()).hexdigest()
+        if payload.get("metadata", {}).get("canonical_jsonl_sha256") != digest:
+            raise RuntimeError("MZSGO frozen bank text hash mismatch")
+        if list(payload.get("segment_names", [])) != list(args.enabled_segments):
+            raise RuntimeError("MZSGO frozen bank segment names/order mismatch")
+        d_g_cached = int(payload["segment_embs"].shape[-1])
+        # Only shape and ID mapping are needed by main/context. No pooled GO
+        # embeddings are substituted for the actual segment/parent bank.
+        go_cache = types.SimpleNamespace(
+            embs=torch.empty((0, d_g_cached)),
+            id2row={g: i for i, g in enumerate(ids)},
+            row2id=ids,
+        )
+        os.environ["MZSGO_FROZEN_GO_BANK"] = str(args.mzsgo_frozen_bank)
+        os.environ["EXPH_GO_JSONL"] = str(args.go_text_path)
+        alt_map = {}
+    else:
+        go_cache = build_go_cache(str(args.go_cache_path))
+        go_terms = load_raw_json(args.go_basic_json)
+        alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
 
     pid2pos_raw = load_raw_json(args.pid2pos)
     pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else pid2pos_raw
@@ -516,6 +596,8 @@ def run_training(args):
     pid2pos, active_go_ids, seen, zero, rare = align_to_cache(
         go_cache, pid2pos, active_go_ids, seen, zero, rare
     )
+    if args.mzsgo_enabled and (set(active_go_ids) != set(seen_universe) or len(active_go_ids) != len(seen_universe)):
+        raise RuntimeError("GO cache silently removed MZSGO seen GO terms")
     logger.info("[GO universe] active=%d seen=%d rare=%d zero=%d", len(active_go_ids), len(seen), len(rare), len(zero))
 
     dag_parents = (
@@ -539,6 +621,8 @@ def run_training(args):
         p.requires_grad = False
     go_encoder.eval()
 
+    if args.mzsgo_enabled and args.enabled_segments != ["name", "definition", "is_a"]:
+        raise RuntimeError("MZSGO frozen bank expects name, definition, is_a segments")
     go_text_store = build_go_text_store(args, go_encoder)
     go_text_store.materialize_tokens_once(batch_size=512, show_progress=True)
 
@@ -547,6 +631,8 @@ def run_training(args):
         args, residue_store, go_text_store, pid2pos, dag_parents, zero, rare
     )
     validate_active_universe(pid2pos, active_go_ids, datasets)
+    if args.mzsgo_enabled and (len(datasets["train"]), len(datasets["val"])) != (len(train_pids), len(val_pids)):
+        raise RuntimeError("MZSGO dataset silently dropped proteins")
     train_loader, val_loader = build_dataloaders(datasets, args)
 
     sample = datasets["train"][0]
@@ -795,11 +881,9 @@ def run_training(args):
             epoch=epoch,
         )
 
-        metric_name = (
-            args.monitor_metric
-            if args.monitor_metric in val_logs
-            else "align_MRR"
-        )
+        if args.monitor_metric not in val_logs:
+            raise RuntimeError(f"Checkpoint metric missing: {args.monitor_metric}")
+        metric_name = args.monitor_metric
         score = float(val_logs[metric_name])
         improved = score > best_val + eps if args.monitor_mode == "max" else score < best_val - eps
 

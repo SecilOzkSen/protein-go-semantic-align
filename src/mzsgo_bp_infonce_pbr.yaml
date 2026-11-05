@@ -1,0 +1,95 @@
+# MZSGO BP full baseline config. Requires integrated main.py, trainer.py and frozen GO cache.
+# GO bank must exist at /workspace/MZSGO_temporal/go_cache/bp/frozen_segment_parent_bank.pt
+# Temporal evaluation is a separate post-training step.
+pfresgo:
+  branch: BP
+  benchmark_protocol: standard
+  evaluation_space: benchmark
+  evaluation_split: valid
+  rare_lt: 20
+  enabled_segments:
+    - name
+    - definition
+    - is_a
+data:
+  overlap: 256
+  max_len: 1000
+  use_dag_in_ds: false
+  fs_target_ratio: 0.0
+general:
+  phase: -2
+  go_pooling_strategy: mean
+  go_encoder_inner_pooling: mean
+  go_pool_type: mean
+  go_encoder_output_mode: segment_pooled
+  go_segment_representation_mode: segments_only
+  protein_pooling_strategy: mean_attn_gate
+  use_lora: false
+  ablation_id: MZSGO-BP-RetrieverV2-InfoNCE-PBR
+training:
+  epochs: 30
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 0
+  fp16: true
+  cpu: false
+  seed: 42
+  output_dir: /workspace/MZSGO_temporal/outputs/bp/retriever_v2_infonce_pbr
+  save_every: 1000000
+  keep_last_n: 3
+  resume: null
+  warmstart_path: null
+  eval_only: false
+  log_every: 500
+  log_level: INFO
+  monitor_metric: protein_wise_map
+  secondary_monitor_metric: macro_term_recall@500
+  monitor_mode: max
+  early_stop_patience: 5
+  eval_go_bs: 256
+  go_text_store_max_len: 128
+  go_segment_max_len: 64
+  go_pooling: none
+optim:
+  lr: 1.0e-05
+  weight_decay: 0.0
+  grad_clip: 1.0
+model:
+  align_dim: 768
+  temperature: 0.07
+  attn_heads: 2
+  attn_dropout: 0.1
+loss:
+  lambda_con: 1.0
+  pbr_lambda: 0.001
+  pbr_margin: 0.05
+  pbr_tau: 0.05
+evaluation:
+  retrieval_eval_ks:
+    - 50
+    - 100
+    - 200
+    - 500
+    - 1000
+  positive_rank_quantiles:
+    - 0.5
+    - 0.75
+    - 0.9
+    - 0.95
+diagnostics:
+  log_gradient_norms: true
+  log_positive_rank_cdf: true
+  log_cardinality_metrics: true
+  log_go_segment_weights: true
+wandb:
+  enabled: true
+  project: protein-go-align-mzsgo
+  entity: null
+  wandb_run_name: MZSGO-BP-V2-InfoNCE-PBR-Baseline
+  mode: online
+stores:
+  embed_dir_res: /workspace/MZSGO_temporal/protein_embeddings/esm2_residue_overlap
+mzsgo:
+  enabled: true
+  branch: BP
+  root: /workspace/MZSGO_temporal

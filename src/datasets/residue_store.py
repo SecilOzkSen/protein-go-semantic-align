@@ -39,7 +39,7 @@ def _parse_shard_id_from_index(p):
     p: Path('.../res_esm1b_00000.index.tsv') veya '.../res_esm1b_00000.index'
     -> 0 tabanlı veya 00000 gibi bir sayı döndürür (int)
     """
-    m = re.search(r"res_esm1b_(\d+)\.index(?:\.tsv)?$", p.name)
+    m = re.search(r"res_esm(?:1b|2)_(\d+)\.index(?:\.tsv)?$", p.name)
     if not m:
         raise ValueError(f"Cannot parse shard id from index filename: {p.name}")
     return int(m.group(1))
@@ -47,9 +47,10 @@ def _parse_shard_id_from_index(p):
 # ---------------------------- DiskLRU ----------------------------
 class DiskLRU:
     def __init__(self, root: str, max_gb: float = 12.0, reserve_gb: float = 1.0):
-        self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
-        self.max_bytes = int(max_gb * (1024**3))
-        self.reserve_bytes = int(reserve_gb * (1024**3))
+        self.root = Path(root);
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = int(max_gb * (1024 ** 3))
+        self.reserve_bytes = int(reserve_gb * (1024 ** 3))
 
     def _scan(self):
         files, total = [], 0
@@ -71,15 +72,19 @@ class DiskLRU:
         i = 0
         while total > limit and i < len(files):
             p, sz, _ = files[i]
-            try: p.unlink(); total -= sz
-            except FileNotFoundError: pass
+            try:
+                p.unlink(); total -= sz
+            except FileNotFoundError:
+                pass
             i += 1
+
 
 # ------------------------- LocalShardCache ------------------------
 class LocalShardCache:
     def __init__(self, cache_dir: str = "/content/esm_cache", max_gb: float = 12.0):
-        self.cache_dir = Path(cache_dir); self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.max_bytes = int(max_gb * (1024**3))
+        self.cache_dir = Path(cache_dir);
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.max_bytes = int(max_gb * (1024 ** 3))
         self._meta: Dict[str, Tuple[int, float]] = {}
         self._rebuild_meta()
 
@@ -98,8 +103,10 @@ class LocalShardCache:
 
     def _touch(self, p: Path):
         now = time.time()
-        try: os.utime(p, (now, now))
-        except Exception: pass
+        try:
+            os.utime(p, (now, now))
+        except Exception:
+            pass
         if str(p) in self._meta:
             size, _ = self._meta[str(p)]
             self._meta[str(p)] = (size, now)
@@ -107,15 +114,20 @@ class LocalShardCache:
     def _evict_if_needed(self, incoming_bytes: int):
         while self._current_size() + incoming_bytes > self.max_bytes and self._meta:
             victim = sorted(self._meta.items(), key=lambda kv: kv[1][1])[0][0]
-            try: os.remove(victim)
-            except FileNotFoundError: pass
+            try:
+                os.remove(victim)
+            except FileNotFoundError:
+                pass
             self._meta.pop(victim, None)
 
     def ensure_local(self, src_path: str) -> str:
-        src = Path(src_path); dst = self.cache_dir / src.name
+        src = Path(src_path);
+        dst = self.cache_dir / src.name
         if dst.exists(): self._touch(dst); return str(dst)
-        try: size_bytes = src.stat().st_size
-        except FileNotFoundError: size_bytes = 1 * (1024**3)
+        try:
+            size_bytes = src.stat().st_size
+        except FileNotFoundError:
+            size_bytes = 1 * (1024 ** 3)
         self._evict_if_needed(size_bytes)
         cmd = ["rsync", "-a", "--info=progress2", str(src), str(dst)] if shutil.which("rsync") else ["cp", str(src), str(dst)]
         subprocess.run(cmd, check=True)
@@ -134,27 +146,30 @@ def _npy_load(path: str):
     return np.load(path, mmap_mode="r")
 
 def _torch_load(path: str):
-    try: return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError: return torch.load(path, map_location="cpu")
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
 
 # ============================ Base Store ============================
 class _BaseStore:
     def __init__(
-        self,
-        embed_dir: str,
-        *,
-        pro_manifest_file: Optional[str] = GOOGLE_DRIVE_MANIFEST_CACHE,
-        gdrive_cache: bool = False,
-        cache_dir: str = "/content/esm_cache",
-        cache_gb: float = 12.0,
-        prefer_fp16: bool = False,
-        hub_repo_id: Optional[str] = None,
-        hub_revision: str = "main",
-        hub_repo_type: str = "dataset",
-        hub_local_dir: Optional[str] = None,
-        hub_symlinks: bool = False,
-        hub_cache_max_gb: float = 50.0,
-        hub_cache_reserve_gb: float = 10.0,
+            self,
+            embed_dir: str,
+            *,
+            pro_manifest_file: Optional[str] = GOOGLE_DRIVE_MANIFEST_CACHE,
+            gdrive_cache: bool = False,
+            cache_dir: str = "/content/esm_cache",
+            cache_gb: float = 12.0,
+            prefer_fp16: bool = False,
+            hub_repo_id: Optional[str] = None,
+            hub_revision: str = "main",
+            hub_repo_type: str = "dataset",
+            hub_local_dir: Optional[str] = None,
+            hub_symlinks: bool = False,
+            hub_cache_max_gb: float = 50.0,
+            hub_cache_reserve_gb: float = 10.0,
     ):
         self.embed_dir = str(embed_dir)
         self.prefer_fp16 = bool(prefer_fp16)
@@ -172,7 +187,7 @@ class _BaseStore:
         self._backend = None
         self._pid2shard: Dict[str, str] = {}
         self._shard_ram_cache: Dict[str, dict] = {}
-        self._pid2row_cache: Dict[str, Dict[str,int]] = {}
+        self._pid2row_cache: Dict[str, Dict[str, int]] = {}
         self._pro_manifest_file = pro_manifest_file
 
     # --- paths & HF ---
@@ -197,12 +212,16 @@ class _BaseStore:
     def _resolve_local_path(self, path_like: str) -> str:
         raw = str(path_like)
         if self._file_cache is not None and raw.startswith("/content/drive/"):
-            try: return self._file_cache.ensure_local(raw)
-            except Exception: pass
+            try:
+                return self._file_cache.ensure_local(raw)
+            except Exception:
+                pass
         abs_path = raw if os.path.isabs(raw) else str(Path(self.embed_dir) / raw)
         if os.path.exists(abs_path): return abs_path
-        try: rel = raw if not os.path.isabs(raw) else str(Path(abs_path).relative_to(self.embed_dir))
-        except Exception: rel = Path(raw).name
+        try:
+            rel = raw if not os.path.isabs(raw) else str(Path(abs_path).relative_to(self.embed_dir))
+        except Exception:
+            rel = Path(raw).name
         hf_local = self._maybe_hf_fetch(rel)
         if hf_local and os.path.exists(hf_local): return hf_local
         return abs_path
@@ -232,15 +251,19 @@ class _BaseStore:
 
         self._shard_ram_cache[local_path] = shard
         if path != local_path: self._shard_ram_cache[path] = shard
-        try: os.utime(local_path, None)
-        except Exception: pass
+        try:
+            os.utime(local_path, None)
+        except Exception:
+            pass
         return shard
 
     def _ensure_pid2row_for(self, shard: dict, path_key: str):
         if path_key in self._pid2row_cache: return self._pid2row_cache[path_key]
         pid2row = None
-        if "pid2row" in shard and isinstance(shard["pid2row"], dict): pid2row = shard["pid2row"]
-        elif "row_index" in shard and isinstance(shard["row_index"], dict): pid2row = shard["row_index"]
+        if "pid2row" in shard and isinstance(shard["pid2row"], dict):
+            pid2row = shard["pid2row"]
+        elif "row_index" in shard and isinstance(shard["row_index"], dict):
+            pid2row = shard["row_index"]
         elif "row2pid" in shard and isinstance(shard["row2pid"], (list, tuple)):
             pid2row = {str(p): i for i, p in enumerate(shard["row2pid"])}
         self._pid2row_cache[path_key] = pid2row
@@ -253,18 +276,19 @@ class ESMResidueStore(_BaseStore):
     get(pid) -> torch.FloatTensor [L, D]
     """
     def __init__(
-        self,
-        embed_dir: str,
-        seq_len_lookup: Optional[Dict[str, int]] = None,
-        max_len: Optional[int] = None,
-        overlap: Optional[int] = None,
-        **kwargs
+            self,
+            embed_dir: str,
+            seq_len_lookup: Optional[Dict[str, int]] = None,
+            max_len: Optional[int] = None,
+            overlap: Optional[int] = None,
+            **kwargs
     ):
         super().__init__(embed_dir, **kwargs)
         self.seq_len_lookup = seq_len_lookup or {}
-        self.max_len = max_len; self.overlap = overlap
+        self.max_len = max_len;
+        self.overlap = overlap
 
-        self._pid2span: Dict[str, Tuple[int,int,int]] = {}
+        self._pid2span: Dict[str, Tuple[int, int, int]] = {}
         self._res_shards: List[np.memmap] = []
         self._res_used: List[int] = []
         self._detect_and_build()
@@ -274,17 +298,21 @@ class ESMResidueStore(_BaseStore):
         print(self.embed_dir)
 
         # --- NEW FORMAT: res_esm1b_*.index.tsv + .data.npy
-        res_indices = sorted(root.glob("res_esm1b_*.index.tsv"))
+        res_indices = sorted(root.glob("res_esm1b_*.index.tsv")) + sorted(root.glob("res_esm2_*.index.tsv"))
         if not res_indices:
-            res_indices = sorted(root.glob("res_esm1b_*.index"))  # bazı ortamlarda .tsv yok
+            res_indices = sorted(root.glob("res_esm1b_*.index")) + sorted(root.glob("res_esm2_*.index"))
+        families = {"esm2" if p.name.startswith("res_esm2_") else "esm1b" for p in res_indices}
+        if len(families) > 1:
+            raise RuntimeError("Mixed ESM-1b/ESM-2 shards in one directory; use separate stores")  # bazı ortamlarda .tsv yok
 
         res_data = {}
         for p in res_indices:
             shard_id = _parse_shard_id_from_index(p)  # <-- DÜZELTİLEN KISIM
-            data_path = p.with_name(f"res_esm1b_{shard_id:05d}.data.npy")
+            family = "esm2" if p.name.startswith("res_esm2_") else "esm1b"
+            data_path = p.with_name(f"res_{family}_{shard_id:05d}.data.npy")
             if not data_path.exists():
                 # alt klasörlerde olabilir → kökten ara (opsiyonel güvenlik)
-                cand = list(root.rglob(f"res_esm1b_{shard_id:05d}.data.npy"))
+                cand = list(root.rglob(f"res_{family}_{shard_id:05d}.data.npy"))
                 if cand:
                     data_path = cand[0]
             res_data[shard_id] = data_path
@@ -296,7 +324,8 @@ class ESMResidueStore(_BaseStore):
                 data_path = res_data[sid]
                 arr = np.load(data_path, mmap_mode="r")
                 used = arr.shape[0]
-                meta_path = idx_path.with_name(f"res_esm1b_{sid:05d}.meta.json")
+                family = "esm2" if idx_path.name.startswith("res_esm2_") else "esm1b"
+                meta_path = idx_path.with_name(f"res_{family}_{sid:05d}.meta.json")
                 if meta_path.exists():
                     try:
                         m = json.load(open(meta_path, "r"))
@@ -318,7 +347,8 @@ class ESMResidueStore(_BaseStore):
             with open(self._pro_manifest_file, "rb") as f:
                 pid2shard: Dict[str, str] = pickle.load(f)
             self._pid2shard = {str(k): self._abspath(v) for k, v in pid2shard.items()}
-            self._backend = "LEGACY_MANIFEST"; return
+            self._backend = "LEGACY_MANIFEST";
+            return
 
         # --- Fallback: tarama
         fallback = list(root.glob("*.pt")) + list(root.glob("*.npy")) + list(root.glob("*.npz"))
@@ -357,8 +387,8 @@ class ESMResidueStore(_BaseStore):
         cnt = H.new_zeros((L_seq, 1))
         cursor = 0
         for st, sl in zip(starts, seg_lens):
-            out[st:st+sl] += H[cursor:cursor+sl]
-            cnt[st:st+sl] += 1
+            out[st:st + sl] += H[cursor:cursor + sl]
+            cnt[st:st + sl] += 1
             cursor += sl
         out = out / cnt.clamp_min(1e-8)
         return out
@@ -375,8 +405,8 @@ class ESMResidueStore(_BaseStore):
             sidx, s, e = self._pid2span[pid]
             used = self._res_used[sidx]
             assert 0 <= s < e <= used
-            view = self._res_shards[sidx][s:e]                 # np.memmap
-            H = torch.from_numpy(view.copy()).to(torch.float32)       # [L,D] float32 view
+            view = self._res_shards[sidx][s:e]  # np.memmap
+            H = torch.from_numpy(view.copy()).to(torch.float32)  # [L,D] float32 view
             return H
 
         # Legacy yollar:
@@ -393,9 +423,10 @@ class ESMResidueStore(_BaseStore):
             i = int(pid2row.get(pid, pid2row.get(str(pid), -1)))
             if i < 0: raise KeyError(f"Protein '{pid}' not indexed in concat shard {path}")
             arrays = shard["arrays"]
-            offsets = arrays["offsets"]      # [N+1]
-            embs_mm = arrays["embeddings"]   # [N_total_res, D]
-            start = int(offsets[i]); end = int(offsets[i+1])
+            offsets = arrays["offsets"]  # [N+1]
+            embs_mm = arrays["embeddings"]  # [N_total_res, D]
+            start = int(offsets[i]);
+            end = int(offsets[i + 1])
             view = embs_mm[start:end]
             H = torch.from_numpy(view)
             if H.dtype != torch.float32: H = H.float()
@@ -434,6 +465,7 @@ class ESMResidueStore(_BaseStore):
             H = self._stitch_with_overlap(H, L_seq)
         return H
 
+
 # ============================== Fused Store ===============================
 class ESMFusedStore(_BaseStore):
     """
@@ -443,10 +475,11 @@ class ESMFusedStore(_BaseStore):
     Ayrıca legacy manifest / npz / pt da çalışır.
     get(pid) -> torch.FloatTensor [D]
     """
+
     def __init__(self, embed_dir: str, **kwargs):
         super().__init__(embed_dir, **kwargs)
-        self._pid2row: Dict[str, Tuple[int,int]] = {}   # pid -> (shard_idx, row)
-        self._shards: List[np.memmap] = []              # each [N, D]
+        self._pid2row: Dict[str, Tuple[int, int]] = {}  # pid -> (shard_idx, row)
+        self._shards: List[np.memmap] = []  # each [N, D]
         self._used: List[int] = []
         self._detect_and_build()
 
@@ -477,7 +510,8 @@ class ESMFusedStore(_BaseStore):
                     ids = [ln.strip() for ln in fh if ln.strip()]
                 assert used <= len(ids) <= arr.shape[0], f"ID/used_rows uyumsuz: {ids_path}"
                 shard_idx = len(self._shards)
-                self._shards.append(arr); self._used.append(used)
+                self._shards.append(arr);
+                self._used.append(used)
                 for r, pid in enumerate(ids[:used]):
                     self._pid2row[pid] = (shard_idx, r)
             return
@@ -487,7 +521,8 @@ class ESMFusedStore(_BaseStore):
             with open(self._pro_manifest_file, "rb") as f:
                 pid2shard: Dict[str, str] = pickle.load(f)
             self._pid2shard = {str(k): self._abspath(v) for k, v in pid2shard.items()}
-            self._backend = "LEGACY_MANIFEST"; return
+            self._backend = "LEGACY_MANIFEST";
+            return
 
         # --- Fallback tarama
         fallback = list(root.glob("*.pt")) + list(root.glob("*.npy")) + list(root.glob("*.npz"))
@@ -506,8 +541,9 @@ class ESMFusedStore(_BaseStore):
             if pid not in self._pid2row:
                 raise KeyError(f"Protein '{pid}' not found in fused ids.txt index under {self.embed_dir}")
             sidx, r = self._pid2row[pid]
-            used = self._used[sidx]; assert 0 <= r < used
-            view = self._shards[sidx][r]                   # np.ndarray [D]
+            used = self._used[sidx];
+            assert 0 <= r < used
+            view = self._shards[sidx][r]  # np.ndarray [D]
             v = torch.from_numpy(view.copy()).to(torch.float32)
             if v.ndim != 1:
                 raise TypeError(f"Fused embedding must be [D], got {tuple(v.shape)} for '{pid}'")
@@ -526,7 +562,8 @@ class ESMFusedStore(_BaseStore):
             if not pid2row: raise KeyError(f"concat(fused) missing pid2row: {path}")
             i = int(pid2row.get(pid, pid2row.get(str(pid), -1)))
             if i < 0: raise KeyError(f"Protein '{pid}' not indexed in concat shard {path}")
-            arrays = shard["arrays"]; embs_mm = arrays["embeddings"]  # [N,D]
+            arrays = shard["arrays"];
+            embs_mm = arrays["embeddings"]  # [N,D]
             v = torch.from_numpy(embs_mm[i])
         else:
             path_key = path
@@ -552,25 +589,27 @@ class ESMFusedStore(_BaseStore):
             raise TypeError(f"Fused store expects [D], got shape {tuple(v.shape)} for '{pid}'")
         if v.dtype not in (torch.float32, torch.bfloat16): v = v.float()
         return v
+
+
 # ============================== Factory ===============================
 def build_esm_stores(
-    *,
-    residue_dir: str,
-    fused_dir: Optional[str] = None,
-    residue_manifest: Optional[str] = None,
-    fused_manifest: Optional[str] = None,
-    seq_len_lookup: Optional[Dict[str,int]] = None,
-    max_len: Optional[int] = None,
-    overlap: Optional[int] = None,
-    gdrive_cache: bool = False,
-    cache_dir: str = "/content/esm_cache",
-    cache_gb: float = 12.0,
-    prefer_fp16: bool = False,
-    hub_repo_id: Optional[str] = None,
-    hub_revision: str = "main",
-    hub_repo_type: str = "dataset",
-    hub_local_dir: Optional[str] = None,
-    hub_symlinks: bool = False,
+        *,
+        residue_dir: str,
+        fused_dir: Optional[str] = None,
+        residue_manifest: Optional[str] = None,
+        fused_manifest: Optional[str] = None,
+        seq_len_lookup: Optional[Dict[str, int]] = None,
+        max_len: Optional[int] = None,
+        overlap: Optional[int] = None,
+        gdrive_cache: bool = False,
+        cache_dir: str = "/content/esm_cache",
+        cache_gb: float = 12.0,
+        prefer_fp16: bool = False,
+        hub_repo_id: Optional[str] = None,
+        hub_revision: str = "main",
+        hub_repo_type: str = "dataset",
+        hub_local_dir: Optional[str] = None,
+        hub_symlinks: bool = False,
 ) -> Tuple[ESMResidueStore, Optional[ESMFusedStore]]:
     """Tek çağrıda iki store kurar, manifestleri AYRI verir."""
     res_store = ESMResidueStore(

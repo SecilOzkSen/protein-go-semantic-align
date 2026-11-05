@@ -3,16 +3,17 @@ from __future__ import annotations
 from collections import defaultdict
 import json
 import os
+import hashlib
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from src.configs.data_classes import TrainerConfig
-from src.metrics.cafa import compute_protein_centric_fmax, compute_term_aupr
-from src.metrics.retrieval import compute_retrieval_metrics
+from src.metrics.validated_metrics import compute_protein_centric_fmax, compute_term_aupr
+from src.metrics.validated_metrics import compute_retrieval_metrics
 from src.models.alignment_model import ProteinGoAligner
-from src.metrics.cafa import protein_centric_f_at_threshold
+from src.metrics.validated_metrics import protein_centric_f_at_threshold
 
 
 def multi_positive_full_go_infonce(scores, pos_mask, temperature):
@@ -127,8 +128,14 @@ class OppTrainer:
         self._go_ids_cpu = torch.tensor(self.eval_id_list, dtype=torch.long)
         self._go_id2col = {g: i for i, g in enumerate(self.eval_id_list)}
 
-        self._build_frozen_segment_bank()
-        self._build_parent_bank()
+        # Optional frozen bank cache. Training uses only ctx.eval_id_list (seen GO),
+        # even when the cache contains the full seen + temporal universe.
+        cache_path = os.environ.get("MZSGO_FROZEN_GO_BANK", "").strip()
+        if cache_path:
+            self._load_frozen_go_bank(cache_path)
+        else:
+            self._build_frozen_segment_bank()
+            self._build_parent_bank()
 
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.opt = torch.optim.AdamW(
@@ -175,6 +182,84 @@ class OppTrainer:
             raise RuntimeError("Warmstart loaded zero compatible tensors.")
         missing, unexpected = self.model.load_state_dict(loadable, strict=False)
         print(f"[WARMSTART] loaded={len(loadable)} missing={len(missing)} unexpected={len(unexpected)}")
+
+    @staticmethod
+    def _file_sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @torch.no_grad()
+    def _load_frozen_go_bank(self, cache_path):
+        """Load immutable BioMedBERT banks, selecting active GO IDs in exact order.
+
+        The full cache may contain temporal GO terms. They are not used during
+        training unless the caller explicitly includes them in eval_id_list.
+        """
+        if not os.path.isfile(cache_path):
+            raise FileNotFoundError(f"Frozen GO bank not found: {cache_path}")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if payload.get("format") != "mzsgo_frozen_segment_parent_v1":
+            raise RuntimeError("Unexpected frozen GO bank format")
+
+        metadata = payload.get("metadata", {})
+        jsonl = os.environ.get("EXPH_GO_JSONL", "").strip()
+        if not jsonl:
+            raise RuntimeError("Set EXPH_GO_JSONL to the canonical GO JSONL when using the cache")
+        if not os.path.isfile(jsonl):
+            raise FileNotFoundError(jsonl)
+        if self._file_sha256(jsonl) != metadata.get("canonical_jsonl_sha256"):
+            raise RuntimeError("GO text SHA256 mismatch: cache is stale or wrong ontology")
+        expected_model = getattr(self.model.go_encoder, "model_name", None)
+        if expected_model is not None and str(expected_model) != str(metadata.get("model")):
+            raise RuntimeError("BioMedBERT checkpoint differs from cached checkpoint")
+        expected_len = int(self.ctx.go_text_store.segment_max_len)
+        if int(metadata.get("segment_max_len", -1)) != expected_len:
+            raise RuntimeError("GO segment token length differs from cache")
+        if metadata.get("normalized") is not False:
+            raise RuntimeError("Expected unnormalized frozen GO embeddings")
+
+        full_ids = [int(x) for x in payload["go_ids"]]
+        if len(full_ids) != len(set(full_ids)):
+            raise RuntimeError("Duplicate GO IDs in cache")
+        lookup = {g: i for i, g in enumerate(full_ids)}
+        missing = sorted(set(self.eval_id_list) - set(lookup))
+        if missing:
+            raise RuntimeError(f"Active GO IDs missing from frozen bank: {missing[:20]}")
+        idx = torch.tensor([lookup[g] for g in self.eval_id_list], dtype=torch.long)
+        names = list(payload["segment_names"])
+        expected_names = list(self.ctx.go_text_store.segment_names)
+        if names != expected_names:
+            raise RuntimeError(f"GO segment order mismatch: {names} vs {expected_names}")
+
+        seg = payload["segment_embs"]
+        seg_present = payload["segment_present"]
+        par = payload["parent_embs"]
+        par_present = payload["parent_present"]
+        n = len(full_ids)
+        d = int(self.cfg.d_g)
+        if seg.ndim != 3 or seg.shape != (n, len(names), d):
+            raise RuntimeError(f"Invalid segment bank shape: {tuple(seg.shape)}")
+        if seg_present.shape != seg.shape[:2]:
+            raise RuntimeError("Invalid segment presence mask")
+        if par.ndim != 3 or par.shape[0] != n or par.shape[2] != d:
+            raise RuntimeError(f"Invalid parent bank shape: {tuple(par.shape)}")
+        if par_present.shape != par.shape[:2]:
+            raise RuntimeError("Invalid parent presence mask")
+        if not torch.isfinite(seg).all() or not torch.isfinite(par).all():
+            raise RuntimeError("Nonfinite GO embeddings")
+        self._segment_embs_cpu = seg.index_select(0, idx).float().contiguous()
+        self._segment_present_cpu = seg_present.index_select(0, idx).bool().contiguous()
+        self._parent_bank_cpu = par.index_select(0, idx).float().contiguous()
+        self._parent_present_cpu = par_present.index_select(0, idx).bool().contiguous()
+        self._segment_names = names
+        if not self._segment_present_cpu.any(dim=1).all():
+            raise RuntimeError("Active GO term with no present segments")
+        print(f"[GO-CACHE] loaded={cache_path} active={len(idx)}/{n} "
+              f"segments={tuple(self._segment_embs_cpu.shape)} "
+              f"parents={tuple(self._parent_bank_cpu.shape)}")
 
     @torch.no_grad()
     def _build_frozen_segment_bank(self):
@@ -705,11 +790,12 @@ class OppTrainer:
         best_f = float(micro_f.max()) if len(micro_f) else 0.0
 
         logs["obs_fmax"] = best_f
-        logs["obs_aupr"] = float(compute_term_aupr(true_np, score_np))
+        logs["obs_macro_term_ap"] = float(compute_term_aupr(true_np, score_np))  # Explicit macro term AP
+        logs["obs_aupr"] = logs["obs_macro_term_ap"]  # Backward-compatible alias; NOT trapezoidal AUPR
         protein_fmax, threshold = compute_protein_centric_fmax(
             true_np, score_np
         )
-        logs["obs_protein_fmax"] = float(protein_fmax)
+        logs["obs_protein_fmax"] = float(protein_fmax)  # Exact raw-score validation Fmax
         logs["obs_protein_fmax_threshold"] = float(threshold)  # RAW score threshold
         fixed_t = 0.3359
 
