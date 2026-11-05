@@ -438,7 +438,7 @@ def build_go_text_store(args, go_encoder):
 def align_to_cache(go_cache, pid2pos, *id_lists):
     cache_ids = set(map(int, go_cache.id2row.keys()))
     aligned_pid2pos = {
-        pid: sorted({int(g) for g in gos if int(g) in cache_ids})
+        pid: sorted({_go_int(g) for g in gos if _go_int(g) in cache_ids})
         for pid, gos in pid2pos.items()
     }
     aligned_lists = [sorted({int(g) for g in xs if int(g) in cache_ids}) for xs in id_lists]
