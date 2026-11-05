@@ -636,29 +636,6 @@ def run_training(args):
         raise RuntimeError("MZSGO dataset silently dropped proteins")
     train_loader, val_loader = build_dataloaders(datasets, args)
 
-    #TODO: Erase
-    from torch.utils.data import Subset, DataLoader
-
-    if args.output_dir.endswith("/smoke"):
-        train_loader = DataLoader(
-            Subset(datasets["train"], range(20)),
-            batch_size=4,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=ContrastiveEmbCollator(),
-        )
-
-        val_loader = DataLoader(
-            Subset(datasets["val"], range(20)),
-            batch_size=2,
-            shuffle=False,
-            num_workers=0,
-            collate_fn=ContrastiveEmbCollator(),
-        )
-
-        print("[SMOKE] 20 training proteins, 20 validation proteins")
-    #TODO: Erase
-
     sample = datasets["train"][0]
     d_h = int(sample["prot_emb"].shape[1])
     d_g = int(go_cache.embs.shape[1])

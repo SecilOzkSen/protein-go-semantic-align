@@ -45,7 +45,7 @@ training:
   monitor_metric: protein_wise_map
   secondary_monitor_metric: macro_term_recall@500
   monitor_mode: max
-  early_stop_patience: 5
+  early_stop_patience: 3
   eval_go_bs: 256
   go_text_store_max_len: 128
   go_segment_max_len: 64
