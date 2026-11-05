@@ -37,7 +37,7 @@ training:
   keep_last_n: 3
   resume: null
   warmstart_path: null
-  eval_only: false
+  eval_only: true
   log_every: 1
   log_level: INFO
   monitor_metric: protein_wise_map
