@@ -640,6 +640,14 @@ def run_training(args):
     from torch.utils.data import Subset, DataLoader
 
     if args.output_dir.endswith("/smoke"):
+        train_loader = DataLoader(
+            Subset(datasets["train"], range(20)),
+            batch_size=4,
+            shuffle=False,
+            num_workers=0,
+            collate_fn=ContrastiveEmbCollator(),
+        )
+
         val_loader = DataLoader(
             Subset(datasets["val"], range(20)),
             batch_size=2,
@@ -647,7 +655,8 @@ def run_training(args):
             num_workers=0,
             collate_fn=ContrastiveEmbCollator(),
         )
-        print("[SMOKE] Validation limited to 20 proteins")
+
+        print("[SMOKE] 20 training proteins, 20 validation proteins")
     #TODO: Erase
 
     sample = datasets["train"][0]
