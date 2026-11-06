@@ -263,7 +263,7 @@ class ProteinGoAligner(nn.Module):
             parameter.requires_grad_(False)
         self.window_length = 128
         self.window_stride = 64
-        self.go_chunk_size = 128
+        self.go_chunk_size = 512
         self.last_h_diagnostics = {}
 
         self.last_pool_info = {}

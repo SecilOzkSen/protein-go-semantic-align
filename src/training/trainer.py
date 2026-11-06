@@ -517,9 +517,14 @@ class OppTrainer:
         if not torch.isfinite(l_total):
             raise RuntimeError("Non-finite Retriever v2 total loss.")
 
-        score_diag = self._score_diagnostics(scores.detach(), pos_mask)
-        score_diag.update(self.model.last_h_diagnostics)
-        rank_diag = self._rank_diagnostics(scores.detach(), pos_mask)
+        # Expensive full-GO ranking diagnostics are logging-only, not part of the loss.
+        # Compute them every 500 steps; retain lightweight model diagnostics each step.
+        score_diag = dict(self.model.last_h_diagnostics)
+        rank_diag = {}
+        if (self._global_step + 1) % 500 == 0:
+            with torch.no_grad():
+                score_diag.update(self._score_diagnostics(scores.detach(), pos_mask))
+                rank_diag = self._rank_diagnostics(scores.detach(), pos_mask)
         self._global_step += 1
 
         out = {
