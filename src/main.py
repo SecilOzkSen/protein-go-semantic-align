@@ -500,6 +500,65 @@ def validate_active_universe(pid2pos, active_go_ids, datasets):
 # Runner
 # =============================================================================
 
+
+def restore_validation_history(resume_path, start_epoch, metric_name, macro_name, mode):
+    """Rebuild best scores and patience from completed epochs in the original train.log.
+
+    Refuse to silently reset checkpoint selection if the history is unavailable.
+    """
+    import re
+
+    log_path = Path(resume_path).resolve().parent / "train.log"
+    if not log_path.is_file():
+        raise RuntimeError(f"Resume requires original validation log: {log_path}")
+
+    records = {}
+    pattern = re.compile(r"\[val\] epoch (\d+) :: (.*)")
+    for line in log_path.open(encoding="utf-8", errors="replace"):
+        match = pattern.search(line)
+        if not match:
+            continue
+        epoch = int(match.group(1))
+        if epoch >= start_epoch:
+            continue
+        metrics = {}
+        for field in match.group(2).split(" | "):
+            if ":" not in field:
+                continue
+            name, value = field.split(":", 1)
+            try:
+                metrics[name.strip()] = float(value.strip())
+            except ValueError:
+                continue
+        if metric_name in metrics and macro_name in metrics:
+            records[epoch] = metrics
+
+    if set(records) != set(range(start_epoch)):
+        missing = sorted(set(range(start_epoch)) - set(records))
+        raise RuntimeError(
+            f"Incomplete original validation history in {log_path}; "
+            f"missing epochs: {missing}. Refusing unsafe best-metric reset."
+        )
+
+    best = -inf if mode == "max" else inf
+    best_macro = -inf
+    best_epoch = None
+    macro_epoch = None
+    patience = 0
+    eps = 1e-6
+    for epoch in range(start_epoch):
+        score = records[epoch][metric_name]
+        macro_score = records[epoch][macro_name]
+        improved = score > best + eps if mode == "max" else score < best - eps
+        macro_improved = macro_score > best_macro + eps
+        if improved:
+            best, best_epoch = score, epoch
+        if macro_improved:
+            best_macro, macro_epoch = macro_score, epoch
+        patience = 0 if (improved or macro_improved) else patience + 1
+    return best, best_macro, patience, best_epoch, macro_epoch
+
+
 def run_training(args):
     logger = logging.getLogger("main")
     device = torch.device("cpu" if args.cpu else args.general_device)
@@ -636,7 +695,7 @@ def run_training(args):
         raise RuntimeError("MZSGO dataset silently dropped proteins")
     train_loader, val_loader = build_dataloaders(datasets, args)
 
-    #TODO:Erase
+    # TODO:Erase
     from torch.utils.data import Subset, DataLoader
     from src.training.collate import ContrastiveEmbCollator
 
@@ -658,7 +717,7 @@ def run_training(args):
         )
 
         print("[SMOKE] 5 training steps, 20 validation proteins")
-    #TODO: erase
+    # TODO: erase
 
     sample = datasets["train"][0]
     d_h = int(sample["prot_emb"].shape[1])
@@ -804,6 +863,43 @@ def run_training(args):
     best_macro = -inf
     no_improve_epochs = 0
     eps = 1e-6
+    if args.resume and not args.eval_only:
+        (best_val, best_macro, no_improve_epochs,
+         best_epoch, macro_epoch) = restore_validation_history(
+            args.resume, start_epoch, args.monitor_metric,
+            args.secondary_monitor_metric, args.monitor_mode,
+        )
+        logger.info(
+            "[RESUME-HISTORY] best %s=%.4f (epoch %s) | best %s=%.4f "
+            "(epoch %s) | patience=%d",
+            args.monitor_metric, best_val, best_epoch,
+            args.secondary_monitor_metric, best_macro, macro_epoch,
+            no_improve_epochs,
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Preserve the previous primary checkpoint when resuming from that best epoch.
+        # Do not copy a checkpoint from a later epoch into an earlier resume history.
+        saved_epoch = start_epoch - 1
+        if best_epoch == saved_epoch:
+            dest = out_dir / "best_primary.pt"
+            if not dest.exists() and Path(args.resume).resolve() != dest.resolve():
+                shutil.copy2(args.resume, dest)
+        else:
+            logger.warning(
+                "[RESUME-HISTORY] Historical primary best is epoch %s, "
+                "but resume checkpoint is epoch %s. Keep original best_primary.pt "
+                "in the source directory.", best_epoch, saved_epoch,
+            )
+        # The macro-best file is copied only when its epoch is verified.
+        macro_source = Path(args.resume).resolve().parent / "best_macro.pt"
+        macro_dest = out_dir / "best_macro.pt"
+        if macro_source.is_file() and not macro_dest.exists():
+            macro_meta = torch.load(macro_source, map_location="cpu", weights_only=False).get("meta", {})
+            if int(macro_meta.get("epoch", -1)) == macro_epoch:
+                if macro_source != macro_dest.resolve():
+                    shutil.copy2(macro_source, macro_dest)
+            else:
+                logger.warning("[RESUME-HISTORY] Historical macro-best checkpoint not copied: epoch mismatch")
 
     if run is not None:
         run.define_metric("trainer_step")

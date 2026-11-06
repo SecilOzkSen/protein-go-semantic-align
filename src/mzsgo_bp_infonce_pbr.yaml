@@ -34,10 +34,10 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/MZSGO_temporal/outputs/bp/retriever_v2_infonce_pbr
+  output_dir: /workspace/MZSGO_temporal/outputs/bp/retriever_v2_fast
   save_every: 1000000
   keep_last_n: 3
-  resume: null
+  resume: /workspace/MZSGO_temporal/outputs/bp/retriever_v2_infonce_pbr/checkpoint_step92912.pt
   warmstart_path: null
   eval_only: false
   log_every: 500
