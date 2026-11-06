@@ -58,7 +58,17 @@ def original_metrics(y, s, repo, metric_tag="temporal_unseen"):
     if not (Path(repo) / 'utils' / 'util.py').is_file():
         raise FileNotFoundError('Original MZSGO utils/util.py not found')
     sys.path.insert(0, str(Path(repo).resolve()))
-    from utils.util import evaluate_annotations
+    import importlib.util
+
+    util_path = Path(repo) / "utils" / "util.py"
+
+    spec = importlib.util.spec_from_file_location(
+        "mzsgo_original_util", util_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    evaluate_annotations = module.evaluate_annotations
     f, p, r, a, t = evaluate_annotations(torch.from_numpy(y), torch.from_numpy(s), metric_tag)
     return dict(Fmax=float(f), precision=float(p), recall=float(r), AUPR=float(a), threshold=float(t))
 
