@@ -37,7 +37,7 @@ class FullSpaceCrossScorer(nn.Module):
         weights=seg_logits.softmax(-1)
         pooled=(weights[...,None]*ctx).sum(2)
         qpool=(weights[...,None]*query).sum(2)
-        diff=(ctx[:,:,0]-ctx[:,:,1]).square().mean(-1).sqrt()
+        diff = (ctx[:, :, 0] - ctx[:, :, 1]).square().mean(-1).clamp_min(1e-8).sqrt()
         extras=torch.stack([base,sim.max(-1).values,
                             (sim*weights).sum(-1),diff,
                             weights[:,:,0]],-1)
