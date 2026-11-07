@@ -1,7 +1,7 @@
 """50-epoch alignment relevance head with protein-disjoint early stopping and held-out test.
 Run on frozen retriever validation extraction. No test labels read.
 """
-import argparse, json, copy, sys
+import argparse, json, copy, sys, importlib.util
 from pathlib import Path
 import numpy as np
 import torch
@@ -86,11 +86,25 @@ def evaluate(model, indices, feat, score, pids, lab, gindex, mu, sd, columns, de
 
 def mzsgo_fmax_diagnostic(model, indices, feat, score, pids, lab, gindex, mu, sd, columns, device, repo):
     """Call original MZSGO evaluate_annotations, not a surrogate Fmax implementation."""
-    util = Path(repo) / 'utils' / 'util.py'
-    if not util.is_file():
-        raise FileNotFoundError(f'MZSGO original evaluator missing: {util}')
-    sys.path.insert(0, str(Path(repo).resolve()))
-    from utils.util import evaluate_annotations
+    # Load by absolute file path: avoids collisions with another installed `utils` package.
+    roots = [Path(repo), Path('/workspace/MZSGO_temporal'), Path('/workspace/protein-go-semantic-align')]
+    candidates = []
+    for root in roots:
+        if root.is_file() and root.name == 'util.py':
+            candidates.append(root)
+        elif root.is_dir():
+            candidates.extend(root.glob('**/utils/util.py'))
+    util = next((f for f in candidates if f.is_file() and 'evaluate_annotations' in f.read_text(errors='replace')), None)
+    if util is None:
+        raise FileNotFoundError('Cannot locate original MZSGO evaluate_annotations. '
+                                'Pass --mzsgo-repo PATH_TO_MZSGO_REPOSITORY; searched: ' + ', '.join(map(str, roots)))
+    # Some MZSGO util.py implementations import sibling modules.
+    sys.path.insert(0, str(util.parent.parent.resolve()))
+    spec = importlib.util.spec_from_file_location('_mzsgo_original_util', str(util))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    evaluate_annotations = module.evaluate_annotations
+    print(f'[MZSGO evaluator] {util}', flush=True)
     n = len(indices);
     g = score.shape[1]
     truth = np.zeros((n, g), dtype=np.int32)
@@ -121,8 +135,8 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--epochs', type=int, default=50)
-    ap.add_argument('--patience', type=int, default=7)
-    ap.add_argument('--min-delta', type=float, default=0.0005)
+    ap.add_argument('--patience', type=int, default=10)
+    ap.add_argument('--min-delta', type=float, default=0.00001)
     ap.add_argument('--negatives-per-positive', type=int, default=5)
     ap.add_argument('--max-train-pairs', type=int, default=500000)
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -189,6 +203,7 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
     best = -float('inf');
     best_epoch = 0;
+    last_significant = -float('inf');
     bad = 0;
     history = []
     for epoch in range(1, args.epochs + 1):
@@ -208,22 +223,31 @@ def main():
         model.eval()
         stop_map = exact_map(model, stop, feat, score, pids, lab, gindex, mu, sd, columns, device)
         train_bce = sum(losses) / total
-        improved = stop_map > best + args.min_delta
+        # Always save the true highest exact mAP, regardless of min_delta.
+        improved = stop_map > best
         if improved:
             best = stop_map;
-            best_epoch = epoch;
-            bad = 0
-            torch.save({'state_dict': copy.deepcopy(model.cpu().state_dict()),
+            best_epoch = epoch
+            torch.save({'state_dict': {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
                         'columns': columns, 'mean': mu, 'std': sd,
                         'best_epoch': best_epoch, 'early_stop_exact_map': best,
                         'feature_names': json.loads((data / 'metadata.json').read_text()).get('feature_names', []) if (
                                     data / 'metadata.json').exists() else []},
                        out / 'alignment_best.pt')
-            model.to(device)
+        # Patience resets only after an improvement of at least min_delta
+        # relative to the last significant reference, not the latest tiny best.
+        significant = stop_map > last_significant + args.min_delta
+        if significant:
+            last_significant = stop_map
+            bad = 0
         else:
             bad += 1
-        history.append({'epoch': epoch, 'train_bce': train_bce, 'stop_exact_map': stop_map, 'best': best, 'improved': improved})
-        print(f'[alignment] epoch={epoch} train_bce={train_bce:.5f} stop_exact_mAP={stop_map:.6f} best={best:.6f} patience={bad}/{args.patience}', flush=True)
+        history.append({'epoch': epoch, 'train_bce': train_bce, 'stop_exact_map': stop_map,
+                        'best': best, 'checkpoint_updated': improved,
+                        'significant_improvement': significant})
+        print(
+            f'[alignment] epoch={epoch} train_bce={train_bce:.5f} stop_exact_mAP={stop_map:.6f} best={best:.6f} best_epoch={best_epoch} patience={bad}/{args.patience}',
+            flush=True)
         if bad >= args.patience:
             print('[EARLY STOP]', flush=True);
             break
