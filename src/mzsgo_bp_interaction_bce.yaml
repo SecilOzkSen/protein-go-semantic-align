@@ -27,7 +27,7 @@ training:
   epochs: 30
   batch_size: 64
   eval_batch_size: 4
-  num_workers: 2
+  num_workers: 0
   fp16: true
   cpu: false
   seed: 42
