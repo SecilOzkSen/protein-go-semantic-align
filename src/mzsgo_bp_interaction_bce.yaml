@@ -37,7 +37,7 @@ training:
   resume: null
   warmstart_path: null
   eval_only: false
-  log_every: 500
+  log_every: 100
   log_level: INFO
   monitor_metric: protein_wise_map
   secondary_monitor_metric: macro_term_recall@500

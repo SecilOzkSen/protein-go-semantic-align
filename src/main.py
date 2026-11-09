@@ -925,7 +925,17 @@ def run_training(args):
         running = {"total": 0.0, "contrastive": 0.0, "bce": 0.0}
         n_batches = 0
 
+        import time
+        t0 = time.perf_counter()
+        print("[DEBUG] Waiting for first training batch...", flush=True)
+
         for batch in train_loader:
+            if n_batches == 0:
+                print(
+                    f"[DEBUG] First batch ready in "
+                    f"{time.perf_counter() - t0:.2f}s",
+                    flush=True
+                )
             with torch.autocast(
                     device_type=device.type,
                     dtype=torch.bfloat16,
