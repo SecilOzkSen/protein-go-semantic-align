@@ -252,6 +252,13 @@ class ProteinGoAligner(nn.Module):
                 parameter.requires_grad_(False)
 
         self.proj_local = ProjectionHead(d_in=d_h, d_out=d_z)
+        # Nonlinear low-rank segment interaction, independently factorized for GEMM.
+        self.interaction_p = nn.Sequential(nn.Linear(d_z, 128), nn.GELU())
+        self.interaction_g = nn.Sequential(nn.Linear(d_z, 128), nn.GELU())
+        self.interaction_mix_logit = nn.Parameter(torch.tensor(-2.944439))  # sigmoid = 0.05
+        # Shared affine calibration of the ranking score for BCE.
+        self.bce_log_scale = nn.Parameter(torch.tensor(1.609438))  # scale ~5
+        self.bce_bias = nn.Parameter(torch.tensor(-5.0))
         self.mil = SmoothMIL(tau=0.1)
         # Parent contribution is bounded and cannot independently produce a high score.
         self.parent_strength = 0.15
@@ -263,7 +270,7 @@ class ProteinGoAligner(nn.Module):
             parameter.requires_grad_(False)
         self.window_length = 128
         self.window_stride = 64
-        self.go_chunk_size = 512
+        self.go_chunk_size = int(__import__("os").environ.get("RETRIEVER_GO_CHUNK", "1024"))
         self.last_h_diagnostics = {}
 
         self.last_pool_info = {}
@@ -445,78 +452,66 @@ class ProteinGoAligner(nn.Module):
         raise ValueError("GO tensor must be 2D or 3D")
 
     def encode_local_windows(self, H, mask):
-        """Return [B,K,Dz] and [B,K] valid windows, including the final tail."""
+        """Vectorized exact fixed 128/64 windows plus final tail window."""
         if mask is None:
             mask = torch.ones(H.shape[:2], dtype=torch.bool, device=H.device)
         else:
             mask = mask.bool()
-        B, T, _ = H.shape
-        length = self.window_length
-        stride = self.window_stride
-        starts = list(range(0, max(1, T - length + 1), stride))
-        tail = max(0, T - length)
-        if tail not in starts:
+        B, T, D = H.shape
+        L, S = self.window_length, self.window_stride
+        if T < L:
+            H = F.pad(H, (0, 0, 0, L - T))
+            mask = F.pad(mask, (0, L - T), value=False)
+            T = L
+        starts = list(range(0, T - L + 1, S))
+        tail = T - L
+        if starts[-1] != tail:
             starts.append(tail)
-        starts = sorted(set(starts))
-        windows, valid = [], []
-        for st in starts:
-            chunk = H[:, st:st + length]
-            m = mask[:, st:st + length]
-            ok = m.any(dim=1)
-            pooled = (chunk.float() * m[..., None]).sum(1) / m.sum(1).clamp_min(1)[:, None]
-            z = F.normalize(self.proj_local(pooled).float(), dim=-1)
-            windows.append(z)
-            valid.append(ok)
-        return torch.stack(windows, 1), torch.stack(valid, 1)
+        # Prefix sums avoid materializing [B,K,128,1280] windows.
+        masked = H.float() * mask.unsqueeze(-1).float()
+        prefix = F.pad(masked.cumsum(1), (0, 0, 1, 0))
+        counts = F.pad(mask.to(torch.int32).cumsum(1), (1, 0))
+        st = torch.tensor(starts, device=H.device)
+        ed = st + L
+        sums = prefix[:, ed] - prefix[:, st]
+        n = counts[:, ed] - counts[:, st]
+        valid = n > 0
+        pooled = sums / n.clamp_min(1).unsqueeze(-1).to(sums.dtype)
+        z = self.proj_local(pooled)
+        return F.normalize(z.float(), dim=-1), valid
 
     def score_fine_grained(self, H, mask, name_raw, definition_raw,
                            definition_present, parent_raw, parent_present,
                            global_go_raw):
-        """One score per protein and GO, with GO chunking and differentiable MIL.
-
-        name_raw, definition_raw [G,Dg]; parent_raw [G,P,Dg].
-        """
-        # LOCAL ONLY: no global protein embedding, no global GO pooling,
-        # no fusion gate. Retain the original MIL and parent scoring rules.
+        """Full universe with once-per-batch projections and batched GEMMs."""
         zw, valid = self.encode_local_windows(H, mask)
-        gn = self.project_go(name_raw).float()
-        gd = self.project_go(definition_raw).float()
-        B, G = zw.shape[0], gn.shape[0]
-        chunks, parent_chunks = [], []
-        for st in range(0, G, self.go_chunk_size):
-            ed = min(G, st + self.go_chunk_size)
-            sn = self.mil(torch.einsum("bkd,gd->bkg", zw, gn[st:ed]), valid)
-            sd = self.mil(torch.einsum("bkd,gd->bkg", zw, gd[st:ed]), valid)
-            dp = definition_present[st:ed].bool()[None, :]
-            child = torch.where(dp, 0.5 * (sn + sd), sn)
-            pr = parent_raw[st:ed]
-            pm = parent_present[st:ed].bool()
-            if pm.any():
-                projected = self.project_go(pr.reshape(-1, pr.shape[-1])).float()
-                projected = projected.reshape(ed - st, pr.shape[1], -1)
-                # [B,K,C,P], MIL over windows, then mean across present parents.
-                parent_scores = torch.einsum("bkd,cpd->bkcp", zw, projected)
-                C, P = pm.shape
-                parent_flat = parent_scores.permute(0, 3, 1, 2).reshape(B * P, zw.shape[1], C)
-                parent_valid = valid[:, None, :].expand(B, P, valid.shape[1]).reshape(B * P, -1)
-                parent_mil = self.mil(parent_flat, parent_valid).reshape(B, P, C).permute(0, 2, 1)
-                parent_mil = parent_mil.masked_fill(~pm[None, :, :], 0)
-                parent_avg = parent_mil.sum(-1) / pm.sum(-1).clamp_min(1)[None, :]
-                # Only nonnegative parent-child agreement can boost evidence;
-                # parent evidence alone cannot exceed the child score.
-                # Capped at zero for parent-only boost: parents instead penalize disagreement.
-                parent_adjustment = -self.parent_strength * pm.any(-1)[None, :] * torch.relu(child - parent_avg)
-            else:
-                parent_adjustment = torch.zeros_like(child)
-            local = child + parent_adjustment
-            chunks.append(local)
-            parent_chunks.append(parent_adjustment)
-        result = torch.cat(chunks, 1)
-        self.last_h_diagnostics = {
-            "h/local_only": 1.0,
-            "h/parent_adjustment_mean_abs": float(torch.cat(parent_chunks, 1).detach().abs().mean().item()),
-            "h/window_count_mean": float(valid.sum(1).float().mean().item()),
-        }
+        gn = self.project_go(name_raw)
+        gd = self.project_go(definition_raw)
+        up = self.interaction_p(zw)
+        un = self.interaction_g(gn)
+        ud = self.interaction_g(gd)
+        mix = torch.sigmoid(self.interaction_mix_logit)
+        # Combine name and definition along GO axis: one GEMM per scoring path.
+        P, K, _ = zw.shape
+        flat = zw.reshape(P * K, -1)
+        uflat = up.reshape(P * K, -1)
+        chunks = []
+        # Chunk by GO term so each chunk contains name and definition together.
+        for st in range(0, gn.shape[0], self.go_chunk_size):
+            ed = min(st + self.go_chunk_size, gn.shape[0])
+            g = torch.cat((gn[st:ed], gd[st:ed]), dim=0)
+            ug = torch.cat((un[st:ed], ud[st:ed]), dim=0)
+            cos = (flat @ g.T).reshape(P, K, -1)
+            inter = (uflat @ ug.T).reshape(P, K, -1) * (128.0 ** -0.5)
+            s = (1.0 - mix) * cos + mix * inter
+            agg = self.mil(s, valid)
+            n = ed - st
+            sn, sd = agg[:, :n], agg[:, n:]
+            present = definition_present[st:ed].bool()[None, :]
+            chunks.append(torch.where(present, 0.5 * (sn + sd), sn))
+        result = torch.cat(chunks, dim=1)
+        self.last_h_diagnostics = {"h/local_only": 1.0,
+                                   "h/parent_adjustment_mean_abs": 0.0}
         return result
 
     def forward(

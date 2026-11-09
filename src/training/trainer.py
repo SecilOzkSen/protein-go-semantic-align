@@ -137,6 +137,12 @@ class OppTrainer:
             self._build_frozen_segment_bank()
             self._build_parent_bank()
 
+        # Cached frozen GO bank is immutable, while projection remains trainable.
+        self._segment_embs_gpu = self._segment_embs_cpu.to(self.device, non_blocking=True)
+        self._segment_present_gpu = self._segment_present_cpu.to(self.device, non_blocking=True)
+        self._parent_bank_gpu = self._parent_bank_cpu.to(self.device, non_blocking=True)
+        self._parent_present_gpu = self._parent_present_cpu.to(self.device, non_blocking=True)
+
         params = [p for p in self.model.parameters() if p.requires_grad]
         self.opt = torch.optim.AdamW(
             params, lr=float(cfg.lr), weight_decay=float(cfg.weight_decay)
@@ -366,8 +372,8 @@ class OppTrainer:
     def _current_go_raw_bank(self):
         if self.ctx.go_segment_representation_mode != "segments_only":
             raise RuntimeError("Retriever v2 currently requires segments_only.")
-        emb = self._segment_embs_cpu.to(self.device, non_blocking=True)
-        present = self._segment_present_cpu.to(self.device, non_blocking=True)
+        emb = self._segment_embs_gpu
+        present = self._segment_present_gpu
         gate = getattr(self.model, "go_segment_gate", None)
         if gate is None:
             raise RuntimeError("ProteinGoAligner.go_segment_gate is missing.")
@@ -410,22 +416,18 @@ class OppTrainer:
         return mask
 
     def _score_full_go(self, batch):
-        H = batch["prot_emb_pad"].to(self.device, non_blocking=True).float()
+        H = batch["prot_emb_pad"].to(self.device, non_blocking=True)
         mask = batch["prot_attn_mask"].to(self.device, non_blocking=True).bool()
-        raw, seg_weights = self._current_go_raw_bank()
         names = self._segment_names
-        if "name" not in names or "definition" not in names:
-            raise RuntimeError("Experiment H requires name and definition GO segments")
-        name_idx = names.index("name")
-        definition_idx = names.index("definition")
-        seg = self._segment_embs_cpu.to(self.device, non_blocking=True)
-        present = self._segment_present_cpu.to(self.device, non_blocking=True)
-        parents = self._parent_bank_cpu.to(self.device, non_blocking=True)
-        parent_present = self._parent_present_cpu.to(self.device, non_blocking=True)
+        name_idx, definition_idx = names.index("name"), names.index("definition")
+        seg = self._segment_embs_gpu
+        present = self._segment_present_gpu
         scores = self.model.score_fine_grained(
             H, mask, seg[:, name_idx], seg[:, definition_idx],
-            present[:, definition_idx], parents, parent_present, raw)
-        return scores, seg_weights
+            present[:, definition_idx], None, None, None)
+        # Gate is frozen and unused by scorer; report uniform segment diagnostics.
+        weights = present.float() / present.float().sum(1, keepdim=True).clamp_min(1)
+        return scores, weights
 
     @torch.no_grad()
     def _score_diagnostics(self, scores, pos_mask):
@@ -507,13 +509,18 @@ class OppTrainer:
         l_con = multi_positive_full_go_infonce(
             scores, pos_mask, temperature=self.cfg.temperature
         )
-        l_pbr, pbr_stats = positive_block_rank_loss(
-            scores, pos_mask,
-            margin=self.cfg.pbr_margin,
-            tau=self.cfg.pbr_tau,
+        # Full-universe positive-weighted BCE on shared pair scores.
+        # Keep InfoNCE on ranking scores; BCE gets a learned affine logit map.
+        bce_logits = scores.float() * self.model.bce_log_scale.exp() + self.model.bce_bias
+        pos_weight = float(getattr(self.cfg, "bce_pos_weight", 20.0))
+        lambda_bce = float(getattr(self.cfg, "lambda_bce", 1.0))
+        l_bce = F.binary_cross_entropy_with_logits(
+            bce_logits, pos_mask.float(),
+            pos_weight=torch.tensor(pos_weight, device=scores.device),
+            reduction="mean",
         )
-        l_total = self.cfg.lambda_con * l_con + self.cfg.pbr_lambda * l_pbr
-
+        l_total = self.cfg.lambda_con * l_con + lambda_bce * l_bce
+        pbr_stats = {}
         if not torch.isfinite(l_total):
             raise RuntimeError("Non-finite Retriever v2 total loss.")
 
@@ -530,8 +537,8 @@ class OppTrainer:
         out = {
             "total": l_total,
             "contrastive": l_con,
-            "pbr": l_pbr,
-            "pbr_weighted": float(self.cfg.pbr_lambda) * l_pbr.detach(),
+            "bce": l_bce,
+            "bce_weighted": lambda_bce * l_bce.detach(),
             **pbr_stats,
             **score_diag,
             **rank_diag,

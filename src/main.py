@@ -293,6 +293,8 @@ def load_structured_cfg(path: str):
         pbr_lambda=float(loss.get("pbr_lambda", 0.0)),
         pbr_margin=float(loss.get("pbr_margin", 0.05)),
         pbr_tau=float(loss.get("pbr_tau", 0.05)),
+        lambda_bce=float(loss.get("lambda_bce", 1.0)),
+        bce_pos_weight=float(loss.get("bce_pos_weight", 20.0)),
 
         retrieval_eval_ks=tuple(int(x) for x in evaluation.get("retrieval_eval_ks", [50, 100, 200, 500, 1000])),
         positive_rank_quantiles=tuple(float(x) for x in evaluation.get("positive_rank_quantiles", [0.50, 0.75, 0.90, 0.95])),
@@ -771,6 +773,9 @@ def run_training(args):
         log_go_segment_weights=args.log_go_segment_weights,
     )
 
+    trainer_cfg.lambda_bce = args.lambda_bce
+    trainer_cfg.bce_pos_weight = args.bce_pos_weight
+
     run = None
     if args.wandb:
         wandb.login()
@@ -805,7 +810,7 @@ def run_training(args):
         active_go_ids=active_go_ids,
         protein_pooling=args.protein_pooling_strategy,
         go_segments=args.enabled_segments,
-        objective="full_go_infonce+pbr",
+        objective="full_go_infonce+weighted_bce",
     )
 
     # Dataset-level metadata remains orchestration/data information.
@@ -917,7 +922,7 @@ def run_training(args):
         # Frozen text encoder must remain eval even when the alignment model trains.
         trainer.model.go_encoder.eval()
 
-        running = {"total": 0.0, "contrastive": 0.0, "pbr": 0.0}
+        running = {"total": 0.0, "contrastive": 0.0, "bce": 0.0}
         n_batches = 0
 
         for batch in train_loader:
@@ -968,7 +973,7 @@ def run_training(args):
                 wb_losses = dict(losses)
                 wb_losses["total"] = avg["total"]
                 wb_losses["contrastive"] = avg["contrastive"]
-                wb_losses["pbr"] = avg["pbr"]
+                wb_losses["bce"] = avg["bce"]
 
                 wb.log_train(
                     losses=wb_losses,
