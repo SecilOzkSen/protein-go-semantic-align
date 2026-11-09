@@ -22,10 +22,10 @@ general:
   go_segment_representation_mode: segments_only
   protein_pooling_strategy: mean_attn_gate
   use_lora: false
-  ablation_id: MZSGO-BP-RetrieverV2-InfoNCE-PBR
+  ablation_id: MZSGO-BP-V3-Interaction-WBCE
 training:
   epochs: 30
-  batch_size: 4
+  batch_size: 64
   eval_batch_size: 4
   num_workers: 2
   fp16: true
@@ -37,7 +37,7 @@ training:
   resume: null
   warmstart_path: null
   eval_only: false
-  log_every: 100
+  log_every: 500
   log_level: INFO
   monitor_metric: protein_wise_map
   secondary_monitor_metric: macro_term_recall@500
@@ -76,7 +76,7 @@ evaluation:
   - 0.9
   - 0.95
 diagnostics:
-  log_gradient_norms: false
+  log_gradient_norms: true
   log_positive_rank_cdf: true
   log_cardinality_metrics: true
   log_go_segment_weights: true
@@ -84,7 +84,7 @@ wandb:
   enabled: true
   project: protein-go-align-mzsgo
   entity: null
-  wandb_run_name: MZSGO-BP-V3-Interaction-WBCE
+  wandb_run_name: MZSGO-BP-V3-Interaction-WBCE-Final
   mode: online
 stores:
   embed_dir_res: /workspace/MZSGO_temporal/protein_embeddings/esm2_residue_overlap
