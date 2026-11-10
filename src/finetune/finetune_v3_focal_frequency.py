@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """MZSGO BP V3: InfoNCE + balanced focal, frequency-aware protein sampling.
 
-Run from repository root with `python -m src.script.retrieverv2.finetune_v2_full_train ...`.
+Run from repository root with `python -m src.script.retrieverv2.finetune_v3_focal_frequency ...`.
 No validation, no test-label access, no best-checkpoint selection.
 Requires the V3 architecture matching the supplied checkpoint. Validate on a smoke run.
 """
@@ -85,13 +85,13 @@ def strict_load(model, path):
     return payload
 
 
-def balanced_focal(scores, pos_mask, temperature, gamma, alpha):
+def balanced_focal(logits, pos_mask, gamma, alpha):
     """Protein-balanced focal loss, separate positive/negative means.
 
     This is NOT vanilla all-pair mean BCE. The negative mean prevents the
     20k GO negatives from swamping the positive loss solely by count.
     """
-    logits = scores.float() / max(float(temperature), 1e-8)
+    logits = logits.float()
     targets = pos_mask.float()
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
     pt = torch.exp(-bce)
@@ -99,7 +99,7 @@ def balanced_focal(scores, pos_mask, temperature, gamma, alpha):
     pos_count = targets.sum(1).clamp_min(1)
     neg_count = (1.0 - targets).sum(1).clamp_min(1)
     per_protein = (alpha * (weighted * targets).sum(1) / pos_count
-                   + (1.0-alpha) * (weighted * (1-targets)).sum(1) / neg_count)
+                   + (1.0 - alpha) * (weighted * (1 - targets)).sum(1) / neg_count)
     return per_protein.mean()
 
 
@@ -125,11 +125,11 @@ def main():
     args = load_structured_cfg(cli.config)
     if not args.mzsgo_enabled or args.pfresgo_branch != 'BP':
         raise ValueError('This script requires MZSGO BP config')
-    # V2 uses InfoNCE + PBR. The V2 trainer does not consume lambda_bce.
+    # V3 uses InfoNCE + weighted BCE; this script replaces BCE with focal.
     if 'interaction_bce' not in str(cli.config).lower():
         print('[WARN] Config filename does not mention interaction_bce; strict checkpoint check remains active')
-    if cli.output_dir == args.output_dir or Path(cli.output_dir).resolve() == Path(cli.checkpoint).resolve().parent:
-        raise ValueError('Fine-tune output must differ from original V2 output')
+    if Path(cli.output_dir).resolve() == Path(args.output_dir).resolve() or Path(cli.output_dir).resolve() == Path(cli.checkpoint).resolve().parent:
+        raise ValueError('Fine-tune output must differ from original V3 output')
     output = Path(cli.output_dir).expanduser().resolve()
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f'Output is not empty: {output}. Use a fresh directory.')
@@ -224,7 +224,7 @@ def main():
                         pin_memory=True, drop_last=False, collate_fn=ContrastiveEmbCollator())
     sample = ds[0]
     ctx = TrainingContext(
-        go_cache=SimpleNamespace(embs=torch.empty((0, d_g)), id2row={g:i for i,g in enumerate(sorted(candidate))}, row2id=sorted(candidate)),
+        go_cache=SimpleNamespace(embs=torch.empty((0, d_g)), id2row={g: i for i, g in enumerate(sorted(candidate))}, row2id=sorted(candidate)),
         device=device, go_text_store=go_store, run_name='MZSGO-BP-V3-focal-frequency-finetune',
         fp16_enabled=args.fp16, protein_pooling_strategy=args.protein_pooling_strategy,
         go_pool_type=args.go_pool_type, go_encoder_output_mode=args.go_encoder_output_mode,
@@ -255,9 +255,11 @@ def main():
         for key in ('lambda_con', 'pbr_lambda', 'pbr_margin', 'pbr_tau', 'temperature'):
             if original_cfg.get(key) is not None and not math.isclose(float(original_cfg[key]), float(getattr(args, key)), rel_tol=1e-7, abs_tol=1e-9):
                 raise RuntimeError(f'Checkpoint objective mismatch for {key}: checkpoint={original_cfg[key]} YAML={getattr(args, key)}')
+    if not hasattr(trainer.model, 'bce_log_scale') or not hasattr(trainer.model, 'bce_bias'):
+        raise RuntimeError('V3 learned BCE logit parameters are missing')
     if not callable(getattr(trainer, '_score_full_go', None)) or not callable(getattr(trainer, '_positive_mask', None)):
         raise RuntimeError('V3 trainer does not expose expected scoring/mask methods. Do not run blindly.')
-    if cli.gamma < 0 or not (0 < cli.focal_alpha < 1) or cli.focal_weight < 0 or cli.max_sampling_weight < 1:
+    if cli.gamma < 0 or not (0 < cli.focal_alpha < 1) or cli.focal_weight <= 0 or cli.max_sampling_weight < 1:
         raise ValueError('Invalid focal or sampling parameters')
     # New AdamW, deliberately NOT loading checkpoint optimizer or global step.
     trainer.opt = torch.optim.AdamW(
@@ -278,7 +280,7 @@ def main():
         'focal_gamma': cli.gamma, 'focal_alpha': cli.focal_alpha,
         'focal_weight': cli.focal_weight, 'max_sampling_weight': cli.max_sampling_weight,
         'sampling_with_replacement': True,
-        'focal_logits': 'raw_scores / InfoNCE_temperature',
+        'focal_logits': 'raw_scores * exp(model.bce_log_scale) + model.bce_bias',
         'focal_reduction': 'mean_positive_and_mean_negative_per_protein',
         'validation_used_for_training': True, 'validation_evaluation': False,
     }, indent=2))
@@ -292,7 +294,7 @@ def main():
         trainer.model.train()
         trainer.model.go_encoder.eval()
         t0 = time.perf_counter()
-        totals = {'total':0.0, 'contrastive':0.0, 'focal':0.0}
+        totals = {'total': 0.0, 'contrastive': 0.0, 'focal': 0.0}
         for idx, batch in enumerate(loader, 1):
             if cli.smoke_batches and idx > cli.smoke_batches:
                 break
@@ -300,9 +302,11 @@ def main():
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16):
                 scores, _ = trainer._score_full_go(batch)
                 pos_mask = trainer._positive_mask(batch)
+                if scores.shape != pos_mask.shape or scores.shape[1] != len(seen):
+                    raise RuntimeError(f'Unexpected full-GO score shape: {tuple(scores.shape)}')
                 con = multi_positive_full_go_infonce(scores, pos_mask, temperature=args.temperature)
-                focal = balanced_focal(scores, pos_mask, args.temperature,
-                                       cli.gamma, cli.focal_alpha)
+                focal_logits = scores.float() * trainer.model.bce_log_scale.exp() + trainer.model.bce_bias
+                focal = balanced_focal(focal_logits, pos_mask, cli.gamma, cli.focal_alpha)
                 loss = args.lambda_con * con + cli.focal_weight * focal
                 losses = {'total': loss, 'contrastive': con, 'focal': focal}
             trainer._global_step += 1
@@ -317,15 +321,15 @@ def main():
                     value = losses[key]
                     totals[key] += float(value.detach().item() if torch.is_tensor(value) else value)
             if idx == 1 or idx % cli.log_every == 0 or idx == len(loader):
-                print(f'[train] epoch={epoch+1}/{cli.epochs} batch={idx}/{len(loader)} '
-                      f'global_step={trainer._global_step} loss={totals["total"]/idx:.4f} '
-                      f'InfoNCE={totals["contrastive"]/idx:.4f} '
-                      f'Focal={totals["focal"]/idx:.4f} elapsed={time.perf_counter()-t0:.1f}s', flush=True)
+                print(f'[train] epoch={epoch + 1}/{cli.epochs} batch={idx}/{len(loader)} '
+                      f'global_step={trainer._global_step} loss={totals["total"] / idx:.4f} '
+                      f'InfoNCE={totals["contrastive"] / idx:.4f} '
+                      f'Focal={totals["focal"] / idx:.4f} elapsed={time.perf_counter() - t0:.1f}s', flush=True)
         if cli.smoke_batches:
             print('[SMOKE] Completed; no checkpoint written', flush=True)
             return
-        save_checkpoint(str(output), f'epoch{epoch+1}', trainer, save_args, epoch, trainer._global_step)
-        print(f'[epoch] {epoch+1}/{cli.epochs} finished in {(time.perf_counter()-t0)/60:.1f} min', flush=True)
+        save_checkpoint(str(output), f'epoch{epoch + 1}', trainer, save_args, epoch, trainer._global_step)
+        print(f'[epoch] {epoch + 1}/{cli.epochs} finished in {(time.perf_counter() - t0) / 60:.1f} min', flush=True)
     print(f'[DONE] Final checkpoint: {output / f"checkpoint_epoch{cli.epochs}.pt"}', flush=True)
 
 
