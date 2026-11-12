@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from src.configs.data_classes import TrainerConfig
 from src.metrics.validated_metrics import compute_protein_centric_fmax, compute_term_aupr
 from src.metrics.validated_metrics import compute_retrieval_metrics
-from src.models.alignment_model import ProteinGoAligner
+from src.models.alignment_model_v2_original import ProteinGoAligner
 from src.metrics.validated_metrics import protein_centric_f_at_threshold
 
 
@@ -83,6 +83,50 @@ def positive_block_rank_loss(scores, pos_mask, margin, tau):
             1.0 - torch.stack(hard_violation_stats).mean().item()
         ),
     }
+
+
+def positive_conditioned_local_pbr(
+        scores: torch.Tensor,
+        positive_mask: torch.Tensor,
+        k: int = 128,
+        tau: float = 0.05,
+) -> torch.Tensor:
+    """Local sigmoid PBR with zero margin."""
+
+    per_protein = []
+
+    for row_scores, row_mask in zip(scores, positive_mask):
+        positives = row_scores[row_mask].float()
+        negatives = row_scores[~row_mask].float()
+
+        per_positive = []
+
+        for pos in positives:
+            # Select negatives ranked above or tied with this positive.
+            with torch.no_grad():
+                eligible = torch.where(
+                    negatives.detach() >= pos.detach()
+                )[0]
+
+                if eligible.numel() > 0:
+                    closest = torch.topk(
+                        negatives.detach()[eligible],
+                        k=min(k, eligible.numel()),
+                        largest=False,
+                    ).indices
+                    selected = eligible[closest]
+
+            if eligible.numel() == 0:
+                per_positive.append(pos * 0.0)
+            else:
+                violations = (negatives[selected] - pos) / tau
+                per_positive.append(
+                    torch.sigmoid(violations).mean()
+                )
+
+        per_protein.append(torch.stack(per_positive).mean())
+
+    return torch.stack(per_protein).mean()
 
 
 class OppTrainer:
@@ -422,9 +466,15 @@ class OppTrainer:
         name_idx, definition_idx = names.index("name"), names.index("definition")
         seg = self._segment_embs_gpu
         present = self._segment_present_gpu
+        # Original V2 scoring, including parent agreement penalty.
         scores = self.model.score_fine_grained(
-            H, mask, seg[:, name_idx], seg[:, definition_idx],
-            present[:, definition_idx], None, None, None)
+            H.float(), mask,
+            seg[:, name_idx], seg[:, definition_idx],
+            present[:, definition_idx],
+            self._parent_bank_gpu,
+            self._parent_present_gpu,
+            seg.mean(dim=1),
+        )
         # Gate is frozen and unused by scorer; report uniform segment diagnostics.
         weights = present.float() / present.float().sum(1, keepdim=True).clamp_min(1)
         return scores, weights
@@ -509,18 +559,23 @@ class OppTrainer:
         l_con = multi_positive_full_go_infonce(
             scores, pos_mask, temperature=self.cfg.temperature
         )
-        # Full-universe positive-weighted BCE on shared pair scores.
-        # Keep InfoNCE on ranking scores; BCE gets a learned affine logit map.
-        bce_logits = scores.float() * self.model.bce_log_scale.exp() + self.model.bce_bias
-        pos_weight = float(getattr(self.cfg, "bce_pos_weight", 20.0))
-        lambda_bce = float(getattr(self.cfg, "lambda_bce", 1.0))
-        l_bce = F.binary_cross_entropy_with_logits(
-            bce_logits, pos_mask.float(),
-            pos_weight=torch.tensor(pos_weight, device=scores.device),
-            reduction="mean",
+        # Positive-conditioned local PBR: each positive competes with its
+        # nearest higher-scoring (or tied) negatives, not global top-K.
+        # Margin is exactly zero; k is fixed at 128 for this experiment.
+        if abs(float(self.cfg.pbr_margin)) > 1e-12:
+            raise ValueError("Local PBR experiment requires pbr_margin=0.0 in YAML.")
+        l_local_pbr = positive_conditioned_local_pbr(
+            scores, pos_mask, k=128, tau=float(self.cfg.pbr_tau)
         )
-        l_total = self.cfg.lambda_con * l_con + lambda_bce * l_bce
-        pbr_stats = {}
+        l_total = (
+                float(self.cfg.lambda_con) * l_con
+                + float(self.cfg.pbr_lambda) * l_local_pbr
+        )
+        pbr_stats = {
+            "local_pbr": l_local_pbr.detach(),
+            "local_pbr_weighted": (float(self.cfg.pbr_lambda) * l_local_pbr).detach(),
+            "pbr": l_local_pbr.detach(),
+        }
         if not torch.isfinite(l_total):
             raise RuntimeError("Non-finite Retriever v2 total loss.")
 
@@ -537,8 +592,10 @@ class OppTrainer:
         out = {
             "total": l_total,
             "contrastive": l_con,
-            "bce": l_bce,
-            "bce_weighted": lambda_bce * l_bce.detach(),
+            # Retain legacy logging keys for existing main.py/W&B integration.
+            # BCE is not computed or optimized in this experiment.
+            "bce": l_total.detach() * 0.0,
+            "bce_weighted": l_total.detach() * 0.0,
             **pbr_stats,
             **score_diag,
             **rank_diag,

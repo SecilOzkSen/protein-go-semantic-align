@@ -649,7 +649,9 @@ def run_training(args):
         alt_map = build_altid_map_from_go_terms(go_terms) if go_terms else {}
 
     pid2pos_raw = load_raw_json(args.pid2pos)
-    pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else pid2pos_raw
+    pid2pos = canonicalize_pid2pos(pid2pos_raw, alt_map) if alt_map else {
+        pid: sorted({_go_int(g) for g in gos}) for pid, gos in pid2pos_raw.items()
+    }
     active_go_ids = canonicalize_id_list(active_go_ids, alt_map) if alt_map else list(map(int, active_go_ids))
     seen = canonicalize_id_list(seen, alt_map) if alt_map else seen
     rare = canonicalize_id_list(rare, alt_map) if alt_map else rare
@@ -790,7 +792,7 @@ def run_training(args):
         )
         context.wandb_run = run
 
-    # Retriever v2 trainer: full-GO InfoNCE + PBR, no legacy candidate machinery.
+    # Retriever v2 trainer: full-GO InfoNCE + positive-conditioned local PBR.
     trainer = OppTrainer(
         cfg=trainer_cfg,
         ctx=context,
@@ -810,7 +812,7 @@ def run_training(args):
         active_go_ids=active_go_ids,
         protein_pooling=args.protein_pooling_strategy,
         go_segments=args.enabled_segments,
-        objective="full_go_infonce+weighted_bce",
+        objective="full_go_infonce+positive_conditioned_local_pbr_k128_margin0_lambda1",
     )
 
     # Dataset-level metadata remains orchestration/data information.
@@ -922,7 +924,7 @@ def run_training(args):
         # Frozen text encoder must remain eval even when the alignment model trains.
         trainer.model.go_encoder.eval()
 
-        running = {"total": 0.0, "contrastive": 0.0, "bce": 0.0}
+        running = {"total": 0.0, "contrastive": 0.0, "local_pbr": 0.0}
         n_batches = 0
 
         import time
@@ -983,7 +985,7 @@ def run_training(args):
                 wb_losses = dict(losses)
                 wb_losses["total"] = avg["total"]
                 wb_losses["contrastive"] = avg["contrastive"]
-                wb_losses["bce"] = avg["bce"]
+                wb_losses["local_pbr"] = avg["local_pbr"]
 
                 wb.log_train(
                     losses=wb_losses,
