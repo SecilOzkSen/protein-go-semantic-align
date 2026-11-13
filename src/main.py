@@ -311,8 +311,10 @@ def load_structured_cfg(path: str):
         wandb_run_name=wandb_cfg.get("wandb_run_name"),
         wandb_mode=str(wandb_cfg.get("mode", "online")),
 
-        train_ids_path=(mz_root / "mzsgo_graphs/train_homology30_v2.txt") if is_mzsgo else opt_path(stores.get("train_ids_path")),
-        val_ids_path=(mz_root / "mzsgo_graphs/valid_homology30_v2.txt") if is_mzsgo else opt_path(stores.get("val_ids_path")),
+        train_ids_path=opt_path(mz.get("train_ids_path", str(mz_root / "mzsgo_graphs/train_homology30_v2.txt"))) if is_mzsgo else opt_path(
+            stores.get("train_ids_path")),
+        val_ids_path=opt_path(mz.get("val_ids_path", str(mz_root / "mzsgo_graphs/valid_homology30_v2.txt"))) if is_mzsgo else opt_path(
+            stores.get("val_ids_path")),
         go_basic_json=None if is_mzsgo else opt_path(stores.get("go_basic_json")),
         pid2pos=(mz_proc / f"pid_to_go_train_{branch.lower()}.json") if is_mzsgo else opt_path(stores.get("pid2pos_path")),
         zero_shot_path=opt_path(stores.get("zero_shot_path")),
@@ -581,7 +583,6 @@ def run_training(args):
         root = args.mzsgo_root
         branch = args.pfresgo_branch.lower()
         proc = root / "processed" / branch
-        graph = root / "mzsgo_graphs"
         candidate = set(_read_ids(proc / f"candidate_go_ids_{branch}.json"))
         temporal = set(_read_ids(proc / f"temporal_go_ids_{branch}.json"))
         if not temporal or not temporal < candidate:
@@ -589,8 +590,6 @@ def run_training(args):
         seen_universe = sorted(candidate - temporal)
         if branch == "bp" and (len(candidate), len(temporal), len(seen_universe)) != (20345, 34, 20311):
             raise RuntimeError("BP MZSGO candidate counts differ from locked protocol")
-        args.train_ids_path = graph / "train_homology30_v2.txt"
-        args.val_ids_path = graph / "valid_homology30_v2.txt"
         args.pid2pos = proc / f"pid_to_go_train_{branch}.json"
         args.go_text_path = proc / "go_texts_canonical_segmented_dual_2023_2025.jsonl"
         args.branch_go_ids_path = proc / f"candidate_go_ids_{branch}.json"
@@ -601,6 +600,22 @@ def run_training(args):
         val_pids = set(load_raw_txt(args.val_ids_path))
         if train_pids & val_pids:
             raise RuntimeError("MZSGO train/validation protein leakage")
+        # A branch-specific split must cover its entire original training pool.
+        original_train = set(load_raw_txt(proc / "train.txt"))
+        original_valid = set(load_raw_txt(proc / "valid.txt"))
+        temporal_test = set(load_raw_txt(proc / "test.txt"))
+        expected_pool = original_train | original_valid
+        if original_train & original_valid:
+            raise RuntimeError("MZSGO original train/valid IDs overlap")
+        if (train_pids | val_pids) != expected_pool:
+            raise RuntimeError(
+                f"MZSGO {branch} split coverage mismatch: "
+                f"missing={len(expected_pool - (train_pids | val_pids))}, "
+                f"extra={len((train_pids | val_pids) - expected_pool)}"
+            )
+        if (train_pids | val_pids) & temporal_test:
+            raise RuntimeError("MZSGO temporal test protein leakage")
+        logger.info("[MZSGO] split files: train=%s valid=%s", args.train_ids_path, args.val_ids_path)
         if branch == "bp" and (len(train_pids), len(val_pids)) != (46456, 5162):
             raise RuntimeError("MZSGO BP V2 split counts changed")
         raw_annotations = _read_json(args.pid2pos)
