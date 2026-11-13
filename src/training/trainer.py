@@ -134,6 +134,12 @@ class OppTrainer:
 
     def __init__(self, cfg: TrainerConfig, ctx, go_encoder, wandb_run=None):
         self.cfg = cfg
+        self.pbr_mode = str(getattr(cfg, "pbr_mode", "pure")).lower()
+        if self.pbr_mode not in {"pure", "local"}:
+            raise ValueError(f"Unknown pbr_mode={self.pbr_mode!r}; expected pure or local")
+        self.pbr_local_k = int(getattr(cfg, "pbr_local_k", 128))
+        if self.pbr_local_k < 1:
+            raise ValueError("pbr_local_k must be >= 1")
         self.ctx = ctx
         self.device = torch.device(cfg.device)
         self.wandb_run = wandb_run  # compatibility only; W&B logging is external
@@ -559,23 +565,39 @@ class OppTrainer:
         l_con = multi_positive_full_go_infonce(
             scores, pos_mask, temperature=self.cfg.temperature
         )
-        # Positive-conditioned local PBR: each positive competes with its
-        # nearest higher-scoring (or tied) negatives, not global top-K.
-        # Margin is exactly zero; k is fixed at 128 for this experiment.
-        if abs(float(self.cfg.pbr_margin)) > 1e-12:
-            raise ValueError("Local PBR experiment requires pbr_margin=0.0 in YAML.")
-        l_local_pbr = positive_conditioned_local_pbr(
-            scores, pos_mask, k=128, tau=float(self.cfg.pbr_tau)
-        )
+        # Select the original all-negative PBR or positive-conditioned local PBR.
+        # Pure PBR is SUM over negatives, local PBR is MEAN over selected
+        # negatives. Their coefficients are deliberately NOT interchangeable.
+        if self.pbr_mode == "pure":
+            l_pbr, pbr_diagnostics = positive_block_rank_loss(
+                scores, pos_mask,
+                margin=float(self.cfg.pbr_margin),
+                tau=float(self.cfg.pbr_tau),
+            )
+            pbr_stats = {
+                "pbr": l_pbr.detach(),
+                "pbr_weighted": (float(self.cfg.pbr_lambda) * l_pbr).detach(),
+                **pbr_diagnostics,
+            }
+        else:
+            if abs(float(self.cfg.pbr_margin)) > 1e-12:
+                raise ValueError("Local PBR requires loss.pbr_margin=0.0")
+            l_pbr = positive_conditioned_local_pbr(
+                scores, pos_mask,
+                k=self.pbr_local_k,
+                tau=float(self.cfg.pbr_tau),
+            )
+            pbr_stats = {
+                "pbr": l_pbr.detach(),
+                "local_pbr": l_pbr.detach(),
+                "local_pbr_weighted": (float(self.cfg.pbr_lambda) * l_pbr).detach(),
+            }
+
         l_total = (
                 float(self.cfg.lambda_con) * l_con
-                + float(self.cfg.pbr_lambda) * l_local_pbr
+                + float(self.cfg.pbr_lambda) * l_pbr
         )
-        pbr_stats = {
-            "local_pbr": l_local_pbr.detach(),
-            "local_pbr_weighted": (float(self.cfg.pbr_lambda) * l_local_pbr).detach(),
-            "pbr": l_local_pbr.detach(),
-        }
+
         if not torch.isfinite(l_total):
             raise RuntimeError("Non-finite Retriever v2 total loss.")
 
@@ -592,6 +614,7 @@ class OppTrainer:
         out = {
             "total": l_total,
             "contrastive": l_con,
+            "ranking_loss": l_pbr.detach(),
             # Retain legacy logging keys for existing main.py/W&B integration.
             # BCE is not computed or optimized in this experiment.
             "bce": l_total.detach() * 0.0,

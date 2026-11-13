@@ -291,6 +291,8 @@ def load_structured_cfg(path: str):
 
         lambda_con=float(loss.get("lambda_con", 1.0)),
         pbr_lambda=float(loss.get("pbr_lambda", 0.0)),
+        pbr_mode=str(loss.get("pbr_mode", "pure")).strip().lower(),
+        pbr_local_k=int(loss.get("pbr_local_k", 128)),
         pbr_margin=float(loss.get("pbr_margin", 0.05)),
         pbr_tau=float(loss.get("pbr_tau", 0.05)),
         lambda_bce=float(loss.get("lambda_bce", 1.0)),
@@ -322,6 +324,14 @@ def load_structured_cfg(path: str):
         mzsgo_frozen_bank=(mz_root / "go_cache" / branch.lower() / "frozen_segment_parent_bank.pt") if is_mzsgo else None,
     )
 
+    if args.pbr_mode not in {"pure", "local"}:
+        raise ValueError("loss.pbr_mode must be 'pure' or 'local'")
+    if args.pbr_local_k < 1:
+        raise ValueError("loss.pbr_local_k must be >= 1")
+    if args.pbr_mode == "local" and abs(args.pbr_margin) > 1e-12:
+        raise ValueError("Local PBR requires loss.pbr_margin=0.0")
+    if args.pbr_lambda < 0:
+        raise ValueError("loss.pbr_lambda must be nonnegative")
     if args.use_lora:
         raise ValueError("Retriever v2 requires use_lora=false; GO text encoder is frozen.")
 
@@ -775,6 +785,8 @@ def run_training(args):
         log_go_segment_weights=args.log_go_segment_weights,
     )
 
+    trainer_cfg.pbr_mode = args.pbr_mode
+    trainer_cfg.pbr_local_k = args.pbr_local_k
     trainer_cfg.lambda_bce = args.lambda_bce
     trainer_cfg.bce_pos_weight = args.bce_pos_weight
 
@@ -792,7 +804,7 @@ def run_training(args):
         )
         context.wandb_run = run
 
-    # Retriever v2 trainer: full-GO InfoNCE + positive-conditioned local PBR.
+    # Retriever v2 trainer: full-GO InfoNCE + YAML-selected PBR.
     trainer = OppTrainer(
         cfg=trainer_cfg,
         ctx=context,
@@ -812,7 +824,9 @@ def run_training(args):
         active_go_ids=active_go_ids,
         protein_pooling=args.protein_pooling_strategy,
         go_segments=args.enabled_segments,
-        objective="full_go_infonce+positive_conditioned_local_pbr_k128_margin0_lambda1",
+        objective=(f"full_go_infonce+{args.pbr_mode}_pbr"
+                   f"_lambda{args.pbr_lambda:g}_margin{args.pbr_margin:g}"
+                   + (f"_k{args.pbr_local_k}" if args.pbr_mode == "local" else "")),
     )
 
     # Dataset-level metadata remains orchestration/data information.
@@ -924,7 +938,7 @@ def run_training(args):
         # Frozen text encoder must remain eval even when the alignment model trains.
         trainer.model.go_encoder.eval()
 
-        running = {"total": 0.0, "contrastive": 0.0, "local_pbr": 0.0}
+        running = {"total": 0.0, "contrastive": 0.0, "ranking_loss": 0.0}
         n_batches = 0
 
         import time
@@ -985,7 +999,10 @@ def run_training(args):
                 wb_losses = dict(losses)
                 wb_losses["total"] = avg["total"]
                 wb_losses["contrastive"] = avg["contrastive"]
-                wb_losses["local_pbr"] = avg["local_pbr"]
+                wb_losses["ranking_loss"] = avg["ranking_loss"]
+                wb_losses["pbr"] = avg["ranking_loss"]
+                if args.pbr_mode == "local":
+                    wb_losses["local_pbr"] = avg["ranking_loss"]
 
                 wb.log_train(
                     losses=wb_losses,

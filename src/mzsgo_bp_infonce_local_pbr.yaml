@@ -62,6 +62,7 @@ loss:
   pbr_margin: 0.0
   pbr_tau: 0.05
   lambda_bce: 0.0
+  pbr_mode: local
 evaluation:
   retrieval_eval_ks:
   - 50
