@@ -1,43 +1,35 @@
-import torch
-@torch.no_grad()
-def retrieval_metrics_from_scores(scores, pos_mask, ks=(1,5,10)):
-    scores = scores.float()
-    pos_mask = pos_mask.bool()
+"""Threshold-independent protein-GO ranking metrics.
 
-    # sort descending
-    rank_idx = torch.argsort(scores, dim=1, descending=True)
-    pos_ranked = torch.gather(pos_mask, 1, rank_idx)  # (B,T)
+All metrics average over proteins, not protein-GO pairs.
+"""
+import numpy as np
 
-    pos_count = pos_mask.sum(dim=1)
-    keep = pos_count > 0
-    if keep.sum() == 0:
-        return {f"R@{k}": 0.0 for k in ks} | {"MRR": 0.0, "nDCG@10": 0.0, "num": 0}
 
-    pos_ranked = pos_ranked[keep]
-    pos_count = pos_count[keep].float()
-    out = {"num": int(pos_ranked.size(0))}
-
-    # Recall@K
-    for k in ks:
-        k = min(k, pos_ranked.size(1))
-        hits = pos_ranked[:, :k].sum(dim=1).float()
-        out[f"R@{k}"] = (hits / pos_count.clamp_min(1.0)).mean().item()
-
-    # MRR (first positive rank)
-    first_pos = pos_ranked.float().argmax(dim=1)
-    out["MRR"] = (1.0 / (first_pos.float() + 1.0)).mean().item()
-
-    # nDCG@10
-    k_ndcg = min(10, pos_ranked.size(1))
-    rel = pos_ranked[:, :k_ndcg].float()
-    denom = torch.log2(torch.arange(2, k_ndcg + 2, device=rel.device).float())
-    dcg = (rel / denom).sum(dim=1)
-
-    ideal_hits = torch.minimum(pos_count, torch.tensor(float(k_ndcg), device=rel.device))
-    gains = (1.0 / denom)
-    idcg = torch.zeros_like(dcg)
-    for i in range(k_ndcg):
-        idcg += gains[i] * (ideal_hits > i).float()
-
-    out["nDCG@10"] = (dcg / idcg.clamp_min(1e-12)).mean().item()
-    return out
+def compute_retrieval_metrics(scores, labels):
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels).astype(bool)
+    if scores.ndim != 2 or scores.shape != labels.shape or not np.isfinite(scores).all():
+        raise ValueError('Expected finite scores and matching labels [proteins, GO]')
+    aucs, aps, pbcs = [], [], []
+    for s, y in zip(scores, labels):
+        npos = int(y.sum())
+        nneg = len(y) - npos
+        if not npos or not nneg:
+            continue
+        order = np.argsort(-s, kind='stable')
+        ordered = y[order]
+        ranks = np.arange(1, len(s) + 1, dtype=np.float64)
+        aps.append(float(((np.cumsum(ordered) / ranks) * ordered).sum() / npos))
+        pbcs.append(float(ordered[:npos].sum() / npos))
+        neg = np.sort(s[~y])
+        pos = s[y]
+        lo = np.searchsorted(neg, pos, side='left')
+        hi = np.searchsorted(neg, pos, side='right')
+        aucs.append(float(np.mean((lo + 0.5 * (hi - lo)) / nneg)))
+    if not aucs:
+        raise ValueError('No proteins with both positive and negative GO labels')
+    return {
+        'pairwise_accuracy': float(np.mean(aucs)),
+        'positive_block_coverage': float(np.mean(pbcs)),
+        'protein_wise_map': float(np.mean(aps)),
+    }

@@ -13,20 +13,21 @@ from .residue_store import ESMResidueStore, ESMFusedStore  # <-- fused import
 
 class ProteinEmbDataset(Dataset):
     def __init__(
-        self,
-        protein_ids: Sequence[str],
-        pid2pos: Dict[str, List[int]],
-        fewzero: FewZeroConfig,
-        go_text_store: GoTextStore,
+            self,
+            protein_ids: Sequence[str],
+            pid2pos: Dict[str, List[int]],
+            fewzero: FewZeroConfig,
+            go_text_store: GoTextStore,
 
-        *,
-        dag_parents: Optional[Mapping[int, Sequence[Tuple[int, str]]]] = None,
-        min_pos_for_expand: int = 3,
-        max_ancestor_add: int = 4,
-        max_hops: Optional[int] = 3,
-        ancestor_stoplist: Optional[Set[int]] = None,
-        ancestor_gamma: float = 0.7,
-        store: ESMResidueStore,
+            *,
+            dag_parents: Optional[Mapping[int, Sequence[Tuple[int, str]]]] = None,
+            min_pos_for_expand: int = 3,
+            max_ancestor_add: int = 4,
+            max_hops: Optional[int] = 3,
+            ancestor_stoplist: Optional[Set[int]] = None,
+            ancestor_gamma: float = 0.7,
+            store: ESMResidueStore,
+            exclude_zero_shot_positives: bool = True,
     ):
         super().__init__()
         if store is None:
@@ -51,7 +52,7 @@ class ProteinEmbDataset(Dataset):
         for pid in self.pids:
             orig = pid2pos.get(pid, [])
             # ---- 1) Zero-shot sterilizasyon ----
-            pos = [int(g) for g in orig if int(g) not in fewzero.zero_shot_terms]
+            pos = [int(g) for g in orig if (not exclude_zero_shot_positives or int(g) not in fewzero.zero_shot_terms)]
             # ---- 2) DAG ile genişletme ----
             if dag_parents is None:
                 expanded = pos
@@ -61,7 +62,7 @@ class ProteinEmbDataset(Dataset):
                 expanded, weights, is_gen_map = expand_with_ancestors(
                     pos_terms=pos,
                     parents=dag_parents,
-                    zs_blocklist=fewzero.zero_shot_terms,
+                    zs_blocklist=fewzero.zero_shot_terms if exclude_zero_shot_positives else set(),
                     min_pos=min_pos_for_expand,
                     max_add=max_ancestor_add,
                     max_hops=max_hops,
