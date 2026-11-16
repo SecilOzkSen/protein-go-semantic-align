@@ -832,7 +832,6 @@ def run_training(args):
             args.frequency_weight_min, args.frequency_weight_max
         )
         # Each protein is normalized by the sum of its positive weights in Local PBR.
-        trainer._frequency_weights_gpu = weights.to(trainer.device)
         logger.info(
             "[FREQ-LOCAL-PBR] train_proteins=%d nonzero_terms=%d "
             "weight_min=%.4f weight_mean=%.4f weight_max=%.4f",
@@ -862,6 +861,10 @@ def run_training(args):
         go_encoder=go_encoder,
         wandb_run=None,
     )
+
+    if args.frequency_aware_local:
+        trainer._frequency_weights_gpu = weights.to(trainer.device)
+        assert trainer._frequency_weights_gpu.numel() == len(trainer.eval_id_list)
 
     wb = RetrieverWandbLogger(
         run=run,
