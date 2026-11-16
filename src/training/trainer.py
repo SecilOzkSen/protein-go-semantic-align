@@ -90,14 +90,22 @@ def positive_conditioned_local_pbr(
         positive_mask: torch.Tensor,
         k: int = 128,
         tau: float = 0.05,
+        go_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Local sigmoid PBR with zero margin."""
+    """Local sigmoid PBR with zero margin and optional positive GO weights."""
+
+    if go_weights is not None:
+        if go_weights.ndim != 1 or go_weights.numel() != scores.shape[1]:
+            raise ValueError("go_weights must have shape [G]")
+        if not torch.isfinite(go_weights).all() or (go_weights <= 0).any():
+            raise ValueError("go_weights must be finite and strictly positive")
 
     per_protein = []
 
     for row_scores, row_mask in zip(scores, positive_mask):
         positives = row_scores[row_mask].float()
         negatives = row_scores[~row_mask].float()
+        positive_weights = go_weights[row_mask].float() if go_weights is not None else None
 
         per_positive = []
 
@@ -124,7 +132,11 @@ def positive_conditioned_local_pbr(
                     torch.sigmoid(violations).mean()
                 )
 
-        per_protein.append(torch.stack(per_positive).mean())
+        values = torch.stack(per_positive)
+        if positive_weights is None:
+            per_protein.append(values.mean())
+        else:
+            per_protein.append((values * positive_weights).sum() / positive_weights.sum())
 
     return torch.stack(per_protein).mean()
 
@@ -138,6 +150,8 @@ class OppTrainer:
         if self.pbr_mode not in {"pure", "local"}:
             raise ValueError(f"Unknown pbr_mode={self.pbr_mode!r}; expected pure or local")
         self.pbr_local_k = int(getattr(cfg, "pbr_local_k", 128))
+        self.frequency_aware_local = bool(getattr(cfg, "frequency_aware_local", False))
+        self._frequency_weights_gpu = None
         if self.pbr_local_k < 1:
             raise ValueError("pbr_local_k must be >= 1")
         self.ctx = ctx
@@ -582,10 +596,13 @@ class OppTrainer:
         else:
             if abs(float(self.cfg.pbr_margin)) > 1e-12:
                 raise ValueError("Local PBR requires loss.pbr_margin=0.0")
+            if self.frequency_aware_local and self._frequency_weights_gpu is None:
+                raise RuntimeError("Frequency-aware Local PBR enabled but weights not initialized")
             l_pbr = positive_conditioned_local_pbr(
                 scores, pos_mask,
                 k=self.pbr_local_k,
                 tau=float(self.cfg.pbr_tau),
+                go_weights=self._frequency_weights_gpu if self.frequency_aware_local else None,
             )
             pbr_stats = {
                 "pbr": l_pbr.detach(),

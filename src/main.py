@@ -295,6 +295,10 @@ def load_structured_cfg(path: str):
         pbr_local_k=int(loss.get("pbr_local_k", 128)),
         pbr_margin=float(loss.get("pbr_margin", 0.05)),
         pbr_tau=float(loss.get("pbr_tau", 0.05)),
+        frequency_aware_local=bool(loss.get("frequency_aware_local", False)),
+        frequency_weight_power=float(loss.get("frequency_weight_power", 0.5)),
+        frequency_weight_min=float(loss.get("frequency_weight_min", 0.5)),
+        frequency_weight_max=float(loss.get("frequency_weight_max", 2.0)),
         lambda_bce=float(loss.get("lambda_bce", 1.0)),
         bce_pos_weight=float(loss.get("bce_pos_weight", 20.0)),
 
@@ -332,6 +336,10 @@ def load_structured_cfg(path: str):
         raise ValueError("loss.pbr_local_k must be >= 1")
     if args.pbr_mode == "local" and abs(args.pbr_margin) > 1e-12:
         raise ValueError("Local PBR requires loss.pbr_margin=0.0")
+    if args.frequency_aware_local and args.pbr_mode != "local":
+        raise ValueError("frequency_aware_local requires pbr_mode=local")
+    if args.frequency_aware_local and not (args.frequency_weight_power > 0 and 0 < args.frequency_weight_min <= args.frequency_weight_max):
+        raise ValueError("Invalid frequency weighting parameters")
     if args.pbr_lambda < 0:
         raise ValueError("loss.pbr_lambda must be nonnegative")
     if args.use_lora:
@@ -802,8 +810,36 @@ def run_training(args):
 
     trainer_cfg.pbr_mode = args.pbr_mode
     trainer_cfg.pbr_local_k = args.pbr_local_k
+    trainer_cfg.frequency_aware_local = args.frequency_aware_local
     trainer_cfg.lambda_bce = args.lambda_bce
     trainer_cfg.bce_pos_weight = args.bce_pos_weight
+
+    if args.frequency_aware_local:
+        # Compute frequencies only from the actual homology-V2 training split.
+        train_counts = Counter()
+        for pid in datasets["train"].pids:
+            train_counts.update(set(int(g) for g in pid2pos.get(pid, [])))
+        frequencies = torch.tensor(
+            [train_counts.get(int(g), 0) for g in active_go_ids], dtype=torch.float32
+        )
+        observed = frequencies > 0
+        if not observed.any():
+            raise RuntimeError("No observed training GO frequencies")
+        weights = torch.ones_like(frequencies)
+        weights[observed] = frequencies[observed].pow(-args.frequency_weight_power)
+        weights[observed] /= weights[observed].mean()
+        weights[observed] = weights[observed].clamp(
+            args.frequency_weight_min, args.frequency_weight_max
+        )
+        # Each protein is normalized by the sum of its positive weights in Local PBR.
+        trainer._frequency_weights_gpu = weights.to(trainer.device)
+        logger.info(
+            "[FREQ-LOCAL-PBR] train_proteins=%d nonzero_terms=%d "
+            "weight_min=%.4f weight_mean=%.4f weight_max=%.4f",
+            len(datasets["train"].pids), int(observed.sum()),
+            float(weights[observed].min()), float(weights[observed].mean()),
+            float(weights[observed].max()),
+        )
 
     run = None
     if args.wandb:
