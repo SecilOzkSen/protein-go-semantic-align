@@ -32,7 +32,7 @@ training:
   fp16: true
   cpu: false
   seed: 42
-  output_dir: /workspace/MZSGO_temporal/outputs/cc/v2_infonce_local_pbr_from_scratch
+  output_dir: /workspace/MZSGO_temporal/outputs/cc/v2_infonce_from_scratch
   save_every: 1000000
   keep_last_n: 3
   resume: null
@@ -85,7 +85,7 @@ wandb:
   enabled: true
   project: protein-go-align-mzsgo
   entity: null
-  wandb_run_name: MZSGO-CC-V2-InfoNCE-LocalPBR-Scratch
+  wandb_run_name: MZSGO-CC-V2-InfoNCE
   mode: online
 stores:
   embed_dir_res: /local_data/esm2_residue_overlap #/workspace/MZSGO_temporal/protein_embeddings/esm2_residue_overlap
