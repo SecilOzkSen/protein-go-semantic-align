@@ -37,7 +37,7 @@ training:
   output_dir: /workspace/MZSGO_temporal/outputs/mf/retriever_v2_pure
   save_every: 1000000
   keep_last_n: 3
-  resume: null
+  resume: /workspace/MZSGO_temporal/outputs/mf/retriever_v2_pure/checkpoint_epoch14.pt
   warmstart_path: null
   eval_only: false
   log_every: 500
