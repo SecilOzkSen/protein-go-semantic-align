@@ -35,7 +35,7 @@ training:
   output_dir: /workspace/MZSGO_temporal/outputs/cc/v2_infonce_from_scratch
   save_every: 1000000
   keep_last_n: 3
-  resume: null
+  resume: /workspace/MZSGO_temporal/outputs/cc/v2_infonce_from_scratch/checkpoint_epoch18.pt
   warmstart_path: null
   eval_only: false
   log_every: 500
