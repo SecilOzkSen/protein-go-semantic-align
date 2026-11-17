@@ -1,6 +1,6 @@
-"""MZSGO temporal or general BP evaluation using the frozen GO bank.
-Run: python -m src.evaluation.mzsgo_temporal --mode general --checkpoint PATH --out-dir PATH
-General test scores 20,639 2023 GO candidates; no test-set checkpoint selection.
+"""MZSGO temporal or general evaluation for BP, MF and CC using frozen GO banks.
+General evaluation uses a branch-specific expanded bank, excluding temporal-only GO terms.
+No test-set checkpoint selection.
 """
 import argparse, hashlib, json, sys
 from pathlib import Path
@@ -128,8 +128,6 @@ def main():
     proc = root / 'processed' / branch
     candidate = proc / f'candidate_go_ids_{branch}.json'
     temporal = proc / f'temporal_go_ids_{branch}.json'
-    if args.mode == 'general' and branch != 'bp':
-        raise ValueError('General mode currently supports BP only')
     annot = proc / (f'pid_to_go_general_test_{branch}.json' if args.mode == 'general' else f'pid_to_go_temporal_{branch}.json')
     canonical = proc / 'go_texts_canonical_segmented_dual_2023_2025.jsonl'
     cache = root / 'go_cache' / branch / ('frozen_segment_parent_bank_general_test.pt' if args.mode == 'general' else 'frozen_segment_parent_bank.pt')
@@ -148,7 +146,7 @@ def main():
         if any(not set(v) <= set(unseen) for v in labels.values()):
             raise RuntimeError('Temporal ground truth contains non-temporal GO labels')
         if branch == 'bp' and len(labels) != 3687: raise RuntimeError('BP temporal protein count mismatch')
-    elif len(labels) != 5712:
+    elif branch == 'bp' and len(labels) != 5712:
         raise RuntimeError('BP general protein count mismatch')
     bank = torch.load(cache, map_location='cpu', weights_only=False)
     if bank.get('format') != 'mzsgo_frozen_segment_parent_v1': raise RuntimeError('Bank format mismatch')
@@ -164,22 +162,46 @@ def main():
     if len(bank_ids) != len(set(bank_ids)):
         raise RuntimeError('Duplicate bank GO IDs')
     if args.mode == 'general':
-        if len(bank_ids) != 20673 or not set(ids) <= set(bank_ids):
-            raise RuntimeError('General GO bank universe mismatch')
-        if metadata.get('purpose') != 'general_BP_test_only' or metadata.get('added_unseen_go') != 328:
-            raise RuntimeError('General bank provenance mismatch')
+        # General evaluation requires the branch-specific expanded frozen bank.
+        # The ordinary temporal bank is NOT a valid substitute: it can omit
+        # 2023 general-test GO terms that were not present in the train universe.
         base = root / 'go_cache' / branch / 'frozen_segment_parent_bank.pt'
+        if not base.is_file():
+            raise FileNotFoundError(f'Base frozen GO bank missing: {base}')
+        if not set(ids) <= set(bank_ids):
+            raise RuntimeError('General GO bank does not contain all training candidates')
         if metadata.get('base_bank_sha256') != digest(base):
             raise RuntimeError('General bank does not match original bank')
-        # The expanded bank also includes 34 2025 temporal-only terms.
-        # Exclude them to match the paper's 2023 general BP universe (20,639).
+        if branch == 'bp':
+            # Preserve the existing published BP general-test protocol exactly.
+            if len(bank_ids) != 20673:
+                raise RuntimeError('General BP bank universe mismatch')
+            if metadata.get('purpose') != 'general_BP_test_only' or metadata.get('added_unseen_go') != 328:
+                raise RuntimeError('General BP bank provenance mismatch')
+        else:
+            # CC/MF must use an independently constructed expanded bank.
+            # Reject an unprovenanced or accidentally copied temporal bank.
+            purpose = str(metadata.get('purpose', '')).lower()
+            if 'general' not in purpose or branch not in purpose:
+                raise RuntimeError(
+                    f'General {args.branch} bank provenance mismatch: purpose={metadata.get("purpose")!r}. '
+                    'Build a branch-specific general-test frozen GO bank first.'
+                )
+            if len(bank_ids) <= len(set(ids)):
+                raise RuntimeError('General bank is not expanded beyond training candidates')
+        # Exclude 2025 temporal-only terms, as in the existing BP protocol.
         ids = sorted(set(bank_ids) - set(unseen))
-        if len(ids) != 20639:
+        if branch == 'bp' and len(ids) != 20639:
             raise RuntimeError(f'Expected 20639 general BP GO IDs, got {len(ids)}')
+        if not ids:
+            raise RuntimeError('Empty general candidate universe')
+        print(f'[general] {args.branch}: {len(ids)} GO candidates, '
+              f'{len(labels)} proteins, {len(bank_ids)} bank entries', flush=True)
     elif set(bank_ids) != set(ids):
         raise RuntimeError('Temporal bank GO IDs mismatch')
     if any(not set(v) <= set(ids) for v in labels.values()):
-        raise RuntimeError('Some ground-truth GO IDs are missing from bank')
+        missing = sorted(set().union(*(set(v) for v in labels.values())) - set(ids))
+        raise RuntimeError(f'Some ground-truth GO IDs are missing from the evaluation universe: {missing[:20]}')
     index = {g: i for i, g in enumerate(bank_ids)}
     selection = torch.tensor([index[g] for g in ids], dtype=torch.long)
     seg = bank['segment_embs'].index_select(0, selection).float()
@@ -240,6 +262,9 @@ def main():
               'n_candidates': len(ids), 'n_temporal_go': len(unseen),
               'checkpoint_sha256': digest(args.checkpoint), 'bank_sha256': digest(cache),
               'score_transform': args.score_transform,
+              'annotation_sha256': digest(annot),
+              'candidate_universe_sha256': hashlib.sha256(
+                  json.dumps(ids).encode('utf-8')).hexdigest(),
               'note': 'Test-selected Fmax is an oracle benchmark metric, not a validation-selected operating threshold. Fixed score mapping is not probability calibration.'}
     if args.smoke_proteins:
         result['smoke_test_only'] = True

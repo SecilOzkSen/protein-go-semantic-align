@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Extend the frozen BP GO bank with 328 2023 unseen labels for general test.
+"""Extend a frozen MZSGO branch GO bank with missing 2023 general-test labels.
 
-Does not modify training bank, checkpoint, or canonical source JSONL.
-Run: python -m src.script.mzsgo.prepare_mzsgo_go_test_embeddings
+Does not modify training banks, checkpoints, or canonical source JSONL.
+Requires processed/<branch>/general_test_missing_go_<branch>.json prepared from
+the official 2023 general-test label universe. Does not create ground truth.
+Run: python -m src.script.mzsgo.prepare_mzsgo_go_test_embeddings --branch CC
 """
 from __future__ import annotations
 
@@ -21,6 +23,11 @@ from src.utils.helpers import load_go_texts_canonical
 
 MODEL = "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext"
 SEGMENTS = ["name", "definition", "is_a"]
+BRANCHES = {
+    "bp": ("biological_process", "biological process", "Biological Process"),
+    "mf": ("molecular_function", "molecular function", "Molecular Function"),
+    "cc": ("cellular_component", "cellular component", "Cellular Component"),
+}
 
 
 def gid(x):
@@ -77,10 +84,11 @@ def sentence(s):
     return s if s[-1] in ".!?" else s + "."
 
 
-def make_record(go, terms):
+def make_record(go, terms, branch):
+    namespace, namespace_text, domain = BRANCHES[branch]
     t = terms[go]
-    if t.get("is_obsolete") or t.get("namespace") != "biological_process":
-        raise RuntimeError(f"Invalid 2023 BP GO: {go}")
+    if t.get("is_obsolete") or t.get("namespace") != namespace:
+        raise RuntimeError(f"Invalid 2023 {branch.upper()} GO: {go}")
     if not t.get("name"):
         raise RuntimeError(f"GO term without name: {go}")
     parent_ids = sorted(set(p for p in t["is_a"] if p in terms
@@ -89,15 +97,15 @@ def make_record(go, terms):
     parent_names = [terms[p]["name"] for p in parent_ids]
     segments = {
         "name": sentence(t["name"]),
-        "namespace": "biological process.",
+        "namespace": namespace_text + ".",
         "definition": sentence(t.get("definition", "")),
         "is_a": sentence("; ".join(parent_names[:3]) if parent_names else "none"),
         "part_of": "none.",
     }
     return {
         "go_id": go,
-        "domain": "Biological Process",
-        "namespace": "biological process",
+        "domain": domain,
+        "namespace": namespace_text,
         "name": t["name"],
         "definition": t.get("definition", ""),
         "is_a_parent_ids": parent_ids,
@@ -117,8 +125,8 @@ def make_record(go, terms):
 def encode(encoder, tokens, masks, device, bs):
     outputs = []
     for st in range(0, len(tokens), bs):
-        z = encoder(input_ids=tokens[st:st+bs].to(device),
-                    attention_mask=masks[st:st+bs].to(device), output_mode="pooled")
+        z = encoder(input_ids=tokens[st:st + bs].to(device),
+                    attention_mask=masks[st:st + bs].to(device), output_mode="pooled")
         if isinstance(z, tuple):
             z = z[0]
         elif isinstance(z, dict):
@@ -145,6 +153,7 @@ def make_store(jsonl, encoder, segment_max_len, text_max_len):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=Path("/workspace/MZSGO_temporal"))
+    ap.add_argument("--branch", type=str.upper, choices=["BP", "MF", "CC"], required=True)
     ap.add_argument("--obo", type=Path, default=Path("/workspace/MZSGO/data/go_2023_01_01.obo"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--batch-size", type=int, default=64)
@@ -152,12 +161,13 @@ def main():
     a = ap.parse_args()
     if a.batch_size < 1:
         raise ValueError("batch-size must be positive")
-    proc = a.root / "processed/bp"
-    original = a.root / "go_cache/bp/frozen_segment_parent_bank.pt"
+    branch = a.branch.lower()
+    proc = a.root / "processed" / branch
+    original = a.root / "go_cache" / branch / "frozen_segment_parent_bank.pt"
     source = proc / "go_texts_canonical_segmented_dual_2023_2025.jsonl"
-    missing_path = proc / "general_test_missing_go_bp.json"
-    candidate_path = proc / "candidate_go_ids_bp.json"
-    dest = a.output or a.root / "go_cache/bp/frozen_segment_parent_bank_general_test.pt"
+    missing_path = proc / f"general_test_missing_go_{branch}.json"
+    candidate_path = proc / f"candidate_go_ids_{branch}.json"
+    dest = a.output or a.root / "go_cache" / branch / "frozen_segment_parent_bank_general_test.pt"
     if dest.exists():
         raise FileExistsError(f"Refusing overwrite: {dest}")
     for p in (original, source, missing_path, candidate_path, a.obo):
@@ -179,14 +189,25 @@ def main():
     seg_max = int(meta["segment_max_len"])
     text_max = int(meta["text_max_len"])
     old_ids = [int(x) for x in base["go_ids"]]
-    if len(old_ids) != 20345 or len(set(old_ids)) != len(old_ids):
-        raise RuntimeError("Expected 20345 unique original GO IDs")
+    candidate_ids = {int(str(g).split(":")[-1]) for g in json.loads(candidate_path.read_text())}
+    if len(old_ids) != len(set(old_ids)) or set(old_ids) != candidate_ids:
+        raise RuntimeError("Base bank IDs do not match candidate GO IDs")
+    expected_base = {"bp": 20345, "mf": 6851, "cc": 2783}[branch]
+    if len(old_ids) != expected_base:
+        raise RuntimeError(f"Unexpected {branch.upper()} base GO count: {len(old_ids)} != {expected_base}")
     requested = json.loads(missing_path.read_text())
-    new_ids = sorted({int(g.split(":")[-1]) for g in requested["missing_go_ids"]})
-    if len(new_ids) != 328 or set(new_ids) & set(old_ids):
-        raise RuntimeError("Expected 328 distinct, new GO IDs")
+    if not isinstance(requested, dict) or not isinstance(requested.get("missing_go_ids"), list):
+        raise RuntimeError("Expected JSON object with missing_go_ids list")
+    raw_missing = requested["missing_go_ids"]
+    new_ids = sorted({int(str(g).split(":")[-1]) for g in raw_missing})
+    if len(new_ids) != len(raw_missing) or set(new_ids) & set(old_ids):
+        raise RuntimeError("Missing GO list has duplicates or overlaps base bank")
+    if branch == "bp" and len(new_ids) != 328:
+        raise RuntimeError("BP protocol expected exactly 328 missing GO IDs")
+    if not new_ids:
+        raise RuntimeError("No missing general-test GO IDs; nothing to encode")
     terms = parse_obo(a.obo)
-    records = [make_record(gid(x), terms) for x in new_ids]
+    records = [make_record(gid(x), terms, branch) for x in new_ids]
 
     # Use the identical canonical loader + GoTextStore tokenization as the base-bank creator.
     with tempfile.TemporaryDirectory(prefix="mzsgo_general_go_") as td:
@@ -203,7 +224,7 @@ def main():
         toks = store.batch(new_ids)
         present = toks["seg_present"].bool().cpu()
         G, S, L = toks["seg_input_ids"].shape
-        if (G, S) != (328, 3):
+        if (G, S) != (len(new_ids), 3):
             raise RuntimeError(f"Unexpected new GO token shape: {(G, S, L)}")
         flat = present.reshape(-1)
         indices = flat.nonzero(as_tuple=False).flatten()
@@ -223,15 +244,15 @@ def main():
                 if line.strip():
                     r = json.loads(line)
                     existing[gid(r["go_id"])] = r
-        sample_ids = [old_ids[i] for i in sorted(set([0, len(old_ids)//4,
-                       len(old_ids)//2, 3*len(old_ids)//4, len(old_ids)-1]))]
+        sample_ids = [old_ids[i] for i in sorted(set([0, len(old_ids) // 4,
+                                                      len(old_ids) // 2, 3 * len(old_ids) // 4, len(old_ids) - 1]))]
         sample_path = Path(td) / "sample.jsonl"
         sample_path.write_text("".join(json.dumps(existing[gid(x)]) + "\n" for x in sample_ids))
         sample_toks = make_store(sample_path, encoder, seg_max, text_max).batch(sample_ids)
         sample_present = sample_toks["seg_present"].bool().cpu()
         sample_flat = sample_present.reshape(-1)
         sample_idx = sample_flat.nonzero(as_tuple=False).flatten()
-        sample_vec = torch.zeros(len(sample_ids)*3, 768)
+        sample_vec = torch.zeros(len(sample_ids) * 3, 768)
         sample_enc = encode(encoder,
                             sample_toks["seg_input_ids"].reshape(-1, sample_toks["seg_input_ids"].shape[-1]).index_select(0, sample_idx),
                             sample_toks["seg_attention_mask"].reshape(-1, sample_toks["seg_attention_mask"].shape[-1]).index_select(0, sample_idx),
@@ -263,8 +284,8 @@ def main():
         old_parent = base["parent_embs"].float()
         old_mask = base["parent_present"].bool()
         P = max(old_parent.shape[1], max((len(ps) for ps in parent_lists), default=0), 1)
-        new_parent = torch.zeros((328, P, 768), dtype=torch.float32)
-        new_mask = torch.zeros((328, P), dtype=torch.bool)
+        new_parent = torch.zeros((len(new_ids), P, 768), dtype=torch.float32)
+        new_mask = torch.zeros((len(new_ids), P), dtype=torch.bool)
         for i, ps in enumerate(parent_lists):
             for j, p in enumerate(ps):
                 new_parent[i, j] = parent_vec[p]
@@ -281,7 +302,10 @@ def main():
     ordered_present = torch.stack([base["segment_present"][old_idx[g]] if g in old_idx else present[new_idx[g]] for g in all_ids])
     ordered_parent = torch.stack([old_parent[old_idx[g]] if g in old_idx else new_parent[new_idx[g]] for g in all_ids])
     ordered_mask = torch.stack([old_mask[old_idx[g]] if g in old_idx else new_mask[new_idx[g]] for g in all_ids])
-    assert len(all_ids) == 20673
+    if len(all_ids) != len(old_ids) + len(new_ids):
+        raise RuntimeError("Expanded bank size mismatch")
+    if branch == "bp" and len(all_ids) != 20673:
+        raise RuntimeError("BP protocol expected exactly 20673 expanded GO IDs")
     if not all(torch.isfinite(x).all() for x in (ordered_seg, ordered_parent)):
         raise RuntimeError("Nonfinite vectors")
     result = {
@@ -293,16 +317,17 @@ def main():
         "parent_embs": ordered_parent,
         "parent_present": ordered_mask,
         "metadata": {**meta,
-            "purpose": "general_BP_test_only",
-            "base_bank_sha256": sha256(original),
-            "2023_obo_sha256": sha256(a.obo),
-            "missing_ids_sha256": sha256(missing_path),
-            "added_unseen_go": len(new_ids),
-            "base_go": len(old_ids),
-            "total_go": len(all_ids),
-            "existing_segment_parity_max_abs_diff": delta,
-            "note": "Original bank entries unchanged; new 2023 unseen labels added. Not a training bank.",
-        },
+                     "purpose": f"general_{a.branch}_test_only",
+                     "branch": a.branch,
+                     "base_bank_sha256": sha256(original),
+                     "2023_obo_sha256": sha256(a.obo),
+                     "missing_ids_sha256": sha256(missing_path),
+                     "added_unseen_go": len(new_ids),
+                     "base_go": len(old_ids),
+                     "total_go": len(all_ids),
+                     "existing_segment_parity_max_abs_diff": delta,
+                     "note": "Original bank entries unchanged; missing 2023 general-test labels added. Not a training bank.",
+                     },
     }
     dest.parent.mkdir(parents=True, exist_ok=True)
     temp_out = dest.with_suffix(dest.suffix + ".tmp")
