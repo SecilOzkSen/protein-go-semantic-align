@@ -1,4 +1,4 @@
-"""Apply 2023 GO is_a True Path Rule to saved V2 BP general-test scores.
+"""Apply 2023 GO is_a True Path Rule to saved V2 BP/MF/CC general-test scores.
 
 No inference. Intermediate non-candidate GO nodes are used for propagation.
 Uses original MZSGO evaluate_annotations for RAW and TPR metrics.
@@ -85,6 +85,7 @@ def format_metrics(values):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--raw-dir', required=True)
+    ap.add_argument('--branch', choices=['BP', 'MF', 'CC'], required=True)
     ap.add_argument('--out-dir', required=True)
     ap.add_argument('--root', default='/workspace/MZSGO_temporal')
     ap.add_argument('--mzsgo-repo', default='/workspace/MZSGO')
@@ -92,6 +93,9 @@ def main():
     ap.add_argument('--chunk-size', type=int, default=32)
     args = ap.parse_args()
     raw_dir, out = Path(args.raw_dir), Path(args.out_dir)
+    branch = args.branch.lower()
+    expected_dims = {'bp': (5712, 20639), 'cc': (5764, 2803), 'mf': (5584, 7007)}
+    expected_n, expected_g = expected_dims[branch]
     if raw_dir.resolve() == out.resolve():
         raise ValueError('Output must be separate from RAW directory')
     if out.exists() and any(out.iterdir()):
@@ -104,7 +108,7 @@ def main():
         'pids': raw_dir / 'protein_ids.json',
         'gids': raw_dir / 'go_ids.json',
         'metrics': raw_dir / 'metrics.json',
-        'labels': Path(args.root) / 'processed/bp/pid_to_go_general_test_bp.json',
+        'labels': Path(args.root) / 'processed' / branch / f'pid_to_go_general_test_{branch}.json',
         'obo': Path(args.obo_path),
     }
     for path in files.values():
@@ -113,15 +117,15 @@ def main():
 
     pids = json.loads(files['pids'].read_text())
     gids = [gid(g) for g in json.loads(files['gids'].read_text())]
-    if len(pids) != 5712 or len(gids) != 20639:
-        raise RuntimeError(f'Unexpected general BP dimensions: {len(pids)}, {len(gids)}')
+    if len(pids) != expected_n or len(gids) != expected_g:
+        raise RuntimeError(f'Unexpected general {args.branch} dimensions: {len(pids)}, {len(gids)}; expected {expected_dims[branch]}')
     if len(set(pids)) != len(pids) or len(set(gids)) != len(gids):
         raise RuntimeError('Duplicate IDs')
     raw = np.load(files['raw'], mmap_mode='r')
-    if raw.shape != (5712, 20639) or not np.isfinite(raw).all() or raw.min() < 0 or raw.max() > 1:
+    if raw.shape != (expected_n, expected_g) or not np.isfinite(raw).all() or raw.min() < 0 or raw.max() > 1:
         raise RuntimeError('Invalid RAW score matrix')
     previous = json.loads(files['metrics'].read_text())
-    if previous.get('mode') != 'general' or previous.get('branch') != 'BP' or previous.get('score_transform') != 'linear':
+    if previous.get('mode') != 'general' or previous.get('branch') != args.branch or previous.get('score_transform') != 'linear':
         raise RuntimeError('Unexpected RAW evaluation protocol')
 
     terms, aliases = read_obo(files['obo'])
@@ -229,7 +233,8 @@ def main():
     prop.flush()
     propagated_metrics = format_metrics(util.evaluate_annotations(y, torch.from_numpy(np.asarray(prop)), 'general_tpr'))
     report = {
-        'scope': 'BP general test, 2023 GO is_a, all 20639 scored candidates',
+        'scope': f'{args.branch} general test, 2023 GO is_a, all {len(gids)} scored candidates',
+        'branch': args.branch,
         'ground_truth_propagated': False,
         'prediction_propagation': 'child-to-ancestor max, including intermediate unscored ontology nodes',
         'n_proteins': len(pids), 'n_candidates': len(gids),
