@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from src.configs.data_classes import TrainerConfig
 from src.metrics.validated_metrics import compute_protein_centric_fmax, compute_term_aupr
 from src.metrics.validated_metrics import compute_retrieval_metrics
-from src.models.alignment_model_v2_original import ProteinGoAligner
+from src.models.alignment_model_global_ablation import ProteinGoAligner
 from src.metrics.validated_metrics import protein_centric_f_at_threshold
 
 
