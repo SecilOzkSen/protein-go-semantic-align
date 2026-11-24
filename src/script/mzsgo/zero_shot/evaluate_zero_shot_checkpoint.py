@@ -122,6 +122,7 @@ def execute(args):
     manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     repo_root = args.repo_root.expanduser().resolve()
     loader, source_audit = resolve_loader(manifest, repo_root, args.model_module)
+    print(f"[LOADER] {loader} | training source hashes matched", flush=True)
     checkpoint_hash = sha256_file(checkpoint)
     meta = read_checkpoint_meta(loader, checkpoint)
     config = meta['config']

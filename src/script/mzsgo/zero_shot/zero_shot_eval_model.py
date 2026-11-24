@@ -87,11 +87,13 @@ def resolve_loader(run_manifest, repo_root, explicit_module=None):
     declared_value = (run_manifest.get("inference_entrypoint")
                       or run_manifest.get("config", {}).get("inference_entrypoint"))
     declared = _module_name(declared_value) if declared_value else None
-    candidate_paths = (set((root / "src").glob("*/inference.py"))
-                       | set((root / "src" / "ablations").glob("*/inference.py")))
+    # Original training packages may be nested beneath an extra folder, and
+    # exact historical scorers may be bundled privately with this evaluator.
+    # Discover all importable inference modules beneath src; identity still
+    # requires all four original file hashes, never just an architecture name.
+    candidate_paths = set((root / "src").rglob("inference.py"))
     if explicit is not None:
-        # An explicitly named package may be nested more deeply than the two
-        # conventional discovery layouts. It still needs all critical hashes.
+        # An explicit module is a path preference, never a hash bypass.
         explicit_path = root.joinpath(*explicit.split(".")).with_suffix(".py")
         if explicit_path.is_file():
             candidate_paths.add(explicit_path)
@@ -115,7 +117,9 @@ def resolve_loader(run_manifest, repo_root, explicit_module=None):
             matches.append((name, path, actual))
     if not matches:
         detail = "; ".join(f"{name}: {', '.join(files)}" for name, files in rejected.items())
-        raise ValueError("No inference package matches the run manifest's critical source hashes"
+        ablation = run_manifest.get("config", {}).get("ablation_id", "unknown")
+        raise ValueError(f"No inference package matches {ablation}'s recorded source hashes. "
+                         f"Searched recursively under {root / 'src'}"
                          + (f" for {explicit}" if explicit else "")
                          + (f". Mismatched files: {detail}" if detail else ""))
     matches.sort(key=lambda item: (item[0] != declared, item[0]))
@@ -141,6 +145,8 @@ def resolve_loader(run_manifest, repo_root, explicit_module=None):
         "declared_entrypoint": declared_value, "explicit_module": explicit,
         "identical_matching_modules": [item[0] for item in matches],
         "hash_bypass": False,
+        "discovery_scope": "all importable inference.py files recursively under repository src",
+        "bundled_reference_scorer": ".reference_scoring." in name,
     }
     return name, audit
 
