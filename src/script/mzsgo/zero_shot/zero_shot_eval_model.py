@@ -49,6 +49,17 @@ def _canonical_hash(value):
                                      ensure_ascii=True).encode("utf-8")).hexdigest()
 
 
+def _importable_component(value):
+    """Allow source folders such as b1-1 through importlib's string API.
+
+    Dotted import statements require identifiers; importlib also supports
+    literal hyphens in package directories. Keep path separators, empty parts
+    and traversal out of module names. File hashes still establish identity.
+    """
+    return (value.isidentifier()
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value) is not None)
+
+
 def _module_name(value):
     if isinstance(value, ModuleType):
         value = value.__name__
@@ -56,7 +67,7 @@ def _module_name(value):
     if value.endswith(".load_aligner"):
         value = value[:-len(".load_aligner")]
     _require(value.startswith("src.") and value.endswith(".inference")
-             and all(part.isidentifier() for part in value.split(".")),
+             and all(_importable_component(part) for part in value.split(".")),
              f"Invalid inference module: {value!r}")
     return value
 
@@ -101,7 +112,7 @@ def resolve_loader(run_manifest, repo_root, explicit_module=None):
     matches, rejected = [], {}
     for path in candidates:
         name = ".".join(path.relative_to(root).with_suffix("").parts)
-        if not all(part.isidentifier() for part in name.split(".")):
+        if not all(_importable_component(part) for part in name.split(".")):
             continue
         if explicit is not None and name != explicit:
             continue
