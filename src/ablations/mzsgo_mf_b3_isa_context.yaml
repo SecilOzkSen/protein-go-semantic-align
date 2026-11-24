@@ -1,0 +1,107 @@
+# B3-ISA: original B3 plus the existing cached canonical is_a text channel.
+# Shared GO-only learned gate; parent penalty OFF, plain InfoNCE unchanged.
+experiment:
+  ablation_id: B3-ISA
+mzsgo:
+  branch: MF
+  root: /workspace/MZSGO_temporal
+  split_dir: null
+  train_ids_path: '{split_dir}/train_homology30_v2.txt'
+  val_ids_path: '{split_dir}/valid_homology30_v2.txt'
+  pid2pos_path: '{root}/processed/{branch}/pid_to_go_train_{branch}.json'
+  candidate_go_ids_path: '{root}/processed/{branch}/candidate_go_ids_{branch}.json'
+  temporal_go_ids_path: '{root}/processed/{branch}/temporal_go_ids_{branch}.json'
+  go_text_path: '{root}/processed/{branch}/go_texts_canonical_segmented_dual_2023_2025.jsonl'
+  frozen_bank: '{root}/go_cache/{branch}/frozen_segment_parent_bank.pt'
+  original_train_ids_path: '{root}/processed/{branch}/train.txt'
+  original_valid_ids_path: '{root}/processed/{branch}/valid.txt'
+  temporal_test_ids_path: '{root}/processed/{branch}/test.txt'
+data:
+  max_len: 1000
+  overlap: 256
+  rare_lt: 20
+stores:
+  embed_dir_res: '{root}/protein_embeddings/esm2_residue_overlap'
+model:
+  isa_context_enabled: true
+  protein_mode: local
+  segment_aggregation: learned
+  align_dim: 768
+  temperature: 0.07
+  window_length: 128
+  window_stride: 64
+  mil_tau: 0.1
+  parent_strength: 0.0
+  go_chunk_size: 512
+  encoder_name: microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext
+  go_encoder_inner_pooling: mean
+  go_segment_max_len: 64
+  go_text_store_max_len: 128
+  go_representation: segments
+  go_single_text_max_len: 128
+  single_text_bank_path: '{output_dir}/go_single_text_bank.pt'
+training:
+  epochs: 30
+  batch_size: 64
+  eval_batch_size: 64
+  num_workers: 0
+  fp16: true
+  device: cuda:0
+  seed: 42
+  torch_threads: 4
+  output_dir: '{root}/outputs/{branch}/b3_local_smoothmil_learned_isa_context_infonce_parent_off'
+  keep_last_n: 3
+  resume: null
+  eval_only: false
+  log_every: 500
+  log_level: INFO
+  monitor_metric: protein_wise_map
+  secondary_monitor_metric: macro_term_recall@500
+  monitor_mode: max
+  early_stop_patience: 3
+  eval_go_bs: 256
+optim:
+  lr: 1.0e-05
+  weight_decay: 0.0
+  grad_clip: 1.0
+loss:
+  lambda_con: 1.0
+  pbr_lambda: 0.0
+  pbr_mode: local
+  pbr_local_k: 128
+  pbr_margin: 0.0
+  pbr_tau: 0.05
+  frequency_aware_local: false
+  frequency_weight_power: 0.5
+  frequency_weight_min: 0.5
+  frequency_weight_max: 2.0
+evaluation:
+  retrieval_eval_ks:
+  - 50
+  - 100
+  - 200
+  - 500
+  - 1000
+  positive_rank_quantiles:
+  - 0.5
+  - 0.75
+  - 0.9
+  - 0.95
+  validation_fixed_threshold: null
+diagnostics:
+  log_gradient_norms: true
+  log_positive_rank_cdf: true
+  log_cardinality_metrics: true
+  log_go_segment_weights: true
+  log_go_term_metrics: true
+  log_every_steps: 500
+  log_every_epochs: 1
+  max_table_rows: 200
+  heatmap_rows: 50
+  save_local: true
+wandb:
+  enabled: true
+  project: protein-go-align-mzsgo
+  entity: null
+  run_name: MZSGO-MF-B3-ISA-local-segments-learned-InfoNCE-ParentOFF
+  mode: online
