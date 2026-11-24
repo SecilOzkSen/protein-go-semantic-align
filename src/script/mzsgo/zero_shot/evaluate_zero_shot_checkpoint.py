@@ -2,7 +2,8 @@
 
 Run in the existing repository. Data root, ontology branch, architecture and
 batch size are read from the checkpoint. Its run_manifest.json is found beside
-it. Results are written beside the checkpoint as <stem>.zero_shot.json.
+it. MZSGO protein-centric unseen AUPR is the primary validation metric.
+Results are written beside the checkpoint as <stem>.zero_shot.json.
 """
 from __future__ import annotations
 
@@ -21,7 +22,54 @@ import torch
 
 from .zero_shot_eval_io import load_cohort, validate_checkpoint_meta, sha256_file
 from .zero_shot_eval_metrics import evaluate_rankings
+from .zero_shot_eval_mzsgo_metrics import evaluate_mzsgo
 from .zero_shot_eval_model import resolve_loader, read_checkpoint_meta, score_checkpoint
+
+
+def default_repo_root():
+    """Find src's enclosing repository at any script nesting depth."""
+    for directory in Path(__file__).resolve().parents:
+        if (directory / 'src').is_dir():
+            return directory
+    return Path.cwd().resolve()
+
+
+def cosine_unit_scores(scores, architecture, runtime):
+    """One fixed, unfitted cosine adapter for the MZSGO threshold grid.
+
+    Official MZSGO applies sigmoid to classifier logits. Our cosine scorer has
+    different output semantics, so we explicitly map its theoretical [-1,1]
+    range to [0,1]. This is an adapter for our model, not their logit conversion.
+    Raw scores remain untouched for retrieval and term-AP diagnostics.
+    """
+    if architecture.get('normalize') is not True:
+        raise ValueError('The fixed cosine adapter requires architecture.normalize=True')
+    if float(architecture.get('parent_strength', float('nan'))) != 0.0:
+        raise ValueError('The bounded cosine adapter requires parent adjustment OFF')
+    reduced_precision = runtime.get('autocast_dtype') == 'torch.bfloat16'
+    tolerance = 0.01 if reduced_precision else 1e-5
+    values = np.asarray(scores)
+    if values.dtype.kind != 'f' or not np.isfinite(values).all():
+        raise ValueError('Expected finite floating-point similarity scores')
+    smallest, largest = float(values.min()), float(values.max())
+    if smallest < -1.0 - tolerance or largest > 1.0 + tolerance:
+        raise ValueError(f'Scores exceed the bounded cosine range: [{smallest}, {largest}], tolerance={tolerance}')
+    clipped_count = int(np.count_nonzero((values < -1.0) | (values > 1.0)))
+    unit = values.astype(np.float64, copy=True)
+    np.clip(unit, -1.0, 1.0, out=unit)
+    unit += 1.0
+    unit *= 0.5
+    return unit, {
+        'name': 'fixed_cosine_affine_v1', 'formula': '(clip(s, -1, 1) + 1) / 2',
+        'fitted_parameters': False, 'per_protein_normalization': False,
+        'raw_min': smallest, 'raw_max': largest, 'bound_tolerance': tolerance,
+        'clipped_count': clipped_count,
+        'max_clipped_overshoot': max(0.0, -1.0-smallest, largest-1.0),
+        'output_dtype': str(unit.dtype),
+        'reference_model_conversion': 'sigmoid(classifier_logits)',
+        'reference_conversion_reused': False,
+        'note': 'Same fixed adapter across all ablations. The reference 101-point grid is sensitive to score transformations.',
+    }
 
 
 def parser():
@@ -31,7 +79,7 @@ def parser():
     p.add_argument('--output', type=Path, help='Result JSON path; defaults beside the checkpoint')
     p.add_argument('--root', type=Path, help='Data root override; normally read from checkpoint')
     p.add_argument('--cohort-dir', type=Path, help='Prepared cohort override')
-    p.add_argument('--repo-root', type=Path, default=Path(__file__).resolve().parents[3])
+    p.add_argument('--repo-root', type=Path, default=default_repo_root())
     p.add_argument('--run-manifest', type=Path, help='Only needed if the checkpoint was moved away from its manifest')
     p.add_argument('--model-module', help='Optional original inference module override')
     p.add_argument('--ks', nargs='+', type=int, default=[50, 100, 200, 500, 1000])
@@ -109,6 +157,15 @@ def execute(args):
     metrics, term_rows, protein_rows = evaluate_rankings(
         scores, truth, cohort['go_ids'], cohort['seen_go_ids'], cohort['unseen_go_ids'],
         cohort['protein_ids'], ks=sorted(set(args.ks)))
+    probabilities, score_adapter = cosine_unit_scores(scores, meta['architecture'], runtime)
+    print('[METRIC] MZSGO protein-centric AUPR, fixed cosine adapter, 101 thresholds', flush=True)
+    mzsgo = evaluate_mzsgo(probabilities, truth, cohort['go_ids'], cohort['seen_go_ids'], cohort['unseen_go_ids'])
+    for group in ('all', 'seen', 'unseen'):
+        evaluation = mzsgo[group]
+        metrics[group]['aupr'] = None if evaluation is None else evaluation['aupr']
+        metrics[group]['mzsgo_fmax'] = None if evaluation is None else evaluation['fmax']
+        metrics[group]['mzsgo_aupr_n_proteins'] = 0 if evaluation is None else evaluation['n_proteins']
+        metrics[group]['mzsgo_aupr_n_terms'] = 0 if evaluation is None else evaluation['n_terms']
     recorded = meta.get('validation_metrics', {}).get('protein_wise_map')
     actual = metrics['seen']['protein_wise_map']
     delta = None if recorded is None or actual is None else float(actual - recorded)
@@ -116,25 +173,28 @@ def execute(args):
         raise ValueError('Nonfinite seen mAP comparison')
     parity = 'not_available' if delta is None else ('matched_within_1e-5' if abs(delta) <= 1e-5 else 'review_score_or_metric_parity')
     result = {
-        'format': 'single_checkpoint_natural_zero_positive_validation_v1',
+        'format': 'single_checkpoint_natural_zero_positive_validation_v2_mzsgo_aupr',
         'created_utc': datetime.now(timezone.utc).isoformat(),
         'checkpoint': str(checkpoint), 'checkpoint_sha256': checkpoint_hash,
         'ablation': config['ablation_id'], 'branch': branch, 'epoch': meta['epoch'],
         'completed_epochs': meta['epoch'] + 1, 'architecture': meta['architecture'],
         'cohort_counts': cohort['summary']['counts'], 'cohort_signature': cohort['signature'],
-        'metrics': metrics, 'seen_map_parity': {'recorded': recorded, 'actual': actual, 'difference': delta, 'status': parity},
+        'metrics': metrics, 'primary_metric': 'unseen/aupr',
+        'mzsgo_evaluation': mzsgo, 'score_adapter': score_adapter,
+        'seen_map_parity': {'recorded': recorded, 'actual': actual, 'difference': delta, 'status': parity},
         'term_metrics': term_rows, 'protein_metrics': protein_rows,
         'source_audit': source_audit, 'checkpoint_identity_audit': audit, 'runtime': runtime,
         'elapsed_seconds': time.perf_counter() - started,
-        'metric_note': 'Full active GO rankings. Term AP uses every validation protein and is non-interpolated average precision.',
+        'metric_note': 'AUPR uses original MZSGO protein-centric subset masks and 101-threshold integration with our fixed cosine adapter. Retrieval ranks remain over all active GO; macro term AP retains all validation proteins. These are different metrics.',
         'unseen_note': 'Zero training-positive count, not a certificate of absence from the training loss. Reserved temporal GO excluded.',
     }
     atomic_json(output, result)
     for group in ('unseen', 'seen', 'all'):
         values = metrics[group]
-        details = [f"mAP={values['protein_wise_map']}", f"macro_AP={values['macro_term_ap']}"]
+        details = [f"AUPR={values['aupr']}", f"Fmax={values['mzsgo_fmax']}", f"macro_AP={values['macro_term_ap']}", f"mAP={values['protein_wise_map']}"]
         details.extend(f"R@{k}={values[f'protein_recall@{k}']}" for k in sorted(set(args.ks)))
         print(f"[{group.upper()}] " + ' | '.join(details), flush=True)
+    print(f"[PRIMARY] unseen/AUPR={metrics['unseen']['aupr']} | H={mzsgo['harmonic_mean']}", flush=True)
     print(f'[SEEN PARITY] {parity} difference={delta}', flush=True)
     print(f'[SAVED] {output}', flush=True)
     return 0
