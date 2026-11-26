@@ -335,7 +335,8 @@ def validate_ablation(a):
     if a.ablation_id not in VARIANT_SETTINGS:
         raise ValueError(f"Unknown experiment.ablation_id: {a.ablation_id!r}")
     expected = dict(VARIANT_SETTINGS[a.ablation_id])
-    expected.update(branch="MF", parent_strength=0.0, lambda_con=1.0,
+    # resolve_config validates BP, CC and MF; the ablation contract is shared.
+    expected.update(parent_strength=0.0, lambda_con=1.0,
                     pbr_lambda=0.0, frequency_aware_local=False,
                     frequency_aware_infonce=(a.ablation_id == "B3-FA"),
                     go_encoder_inner_pooling="mean")
