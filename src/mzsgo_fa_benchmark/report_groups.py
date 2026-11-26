@@ -33,6 +33,7 @@ GROUP_KEYS = ("overall", "seen", "unseen")
 MANIFEST_FORMAT = "mzsgo_fa_general_eval_v1"
 REPORT_FORMAT = "mzsgo_fa_general_group_report_v1"
 REPORT_NAME = "metrics_seen_unseen.json"
+PAPER_ROWS_NAME = "general_benchmark_rows.tex"
 PRIMARY_BASIS = "checkpoint_actual_training_positive_annotations"
 DIAGNOSTIC_BASIS = "original_train_plus_validation_pool_diagnostic_only"
 
@@ -191,15 +192,18 @@ def _scores(path, shape, label):
 
 
 def _write_reports_exclusively(outputs):
-    """Publish both completed reports, without replacing any existing file."""
+    """Publish completed JSON reports and paper rows without replacing files."""
     temporary, created = [], []
     try:
         for destination, payload in outputs:
             fd, name = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
             temporary.append(Path(name))
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
-                handle.write("\n")
+                if isinstance(payload, str):
+                    handle.write(payload)
+                else:
+                    json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
+                    handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
         for (destination, _), source in zip(outputs, temporary):
@@ -232,11 +236,38 @@ def _print_table(reports, *, diagnostic=False):
         print("| " + " | ".join([label] + cells) + " |")
 
 
+def general_benchmark_latex_rows(reports):
+    """Paper column order is Fmax, AUPR, unseen AUPR, seen AUPR, H."""
+    primary = reports[0][1]
+    n_train = primary["n_training_annotation_proteins"]
+    n_validation = primary["benchmark_training_pool_partition"]["n_training_annotation_proteins"] - n_train
+    lines = [
+        f"% {primary['branch']} general-test benchmark; actual checkpoint TRAIN positives define seen/unseen.",
+        "% Column order: method, Fmax, AUPR, unseen AUPR, seen AUPR, H.",
+        "% RAW and TPR share gold labels and fixed linear score mapping; no train+validation refit.",
+        f"% Include in the dagger footnote: {primary['branch']} actual TRAIN={n_train:,}; validation={n_validation:,}; no refit.",
+        "% The RAW row is optional if the manuscript currently contains only FA + TPR for this ontology.",
+    ]
+    if primary["branch"] == "CC":
+        lines.append("% If adding RAW to the current CC block, change its multirow count from 12 to 13.")
+    for variant, report in reports:
+        overall, seen, unseen = report["overall"], report["seen"], report["unseen"]
+        values = [overall["Fmax"], overall["AUPR"],
+                  None if unseen is None else unseen["AUPR"],
+                  None if seen is None else seen["AUPR"], report["H"]]
+        method = (r"\textbf{FA (ours)}$^{\dagger}$" if variant == "RAW"
+                  else r"\textbf{FA + TPR (ours)}$^{\dagger}$")
+        cells = ["", method] + [r"\textit{NA}" if value is None else f"{value:.4f}" for value in values]
+        lines.append(" & ".join(cells) + r" \\")
+    return "\n".join(lines) + "\n"
+
+
 def execute(args):
     raw_dir, tpr_dir = Path(args.raw_dir).expanduser().resolve(), Path(args.tpr_dir).expanduser().resolve()
     _require(raw_dir != tpr_dir, "RAW and TPR directories must differ")
     raw_output, tpr_output = raw_dir / REPORT_NAME, tpr_dir / REPORT_NAME
-    for output in (raw_output, tpr_output):
+    paper_output = tpr_dir / PAPER_ROWS_NAME
+    for output in (raw_output, tpr_output, paper_output):
         if output.exists() or output.is_symlink():
             raise FileExistsError(f"Report already exists; no files changed: {output}")
     manifest_path = raw_dir / "evaluation_manifest.json"
@@ -361,10 +392,11 @@ def execute(args):
                          (tpr_path, tpr_report_hash), (metric_source_path, metric_source_hash),
                          (generic_path, generic_hash)):
         _require(sha256_file(path) == digest, f"Input/source changed during reporting: {path}")
-    _write_reports_exclusively([(raw_output, reports[0][1]), (tpr_output, reports[1][1])])
+    _write_reports_exclusively([(raw_output, reports[0][1]), (tpr_output, reports[1][1]),
+                                (paper_output, general_benchmark_latex_rows(reports))])
     _print_table(reports)
     _print_table(reports, diagnostic=True)
-    print(f"\n[SAVED] {raw_output}\n[SAVED] {tpr_output}")
+    print(f"\n[SAVED] {raw_output}\n[SAVED] {tpr_output}\n[SAVED] {paper_output}")
     return {"raw": reports[0][1], "tpr": reports[1][1]}
 
 

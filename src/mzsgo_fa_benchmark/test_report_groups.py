@@ -108,6 +108,7 @@ class GroupReportTests(unittest.TestCase):
     def assert_no_outputs(self):
         self.assertFalse((self.raw / report.REPORT_NAME).exists())
         self.assertFalse((self.tpr / report.REPORT_NAME).exists())
+        self.assertFalse((self.tpr / report.PAPER_ROWS_NAME).exists())
 
     def test_primary_and_diagnostic_partitions_use_distinct_truthful_training_bases(self):
         original_npz_hash = report.sha256_file(self.raw / "evaluation_data.npz")
@@ -143,6 +144,18 @@ class GroupReportTests(unittest.TestCase):
             payload = json.loads((directory / report.REPORT_NAME).read_text())
             self.assertEqual(payload["format"], report.REPORT_FORMAT)
             self.assertNotIn("NaN", (directory / report.REPORT_NAME).read_text())
+        paper = (self.tpr / report.PAPER_ROWS_NAME).read_text()
+        lines = [line for line in paper.splitlines() if line.startswith(" & ")]
+        self.assertEqual(len(lines), 2)
+        for line, variant in zip(lines, ("raw", "tpr")):
+            cells = line.removesuffix(" " + chr(92) * 2).split(" & ")
+            metrics = result[variant]
+            expected = [metrics["overall"]["Fmax"], metrics["overall"]["AUPR"],
+                        metrics["unseen"]["AUPR"], metrics["seen"]["AUPR"], metrics["H"]]
+            self.assertEqual(cells[2:], [f"{value:.4f}" for value in expected])
+            self.assertIn(r"\textbf{FA", cells[1])
+            self.assertIn(r"$^{\dagger}$", cells[1])
+        self.assertIn("actual TRAIN=2; validation=1", paper)
 
     def test_hash_mismatch_stops_before_any_report(self):
         np.save(self.raw / "scores_01.npy", self.scores + .001)
@@ -274,6 +287,7 @@ class GroupReportTests(unittest.TestCase):
             self.assertIsNone(result[variant]["unseen"])
             self.assertIsNone(result[variant]["H"])
             self.assertEqual(result[variant]["n_unseen_test_go"], 0)
+        self.assertIn(r"\textit{NA}", (self.tpr / report.PAPER_ROWS_NAME).read_text())
 
     def test_existing_output_is_never_overwritten(self):
         destination = self.raw / report.REPORT_NAME
@@ -297,6 +311,33 @@ class GroupReportTests(unittest.TestCase):
                 self.execute()
         self.assertFalse((self.raw / report.REPORT_NAME).exists())
         self.assertEqual((self.tpr / report.REPORT_NAME).read_text(), "other process output\n")
+        self.assertEqual(list(self.raw.glob("*.tmp")), [])
+        self.assertEqual(list(self.tpr.glob("*.tmp")), [])
+
+    def test_existing_paper_rows_stop_before_publishing_either_json_report(self):
+        destination = self.tpr / report.PAPER_ROWS_NAME
+        destination.write_text("existing paper rows\n")
+        with self.assertRaises(FileExistsError):
+            self.execute()
+        self.assertEqual(destination.read_text(), "existing paper rows\n")
+        self.assertFalse((self.raw / report.REPORT_NAME).exists())
+        self.assertFalse((self.tpr / report.REPORT_NAME).exists())
+
+    def test_concurrent_paper_rows_preserved_and_both_json_reports_rolled_back(self):
+        native_link = os.link
+        calls = []
+        def racing_link(source, destination):
+            calls.append(Path(destination))
+            if len(calls) == 3:
+                Path(destination).write_text("other process paper rows\n")
+                raise FileExistsError("Paper output appeared after preflight")
+            return native_link(source, destination)
+        with patch.object(report.os, "link", side_effect=racing_link):
+            with self.assertRaises(FileExistsError):
+                self.execute()
+        self.assertFalse((self.raw / report.REPORT_NAME).exists())
+        self.assertFalse((self.tpr / report.REPORT_NAME).exists())
+        self.assertEqual((self.tpr / report.PAPER_ROWS_NAME).read_text(), "other process paper rows\n")
         self.assertEqual(list(self.raw.glob("*.tmp")), [])
         self.assertEqual(list(self.tpr.glob("*.tmp")), [])
 

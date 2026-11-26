@@ -115,6 +115,37 @@ def retrieval_metrics(scores, temporal_labels, temporal_columns, ks):
     return result
 
 
+def paper_rows(result):
+    """Format the two paper rows from this evaluation's computed metrics only."""
+    branch = result["branch"]
+    retrieval = result["full_universe_retrieval"]
+    cutoffs = (50, 100, 200, 500, 1000)
+    missing = [k for k in cutoffs if f"temporal_recall@{k}" not in retrieval]
+    lines = [
+        "% Generated from this run's metrics.json; full precision remains in that file.",
+        "% tab:temporal_retrieval: Ontology & N & R@50 & R@100 & R@200 & R@500 & R@1000 & MRR & mAP",
+    ]
+    if missing:
+        lines.append(f"% {branch} retrieval row unavailable: --ks omitted "
+                     + ", ".join(f"R@{k}" for k in missing) + ".")
+    else:
+        cells = [branch, str(result["n_proteins"])]
+        cells.extend(f"{retrieval[f'temporal_recall@{k}']:.4f}" for k in cutoffs)
+        cells.extend((f"{retrieval['temporal_positive_MRR']:.5f}",
+                      f"{retrieval['temporal_positive_mAP']:.5f}"))
+        lines.append(" & ".join(cells) + r" \\")
+    benchmark = result["unseen_original_mzsgo"]
+    lines.extend([
+        "",
+        f"% tab:mzsgo_temporal_benchmark: append inside the {branch} block and increase its multirow count by one.",
+        "% Model & Fmax & AUPR & Precision & Recall; precision/recall at the model's own Fmax threshold.",
+        r" & FA (ours)$^{\dagger}$ & "
+        + " & ".join(f"{benchmark[key]:.4f}" for key in ("Fmax", "AUPR", "precision", "recall"))
+        + r" \\",
+    ])
+    return "\n".join(lines) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -150,7 +181,7 @@ def main(argv=None):
     util = load_util(args.mzsgo_repo)
     print(f"[CHECKPOINT] {args.checkpoint} | ablation=B3-FA branch={args.branch} epoch={meta['epoch']}", flush=True)
     print(f"[TEMPORAL] proteins={len(pids)} scored_candidates={len(candidates)} temporal_metric_columns={len(temporal)}", flush=True)
-    print("[PROTOCOL] Fmax/AUPR: reserved temporal columns only; retrieval: complete original candidate universe; RAW scores, no true path", flush=True)
+    print("[PROTOCOL] Fmax/AUPR: all reserved temporal columns, fixed clip((raw+1)/2,0,1) mapping; retrieval: RAW scores over the complete original candidate universe; no true-path propagation", flush=True)
 
     def progress(item):
         if item["batch"] % 10 == 0 or item["batch"] == item["n_batches"]:
@@ -190,7 +221,7 @@ def main(argv=None):
         "training_input_audit": resources["audit"], "scoring_runtime": bundle.get("scoring_runtime", {}),
         "full_train_refit": False, "training_proteins": len(resources["train_ids"]),
         "validation_proteins": len(resources["val_ids"]),
-        "note": "This is the supplied temporal cohort, not general-test unseen or unseen validation. No seen/unseen H is defined for the temporal-only target set. Fmax uses the benchmark test threshold sweep; its threshold is not a validation-selected deployment threshold. No frequency reweighting or true-path propagation is applied to prediction scores.",
+        "note": "This is the supplied temporal cohort, not general-test unseen or unseen validation. No seen/unseen H is defined for the temporal-only target set. Threshold metrics use the fixed clip((raw+1)/2,0,1) mapping on all reserved temporal columns. Full-universe retrieval uses raw model scores. Fmax uses the benchmark test threshold sweep; its threshold is not a validation-selected deployment threshold. No frequency reweighting or true-path propagation is applied to prediction scores.",
     }
     out.mkdir(parents=True, exist_ok=True)
     require(not any(out.iterdir()), "Output directory became nonempty while scoring")
@@ -205,6 +236,7 @@ def main(argv=None):
                         temporal_go_ids=np.asarray([go_name(g) for g in temporal], dtype=str),
                         temporal_columns=columns)
     write_json(out / "metrics.json", result)
+    (out / "temporal_rows.tex").write_text(paper_rows(result), encoding="utf-8")
     write_json(out / "evaluation_manifest.json", {
         "format": "mzsgo_fa_temporal_eval_v1", "branch": args.branch,
         "n_proteins": len(pids), "n_candidates": len(candidates), "n_temporal_go": len(temporal),

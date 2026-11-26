@@ -173,6 +173,100 @@ def write_json(path, obj):
     Path(path).write_text(json.dumps(obj, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def general_retrieval_metrics(scores, labels, seen_columns, ks=(1, 10, 50, 100, 200, 500, 1000)):
+    """Rank the complete general-test universe once per protein.
+
+    Seen/unseen restrict the target positives, never the ranking columns.
+    Each group averages over proteins with at least one positive in that
+    group. Stable sorting resolves tied raw scores by saved GO column order,
+    matching the supplied temporal retrieval evaluator. Empty groups have
+    null metrics, not zero performance.
+    """
+    scores, labels = np.asarray(scores), np.asarray(labels)
+    seen_columns = np.asarray(seen_columns)
+    require(scores.ndim == 2 and scores.shape == labels.shape and all(scores.shape),
+            "General retrieval requires matching nonempty [N,G] scores and labels")
+    require(scores.dtype.kind == "f" and bool(np.isfinite(scores).all()),
+            "General retrieval scores must be finite floating values")
+    require(bool(np.isin(labels, (0, 1)).all()) and bool(np.all(labels.sum(axis=1) > 0)),
+            "General retrieval requires binary labels and an annotated protein in every row")
+    n, g = scores.shape
+    require(seen_columns.shape == (g,) and seen_columns.dtype.kind == "b",
+            "Seen-target mask must be a boolean vector matching the candidate GO order")
+    ks = tuple(ks)
+    require(ks and all(type(k) is int and k > 0 for k in ks) and len(set(ks)) == len(ks),
+            "General retrieval K values must be positive and unique")
+    masks = {"overall": np.ones(g, dtype=bool), "seen_targets": seen_columns,
+             "unseen_targets": ~seen_columns}
+    term_count = labels.sum(axis=0)
+    states = {
+        name: {"n_proteins": 0, "ap_sum": 0., "rr_sum": 0., "ranks": [],
+               "recall_sum": {k: 0. for k in ks},
+               "term_hits": {k: np.zeros(g, dtype=np.int64) for k in ks}}
+        for name in masks
+    }
+    for row in range(n):
+        order = np.argsort(-scores[row], kind="stable")
+        inverse = np.empty(g, dtype=np.int64)
+        inverse[order] = np.arange(g)
+        all_positive_columns = np.flatnonzero(labels[row])
+        for name, mask in masks.items():
+            positives = all_positive_columns[mask[all_positive_columns]]
+            if not len(positives):
+                continue
+            state = states[name]
+            ranks = np.sort(inverse[positives] + 1)
+            state["n_proteins"] += 1
+            state["ap_sum"] += float(np.mean(np.arange(1, len(ranks) + 1) / ranks))
+            state["rr_sum"] += 1. / float(ranks[0])
+            state["ranks"].extend(ranks.tolist())
+            for k in ks:
+                hits = inverse[positives] < min(k, g)
+                state["recall_sum"][k] += float(hits.mean())
+                state["term_hits"][k][positives] += hits.astype(np.int64)
+    result = {
+        "score_source": "scores_raw.npy",
+        "candidate_scope": "complete_general_test_candidate_universe",
+        "tie_breaking": "stable descending raw score; saved GO column order for ties",
+        "training_basis": "actual checkpoint training positive annotations",
+        "group_definition": "mask target positives only; keep every candidate in the ranking",
+        "averaging": "per protein, over proteins with at least one target positive in that group",
+        "rank_summary": "median and 90th percentile over all positive protein-GO pairs in the group",
+        "ground_truth_propagated": False, "n_candidates": g, "ks": list(ks),
+    }
+    for name, mask in masks.items():
+        state, supported = states[name], (term_count > 0) & mask
+        count = state["n_proteins"]
+        group = {
+            "n_proteins": count, "n_candidates": g,
+            "n_positive_pairs": int(term_count[mask].sum()),
+            "n_positive_terms": int(np.count_nonzero(supported)),
+            "mAP": state["ap_sum"] / count if count else None,
+            "MRR": state["rr_sum"] / count if count else None,
+            "positive_rank_median": float(np.median(state["ranks"])) if count else None,
+            "positive_rank_p90": float(np.quantile(state["ranks"], .9)) if count else None,
+        }
+        for k in ks:
+            group[f"recall@{k}"] = state["recall_sum"][k] / count if count else None
+            group[f"macro_term_recall@{k}"] = (
+                float(np.mean(state["term_hits"][k][supported] / term_count[supported]))
+                if count else None
+            )
+        result[name] = group
+    return result
+
+
+def general_retrieval_latex_row(branch, retrieval):
+    """The general retrieval table row, formatted only after measurement."""
+    overall = retrieval["overall"]
+    cells = [branch, f"{overall['n_proteins']:,}", f"{overall['n_candidates']:,}",
+             f"{overall['mAP']:.4f}"]
+    cells.extend(f"{overall[f'recall@{k}']:.4f}" for k in (50, 100, 200, 500))
+    return ("% General-test retrieval: complete candidate ranking, raw scores, no TPR.\n"
+            "% Protein-averaged mAP and Recall@K; ties keep saved GO column order.\n"
+            + " & ".join(cells) + " \\\\\n")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--checkpoint", required=True)
@@ -221,6 +315,8 @@ def main(argv=None):
     require(isinstance(scores, np.ndarray) and scores.shape == y.shape and scores.dtype == np.float32,
             "Scorer returned an unexpected matrix")
     require(bool(np.isfinite(scores).all()), "Nonfinite raw scores")
+    train_seen = {gid(term) for values in actual_labels.values() for term in values}
+    retrieval = general_retrieval_metrics(scores, y, np.asarray([term in train_seen for term in ids], dtype=bool))
     scores01 = np.clip((scores + np.float32(1)) / np.float32(2), 0, 1).astype(np.float32)
     original = format_metrics(util.evaluate_annotations(torch.from_numpy(y), torch.from_numpy(scores01), "general"))
     generic = mzsgo_metrics(y, scores01)
@@ -250,6 +346,7 @@ def main(argv=None):
         "bank_sha256": bank_audit["sha256"], "bank_audit": bank_audit,
         "metric_source": str(util_path), "metric_source_sha256": metric_source_hash,
         "general_original_mzsgo": original, "overall_generic_crosscheck": generic,
+        "general_retrieval": retrieval,
         "overall_crosscheck_abs_difference": difference,
         "general_positive_pairs": int(y.sum()), "general_unique_positive_terms": int((y.sum(0) > 0).sum()),
         "actual_training_proteins": len(actual_labels), "training_pool_proteins": len(pool_labels),
@@ -261,12 +358,15 @@ def main(argv=None):
         "note": "General test only. Fixed linear score mapping, no learned calibration. No inference-time frequency weighting. Fmax is the benchmark threshold-sweep maximum, not a deployed operating threshold. No true-path propagation has been applied to this RAW output.",
     }
     write_json(out / "metrics.json", result)
+    (out / "general_retrieval_row.tex").write_text(
+        general_retrieval_latex_row(args.branch, retrieval), encoding="utf-8")
     manifest = {"format": "mzsgo_fa_general_eval_v1", "branch": args.branch,
                 "n_proteins": len(pids), "n_candidates": len(ids),
                 "checkpoint_sha256": result["checkpoint_sha256"],
                 "files": {p.name: sha256(p) for p in sorted(out.iterdir()) if p.is_file()}}
     write_json(out / "evaluation_manifest.json", manifest)
-    print(json.dumps({"RAW": original, "saved": str(out), "next": "evaluate_general_true_path, then report_groups"}, indent=2), flush=True)
+    print(json.dumps({"RAW": original, "general_retrieval_raw": retrieval["overall"],
+                      "saved": str(out), "next": "evaluate_general_true_path, then report_groups"}, indent=2), flush=True)
 
 
 if __name__ == "__main__":

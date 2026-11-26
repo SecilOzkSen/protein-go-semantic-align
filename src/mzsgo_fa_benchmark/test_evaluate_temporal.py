@@ -157,7 +157,14 @@ class TemporalProtocolTests(unittest.TestCase):
         expected = original_retrieval_reference(scores, labels, cols, ks)
         self.assertEqual(actual, expected)
 
-    def test_cli_artifacts_use_temporal_metrics_and_full_universe_retrieval(self):
+    def _check_cli_artifacts_for_branch(self, branch):
+        # Keep a zero-support reserved term for every branch, not just MF.
+        proc = self.data / "processed" / branch.lower()
+        proc.mkdir(parents=True, exist_ok=True)
+        (proc / f"pid_to_go_temporal_{branch.lower()}.json").write_text(json.dumps(self.labels))
+        self.bundle["identity"]["branch"] = branch
+        out = self.root / f"temporal_output_{branch.lower()}"
+
         def fixture_scores(bundle, resources, pids, bank, gids, device, progress):
             self.assertIs(bundle, self.bundle)
             self.assertIs(resources, self.resources)
@@ -167,38 +174,75 @@ class TemporalProtocolTests(unittest.TestCase):
             self.assertEqual(resources["evaluation_annotations"], self.labels)
             self.assertEqual(device, "cpu")
             return self.raw.copy()
-        args = ["--checkpoint", str(self.checkpoint), "--branch", "MF", "--root", str(self.data),
+        args = ["--checkpoint", str(self.checkpoint), "--branch", branch, "--root", str(self.data),
                 "--repo-root", str(self.root), "--mzsgo-repo", str(self.original_repo), "--device", "cpu",
-                "--out-dir", str(self.out), "--ks", "1", "3", "6"]
+                "--out-dir", str(out), "--ks", "1", "3", "6", "50", "100", "200", "500", "1000"]
         with redirect_stdout(io.StringIO()), patch.object(temporal, "inspect_checkpoint", return_value=self.bundle), \
              patch.object(temporal, "prepare_base_resources", return_value=self.resources), \
              patch.object(temporal, "score_test", side_effect=fixture_scores):
             temporal.main(args)
-        result = json.loads((self.out / "metrics.json").read_text())
+        result = json.loads((out / "metrics.json").read_text())
         self.assertEqual(result["mode"], "temporal")
+        self.assertEqual(result["branch"], branch)
         self.assertEqual((result["n_candidates"], result["n_temporal_go"]), (6, 3))
+        self.assertEqual(result["temporal_cohort_audit"]["n_temporal_go_with_test_positives"], 2)
         self.assertFalse(result["true_path_applied"])
         self.assertFalse(result["full_train_refit"])
         self.assertNotIn("H", result)
         self.assertEqual(result["full_universe_retrieval"]["temporal_recall@1"], 0.)
         self.assertEqual(result["full_universe_retrieval"]["temporal_recall@6"], 1.)
-        with np.load(self.out / "evaluation_data.npz", allow_pickle=False) as artifact:
+        with np.load(out / "evaluation_data.npz", allow_pickle=False) as artifact:
             np.testing.assert_array_equal(artifact["labels_temporal"], [[1, 0, 0], [0, 1, 0]])
             np.testing.assert_array_equal(artifact["temporal_columns"], [2, 4, 5])
             self.assertEqual(len(artifact["full_go_ids"]), 6)
             labels = artifact["labels_temporal"].copy()
-        mapped = np.load(self.out / "scores_01.npy", allow_pickle=False)
+        mapped = np.load(out / "scores_01.npy", allow_pickle=False)
         expected = mzsgo_metrics(labels, mapped[:, [2, 4, 5]])
         for key in ("Fmax", "AUPR", "precision", "recall", "threshold"):
             self.assertAlmostEqual(result["unseen_original_mzsgo"][key], expected[key], places=12)
-        manifest = json.loads((self.out / "evaluation_manifest.json").read_text())
+        rows = (out / "temporal_rows.tex").read_text()
+        self.assertIn(branch + r" & 2 & 1.0000 & 1.0000 & 1.0000 & 1.0000 & 1.0000 & 0.25000 & 0.25000 \\", rows)
+        expected_benchmark = (r" & FA (ours)$^{\dagger}$ & " + " & ".join(
+            f"{expected[key]:.4f}" for key in ("Fmax", "AUPR", "precision", "recall")) + r" \\")
+        self.assertIn(expected_benchmark, rows)
+        self.assertIn("% tab:temporal_retrieval:", rows)
+        self.assertIn("% tab:mzsgo_temporal_benchmark:", rows)
+        manifest = json.loads((out / "evaluation_manifest.json").read_text())
         self.assertEqual(manifest["format"], "mzsgo_fa_temporal_eval_v1")
+        self.assertIn("temporal_rows.tex", manifest["files"])
         for name, digest in manifest["files"].items():
-            self.assertEqual(sha256(self.out / name), digest)
-        before = {p.name: p.read_bytes() for p in self.out.iterdir()}
+            self.assertEqual(sha256(out / name), digest)
+        before = {p.name: p.read_bytes() for p in out.iterdir()}
         with self.assertRaisesRegex(ValueError, "new or empty"):
             temporal.main(args)
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.out.iterdir()})
+        self.assertEqual(before, {p.name: p.read_bytes() for p in out.iterdir()})
+
+    def test_cli_artifacts_use_temporal_metrics_and_full_universe_retrieval(self):
+        self._check_cli_artifacts_for_branch("MF")
+
+    def test_cc_cli_retains_reserved_columns_and_exports_paper_rows(self):
+        self._check_cli_artifacts_for_branch("CC")
+
+    def test_bp_cli_retains_reserved_columns_and_exports_paper_rows(self):
+        self._check_cli_artifacts_for_branch("BP")
+
+    def test_paper_rows_preserve_table_column_order_and_precision(self):
+        result = {"branch": "CC", "n_proteins": 123,
+                  "full_universe_retrieval": {
+                      "temporal_recall@50": .125, "temporal_recall@100": .25,
+                      "temporal_recall@200": .5, "temporal_recall@500": .75,
+                      "temporal_recall@1000": .875, "temporal_positive_MRR": .01234,
+                      "temporal_positive_mAP": .02345},
+                  "unseen_original_mzsgo": {"Fmax": .1234, "AUPR": .2345,
+                                             "precision": .3456, "recall": .4567}}
+        rows = temporal.paper_rows(result)
+        self.assertIn(r"CC & 123 & 0.1250 & 0.2500 & 0.5000 & 0.7500 & 0.8750 & 0.01234 & 0.02345 \\", rows)
+        self.assertIn(r" & FA (ours)$^{\dagger}$ & 0.1234 & 0.2345 & 0.3456 & 0.4567 \\", rows)
+        del result["full_universe_retrieval"]["temporal_recall@200"]
+        rows = temporal.paper_rows(result)
+        self.assertIn("% CC retrieval row unavailable: --ks omitted R@200.", rows)
+        self.assertNotIn("CC & 123", rows)
+        self.assertIn(r" & FA (ours)$^{\dagger}$ & 0.1234 & 0.2345 & 0.3456 & 0.4567 \\", rows)
 
     def test_non_primary_checkpoint_is_rejected_before_scoring(self):
         self.bundle["meta"]["selection"]["best_primary_epoch"] = 24
